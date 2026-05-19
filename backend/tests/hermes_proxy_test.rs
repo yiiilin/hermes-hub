@@ -7,12 +7,12 @@ use axum::{
 use hermes_hub_backend::{
     build_router_with_state,
     channel::service::ChannelStore,
-    llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
-    model_config::ModelRegistry,
     hermes::{
         instance::{HermesInstance, HermesInstanceKind, HermesInstanceStatus},
         proxy_client::{HermesProxyResponse, InMemoryHermesProxyClient},
     },
+    llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
+    model_config::ModelRegistry,
     session::store::SessionStore,
     AppConfig, AppState,
 };
