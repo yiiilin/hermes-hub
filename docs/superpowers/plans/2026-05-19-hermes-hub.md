@@ -158,27 +158,27 @@ git commit -m "feat: add auth and invite flow"
 - Create: `backend/tests/docker_provisioner_test.rs`
 - Create: `infra/docker/hermes/Dockerfile`
 
-- [ ] **Step 1: Write provisioner tests first**
+- [x] **Step 1: Write provisioner tests first**
 
 Add tests for ensure/start/stop/rebuild behavior, host-path generation, and container metadata without exposing host ports.
 
-- [ ] **Step 2: Verify the provisioner tests fail**
+- [x] **Step 2: Verify the provisioner tests fail**
 
-Run: `cargo test -p hermes-hub-backend docker_provisioner_test`
+Run: `cargo test -p hermes-hub-backend --test docker_provisioner_test`
 
 Expected: fail until the Docker adapter exists.
 
-- [ ] **Step 3: Implement the DockerProvisioner and HermesInstance persistence**
+- [x] **Step 3: Implement the DockerProvisioner and HermesInstance persistence**
 
 Create managed Hermes containers on an internal Docker network, mount per-user host directories, and persist container state in the database.
 
-- [ ] **Step 4: Verify managed Hermes lifecycle operations**
+- [x] **Step 4: Verify managed Hermes lifecycle operations**
 
-Run: `cargo test -p hermes-hub-backend docker_provisioner_test`
+Run: `cargo test -p hermes-hub-backend --test docker_provisioner_test`
 
 Expected: pass.
 
-- [ ] **Step 5: Commit the provisioning layer**
+- [x] **Step 5: Commit the provisioning layer**
 
 ```bash
 git add backend/src/hermes backend/tests/docker_provisioner_test.rs infra/docker/hermes/Dockerfile

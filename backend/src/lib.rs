@@ -1,5 +1,6 @@
 pub mod app_config;
 pub mod db;
+pub mod hermes;
 pub mod http;
 pub mod security;
 pub mod session {
