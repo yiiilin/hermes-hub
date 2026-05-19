@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod hermes_proxy;
 pub mod invites;
+pub mod llm_proxy;
 
 use axum::{
     http::StatusCode,
@@ -16,6 +17,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .merge(auth::router())
         .merge(invites::router())
+        .merge(llm_proxy::router())
         .merge(crate::channel::routes::router())
         .route("/api/hermes/{*path}", any(hermes_proxy::proxy))
 }

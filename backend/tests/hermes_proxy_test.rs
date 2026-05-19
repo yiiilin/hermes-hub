@@ -7,6 +7,8 @@ use axum::{
 use hermes_hub_backend::{
     build_router_with_state,
     channel::service::ChannelStore,
+    llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
+    model_config::ModelRegistry,
     hermes::{
         instance::{HermesInstance, HermesInstanceKind, HermesInstanceStatus},
         proxy_client::{HermesProxyResponse, InMemoryHermesProxyClient},
@@ -23,6 +25,12 @@ fn test_state(store: SessionStore, proxy: InMemoryHermesProxyClient) -> AppState
         store,
         channel_store: ChannelStore::default(),
         hermes_proxy: proxy,
+        model_registry: ModelRegistry::default_for_tests(),
+        llm_provider: InMemoryLlmProviderClient::new(LlmProviderResponse {
+            status: StatusCode::OK,
+            content_type: Some("application/json".to_string()),
+            body: b"{}".to_vec(),
+        }),
     }
 }
 

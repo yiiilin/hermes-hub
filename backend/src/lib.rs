@@ -3,6 +3,9 @@ pub mod channel;
 pub mod db;
 pub mod hermes;
 pub mod http;
+pub mod llm_proxy;
+pub mod model_config;
+pub mod model_registry;
 pub mod security;
 pub mod session {
     pub mod store;
@@ -15,6 +18,8 @@ pub mod domain {
 use axum::{routing::get, Json, Router};
 use channel::service::ChannelStore;
 use hermes::proxy_client::InMemoryHermesProxyClient;
+use llm_proxy::InMemoryLlmProviderClient;
+use model_config::ModelRegistry;
 use serde::Serialize;
 use session::store::SessionStore;
 
@@ -30,6 +35,8 @@ pub struct AppState {
     pub store: SessionStore,
     pub channel_store: ChannelStore,
     pub hermes_proxy: InMemoryHermesProxyClient,
+    pub model_registry: ModelRegistry,
+    pub llm_provider: InMemoryLlmProviderClient,
 }
 
 #[derive(Serialize)]
@@ -44,6 +51,8 @@ pub fn build_router(config: AppConfig) -> Router {
         store: SessionStore::default(),
         channel_store: ChannelStore::default(),
         hermes_proxy: InMemoryHermesProxyClient::default(),
+        model_registry: ModelRegistry::default_for_tests(),
+        llm_provider: InMemoryLlmProviderClient::default(),
     };
 
     build_router_with_state(state)

@@ -229,27 +229,27 @@ git commit -m "feat: add hermes proxy and channel api"
 - Create: `backend/src/model_registry.rs`
 - Create: `backend/tests/llm_proxy_test.rs`
 
-- [ ] **Step 1: Write model proxy tests first**
+- [x] **Step 1: Write model proxy tests first**
 
 Add tests for `/internal/llm/v1/chat/completions`, `/internal/llm/v1/responses`, `/internal/llm/v1/models`, allowlist validation, default model insertion, and streaming passthrough.
 
-- [ ] **Step 2: Verify the LLM proxy tests fail**
+- [x] **Step 2: Verify the LLM proxy tests fail**
 
-Run: `cargo test -p hermes-hub-backend llm_proxy_test`
+Run: `cargo test -p hermes-hub-backend --test llm_proxy_test`
 
 Expected: fail until the gateway exists.
 
-- [ ] **Step 3: Implement the OpenAI-compatible proxy**
+- [x] **Step 3: Implement the OpenAI-compatible proxy**
 
 Forward Hermes model calls to the active provider config, enforce the allowlist, and record usage metadata without storing prompt bodies.
 
-- [ ] **Step 4: Verify provider rotation does not require Hermes restarts**
+- [x] **Step 4: Verify provider rotation does not require Hermes restarts**
 
-Run: `cargo test -p hermes-hub-backend llm_proxy_test`
+Run: `cargo test -p hermes-hub-backend --test llm_proxy_test`
 
 Expected: pass.
 
-- [ ] **Step 5: Commit the gateway**
+- [x] **Step 5: Commit the gateway**
 
 ```bash
 git add backend/src/http backend/src/model_config.rs backend/src/model_registry.rs backend/tests/llm_proxy_test.rs
