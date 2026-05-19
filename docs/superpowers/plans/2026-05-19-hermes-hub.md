@@ -256,7 +256,47 @@ git add backend/src/http backend/src/model_config.rs backend/src/model_registry.
 git commit -m "feat: add llm proxy"
 ```
 
-### Task 7: Build the React admin console and channel workspace
+### Task 7: Add admin and workspace backend APIs
+
+**Files:**
+- Create: `backend/src/http/admin.rs`
+- Create: `backend/src/http/workspace.rs`
+- Create: `backend/tests/admin_workspace_test.rs`
+- Modify: `backend/src/lib.rs`
+- Modify: `backend/src/http/mod.rs`
+- Modify: `backend/src/model_config.rs`
+- Modify: `backend/src/model_registry.rs`
+- Modify: `backend/src/session/store.rs`
+- Modify: `backend/src/hermes/docker_provisioner.rs`
+
+- [x] **Step 1: Write backend admin/workspace tests first**
+
+Add tests for model config read/update, user list, user disable/enable, Hermes instance listing, workspace ensure-hermes, and returning the current user Hermes instance.
+
+- [x] **Step 2: Verify the admin/workspace tests fail**
+
+Run: `cargo test -p hermes-hub-backend --test admin_workspace_test`
+
+Expected: fail until the admin and workspace routes exist.
+
+- [x] **Step 3: Implement the minimal admin and workspace backend APIs**
+
+Wire model config management, user management, Hermes instance listing, external instance binding, and managed Hermes ensure/rebuild/start/stop endpoints.
+
+- [x] **Step 4: Verify admin/workspace behavior**
+
+Run: `cargo test -p hermes-hub-backend --test admin_workspace_test`
+
+Expected: pass.
+
+- [x] **Step 5: Commit the backend API layer**
+
+```bash
+git add backend/src/http backend/src/model_config.rs backend/src/model_registry.rs backend/src/session backend/src/hermes backend/tests/admin_workspace_test.rs
+git commit -m "feat: add admin and workspace backend apis"
+```
+
+### Task 8: Build the React admin console and channel workspace
 
 **Files:**
 - Create: `frontend/src/api/client.ts`
@@ -296,7 +336,7 @@ git add frontend/src frontend/e2e
 git commit -m "feat: add admin console and workspace ui"
 ```
 
-### Task 8: Add full integration coverage, docs, and release hardening
+### Task 9: Add full integration coverage, docs, and release hardening
 
 **Files:**
 - Create: `backend/tests/integration.rs`

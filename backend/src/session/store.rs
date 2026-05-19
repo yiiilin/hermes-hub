@@ -1,8 +1,9 @@
 use crate::domain::{
     invite::{Invite, InviteStatus, PublicInvite},
-    user::{hash_password, verify_password, User, UserRole, UserStatus},
+    user::{hash_password, verify_password, User, UserListItem, UserRole, UserStatus},
 };
 use crate::hermes::instance::HermesInstance;
+use crate::hermes::instance::HermesInstanceStatus;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use sha2::{Digest, Sha256};
 use std::{
@@ -273,6 +274,40 @@ impl SessionStore {
         Ok(invite.public())
     }
 
+    pub fn list_users(&self) -> Result<Vec<UserListItem>, StoreError> {
+        let inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
+        let mut users = inner
+            .users_by_id
+            .values()
+            .map(User::list_item)
+            .collect::<Vec<_>>();
+
+        users.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        Ok(users)
+    }
+
+    pub fn disable_user(&self, user_id: &str) -> Result<User, StoreError> {
+        let mut inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
+        let user = inner
+            .users_by_id
+            .get_mut(user_id)
+            .ok_or(StoreError::InvalidCredentials)?;
+        user.status = UserStatus::Disabled;
+        user.updated_at = unix_now();
+        Ok(user.clone())
+    }
+
+    pub fn enable_user(&self, user_id: &str) -> Result<User, StoreError> {
+        let mut inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
+        let user = inner
+            .users_by_id
+            .get_mut(user_id)
+            .ok_or(StoreError::InvalidCredentials)?;
+        user.status = UserStatus::Active;
+        user.updated_at = unix_now();
+        Ok(user.clone())
+    }
+
     pub fn bind_hermes_instance(&self, instance: HermesInstance) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
         inner
@@ -288,6 +323,31 @@ impl SessionStore {
             .get(user_id)
             .cloned()
             .ok_or(StoreError::InviteNotFound)
+    }
+
+    pub fn list_hermes_instances(&self) -> Result<Vec<HermesInstance>, StoreError> {
+        let inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
+        let mut instances = inner
+            .hermes_instances_by_user_id
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        instances.sort_by(|left, right| left.user_id.cmp(&right.user_id));
+        Ok(instances)
+    }
+
+    pub fn set_hermes_instance_status(
+        &self,
+        user_id: &str,
+        status: HermesInstanceStatus,
+    ) -> Result<HermesInstance, StoreError> {
+        let mut inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
+        let instance = inner
+            .hermes_instances_by_user_id
+            .get_mut(user_id)
+            .ok_or(StoreError::InviteNotFound)?;
+        instance.status = status;
+        Ok(instance.clone())
     }
 
     pub fn user_by_session_cookie(

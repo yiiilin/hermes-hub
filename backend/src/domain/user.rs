@@ -46,6 +46,17 @@ pub struct PublicUser {
     pub updated_at: u64,
 }
 
+/// Admin/user 列表接口使用的精简用户条目。
+#[derive(Clone, Debug, Serialize)]
+pub struct UserListItem {
+    pub id: String,
+    pub email: String,
+    pub role: UserRole,
+    pub status: UserStatus,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum PasswordError {
     #[error("password hash failed")]
@@ -57,6 +68,17 @@ pub enum PasswordError {
 impl User {
     pub fn public(&self) -> PublicUser {
         PublicUser {
+            id: self.id.clone(),
+            email: self.email.clone(),
+            role: self.role.clone(),
+            status: self.status.clone(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+
+    pub fn list_item(&self) -> UserListItem {
+        UserListItem {
             id: self.id.clone(),
             email: self.email.clone(),
             role: self.role.clone(),

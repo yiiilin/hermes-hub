@@ -1,7 +1,9 @@
+pub mod admin;
 pub mod auth;
 pub mod hermes_proxy;
 pub mod invites;
 pub mod llm_proxy;
+pub mod workspace;
 
 use axum::{
     http::StatusCode,
@@ -16,8 +18,10 @@ use crate::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .merge(auth::router())
+        .merge(admin::router())
         .merge(invites::router())
         .merge(llm_proxy::router())
+        .merge(workspace::router())
         .merge(crate::channel::routes::router())
         .route("/api/hermes/{*path}", any(hermes_proxy::proxy))
 }

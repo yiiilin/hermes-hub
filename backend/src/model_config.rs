@@ -8,8 +8,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use serde::Serialize;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ModelConfig {
     pub provider_name: String,
     pub provider_base_url: String,
@@ -81,6 +82,12 @@ impl ModelRegistry {
             .lock()
             .map(|inner| inner.config.clone())
             .map_err(|_| ModelRegistryError::LockFailed)
+    }
+
+    pub fn replace(&self, config: ModelConfig) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.config = config;
+        }
     }
 
     pub fn models_payload(&self) -> Result<serde_json::Value, ModelRegistryError> {
