@@ -45,27 +45,27 @@ Progress must be tracked in this file only:
 - Create: `.env.example`
 - Create: `README.md`
 
-- [ ] **Step 1: Write the failing smoke tests**
+- [x] **Step 1: Write the failing smoke tests**
 
 Add a backend test that fails until the app can load config and build the router, and add a frontend smoke test that fails until the React entry point renders.
 
-- [ ] **Step 2: Verify the repository does not build yet**
+- [x] **Step 2: Verify the repository does not build yet**
 
 Run: `cargo test --workspace`
 
 Expected: fail because the workspace and app code are not implemented yet.
 
-- [ ] **Step 3: Create the minimal workspace and app skeleton**
+- [x] **Step 3: Create the minimal workspace and app skeleton**
 
 Add the root Rust workspace, backend binary entry point, frontend Vite entry point, Docker Compose file, and baseline docs/config files.
 
-- [ ] **Step 4: Verify the skeleton builds**
+- [x] **Step 4: Verify the skeleton builds**
 
 Run: `cargo test --workspace && cd frontend && npm test`
 
 Expected: both commands pass after the minimal scaffolding exists.
 
-- [ ] **Step 5: Commit the scaffold**
+- [x] **Step 5: Commit the scaffold**
 
 ```bash
 git add Cargo.toml backend frontend infra Makefile .env.example README.md
@@ -82,27 +82,27 @@ git commit -m "chore: scaffold hermes hub workspace"
 - Create: `backend/src/security/mod.rs`
 - Create: `backend/tests/schema_test.rs`
 
-- [ ] **Step 1: Write migration tests first**
+- [x] **Step 1: Write migration tests first**
 
 Add tests that fail until the initial tables exist and secret encryption/decryption is wired.
 
-- [ ] **Step 2: Verify schema tests fail**
+- [x] **Step 2: Verify schema tests fail**
 
-Run: `cargo test -p hermes-hub-backend schema_test`
+Run: `cargo test -p hermes-hub-backend --test schema_test`
 
 Expected: fail because the migration and crypto modules are not implemented yet.
 
-- [ ] **Step 3: Implement the initial tables and encrypted secret helpers**
+- [x] **Step 3: Implement the initial tables and encrypted secret helpers**
 
 Add the tables for users, sessions, invites, invite uses, channels, channel sessions, hermes instances, instance tokens, model configs, proxy audit logs, and llm usage events.
 
-- [ ] **Step 4: Verify migrations apply cleanly**
+- [x] **Step 4: Verify migrations apply cleanly**
 
-Run: `cargo test -p hermes-hub-backend schema_test`
+Run: `cargo test -p hermes-hub-backend --test schema_test`
 
 Expected: pass.
 
-- [ ] **Step 5: Commit the schema work**
+- [x] **Step 5: Commit the schema work**
 
 ```bash
 git add backend/migrations backend/src/db backend/src/security backend/tests/schema_test.rs
@@ -120,27 +120,27 @@ git commit -m "feat: add database schema and secret encryption"
 - Create: `backend/src/session/store.rs`
 - Create: `backend/tests/auth_invites_test.rs`
 
-- [ ] **Step 1: Write auth and invite tests first**
+- [x] **Step 1: Write auth and invite tests first**
 
 Add tests for first-user bootstrap admin creation, password hashing, login cookies, invite expiry, invite max uses, and invite revocation.
 
-- [ ] **Step 2: Verify the auth tests fail**
+- [x] **Step 2: Verify the auth tests fail**
 
-Run: `cargo test -p hermes-hub-backend auth_invites_test`
+Run: `cargo test -p hermes-hub-backend --test auth_invites_test`
 
 Expected: fail until the handlers and storage exist.
 
-- [ ] **Step 3: Implement the minimal auth and invite handlers**
+- [x] **Step 3: Implement the minimal auth and invite handlers**
 
 Wire up bootstrap registration, invite creation, invite redemption, login, logout, and current-user lookup.
 
-- [ ] **Step 4: Verify invite-only registration works**
+- [x] **Step 4: Verify invite-only registration works**
 
-Run: `cargo test -p hermes-hub-backend auth_invites_test`
+Run: `cargo test -p hermes-hub-backend --test auth_invites_test`
 
 Expected: pass.
 
-- [ ] **Step 5: Commit auth and invite flow**
+- [x] **Step 5: Commit auth and invite flow**
 
 ```bash
 git add backend/src/http backend/src/domain backend/src/session backend/tests/auth_invites_test.rs
