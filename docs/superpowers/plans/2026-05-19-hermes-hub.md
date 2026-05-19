@@ -309,27 +309,27 @@ git commit -m "feat: add admin and workspace backend apis"
 - Create: `frontend/e2e/auth.spec.ts`
 - Create: `frontend/e2e/workspace.spec.ts`
 
-- [ ] **Step 1: Write frontend route and E2E tests first**
+- [x] **Step 1: Write frontend route and E2E tests first**
 
 Add tests for login, bootstrap admin, invite redemption, channel creation, session streaming, and admin model configuration.
 
-- [ ] **Step 2: Verify the UI tests fail**
+- [x] **Step 2: Verify the UI tests fail**
 
 Run: `cd frontend && npm run test:e2e`
 
 Expected: fail until the routes and API client exist.
 
-- [ ] **Step 3: Implement the minimal admin and workspace UI**
+- [x] **Step 3: Implement the minimal admin and workspace UI**
 
 Build the login page, invite redemption flow, admin pages, channel list, session view, and streaming message area.
 
-- [ ] **Step 4: Verify the React app works end-to-end**
+- [x] **Step 4: Verify the React app works end-to-end**
 
 Run: `cd frontend && npm test && npm run test:e2e`
 
 Expected: pass.
 
-- [ ] **Step 5: Commit the UI**
+- [x] **Step 5: Commit the UI**
 
 ```bash
 git add frontend/src frontend/e2e
