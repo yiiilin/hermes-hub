@@ -194,27 +194,27 @@ git commit -m "feat: add docker hermes provisioner"
 - Create: `backend/src/channel/routes.rs`
 - Create: `backend/tests/hermes_proxy_test.rs`
 
-- [ ] **Step 1: Write proxy and channel tests first**
+- [x] **Step 1: Write proxy and channel tests first**
 
 Add tests for channel creation, session creation, Hermes path forwarding, streaming passthrough, and denylisted admin/internal routes.
 
-- [ ] **Step 2: Verify the proxy tests fail**
+- [x] **Step 2: Verify the proxy tests fail**
 
-Run: `cargo test -p hermes-hub-backend hermes_proxy_test`
+Run: `cargo test -p hermes-hub-backend --test hermes_proxy_test`
 
 Expected: fail until the proxy and channel modules exist.
 
-- [ ] **Step 3: Implement the channel-first API and transparent Hermes proxy**
+- [x] **Step 3: Implement the channel-first API and transparent Hermes proxy**
 
 Add `channel -> session` persistence and forward user requests to the bound Hermes instance with request/response streaming preserved.
 
-- [ ] **Step 4: Verify session and proxy behavior**
+- [x] **Step 4: Verify session and proxy behavior**
 
-Run: `cargo test -p hermes-hub-backend hermes_proxy_test`
+Run: `cargo test -p hermes-hub-backend --test hermes_proxy_test`
 
 Expected: pass.
 
-- [ ] **Step 5: Commit the Hermes proxy work**
+- [x] **Step 5: Commit the Hermes proxy work**
 
 ```bash
 git add backend/src/http backend/src/channel backend/tests/hermes_proxy_test.rs

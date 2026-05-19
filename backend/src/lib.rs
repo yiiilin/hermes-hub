@@ -1,4 +1,5 @@
 pub mod app_config;
+pub mod channel;
 pub mod db;
 pub mod hermes;
 pub mod http;
@@ -12,6 +13,8 @@ pub mod domain {
 }
 
 use axum::{routing::get, Json, Router};
+use channel::service::ChannelStore;
+use hermes::proxy_client::InMemoryHermesProxyClient;
 use serde::Serialize;
 use session::store::SessionStore;
 
@@ -25,6 +28,8 @@ pub use app_config::AppConfig;
 pub struct AppState {
     pub config: AppConfig,
     pub store: SessionStore,
+    pub channel_store: ChannelStore,
+    pub hermes_proxy: InMemoryHermesProxyClient,
 }
 
 #[derive(Serialize)]
@@ -37,8 +42,14 @@ pub fn build_router(config: AppConfig) -> Router {
     let state = AppState {
         config,
         store: SessionStore::default(),
+        channel_store: ChannelStore::default(),
+        hermes_proxy: InMemoryHermesProxyClient::default(),
     };
 
+    build_router_with_state(state)
+}
+
+pub fn build_router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .merge(http::router())

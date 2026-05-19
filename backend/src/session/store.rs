@@ -2,6 +2,7 @@ use crate::domain::{
     invite::{Invite, InviteStatus, PublicInvite},
     user::{hash_password, verify_password, User, UserRole, UserStatus},
 };
+use crate::hermes::instance::HermesInstance;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use sha2::{Digest, Sha256};
 use std::{
@@ -30,6 +31,7 @@ struct StoreInner {
     sessions_by_hash: HashMap<String, StoredSession>,
     invites_by_id: HashMap<String, Invite>,
     invite_ids_by_hash: HashMap<String, String>,
+    hermes_instances_by_user_id: HashMap<String, HermesInstance>,
 }
 
 #[derive(Clone)]
@@ -269,6 +271,43 @@ impl SessionStore {
         invite.status = InviteStatus::Revoked;
         invite.updated_at = now;
         Ok(invite.public())
+    }
+
+    pub fn bind_hermes_instance(&self, instance: HermesInstance) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
+        inner
+            .hermes_instances_by_user_id
+            .insert(instance.user_id.clone(), instance);
+        Ok(())
+    }
+
+    pub fn hermes_instance_for_user(&self, user_id: &str) -> Result<HermesInstance, StoreError> {
+        let inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
+        inner
+            .hermes_instances_by_user_id
+            .get(user_id)
+            .cloned()
+            .ok_or(StoreError::InviteNotFound)
+    }
+
+    pub fn user_by_session_cookie(
+        &self,
+        cookie: &str,
+        cookie_name: &str,
+    ) -> Result<User, StoreError> {
+        let token = cookie
+            .split(';')
+            .filter_map(|part| part.trim().split_once('='))
+            .find_map(|(name, value)| {
+                if name == cookie_name {
+                    Some(value)
+                } else {
+                    None
+                }
+            })
+            .ok_or(StoreError::Unauthorized)?;
+
+        self.user_by_session_token(token)
     }
 }
 

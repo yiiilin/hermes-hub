@@ -1,9 +1,11 @@
 pub mod auth;
+pub mod hermes_proxy;
 pub mod invites;
 
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
+    routing::any,
     Json, Router,
 };
 use serde::Serialize;
@@ -11,7 +13,11 @@ use serde::Serialize;
 use crate::AppState;
 
 pub fn router() -> Router<AppState> {
-    Router::new().merge(auth::router()).merge(invites::router())
+    Router::new()
+        .merge(auth::router())
+        .merge(invites::router())
+        .merge(crate::channel::routes::router())
+        .route("/api/hermes/{*path}", any(hermes_proxy::proxy))
 }
 
 #[derive(Debug)]
