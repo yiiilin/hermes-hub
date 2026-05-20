@@ -34,6 +34,8 @@ pub enum ApiError {
     Conflict(&'static str),
     Gone(&'static str),
     NotFound(&'static str),
+    BadGateway(&'static str),
+    GatewayTimeout(&'static str),
     Internal,
 }
 
@@ -56,6 +58,10 @@ impl IntoResponse for ApiError {
             ApiError::Conflict(message) => (StatusCode::CONFLICT, "conflict", message),
             ApiError::Gone(message) => (StatusCode::GONE, "gone", message),
             ApiError::NotFound(message) => (StatusCode::NOT_FOUND, "not_found", message),
+            ApiError::BadGateway(message) => (StatusCode::BAD_GATEWAY, "bad_gateway", message),
+            ApiError::GatewayTimeout(message) => {
+                (StatusCode::GATEWAY_TIMEOUT, "gateway_timeout", message)
+            }
             ApiError::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",

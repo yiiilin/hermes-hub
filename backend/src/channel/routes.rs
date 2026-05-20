@@ -64,10 +64,11 @@ async fn create_channel(
     headers: HeaderMap,
     Json(payload): Json<CreateChannelRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = current_user(&state, &headers)?;
+    let user = current_user(&state, &headers).await?;
     let channel = state
         .channel_store
         .create_channel(&user.id, &payload.name, payload.description)
+        .await
         .map_err(map_channel_error)?;
 
     Ok((
@@ -80,10 +81,11 @@ async fn list_channels(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = current_user(&state, &headers)?;
+    let user = current_user(&state, &headers).await?;
     let channels = state
         .channel_store
         .list_channels(&user.id)
+        .await
         .map_err(map_channel_error)?;
 
     Ok(Json(ChannelListResponse { channels }))
@@ -94,10 +96,11 @@ async fn get_channel(
     headers: HeaderMap,
     Path(channel_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = current_user(&state, &headers)?;
+    let user = current_user(&state, &headers).await?;
     let channel = state
         .channel_store
         .get_channel(&user.id, &channel_id)
+        .await
         .map_err(map_channel_error)?;
 
     Ok(Json(ChannelResponse { channel }))
@@ -109,11 +112,12 @@ async fn create_session(
     Path(channel_id): Path<String>,
     Json(payload): Json<CreateSessionRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = current_user(&state, &headers)?;
+    let user = current_user(&state, &headers).await?;
     let kind = ChannelSessionKind::parse(&payload.kind).map_err(map_channel_error)?;
     let session = state
         .channel_store
         .create_session(&user.id, &channel_id, kind, payload.title)
+        .await
         .map_err(map_channel_error)?;
 
     Ok((
@@ -127,10 +131,11 @@ async fn list_sessions(
     headers: HeaderMap,
     Path(channel_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = current_user(&state, &headers)?;
+    let user = current_user(&state, &headers).await?;
     let sessions = state
         .channel_store
         .list_sessions(&user.id, &channel_id)
+        .await
         .map_err(map_channel_error)?;
 
     Ok(Json(SessionListResponse { sessions }))
@@ -141,10 +146,11 @@ async fn get_session(
     headers: HeaderMap,
     Path((channel_id, session_id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = current_user(&state, &headers)?;
+    let user = current_user(&state, &headers).await?;
     let session = state
         .channel_store
         .get_session(&user.id, &channel_id, &session_id)
+        .await
         .map_err(map_channel_error)?;
 
     Ok(Json(SessionResponse { session }))
@@ -154,6 +160,6 @@ fn map_channel_error(error: ChannelStoreError) -> ApiError {
     match error {
         ChannelStoreError::ChannelNotFound => ApiError::NotFound("channel not found"),
         ChannelStoreError::InvalidSessionKind => ApiError::BadRequest("invalid session kind"),
-        ChannelStoreError::LockFailed => ApiError::Internal,
+        ChannelStoreError::LockFailed | ChannelStoreError::DatabaseFailed => ApiError::Internal,
     }
 }

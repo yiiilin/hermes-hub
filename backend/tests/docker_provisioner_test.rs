@@ -1,9 +1,79 @@
 use hermes_hub_backend::hermes::{
-    docker_provisioner::{DockerProvisioner, DockerProvisionerConfig},
+    docker_provisioner::{
+        DockerProvisioner, DockerProvisionerConfig, DockerRuntime, DockerRuntimeOutput,
+    },
     instance::{HermesInstanceKind, HermesInstanceStatus},
     provisioner::HermesProvisioner,
 };
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
+
+#[derive(Clone, Default)]
+struct FakeDockerRuntime {
+    calls: Arc<Mutex<Vec<Vec<String>>>>,
+    container_exists: Arc<Mutex<bool>>,
+}
+
+#[async_trait::async_trait]
+impl DockerRuntime for FakeDockerRuntime {
+    async fn run(
+        &self,
+        args: Vec<String>,
+    ) -> Result<DockerRuntimeOutput, hermes_hub_backend::hermes::provisioner::ProvisionerError>
+    {
+        self.calls.lock().expect("calls lock").push(args.clone());
+
+        if args.get(0).map(String::as_str) == Some("network")
+            && args.get(1).map(String::as_str) == Some("inspect")
+        {
+            return Ok(DockerRuntimeOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "network not found".to_string(),
+            });
+        }
+
+        if args.get(0).map(String::as_str) == Some("container")
+            && args.get(1).map(String::as_str) == Some("inspect")
+        {
+            let exists = *self.container_exists.lock().expect("exists lock");
+            return Ok(DockerRuntimeOutput {
+                success: exists,
+                stdout: if exists {
+                    "container-existing".to_string()
+                } else {
+                    String::new()
+                },
+                stderr: if exists {
+                    String::new()
+                } else {
+                    "No such container".to_string()
+                },
+            });
+        }
+
+        if args.get(0).map(String::as_str) == Some("create") {
+            *self.container_exists.lock().expect("exists lock") = true;
+            return Ok(DockerRuntimeOutput {
+                success: true,
+                stdout: "container-created".to_string(),
+                stderr: String::new(),
+            });
+        }
+
+        if args.get(0).map(String::as_str) == Some("rm") {
+            *self.container_exists.lock().expect("exists lock") = false;
+        }
+
+        Ok(DockerRuntimeOutput {
+            success: true,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+}
 
 fn test_config() -> DockerProvisionerConfig {
     DockerProvisionerConfig {
@@ -15,15 +85,17 @@ fn test_config() -> DockerProvisionerConfig {
         default_model: "gpt-4.1-mini".to_string(),
         memory_limit: Some("1g".to_string()),
         cpu_limit: Some("1.0".to_string()),
+        docker_binary: "docker".to_string(),
     }
 }
 
 #[tokio::test]
 async fn docker_provisioner_test() {
-    let provisioner = DockerProvisioner::new(test_config());
+    let runtime = FakeDockerRuntime::default();
+    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime.clone()));
 
     let instance = provisioner
-        .ensure_instance("user-123")
+        .ensure_instance("user-123", "instance-token")
         .await
         .expect("instance can be created");
 
@@ -61,14 +133,36 @@ async fn docker_provisioner_test() {
     assert!(spec
         .env
         .iter()
-        .any(|entry| entry == "LLM_BASE_URL=http://hermes-hub:8080/internal/llm/v1"));
+        .any(|entry| entry == "OPENAI_BASE_URL=http://hermes-hub:8080/internal/llm/v1"));
+    assert!(spec
+        .env
+        .iter()
+        .any(|entry| entry == "OPENAI_API_KEY=instance-token"));
     assert!(spec
         .mounts
         .iter()
         .any(|mount| mount.container_path == "/config" && mount.read_only));
+    assert_eq!(instance.container_id.as_deref(), Some("container-created"));
+
+    let calls = runtime.calls.lock().expect("calls lock").clone();
+    assert!(calls
+        .iter()
+        .any(|args| args == &vec![
+            "network".to_string(),
+            "create".to_string(),
+            "hermes-hub-net".to_string(),
+        ]));
+    let create_call = calls
+        .iter()
+        .find(|args| args.first().map(String::as_str) == Some("create"))
+        .expect("container create command is issued");
+    assert!(
+        !create_call.iter().any(|arg| arg == "-p" || arg == "--publish"),
+        "managed Hermes must not publish host ports"
+    );
 
     provisioner
-        .stop_instance(&instance.id)
+        .stop_instance(&instance)
         .await
         .expect("instance can be stopped");
     assert_eq!(
@@ -80,7 +174,7 @@ async fn docker_provisioner_test() {
     );
 
     provisioner
-        .start_instance(&instance.id)
+        .start_instance(&instance)
         .await
         .expect("instance can be started");
     assert_eq!(
@@ -92,7 +186,7 @@ async fn docker_provisioner_test() {
     );
 
     let rebuilt = provisioner
-        .rebuild_instance(&instance.id)
+        .rebuild_instance(&instance, "rotated-token")
         .await
         .expect("instance can be rebuilt");
 

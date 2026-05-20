@@ -344,29 +344,97 @@ git commit -m "feat: add admin console and workspace ui"
 - Update: `README.md`
 - Update: `docs/` as needed
 
-- [ ] **Step 1: Write the integration and CI tests first**
+- [x] **Step 1: Write the integration and CI tests first**
 
 Add a full-stack integration suite that covers bootstrap admin, invite-only signup, managed Hermes provisioning, proxy routing, and LLM gateway rotation.
 
-- [ ] **Step 2: Verify the full-stack tests fail before the final wiring is complete**
+- [x] **Step 2: Verify the full-stack tests fail before the final wiring is complete**
 
 Run: `cargo test --workspace && cd frontend && npm test && cd .. && docker compose -f infra/docker/docker-compose.yml up --build`
 
 Expected: fail until all modules are wired together.
 
-- [ ] **Step 3: Wire the last integration gaps and CI workflow**
+- [x] **Step 3: Wire the last integration gaps and CI workflow**
 
 Connect the backend, frontend, database, Docker provisioning, and deployment workflow into a single repeatable local stack.
 
-- [ ] **Step 4: Verify the release candidate passes the full suite**
+- [x] **Step 4: Verify the release candidate passes the full suite**
 
 Run: `cargo test --workspace && cd frontend && npm test && npm run test:e2e`
 
 Expected: pass.
 
-- [ ] **Step 5: Commit the release hardening**
+- [x] **Step 5: Commit the release hardening**
 
 ```bash
 git add backend frontend infra .github README.md docs
 git commit -m "chore: harden hermes hub release"
 ```
+
+### Task 10: Replace mock runtime adapters with real production adapters
+
+**Files:**
+- Modify: `backend/Cargo.toml`
+- Modify: `backend/src/lib.rs`
+- Modify: `backend/src/app_config.rs`
+- Modify: `backend/src/llm_proxy.rs`
+- Modify: `backend/src/http/llm_proxy.rs`
+- Modify: `backend/src/hermes/proxy_client.rs`
+- Modify: `backend/src/http/hermes_proxy.rs`
+- Modify: `backend/src/hermes/docker_provisioner.rs`
+- Modify: `backend/src/http/workspace.rs`
+- Modify: `backend/src/http/admin.rs`
+- Modify: `backend/tests/llm_proxy_test.rs`
+- Modify: `backend/tests/hermes_proxy_test.rs`
+- Modify: `backend/tests/docker_provisioner_test.rs`
+
+- [x] **Step 1: Add failing adapter tests first**
+
+Add tests that prove production LLM/Hermes proxy clients hit real HTTP endpoints, preserve streaming-compatible headers, map upstream failures correctly, and that managed Docker provisioning can invoke Docker through a swappable command runner.
+
+- [x] **Step 2: Implement real HTTP proxy adapters**
+
+Add production reqwest-backed clients for Hermes and OpenAI-compatible providers, keep in-memory clients only for tests, enforce timeout/body limits, and avoid leaking provider/Hermes tokens through browser responses.
+
+- [x] **Step 3: Implement real Docker daemon provisioning**
+
+Create host directories, ensure the Docker network exists, create/start/stop/remove managed Hermes containers, inject Hub LLM proxy config, keep host ports unpublished, and persist container ids/status through existing APIs.
+
+- [x] **Step 4: Verify backend adapter coverage**
+
+Run: `cargo test --workspace`
+
+Expected: pass with real adapters tested through local fake HTTP servers and fake Docker command runners, without requiring a real Hermes or Docker daemon in unit tests.
+
+### Task 11: Close product hardening gaps for the first runnable release
+
+**Files:**
+- Modify: `backend/src/session/store.rs`
+- Modify: `backend/src/http/llm_proxy.rs`
+- Modify: `backend/src/http/hermes_proxy.rs`
+- Modify: `frontend/src/api/client.ts`
+- Modify: `frontend/src/routes/login.tsx`
+- Modify: `frontend/src/routes/admin.tsx`
+- Modify: `frontend/src/routes/channels.tsx`
+- Modify: `frontend/src/routes/channel-session.tsx`
+- Modify: `README.md`
+- Modify: `.env.example`
+- Modify: `infra/docker/docker-compose.yml`
+
+- [x] **Step 1: Add audit/usage and UI behavior tests**
+
+Add focused tests for proxy audit logs, LLM usage events, invite/login/admin/channel user flows, and encoded denied Hermes paths.
+
+- [x] **Step 2: Implement audit/usage writes and frontend actions**
+
+Record proxy/LLM metadata without prompt bodies, make login/register/invite/admin/model/channel/session controls actually call APIs, and surface usable loading/error states.
+
+- [x] **Step 3: Update deployment docs and compose configuration**
+
+Document production adapter defaults, Docker socket/data-root/network requirements, secret-key generation, and the limits of automated verification without a real Hermes image/provider key.
+
+- [x] **Step 4: Verify the release candidate again**
+
+Run: `cargo test --workspace && cd frontend && npm test && npm run build && npm run test:e2e && cd .. && docker compose -f infra/docker/docker-compose.yml config`
+
+Expected: pass, with any real-Hermes/manual-provider gaps explicitly documented.

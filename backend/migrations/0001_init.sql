@@ -127,3 +127,6 @@ create table if not exists channel_sessions (
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
+
+-- 保持现有 API 语义：用户可以先创建 channel，再绑定或创建 Hermes 实例。
+alter table channels alter column hermes_instance_id drop not null;

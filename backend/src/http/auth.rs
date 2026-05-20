@@ -55,6 +55,7 @@ async fn bootstrap_register(
     let user = state
         .store
         .create_bootstrap_admin(&payload.email, &payload.password)
+        .await
         .map_err(map_register_error)?;
 
     Ok((
@@ -72,6 +73,7 @@ async fn register_with_invite(
     let user = state
         .store
         .register_with_invite(&payload.invite_token, &payload.email, &payload.password)
+        .await
         .map_err(map_invite_register_error)?;
 
     Ok((
@@ -89,10 +91,12 @@ async fn login(
     let user = state
         .store
         .login(&payload.email, &payload.password)
+        .await
         .map_err(map_login_error)?;
     let session_token = state
         .store
         .create_session(&user.id)
+        .await
         .map_err(|_| ApiError::Internal)?;
     let cookie = session_cookie(&state.config.cookie_name, &session_token);
 
@@ -113,6 +117,7 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Res
         state
             .store
             .delete_session(&token)
+            .await
             .map_err(|_| ApiError::Internal)?;
     }
 
@@ -130,25 +135,26 @@ async fn me(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = current_user(&state, &headers)?;
+    let user = current_user(&state, &headers).await?;
 
     Ok(Json(UserResponse {
         user: user.public(),
     }))
 }
 
-pub fn current_user(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError> {
+pub async fn current_user(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError> {
     let token = session_token_from_headers(headers, &state.config.cookie_name)
         .ok_or(ApiError::Unauthorized)?;
 
     state
         .store
         .user_by_session_token(&token)
+        .await
         .map_err(|_| ApiError::Unauthorized)
 }
 
-pub fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError> {
-    let user = current_user(state, headers)?;
+pub async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError> {
+    let user = current_user(state, headers).await?;
 
     if user.role != UserRole::Admin {
         return Err(ApiError::Forbidden);

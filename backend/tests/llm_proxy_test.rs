@@ -1,26 +1,47 @@
 use axum::{
     body::{to_bytes, Body},
-    http::{header, Method, Request, StatusCode},
-    response::Response,
+    extract::State,
+    http::{header, HeaderMap, Method, Request, StatusCode},
+    response::{IntoResponse, Response},
+    routing::post,
     Router,
 };
 use hermes_hub_backend::{
     build_router_with_state,
     channel::service::ChannelStore,
-    llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
+    docker_config_from_app,
+    hermes::{
+        docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
+        proxy_client::InMemoryHermesProxyClient,
+    },
+    llm_proxy::{
+        DynLlmProviderClient, InMemoryLlmProviderClient, LlmProviderResponse,
+        ReqwestLlmProviderClient,
+    },
     model_config::{ModelConfig, ModelRegistry},
     session::store::SessionStore,
     AppConfig, AppState,
 };
 use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
+use tokio::net::TcpListener;
 use tower::ServiceExt;
 
 fn test_state(provider: InMemoryLlmProviderClient, registry: ModelRegistry) -> AppState {
+    test_state_with_provider(provider.shared(), registry)
+}
+
+fn test_state_with_provider(provider: DynLlmProviderClient, registry: ModelRegistry) -> AppState {
+    let config = AppConfig::for_tests();
     AppState {
-        config: AppConfig::for_tests(),
+        docker_provisioner: DockerProvisioner::new_with_runtime(
+            docker_config_from_app(&config, config.initial_model_config.default_model.clone()),
+            Arc::new(NoopDockerRuntime),
+        ),
+        config,
         store: SessionStore::default(),
         channel_store: ChannelStore::default(),
-        hermes_proxy: Default::default(),
+        hermes_proxy: InMemoryHermesProxyClient::default().shared(),
         model_registry: registry,
         llm_provider: provider,
     }
@@ -98,6 +119,53 @@ async fn response_json(response: Response<Body>) -> (StatusCode, Value) {
     };
 
     (status, value)
+}
+
+#[derive(Clone, Default)]
+struct CapturedProviderRequest {
+    authorization: Arc<Mutex<Option<String>>>,
+    body: Arc<Mutex<Option<Value>>>,
+}
+
+async fn provider_handler(
+    State(captured): State<CapturedProviderRequest>,
+    headers: HeaderMap,
+    body: Body,
+) -> impl IntoResponse {
+    let bytes = to_bytes(body, usize::MAX)
+        .await
+        .expect("provider body can be read");
+    *captured.authorization.lock().expect("auth lock") = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    *captured.body.lock().expect("body lock") =
+        serde_json::from_slice::<Value>(&bytes).ok();
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/event-stream")],
+        "data: real-provider\n\n",
+    )
+}
+
+async fn spawn_provider_server(captured: CapturedProviderRequest) -> String {
+    let app = Router::new()
+        .route("/v1/chat/completions", post(provider_handler))
+        .route("/v1/responses", post(provider_handler))
+        .with_state(captured);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test provider can bind");
+    let addr = listener.local_addr().expect("test provider addr");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("test provider server runs");
+    });
+
+    format!("http://{addr}")
 }
 
 #[tokio::test]
@@ -182,4 +250,66 @@ async fn llm_proxy_test() {
     assert_eq!(responses.status(), StatusCode::OK);
     let forwarded = provider.last_request().expect("provider request");
     assert_eq!(forwarded.path, "/responses");
+}
+
+#[tokio::test]
+async fn llm_proxy_uses_real_http_provider_and_records_usage() {
+    let captured = CapturedProviderRequest::default();
+    let provider_base_url = format!("{}/v1", spawn_provider_server(captured.clone()).await);
+    let registry = ModelRegistry::new(ModelConfig {
+        provider_name: "local-provider".to_string(),
+        provider_base_url,
+        provider_api_key: "real-provider-token".to_string(),
+        default_model: "gpt-4.1-mini".to_string(),
+        allowed_models: vec!["gpt-4.1-mini".to_string()],
+        allow_streaming: true,
+        request_timeout_seconds: 5,
+    });
+    registry
+        .add_instance_token_for_instance("instance-for-usage", "instance-token")
+        .await
+        .expect("memory token can be registered");
+    let state = test_state_with_provider(ReqwestLlmProviderClient::default().shared(), registry);
+    let app = build_router_with_state(state.clone());
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/internal/llm/v1/chat/completions",
+        json!({ "messages": [], "stream": true }),
+        Some("instance-token"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .expect("content type")
+            .to_str()
+            .expect("ascii"),
+        "text/event-stream"
+    );
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body can be read");
+    assert_eq!(bytes, "data: real-provider\n\n");
+    assert_eq!(
+        captured
+            .authorization
+            .lock()
+            .expect("auth lock")
+            .as_deref(),
+        Some("Bearer real-provider-token")
+    );
+    assert_eq!(
+        captured.body.lock().expect("body lock").as_ref().expect("body")
+            ["model"],
+        "gpt-4.1-mini"
+    );
+    assert_eq!(
+        state.store.llm_usage_count().await.expect("usage count"),
+        1
+    );
 }

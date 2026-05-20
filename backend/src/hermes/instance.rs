@@ -28,7 +28,10 @@ pub struct HermesInstance {
     pub status: HermesInstanceStatus,
     pub name: String,
     pub base_url: String,
+    #[serde(skip_serializing)]
     pub api_token_secret_ref: Option<String>,
+    #[serde(skip_serializing)]
+    pub llm_api_key: Option<String>,
     pub container_id: Option<String>,
     pub host_workspace_path: Option<String>,
     pub host_sandbox_path: Option<String>,
@@ -53,6 +56,7 @@ impl HermesInstance {
             name: format!("hermes-user-{user_id}"),
             base_url,
             api_token_secret_ref: None,
+            llm_api_key: None,
             container_id: None,
             host_workspace_path: Some(host_workspace_path),
             host_sandbox_path: Some(host_sandbox_path),

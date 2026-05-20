@@ -1,15 +1,22 @@
 use axum::{
     body::{to_bytes, Body},
-    http::{header, Method, Request, StatusCode},
-    response::Response,
+    extract::{OriginalUri, State},
+    http::{header, HeaderMap, Method, Request, StatusCode},
+    response::{IntoResponse, Response},
+    routing::post,
     Router,
 };
 use hermes_hub_backend::{
     build_router_with_state,
     channel::service::ChannelStore,
+    docker_config_from_app,
     hermes::{
+        docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
         instance::{HermesInstance, HermesInstanceKind, HermesInstanceStatus},
-        proxy_client::{HermesProxyResponse, InMemoryHermesProxyClient},
+        proxy_client::{
+            DynHermesProxyClient, HermesProxyResponse, InMemoryHermesProxyClient,
+            ReqwestHermesProxyClient,
+        },
     },
     llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
     model_config::ModelRegistry,
@@ -17,11 +24,22 @@ use hermes_hub_backend::{
     AppConfig, AppState,
 };
 use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
+use tokio::net::TcpListener;
 use tower::ServiceExt;
 
 fn test_state(store: SessionStore, proxy: InMemoryHermesProxyClient) -> AppState {
+    test_state_with_proxy(store, proxy.shared())
+}
+
+fn test_state_with_proxy(store: SessionStore, proxy: DynHermesProxyClient) -> AppState {
+    let config = AppConfig::for_tests();
     AppState {
-        config: AppConfig::for_tests(),
+        docker_provisioner: DockerProvisioner::new_with_runtime(
+            docker_config_from_app(&config, config.initial_model_config.default_model.clone()),
+            Arc::new(NoopDockerRuntime),
+        ),
+        config,
         store,
         channel_store: ChannelStore::default(),
         hermes_proxy: proxy,
@@ -30,7 +48,8 @@ fn test_state(store: SessionStore, proxy: InMemoryHermesProxyClient) -> AppState
             status: StatusCode::OK,
             content_type: Some("application/json".to_string()),
             body: b"{}".to_vec(),
-        }),
+        })
+        .shared(),
     }
 }
 
@@ -147,12 +166,73 @@ fn managed_instance_for(user_id: &str) -> HermesInstance {
         name: "hermes-user-admin".to_string(),
         base_url: "http://hermes-user-admin:8000".to_string(),
         api_token_secret_ref: Some("hermes-secret-token".to_string()),
+        llm_api_key: None,
         container_id: Some("container-1".to_string()),
         host_workspace_path: Some("/tmp/hermes/admin/workspace".to_string()),
         host_sandbox_path: Some("/tmp/hermes/admin/sandbox".to_string()),
         host_config_path: Some("/tmp/hermes/admin/config".to_string()),
         health_status: "healthy".to_string(),
     }
+}
+
+fn managed_instance_with_base_url(user_id: &str, base_url: String) -> HermesInstance {
+    HermesInstance {
+        base_url,
+        ..managed_instance_for(user_id)
+    }
+}
+
+#[derive(Clone, Default)]
+struct CapturedHermesRequest {
+    authorization: Arc<Mutex<Option<String>>>,
+    content_type: Arc<Mutex<Option<String>>>,
+    uri: Arc<Mutex<Option<String>>>,
+    body: Arc<Mutex<Option<Value>>>,
+}
+
+async fn hermes_handler(
+    State(captured): State<CapturedHermesRequest>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    body: Body,
+) -> impl IntoResponse {
+    let bytes = to_bytes(body, usize::MAX)
+        .await
+        .expect("hermes body can be read");
+    *captured.authorization.lock().expect("auth lock") = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    *captured.content_type.lock().expect("content type lock") = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    *captured.uri.lock().expect("uri lock") = Some(uri.to_string());
+    *captured.body.lock().expect("body lock") = serde_json::from_slice::<Value>(&bytes).ok();
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/event-stream")],
+        "event: message\ndata: real-hermes\n\n",
+    )
+}
+
+async fn spawn_hermes_server(captured: CapturedHermesRequest) -> String {
+    let app = Router::new()
+        .route("/v1/runs", post(hermes_handler))
+        .with_state(captured);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test hermes can bind");
+    let addr = listener.local_addr().expect("test hermes addr");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("test hermes server runs");
+    });
+
+    format!("http://{addr}")
 }
 
 #[tokio::test]
@@ -167,10 +247,12 @@ async fn hermes_proxy_test() {
     let cookie = bootstrap_and_login(&app).await;
     let user_id = store
         .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
         .expect("user can be read from session")
         .id;
     store
         .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
         .expect("instance can be bound");
 
     let create_channel = request_json(
@@ -233,4 +315,81 @@ async fn hermes_proxy_test() {
 
     let denied = request_empty(&app, Method::GET, "/api/hermes/admin/config", Some(&cookie)).await;
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let encoded_denied = request_empty(
+        &app,
+        Method::GET,
+        "/api/hermes/%69nternal/config",
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(encoded_denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        store.proxy_audit_count().await.expect("audit count"),
+        1,
+        "only the successful proxied request is audited in this test"
+    );
+}
+
+#[tokio::test]
+async fn hermes_proxy_uses_real_http_client_and_records_audit() {
+    let captured = CapturedHermesRequest::default();
+    let hermes_base_url = spawn_hermes_server(captured.clone()).await;
+    let store = SessionStore::default();
+    let app = test_app(
+        store.clone(),
+        InMemoryHermesProxyClient::default(), // 临时构建后会用真实 proxy state 覆盖。
+    );
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+
+    let real_state = test_state_with_proxy(
+        store.clone(),
+        ReqwestHermesProxyClient::default().shared(),
+    );
+    let real_app = build_router_with_state(real_state);
+    store
+        .bind_hermes_instance(managed_instance_with_base_url(&user_id, hermes_base_url))
+        .await
+        .expect("instance can be bound");
+
+    let proxied = request_json(
+        &real_app,
+        Method::POST,
+        "/api/hermes/v1/runs?stream=true",
+        json!({ "prompt": "hello" }),
+        Some(&cookie),
+    )
+    .await;
+
+    assert_eq!(proxied.status(), StatusCode::OK);
+    let bytes = to_bytes(proxied.into_body(), usize::MAX)
+        .await
+        .expect("stream body can be read");
+    assert_eq!(bytes, "event: message\ndata: real-hermes\n\n");
+    assert_eq!(
+        captured
+            .authorization
+            .lock()
+            .expect("auth lock")
+            .as_deref(),
+        Some("Bearer hermes-secret-token")
+    );
+    assert_eq!(
+        captured.uri.lock().expect("uri lock").as_deref(),
+        Some("/v1/runs?stream=true")
+    );
+    assert_eq!(
+        captured.body.lock().expect("body lock").as_ref().expect("body")
+            ["prompt"],
+        "hello"
+    );
+    assert_eq!(
+        store.proxy_audit_count().await.expect("audit count"),
+        1
+    );
 }

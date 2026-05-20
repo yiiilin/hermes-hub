@@ -19,6 +19,8 @@ body {
 .sidebar {
   background: #132026;
   color: #f7fbfc;
+  display: flex;
+  flex-direction: column;
   padding: 20px;
 }
 
@@ -52,6 +54,16 @@ nav a:hover {
   background: #22343c;
 }
 
+.account {
+  align-items: center;
+  border-top: 1px solid #2c4049;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  margin-top: auto;
+  padding-top: 16px;
+}
+
 .content {
   display: grid;
   gap: 20px;
@@ -74,6 +86,18 @@ nav a:hover {
   padding: 20px;
 }
 
+.panel-heading {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.panel-heading h2 {
+  margin: 0;
+}
+
 .login-panel {
   max-width: 520px;
 }
@@ -90,7 +114,9 @@ label {
 }
 
 input,
-button {
+button,
+select,
+textarea {
   border: 1px solid #bac6cc;
   border-radius: 6px;
   font: inherit;
@@ -98,11 +124,90 @@ button {
   padding: 8px 10px;
 }
 
+textarea {
+  min-height: 120px;
+  resize: vertical;
+}
+
 button {
   background: #1d6f8f;
   border-color: #1d6f8f;
   color: #ffffff;
   cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.secondary,
+.icon-button,
+.segmented button {
+  background: #ffffff;
+  color: #1d3540;
+}
+
+.icon-button {
+  align-items: center;
+  display: inline-flex;
+  justify-content: center;
+  min-height: 34px;
+  padding: 6px;
+}
+
+.segmented {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-bottom: 16px;
+}
+
+.segmented button.active {
+  background: #1d6f8f;
+  border-color: #1d6f8f;
+  color: #ffffff;
+}
+
+.inline-form {
+  align-items: end;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-bottom: 14px;
+}
+
+.checkbox-row {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.checkbox-row input {
+  min-height: auto;
+}
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.copy-line,
+.error {
+  border-radius: 6px;
+  padding: 10px;
+}
+
+.copy-line {
+  background: #eef7f4;
+  color: #17463b;
+  overflow-wrap: anywhere;
+}
+
+.error {
+  background: #fff0f0;
+  color: #9d1c1c;
 }
 
 table {
@@ -133,6 +238,31 @@ td {
   padding: 12px;
 }
 
+.compact-list {
+  margin-top: 12px;
+}
+
+.list li.selected {
+  border-color: #1d6f8f;
+}
+
+.list-button {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  display: grid;
+  gap: 4px;
+  min-height: 0;
+  padding: 0;
+  text-align: left;
+}
+
+.session-grid {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: minmax(240px, 0.8fr) minmax(280px, 1.2fr);
+}
+
 .session-surface,
 .stream {
   background: #101820;
@@ -144,7 +274,9 @@ td {
 
 @media (max-width: 760px) {
   .shell,
-  .grid-section {
+  .grid-section,
+  .inline-form,
+  .session-grid {
     grid-template-columns: 1fr;
   }
 

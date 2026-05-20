@@ -44,7 +44,7 @@ async fn create_invite(
     headers: HeaderMap,
     Json(payload): Json<CreateInviteRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let admin = require_admin(&state, &headers)?;
+    let admin = require_admin(&state, &headers).await?;
     let expires_at = payload
         .expires_at
         .ok_or(ApiError::BadRequest("expires_at is required"))?;
@@ -59,6 +59,7 @@ async fn create_invite(
     let created = state
         .store
         .create_invite(&admin.id, expires_at, max_uses)
+        .await
         .map_err(|_| ApiError::Internal)?;
 
     Ok((
@@ -74,8 +75,12 @@ async fn list_invites(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_admin(&state, &headers)?;
-    let invites = state.store.list_invites().map_err(|_| ApiError::Internal)?;
+    require_admin(&state, &headers).await?;
+    let invites = state
+        .store
+        .list_invites()
+        .await
+        .map_err(|_| ApiError::Internal)?;
 
     Ok(Json(InviteListResponse { invites }))
 }
@@ -85,10 +90,11 @@ async fn revoke_invite(
     headers: HeaderMap,
     Path(invite_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_admin(&state, &headers)?;
+    require_admin(&state, &headers).await?;
     let invite = state
         .store
         .revoke_invite(&invite_id)
+        .await
         .map_err(map_revoke_error)?;
 
     Ok(Json(InviteResponse { invite }))

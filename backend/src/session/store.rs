@@ -2,10 +2,14 @@ use crate::domain::{
     invite::{Invite, InviteStatus, PublicInvite},
     user::{hash_password, verify_password, User, UserListItem, UserRole, UserStatus},
 };
-use crate::hermes::instance::HermesInstance;
-use crate::hermes::instance::HermesInstanceStatus;
+use crate::hermes::instance::{HermesInstance, HermesInstanceKind, HermesInstanceStatus};
+use crate::{
+    db::runtime::block_on_db,
+    security::crypto::{decrypt_secret, encrypt_secret, SecretCipher},
+};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use sha2::{Digest, Sha256};
+use sqlx::{Executor, PgPool, Postgres, Row};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -16,13 +20,23 @@ use uuid::Uuid;
 
 const SESSION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 
-/// Small in-memory store for the MVP auth flow.
-///
-/// This keeps Task 3 focused while preserving method boundaries that can later
-/// be moved to SQLx/PostgreSQL without changing HTTP handlers.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SessionStore {
-    inner: Arc<Mutex<StoreInner>>,
+    backend: SessionStoreBackend,
+}
+
+#[derive(Clone)]
+enum SessionStoreBackend {
+    Memory(Arc<Mutex<StoreInner>>),
+    Postgres { pool: PgPool, cipher: SecretCipher },
+}
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self {
+            backend: SessionStoreBackend::Memory(Arc::new(Mutex::new(StoreInner::default()))),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -33,6 +47,8 @@ struct StoreInner {
     invites_by_id: HashMap<String, Invite>,
     invite_ids_by_hash: HashMap<String, String>,
     hermes_instances_by_user_id: HashMap<String, HermesInstance>,
+    proxy_audit_logs: Vec<ProxyAuditEvent>,
+    llm_usage_events: Vec<LlmUsageEvent>,
 }
 
 #[derive(Clone)]
@@ -45,6 +61,31 @@ struct StoredSession {
 pub struct CreatedInvite {
     pub token: String,
     pub invite: PublicInvite,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProxyAuditEvent {
+    pub user_id: Option<String>,
+    pub hermes_instance_id: Option<String>,
+    pub direction: String,
+    pub method: String,
+    pub path: String,
+    pub status_code: Option<u16>,
+    pub duration_ms: Option<u64>,
+    pub error_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LlmUsageEvent {
+    pub user_id: Option<String>,
+    pub hermes_instance_id: Option<String>,
+    pub model: String,
+    pub upstream_provider: String,
+    pub status_code: Option<u16>,
+    pub duration_ms: Option<u64>,
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    pub total_tokens: Option<u32>,
 }
 
 #[derive(Debug, Error)]
@@ -71,286 +112,608 @@ pub enum StoreError {
     PasswordFailed,
     #[error("store lock failed")]
     LockFailed,
+    #[error("database operation failed")]
+    DatabaseFailed,
+    #[error("secret operation failed")]
+    SecretFailed,
 }
 
 impl SessionStore {
-    pub fn create_bootstrap_admin(&self, email: &str, password: &str) -> Result<User, StoreError> {
-        let mut inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
-
-        if !inner.users_by_id.is_empty() {
-            return Err(StoreError::BootstrapClosed);
+    pub fn postgres(pool: PgPool, cipher: SecretCipher) -> Self {
+        Self {
+            backend: SessionStoreBackend::Postgres { pool, cipher },
         }
-
-        inner.create_user(email, password, UserRole::Admin)
     }
 
-    pub fn register_with_invite(
+    pub async fn create_bootstrap_admin(
+        &self,
+        email: &str,
+        password: &str,
+    ) -> Result<User, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+
+                if !inner.users_by_id.is_empty() {
+                    return Err(StoreError::BootstrapClosed);
+                }
+
+                inner.create_user(email, password, UserRole::Admin)
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let mut tx = pool.begin().await.map_err(|_| StoreError::DatabaseFailed)?;
+                sqlx::query("select pg_advisory_xact_lock(hashtext('hermes_hub_bootstrap_admin'))")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?;
+                let count = sqlx::query("select count(*)::bigint as count from users")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?
+                    .try_get::<i64, _>("count")
+                    .map_err(|_| StoreError::DatabaseFailed)?;
+
+                if count > 0 {
+                    return Err(StoreError::BootstrapClosed);
+                }
+
+                let user =
+                    postgres_create_user_with_executor(&mut *tx, email, password, UserRole::Admin)
+                        .await?;
+                tx.commit()
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?;
+                Ok(user)
+            }),
+        }
+    }
+
+    pub async fn register_with_invite(
         &self,
         invite_token: &str,
         email: &str,
         password: &str,
     ) -> Result<User, StoreError> {
-        let mut inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
-        let now = unix_now();
-        let token_hash = hash_token(invite_token);
-        let invite_id = inner
-            .invite_ids_by_hash
-            .get(&token_hash)
-            .cloned()
-            .ok_or(StoreError::InviteNotFound)?;
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                register_with_invite_in_memory(&mut inner, invite_token, email, password)
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let mut tx = pool.begin().await.map_err(|_| StoreError::DatabaseFailed)?;
+                let now = unix_now();
+                let token_hash = hash_token(invite_token);
+                let invite_sql = invite_select("select", "where token_hash = $1 for update", "");
+                let invite_row = sqlx::query(&invite_sql)
+                    .bind(token_hash)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?
+                    .ok_or(StoreError::InviteNotFound)?;
+                let invite = row_to_invite(&invite_row)?;
 
-        let invite = inner
-            .invites_by_id
-            .get_mut(&invite_id)
-            .ok_or(StoreError::InviteNotFound)?;
+                if invite.status == InviteStatus::Revoked {
+                    return Err(StoreError::InviteRevoked);
+                }
+                if invite.expires_at <= now {
+                    mark_invite_status_with_executor(&mut *tx, &invite.id, InviteStatus::Expired)
+                        .await?;
+                    tx.commit()
+                        .await
+                        .map_err(|_| StoreError::DatabaseFailed)?;
+                    return Err(StoreError::InviteExpired);
+                }
+                if invite.used_count >= invite.max_uses || invite.status == InviteStatus::Exhausted
+                {
+                    mark_invite_status_with_executor(&mut *tx, &invite.id, InviteStatus::Exhausted)
+                        .await?;
+                    tx.commit()
+                        .await
+                        .map_err(|_| StoreError::DatabaseFailed)?;
+                    return Err(StoreError::InviteExhausted);
+                }
+                if postgres_user_id_by_email_with_executor(&mut *tx, email)
+                    .await?
+                    .is_some()
+                {
+                    return Err(StoreError::EmailAlreadyRegistered);
+                }
 
-        if invite.status == InviteStatus::Revoked {
-            return Err(StoreError::InviteRevoked);
+                let user =
+                    postgres_create_user_with_executor(&mut *tx, email, password, UserRole::User)
+                        .await?;
+                let next_used_count = invite.used_count + 1;
+                let next_status = if next_used_count >= invite.max_uses {
+                    "exhausted"
+                } else {
+                    "pending"
+                };
+                sqlx::query(
+                    r#"
+                    update invites
+                    set used_count = used_count + 1,
+                        status = $2,
+                        updated_at = now()
+                    where id = $1::uuid
+                    "#,
+                )
+                .bind(&invite.id)
+                .bind(next_status)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+                sqlx::query(
+                    "insert into invite_uses (id, invite_id, used_by_user_id) values ($1::uuid, $2::uuid, $3::uuid)",
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(&invite.id)
+                .bind(&user.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+                tx.commit()
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?;
+
+                Ok(user)
+            }),
         }
-
-        if invite.expires_at <= now {
-            invite.status = InviteStatus::Expired;
-            invite.updated_at = now;
-            return Err(StoreError::InviteExpired);
-        }
-
-        if invite.used_count >= invite.max_uses || invite.status == InviteStatus::Exhausted {
-            invite.status = InviteStatus::Exhausted;
-            invite.updated_at = now;
-            return Err(StoreError::InviteExhausted);
-        }
-
-        if inner
-            .user_ids_by_email
-            .contains_key(&normalize_email(email))
-        {
-            return Err(StoreError::EmailAlreadyRegistered);
-        }
-
-        let user = inner.create_user(email, password, UserRole::User)?;
-        let invite = inner
-            .invites_by_id
-            .get_mut(&invite_id)
-            .ok_or(StoreError::InviteNotFound)?;
-        invite.used_count += 1;
-        invite.updated_at = now;
-
-        if invite.used_count >= invite.max_uses {
-            invite.status = InviteStatus::Exhausted;
-        }
-
-        Ok(user)
     }
 
-    pub fn login(&self, email: &str, password: &str) -> Result<User, StoreError> {
-        let inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
-        let email = normalize_email(email);
-        let user_id = inner
-            .user_ids_by_email
-            .get(&email)
-            .ok_or(StoreError::InvalidCredentials)?;
-        let user = inner
-            .users_by_id
-            .get(user_id)
-            .ok_or(StoreError::InvalidCredentials)?;
+    pub async fn login(&self, email: &str, password: &str) -> Result<User, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                login_in_memory(&inner, email, password)
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let user = postgres_user_by_email(pool, email)
+                    .await?
+                    .ok_or(StoreError::InvalidCredentials)?;
 
-        if user.status != UserStatus::Active {
-            return Err(StoreError::InvalidCredentials);
+                if user.status != UserStatus::Active {
+                    return Err(StoreError::InvalidCredentials);
+                }
+
+                let verified = verify_password(&user.password_hash, password)
+                    .map_err(|_| StoreError::PasswordFailed)?;
+                if !verified {
+                    return Err(StoreError::InvalidCredentials);
+                }
+
+                Ok(user)
+            }),
         }
+    }
 
-        let verified = verify_password(&user.password_hash, password)
-            .map_err(|_| StoreError::PasswordFailed)?;
+    pub async fn create_session(&self, user_id: &str) -> Result<String, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let token = random_token();
+                let session = StoredSession {
+                    user_id: user_id.to_string(),
+                    expires_at: unix_now() + SESSION_TTL_SECONDS,
+                };
 
-        if !verified {
-            return Err(StoreError::InvalidCredentials);
+                inner.sessions_by_hash.insert(hash_token(&token), session);
+                Ok(token)
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let token = random_token();
+                let expires_at = unix_now() + SESSION_TTL_SECONDS;
+                sqlx::query(
+                    r#"
+                    insert into sessions (id, user_id, session_token_hash, expires_at)
+                    values ($1::uuid, $2::uuid, $3, to_timestamp($4))
+                    "#,
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(user_id)
+                .bind(hash_token(&token))
+                .bind(expires_at as f64)
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                Ok(token)
+            }),
         }
-
-        Ok(user.clone())
     }
 
-    pub fn create_session(&self, user_id: &str) -> Result<String, StoreError> {
-        let mut inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
-        let token = random_token();
-        let session = StoredSession {
-            user_id: user_id.to_string(),
-            expires_at: unix_now() + SESSION_TTL_SECONDS,
-        };
+    pub async fn user_by_session_token(&self, token: &str) -> Result<User, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                user_by_session_token_in_memory(&mut inner, token)
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let token_hash = hash_token(token);
+                let row = sqlx::query(
+                    r#"
+                    select extract(epoch from sessions.expires_at)::bigint as session_expires_at,
+                           users.id::text as id,
+                           users.email,
+                           users.password_hash,
+                           users.role,
+                           users.status,
+                           extract(epoch from users.created_at)::bigint as created_at,
+                           extract(epoch from users.updated_at)::bigint as updated_at
+                    from sessions
+                    join users on users.id = sessions.user_id
+                    where sessions.session_token_hash = $1
+                    "#,
+                )
+                .bind(&token_hash)
+                .fetch_optional(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?
+                .ok_or(StoreError::Unauthorized)?;
+                let expires_at =
+                    row.try_get::<i64, _>("session_expires_at")
+                        .map_err(|_| StoreError::DatabaseFailed)? as u64;
 
-        inner.sessions_by_hash.insert(hash_token(&token), session);
-        Ok(token)
-    }
+                if expires_at <= unix_now() {
+                    sqlx::query("delete from sessions where session_token_hash = $1")
+                        .bind(token_hash)
+                        .execute(pool)
+                        .await
+                        .map_err(|_| StoreError::DatabaseFailed)?;
+                    return Err(StoreError::Unauthorized);
+                }
 
-    pub fn user_by_session_token(&self, token: &str) -> Result<User, StoreError> {
-        let mut inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
-        let token_hash = hash_token(token);
-        let now = unix_now();
-        let session = inner
-            .sessions_by_hash
-            .get(&token_hash)
-            .cloned()
-            .ok_or(StoreError::Unauthorized)?;
+                let user = row_to_user(&row)?;
+                if user.status != UserStatus::Active {
+                    return Err(StoreError::Unauthorized);
+                }
 
-        if session.expires_at <= now {
-            inner.sessions_by_hash.remove(&token_hash);
-            return Err(StoreError::Unauthorized);
+                Ok(user)
+            }),
         }
-
-        inner
-            .users_by_id
-            .get(&session.user_id)
-            .filter(|user| user.status == UserStatus::Active)
-            .cloned()
-            .ok_or(StoreError::Unauthorized)
     }
 
-    pub fn delete_session(&self, token: &str) -> Result<(), StoreError> {
-        let mut inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
-        inner.sessions_by_hash.remove(&hash_token(token));
-        Ok(())
+    pub async fn delete_session(&self, token: &str) -> Result<(), StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                inner.sessions_by_hash.remove(&hash_token(token));
+                Ok(())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                sqlx::query("delete from sessions where session_token_hash = $1")
+                    .bind(hash_token(token))
+                    .execute(pool)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?;
+                Ok(())
+            }),
+        }
     }
 
-    pub fn create_invite(
+    pub async fn create_invite(
         &self,
         created_by_user_id: &str,
         expires_at: u64,
         max_uses: u32,
     ) -> Result<CreatedInvite, StoreError> {
-        let mut inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
-        let now = unix_now();
-        let token = random_token();
-        let invite = Invite {
-            id: Uuid::new_v4().to_string(),
-            token_hash: hash_token(&token),
-            created_by_user_id: created_by_user_id.to_string(),
-            status: InviteStatus::Pending,
-            expires_at,
-            max_uses,
-            used_count: 0,
-            created_at: now,
-            updated_at: now,
-        };
-        let public = invite.public();
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                create_invite_in_memory(&mut inner, created_by_user_id, expires_at, max_uses)
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let token = random_token();
+                let invite = Invite {
+                    id: Uuid::new_v4().to_string(),
+                    token_hash: hash_token(&token),
+                    created_by_user_id: created_by_user_id.to_string(),
+                    status: InviteStatus::Pending,
+                    expires_at,
+                    max_uses,
+                    used_count: 0,
+                    created_at: unix_now(),
+                    updated_at: unix_now(),
+                };
+                sqlx::query(
+                    r#"
+                    insert into invites (
+                        id, token_hash, created_by_user_id, status,
+                        expires_at, max_uses, used_count, created_at, updated_at
+                    )
+                    values ($1::uuid, $2, $3::uuid, 'pending',
+                            to_timestamp($4), $5, 0, to_timestamp($6), to_timestamp($7))
+                    "#,
+                )
+                .bind(&invite.id)
+                .bind(&invite.token_hash)
+                .bind(&invite.created_by_user_id)
+                .bind(expires_at as f64)
+                .bind(max_uses as i32)
+                .bind(invite.created_at as f64)
+                .bind(invite.updated_at as f64)
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
 
-        inner
-            .invite_ids_by_hash
-            .insert(invite.token_hash.clone(), invite.id.clone());
-        inner.invites_by_id.insert(invite.id.clone(), invite);
-
-        Ok(CreatedInvite {
-            token,
-            invite: public,
-        })
+                Ok(CreatedInvite {
+                    token,
+                    invite: invite.public(),
+                })
+            }),
+        }
     }
 
-    pub fn list_invites(&self) -> Result<Vec<PublicInvite>, StoreError> {
-        let mut inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
-        let now = unix_now();
-        let mut invites = inner
-            .invites_by_id
-            .values_mut()
-            .map(|invite| {
-                if invite.status == InviteStatus::Pending && invite.expires_at <= now {
-                    invite.status = InviteStatus::Expired;
-                    invite.updated_at = now;
-                }
-                invite.public()
-            })
-            .collect::<Vec<_>>();
+    pub async fn list_invites(&self) -> Result<Vec<PublicInvite>, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                list_invites_in_memory(&mut inner)
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                sqlx::query(
+                    "update invites set status = 'expired', updated_at = now() where status = 'pending' and expires_at <= now()",
+                )
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
 
-        invites.sort_by(|left, right| right.created_at.cmp(&left.created_at));
-        Ok(invites)
+                let invite_sql = invite_select("select", "", "order by created_at desc");
+                let rows = sqlx::query(&invite_sql)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?;
+
+                rows.iter()
+                    .map(row_to_invite)
+                    .map(|invite| invite.map(|invite| invite.public()))
+                    .collect()
+            }),
+        }
     }
 
-    pub fn revoke_invite(&self, invite_id: &str) -> Result<PublicInvite, StoreError> {
-        let mut inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
-        let now = unix_now();
-        let invite = inner
-            .invites_by_id
-            .get_mut(invite_id)
-            .ok_or(StoreError::InviteIdNotFound)?;
+    pub async fn revoke_invite(&self, invite_id: &str) -> Result<PublicInvite, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                revoke_invite_in_memory(&mut inner, invite_id)
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let row = sqlx::query(
+                    r#"
+                    update invites
+                    set status = 'revoked', updated_at = now()
+                    where id = $1::uuid
+                    returning id::text as id,
+                              token_hash,
+                              coalesce(created_by_user_id::text, '') as created_by_user_id,
+                              status,
+                              extract(epoch from expires_at)::bigint as expires_at,
+                              max_uses,
+                              used_count,
+                              extract(epoch from created_at)::bigint as created_at,
+                              extract(epoch from updated_at)::bigint as updated_at
+                    "#,
+                )
+                .bind(invite_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?
+                .ok_or(StoreError::InviteIdNotFound)?;
 
-        invite.status = InviteStatus::Revoked;
-        invite.updated_at = now;
-        Ok(invite.public())
+                Ok(row_to_invite(&row)?.public())
+            }),
+        }
     }
 
-    pub fn list_users(&self) -> Result<Vec<UserListItem>, StoreError> {
-        let inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
-        let mut users = inner
-            .users_by_id
-            .values()
-            .map(User::list_item)
-            .collect::<Vec<_>>();
+    pub async fn list_users(&self) -> Result<Vec<UserListItem>, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let mut users = inner
+                    .users_by_id
+                    .values()
+                    .map(User::list_item)
+                    .collect::<Vec<_>>();
 
-        users.sort_by(|left, right| right.created_at.cmp(&left.created_at));
-        Ok(users)
+                users.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+                Ok(users)
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let rows = sqlx::query(
+                    r#"
+                    select id::text as id,
+                           email,
+                           password_hash,
+                           role,
+                           status,
+                           extract(epoch from created_at)::bigint as created_at,
+                           extract(epoch from updated_at)::bigint as updated_at
+                    from users
+                    order by created_at desc
+                    "#,
+                )
+                .fetch_all(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                rows.iter()
+                    .map(row_to_user)
+                    .map(|user| user.map(|user| user.list_item()))
+                    .collect()
+            }),
+        }
     }
 
-    pub fn disable_user(&self, user_id: &str) -> Result<User, StoreError> {
-        let mut inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
-        let user = inner
-            .users_by_id
-            .get_mut(user_id)
-            .ok_or(StoreError::InvalidCredentials)?;
-        user.status = UserStatus::Disabled;
-        user.updated_at = unix_now();
-        Ok(user.clone())
+    pub async fn disable_user(&self, user_id: &str) -> Result<User, StoreError> {
+        self.set_user_status(user_id, UserStatus::Disabled).await
     }
 
-    pub fn enable_user(&self, user_id: &str) -> Result<User, StoreError> {
-        let mut inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
-        let user = inner
-            .users_by_id
-            .get_mut(user_id)
-            .ok_or(StoreError::InvalidCredentials)?;
-        user.status = UserStatus::Active;
-        user.updated_at = unix_now();
-        Ok(user.clone())
+    pub async fn enable_user(&self, user_id: &str) -> Result<User, StoreError> {
+        self.set_user_status(user_id, UserStatus::Active).await
     }
 
-    pub fn bind_hermes_instance(&self, instance: HermesInstance) -> Result<(), StoreError> {
-        let mut inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
-        inner
-            .hermes_instances_by_user_id
-            .insert(instance.user_id.clone(), instance);
-        Ok(())
+    pub async fn bind_hermes_instance(&self, instance: HermesInstance) -> Result<(), StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                inner
+                    .hermes_instances_by_user_id
+                    .insert(instance.user_id.clone(), instance);
+                Ok(())
+            }
+            SessionStoreBackend::Postgres { pool, cipher } => block_on_db(async {
+                let encrypted_token = instance
+                    .api_token_secret_ref
+                    .as_ref()
+                    .map(|token| encrypt_secret(cipher, token));
+                sqlx::query(
+                    r#"
+                    insert into hermes_instances (
+                        id, user_id, kind, status, name, base_url, api_token_secret_ref,
+                        container_id, host_workspace_path, host_sandbox_path, host_config_path,
+                        health_status, updated_at
+                    )
+                    values (
+                        $1::uuid, $2::uuid, $3, $4, $5, $6, $7,
+                        $8, $9, $10, $11, $12, now()
+                    )
+                    on conflict (user_id) do update
+                    set id = excluded.id,
+                        kind = excluded.kind,
+                        status = excluded.status,
+                        name = excluded.name,
+                        base_url = excluded.base_url,
+                        api_token_secret_ref = excluded.api_token_secret_ref,
+                        container_id = excluded.container_id,
+                        host_workspace_path = excluded.host_workspace_path,
+                        host_sandbox_path = excluded.host_sandbox_path,
+                        host_config_path = excluded.host_config_path,
+                        health_status = excluded.health_status,
+                        updated_at = now()
+                    "#,
+                )
+                .bind(&instance.id)
+                .bind(&instance.user_id)
+                .bind(hermes_kind_as_str(&instance.kind))
+                .bind(hermes_status_as_str(&instance.status))
+                .bind(&instance.name)
+                .bind(&instance.base_url)
+                .bind(encrypted_token)
+                .bind(&instance.container_id)
+                .bind(&instance.host_workspace_path)
+                .bind(&instance.host_sandbox_path)
+                .bind(&instance.host_config_path)
+                .bind(&instance.health_status)
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                Ok(())
+            }),
+        }
     }
 
-    pub fn hermes_instance_for_user(&self, user_id: &str) -> Result<HermesInstance, StoreError> {
-        let inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
-        inner
-            .hermes_instances_by_user_id
-            .get(user_id)
-            .cloned()
-            .ok_or(StoreError::InviteNotFound)
+    pub async fn hermes_instance_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<HermesInstance, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                inner
+                    .hermes_instances_by_user_id
+                    .get(user_id)
+                    .cloned()
+                    .ok_or(StoreError::InviteNotFound)
+            }
+            SessionStoreBackend::Postgres { pool, cipher } => block_on_db(async {
+                let hermes_sql = hermes_instance_select("select", "where user_id = $1::uuid", "");
+                let row = sqlx::query(&hermes_sql)
+                    .bind(user_id)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?
+                    .ok_or(StoreError::InviteNotFound)?;
+
+                row_to_hermes_instance(&row, cipher)
+            }),
+        }
     }
 
-    pub fn list_hermes_instances(&self) -> Result<Vec<HermesInstance>, StoreError> {
-        let inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
-        let mut instances = inner
-            .hermes_instances_by_user_id
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        instances.sort_by(|left, right| left.user_id.cmp(&right.user_id));
-        Ok(instances)
+    pub async fn list_hermes_instances(&self) -> Result<Vec<HermesInstance>, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let mut instances = inner
+                    .hermes_instances_by_user_id
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                instances.sort_by(|left, right| left.user_id.cmp(&right.user_id));
+                Ok(instances)
+            }
+            SessionStoreBackend::Postgres { pool, cipher } => block_on_db(async {
+                let hermes_sql = hermes_instance_select("select", "", "order by user_id");
+                let rows = sqlx::query(&hermes_sql)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?;
+
+                rows.iter()
+                    .map(|row| row_to_hermes_instance(row, cipher))
+                    .collect()
+            }),
+        }
     }
 
-    pub fn set_hermes_instance_status(
+    pub async fn set_hermes_instance_status(
         &self,
         user_id: &str,
         status: HermesInstanceStatus,
     ) -> Result<HermesInstance, StoreError> {
-        let mut inner = self.inner.lock().map_err(|_| StoreError::LockFailed)?;
-        let instance = inner
-            .hermes_instances_by_user_id
-            .get_mut(user_id)
-            .ok_or(StoreError::InviteNotFound)?;
-        instance.status = status;
-        Ok(instance.clone())
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let instance = inner
+                    .hermes_instances_by_user_id
+                    .get_mut(user_id)
+                    .ok_or(StoreError::InviteNotFound)?;
+                instance.status = status;
+                Ok(instance.clone())
+            }
+            SessionStoreBackend::Postgres { pool, cipher } => block_on_db(async {
+                let row = sqlx::query(
+                    r#"
+                    update hermes_instances
+                    set status = $2, updated_at = now()
+                    where user_id = $1::uuid
+                    returning id::text as id,
+                              user_id::text as user_id,
+                              kind,
+                              status,
+                              name,
+                              base_url,
+                              api_token_secret_ref,
+                              container_id,
+                              host_workspace_path,
+                              host_sandbox_path,
+                              host_config_path,
+                              health_status
+                    "#,
+                )
+                .bind(user_id)
+                .bind(hermes_status_as_str(&status))
+                .fetch_optional(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?
+                .ok_or(StoreError::InviteNotFound)?;
+
+                row_to_hermes_instance(&row, cipher)
+            }),
+        }
     }
 
-    pub fn user_by_session_cookie(
+    pub async fn user_by_session_cookie(
         &self,
         cookie: &str,
         cookie_name: &str,
@@ -367,7 +730,153 @@ impl SessionStore {
             })
             .ok_or(StoreError::Unauthorized)?;
 
-        self.user_by_session_token(token)
+        self.user_by_session_token(token).await
+    }
+
+    pub async fn record_proxy_audit(&self, event: ProxyAuditEvent) -> Result<(), StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                inner.proxy_audit_logs.push(event);
+                Ok(())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                sqlx::query(
+                    r#"
+                    insert into proxy_audit_logs (
+                        id, user_id, hermes_instance_id, direction, method, path,
+                        status_code, duration_ms, error_code
+                    )
+                    values ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9)
+                    "#,
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(optional_uuid(event.user_id.as_deref())?)
+                .bind(optional_uuid(event.hermes_instance_id.as_deref())?)
+                .bind(event.direction)
+                .bind(event.method)
+                .bind(event.path)
+                .bind(event.status_code.map(i32::from))
+                .bind(optional_i32(event.duration_ms)?)
+                .bind(event.error_code)
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                Ok(())
+            }),
+        }
+    }
+
+    pub async fn record_llm_usage(&self, event: LlmUsageEvent) -> Result<(), StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                inner.llm_usage_events.push(event);
+                Ok(())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                sqlx::query(
+                    r#"
+                    insert into llm_usage_events (
+                        id, user_id, hermes_instance_id, model, upstream_provider,
+                        status_code, duration_ms, prompt_tokens, completion_tokens, total_tokens
+                    )
+                    values ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    "#,
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(optional_uuid(event.user_id.as_deref())?)
+                .bind(optional_uuid(event.hermes_instance_id.as_deref())?)
+                .bind(event.model)
+                .bind(event.upstream_provider)
+                .bind(event.status_code.map(i32::from))
+                .bind(optional_i32(event.duration_ms)?)
+                .bind(optional_u32_as_i32(event.prompt_tokens)?)
+                .bind(optional_u32_as_i32(event.completion_tokens)?)
+                .bind(optional_u32_as_i32(event.total_tokens)?)
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                Ok(())
+            }),
+        }
+    }
+
+    pub async fn proxy_audit_count(&self) -> Result<usize, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => inner
+                .lock()
+                .map(|inner| inner.proxy_audit_logs.len())
+                .map_err(|_| StoreError::LockFailed),
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let count = sqlx::query("select count(*)::bigint as count from proxy_audit_logs")
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?
+                    .try_get::<i64, _>("count")
+                    .map_err(|_| StoreError::DatabaseFailed)?;
+                usize::try_from(count).map_err(|_| StoreError::DatabaseFailed)
+            }),
+        }
+    }
+
+    pub async fn llm_usage_count(&self) -> Result<usize, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => inner
+                .lock()
+                .map(|inner| inner.llm_usage_events.len())
+                .map_err(|_| StoreError::LockFailed),
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let count = sqlx::query("select count(*)::bigint as count from llm_usage_events")
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?
+                    .try_get::<i64, _>("count")
+                    .map_err(|_| StoreError::DatabaseFailed)?;
+                usize::try_from(count).map_err(|_| StoreError::DatabaseFailed)
+            }),
+        }
+    }
+
+    async fn set_user_status(&self, user_id: &str, status: UserStatus) -> Result<User, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let user = inner
+                    .users_by_id
+                    .get_mut(user_id)
+                    .ok_or(StoreError::InvalidCredentials)?;
+                user.status = status;
+                user.updated_at = unix_now();
+                Ok(user.clone())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let row = sqlx::query(
+                    r#"
+                    update users
+                    set status = $2, updated_at = now()
+                    where id = $1::uuid
+                    returning id::text as id,
+                              email,
+                              password_hash,
+                              role,
+                              status,
+                              extract(epoch from created_at)::bigint as created_at,
+                              extract(epoch from updated_at)::bigint as updated_at
+                    "#,
+                )
+                .bind(user_id)
+                .bind(user_status_as_str(&status))
+                .fetch_optional(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?
+                .ok_or(StoreError::InvalidCredentials)?;
+
+                row_to_user(&row)
+            }),
+        }
     }
 }
 
@@ -398,6 +907,522 @@ impl StoreInner {
         self.user_ids_by_email.insert(email, user.id.clone());
         self.users_by_id.insert(user.id.clone(), user.clone());
         Ok(user)
+    }
+}
+
+fn register_with_invite_in_memory(
+    inner: &mut StoreInner,
+    invite_token: &str,
+    email: &str,
+    password: &str,
+) -> Result<User, StoreError> {
+    let now = unix_now();
+    let token_hash = hash_token(invite_token);
+    let invite_id = inner
+        .invite_ids_by_hash
+        .get(&token_hash)
+        .cloned()
+        .ok_or(StoreError::InviteNotFound)?;
+
+    let invite = inner
+        .invites_by_id
+        .get_mut(&invite_id)
+        .ok_or(StoreError::InviteNotFound)?;
+
+    if invite.status == InviteStatus::Revoked {
+        return Err(StoreError::InviteRevoked);
+    }
+    if invite.expires_at <= now {
+        invite.status = InviteStatus::Expired;
+        invite.updated_at = now;
+        return Err(StoreError::InviteExpired);
+    }
+    if invite.used_count >= invite.max_uses || invite.status == InviteStatus::Exhausted {
+        invite.status = InviteStatus::Exhausted;
+        invite.updated_at = now;
+        return Err(StoreError::InviteExhausted);
+    }
+    if inner
+        .user_ids_by_email
+        .contains_key(&normalize_email(email))
+    {
+        return Err(StoreError::EmailAlreadyRegistered);
+    }
+
+    let user = inner.create_user(email, password, UserRole::User)?;
+    let invite = inner
+        .invites_by_id
+        .get_mut(&invite_id)
+        .ok_or(StoreError::InviteNotFound)?;
+    invite.used_count += 1;
+    invite.updated_at = now;
+
+    if invite.used_count >= invite.max_uses {
+        invite.status = InviteStatus::Exhausted;
+    }
+
+    Ok(user)
+}
+
+fn login_in_memory(inner: &StoreInner, email: &str, password: &str) -> Result<User, StoreError> {
+    let email = normalize_email(email);
+    let user_id = inner
+        .user_ids_by_email
+        .get(&email)
+        .ok_or(StoreError::InvalidCredentials)?;
+    let user = inner
+        .users_by_id
+        .get(user_id)
+        .ok_or(StoreError::InvalidCredentials)?;
+
+    if user.status != UserStatus::Active {
+        return Err(StoreError::InvalidCredentials);
+    }
+
+    let verified =
+        verify_password(&user.password_hash, password).map_err(|_| StoreError::PasswordFailed)?;
+
+    if !verified {
+        return Err(StoreError::InvalidCredentials);
+    }
+
+    Ok(user.clone())
+}
+
+fn user_by_session_token_in_memory(
+    inner: &mut StoreInner,
+    token: &str,
+) -> Result<User, StoreError> {
+    let token_hash = hash_token(token);
+    let now = unix_now();
+    let session = inner
+        .sessions_by_hash
+        .get(&token_hash)
+        .cloned()
+        .ok_or(StoreError::Unauthorized)?;
+
+    if session.expires_at <= now {
+        inner.sessions_by_hash.remove(&token_hash);
+        return Err(StoreError::Unauthorized);
+    }
+
+    inner
+        .users_by_id
+        .get(&session.user_id)
+        .filter(|user| user.status == UserStatus::Active)
+        .cloned()
+        .ok_or(StoreError::Unauthorized)
+}
+
+fn create_invite_in_memory(
+    inner: &mut StoreInner,
+    created_by_user_id: &str,
+    expires_at: u64,
+    max_uses: u32,
+) -> Result<CreatedInvite, StoreError> {
+    let now = unix_now();
+    let token = random_token();
+    let invite = Invite {
+        id: Uuid::new_v4().to_string(),
+        token_hash: hash_token(&token),
+        created_by_user_id: created_by_user_id.to_string(),
+        status: InviteStatus::Pending,
+        expires_at,
+        max_uses,
+        used_count: 0,
+        created_at: now,
+        updated_at: now,
+    };
+    let public = invite.public();
+
+    inner
+        .invite_ids_by_hash
+        .insert(invite.token_hash.clone(), invite.id.clone());
+    inner.invites_by_id.insert(invite.id.clone(), invite);
+
+    Ok(CreatedInvite {
+        token,
+        invite: public,
+    })
+}
+
+fn list_invites_in_memory(inner: &mut StoreInner) -> Result<Vec<PublicInvite>, StoreError> {
+    let now = unix_now();
+    let mut invites = inner
+        .invites_by_id
+        .values_mut()
+        .map(|invite| {
+            if invite.status == InviteStatus::Pending && invite.expires_at <= now {
+                invite.status = InviteStatus::Expired;
+                invite.updated_at = now;
+            }
+            invite.public()
+        })
+        .collect::<Vec<_>>();
+
+    invites.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    Ok(invites)
+}
+
+fn revoke_invite_in_memory(
+    inner: &mut StoreInner,
+    invite_id: &str,
+) -> Result<PublicInvite, StoreError> {
+    let now = unix_now();
+    let invite = inner
+        .invites_by_id
+        .get_mut(invite_id)
+        .ok_or(StoreError::InviteIdNotFound)?;
+
+    invite.status = InviteStatus::Revoked;
+    invite.updated_at = now;
+    Ok(invite.public())
+}
+
+async fn postgres_create_user_with_executor<'e, E>(
+    executor: E,
+    email: &str,
+    password: &str,
+    role: UserRole,
+) -> Result<User, StoreError>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let email = normalize_email(email);
+    let now = unix_now();
+    let user = User {
+        id: Uuid::new_v4().to_string(),
+        email,
+        password_hash: hash_password(password).map_err(|_| StoreError::PasswordFailed)?,
+        role,
+        status: UserStatus::Active,
+        created_at: now,
+        updated_at: now,
+    };
+
+    sqlx::query(
+        r#"
+        insert into users (id, email, password_hash, role, status, created_at, updated_at)
+        values ($1::uuid, $2, $3, $4, $5, to_timestamp($6), to_timestamp($7))
+        "#,
+    )
+    .bind(&user.id)
+    .bind(&user.email)
+    .bind(&user.password_hash)
+    .bind(user_role_as_str(&user.role))
+    .bind(user_status_as_str(&user.status))
+    .bind(user.created_at as f64)
+    .bind(user.updated_at as f64)
+    .execute(executor)
+    .await
+    .map_err(|_| StoreError::DatabaseFailed)?;
+
+    Ok(user)
+}
+
+async fn postgres_user_id_by_email_with_executor<'e, E>(
+    executor: E,
+    email: &str,
+) -> Result<Option<String>, StoreError>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let row = sqlx::query("select id::text as id from users where email = $1")
+        .bind(normalize_email(email))
+        .fetch_optional(executor)
+        .await
+        .map_err(|_| StoreError::DatabaseFailed)?;
+
+    row.map(|row| row.try_get("id").map_err(|_| StoreError::DatabaseFailed))
+        .transpose()
+}
+
+async fn postgres_user_by_email(pool: &PgPool, email: &str) -> Result<Option<User>, StoreError> {
+    let row = sqlx::query(
+        r#"
+        select id::text as id,
+               email,
+               password_hash,
+               role,
+               status,
+               extract(epoch from created_at)::bigint as created_at,
+               extract(epoch from updated_at)::bigint as updated_at
+        from users
+        where email = $1
+        "#,
+    )
+    .bind(normalize_email(email))
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| StoreError::DatabaseFailed)?;
+
+    row.map(|row| row_to_user(&row)).transpose()
+}
+
+async fn mark_invite_status_with_executor<'e, E>(
+    executor: E,
+    invite_id: &str,
+    status: InviteStatus,
+) -> Result<(), StoreError>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    sqlx::query("update invites set status = $2, updated_at = now() where id = $1::uuid")
+        .bind(invite_id)
+        .bind(invite_status_as_str(&status))
+        .execute(executor)
+        .await
+        .map_err(|_| StoreError::DatabaseFailed)?;
+    Ok(())
+}
+
+fn invite_select(prefix: &str, filter: &str, suffix: &str) -> String {
+    format!(
+        r#"{prefix}
+           id::text as id,
+           token_hash,
+           coalesce(created_by_user_id::text, '') as created_by_user_id,
+           status,
+           extract(epoch from expires_at)::bigint as expires_at,
+           max_uses,
+           used_count,
+           extract(epoch from created_at)::bigint as created_at,
+           extract(epoch from updated_at)::bigint as updated_at
+           from invites
+           {filter}
+           {suffix}"#
+    )
+}
+
+fn hermes_instance_select(prefix: &str, filter: &str, suffix: &str) -> String {
+    format!(
+        r#"{prefix}
+           id::text as id,
+           user_id::text as user_id,
+           kind,
+           status,
+           name,
+           base_url,
+           api_token_secret_ref,
+           container_id,
+           host_workspace_path,
+           host_sandbox_path,
+           host_config_path,
+           health_status
+           from hermes_instances
+           {filter}
+           {suffix}"#
+    )
+}
+
+fn row_to_user(row: &sqlx::postgres::PgRow) -> Result<User, StoreError> {
+    let role = row
+        .try_get::<String, _>("role")
+        .map_err(|_| StoreError::DatabaseFailed)?;
+    let status = row
+        .try_get::<String, _>("status")
+        .map_err(|_| StoreError::DatabaseFailed)?;
+
+    Ok(User {
+        id: row.try_get("id").map_err(|_| StoreError::DatabaseFailed)?,
+        email: row
+            .try_get("email")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        password_hash: row
+            .try_get("password_hash")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        role: parse_user_role(&role)?,
+        status: parse_user_status(&status)?,
+        created_at: row
+            .try_get::<i64, _>("created_at")
+            .map_err(|_| StoreError::DatabaseFailed)? as u64,
+        updated_at: row
+            .try_get::<i64, _>("updated_at")
+            .map_err(|_| StoreError::DatabaseFailed)? as u64,
+    })
+}
+
+fn row_to_invite(row: &sqlx::postgres::PgRow) -> Result<Invite, StoreError> {
+    let status = row
+        .try_get::<String, _>("status")
+        .map_err(|_| StoreError::DatabaseFailed)?;
+
+    Ok(Invite {
+        id: row.try_get("id").map_err(|_| StoreError::DatabaseFailed)?,
+        token_hash: row
+            .try_get("token_hash")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        created_by_user_id: row
+            .try_get("created_by_user_id")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        status: parse_invite_status(&status)?,
+        expires_at: row
+            .try_get::<i64, _>("expires_at")
+            .map_err(|_| StoreError::DatabaseFailed)? as u64,
+        max_uses: row
+            .try_get::<i32, _>("max_uses")
+            .map_err(|_| StoreError::DatabaseFailed)? as u32,
+        used_count: row
+            .try_get::<i32, _>("used_count")
+            .map_err(|_| StoreError::DatabaseFailed)? as u32,
+        created_at: row
+            .try_get::<i64, _>("created_at")
+            .map_err(|_| StoreError::DatabaseFailed)? as u64,
+        updated_at: row
+            .try_get::<i64, _>("updated_at")
+            .map_err(|_| StoreError::DatabaseFailed)? as u64,
+    })
+}
+
+fn row_to_hermes_instance(
+    row: &sqlx::postgres::PgRow,
+    cipher: &SecretCipher,
+) -> Result<HermesInstance, StoreError> {
+    let kind = row
+        .try_get::<String, _>("kind")
+        .map_err(|_| StoreError::DatabaseFailed)?;
+    let status = row
+        .try_get::<String, _>("status")
+        .map_err(|_| StoreError::DatabaseFailed)?;
+    let encrypted_token = row
+        .try_get::<Option<String>, _>("api_token_secret_ref")
+        .map_err(|_| StoreError::DatabaseFailed)?;
+    let api_token_secret_ref = encrypted_token
+        .as_deref()
+        .map(|token| decrypt_secret(cipher, token).map_err(|_| StoreError::SecretFailed))
+        .transpose()?;
+
+    Ok(HermesInstance {
+        id: row.try_get("id").map_err(|_| StoreError::DatabaseFailed)?,
+        user_id: row
+            .try_get("user_id")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        kind: parse_hermes_kind(&kind)?,
+        status: parse_hermes_status(&status)?,
+        name: row
+            .try_get("name")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        base_url: row
+            .try_get("base_url")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        api_token_secret_ref,
+        llm_api_key: None,
+        container_id: row
+            .try_get("container_id")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        host_workspace_path: row
+            .try_get("host_workspace_path")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        host_sandbox_path: row
+            .try_get("host_sandbox_path")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        host_config_path: row
+            .try_get("host_config_path")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        health_status: row
+            .try_get("health_status")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+    })
+}
+
+fn optional_uuid(value: Option<&str>) -> Result<Option<Uuid>, StoreError> {
+    value
+        .map(|value| Uuid::parse_str(value).map_err(|_| StoreError::DatabaseFailed))
+        .transpose()
+}
+
+fn optional_i32(value: Option<u64>) -> Result<Option<i32>, StoreError> {
+    value
+        .map(|value| i32::try_from(value).map_err(|_| StoreError::DatabaseFailed))
+        .transpose()
+}
+
+fn optional_u32_as_i32(value: Option<u32>) -> Result<Option<i32>, StoreError> {
+    value
+        .map(|value| i32::try_from(value).map_err(|_| StoreError::DatabaseFailed))
+        .transpose()
+}
+
+fn parse_user_role(value: &str) -> Result<UserRole, StoreError> {
+    match value {
+        "admin" => Ok(UserRole::Admin),
+        "user" => Ok(UserRole::User),
+        _ => Err(StoreError::DatabaseFailed),
+    }
+}
+
+fn parse_user_status(value: &str) -> Result<UserStatus, StoreError> {
+    match value {
+        "active" => Ok(UserStatus::Active),
+        "disabled" => Ok(UserStatus::Disabled),
+        _ => Err(StoreError::DatabaseFailed),
+    }
+}
+
+fn parse_invite_status(value: &str) -> Result<InviteStatus, StoreError> {
+    match value {
+        "pending" => Ok(InviteStatus::Pending),
+        "revoked" => Ok(InviteStatus::Revoked),
+        "expired" => Ok(InviteStatus::Expired),
+        "exhausted" => Ok(InviteStatus::Exhausted),
+        _ => Err(StoreError::DatabaseFailed),
+    }
+}
+
+fn parse_hermes_kind(value: &str) -> Result<HermesInstanceKind, StoreError> {
+    match value {
+        "external" => Ok(HermesInstanceKind::External),
+        "managed_docker" => Ok(HermesInstanceKind::ManagedDocker),
+        _ => Err(StoreError::DatabaseFailed),
+    }
+}
+
+fn parse_hermes_status(value: &str) -> Result<HermesInstanceStatus, StoreError> {
+    match value {
+        "provisioning" => Ok(HermesInstanceStatus::Provisioning),
+        "running" => Ok(HermesInstanceStatus::Running),
+        "stopped" => Ok(HermesInstanceStatus::Stopped),
+        "error" => Ok(HermesInstanceStatus::Error),
+        _ => Err(StoreError::DatabaseFailed),
+    }
+}
+
+fn user_role_as_str(role: &UserRole) -> &'static str {
+    match role {
+        UserRole::Admin => "admin",
+        UserRole::User => "user",
+    }
+}
+
+fn user_status_as_str(status: &UserStatus) -> &'static str {
+    match status {
+        UserStatus::Active => "active",
+        UserStatus::Disabled => "disabled",
+    }
+}
+
+fn invite_status_as_str(status: &InviteStatus) -> &'static str {
+    match status {
+        InviteStatus::Pending => "pending",
+        InviteStatus::Revoked => "revoked",
+        InviteStatus::Expired => "expired",
+        InviteStatus::Exhausted => "exhausted",
+    }
+}
+
+fn hermes_kind_as_str(kind: &HermesInstanceKind) -> &'static str {
+    match kind {
+        HermesInstanceKind::External => "external",
+        HermesInstanceKind::ManagedDocker => "managed_docker",
+    }
+}
+
+fn hermes_status_as_str(status: &HermesInstanceStatus) -> &'static str {
+    match status {
+        HermesInstanceStatus::Provisioning => "provisioning",
+        HermesInstanceStatus::Running => "running",
+        HermesInstanceStatus::Stopped => "stopped",
+        HermesInstanceStatus::Error => "error",
     }
 }
 

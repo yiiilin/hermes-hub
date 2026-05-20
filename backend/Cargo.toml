@@ -7,13 +7,18 @@ rust-version.workspace = true
 
 [dependencies]
 argon2 = "0.5"
+async-trait = "0.1"
 axum.workspace = true
 base64 = "0.22"
 chacha20poly1305 = { version = "0.10", features = ["std"] }
+futures-util = "0.3"
 getrandom = "0.3"
+percent-encoding = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "macros", "migrate"] }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -21,4 +26,5 @@ tracing-subscriber.workspace = true
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+tempfile = "3"
 tower = { workspace = true, features = ["util"] }

@@ -1,5 +1,4 @@
-use std::future::Future;
-
+use async_trait::async_trait;
 use thiserror::Error;
 
 use super::instance::HermesInstance;
@@ -12,27 +11,36 @@ pub enum ProvisionerError {
     InvalidManagedInstance,
     #[error("provisioner lock failed")]
     LockFailed,
+    #[error("filesystem operation failed: {0}")]
+    Filesystem(String),
+    #[error("docker runtime failed: {0}")]
+    DockerRuntime(String),
+    #[error("docker command failed: {0}")]
+    DockerCommand(String),
 }
 
 /// Hermes 实例编排抽象。v1 实现 Docker，未来可替换为独立 provisioner 或 K8s。
+#[async_trait]
 pub trait HermesProvisioner {
-    fn ensure_instance(
+    async fn ensure_instance(
         &self,
         user_id: &str,
-    ) -> impl Future<Output = Result<HermesInstance, ProvisionerError>> + Send;
+        llm_api_key: &str,
+    ) -> Result<HermesInstance, ProvisionerError>;
 
-    fn start_instance(
+    async fn start_instance(
         &self,
-        instance_id: &str,
-    ) -> impl Future<Output = Result<(), ProvisionerError>> + Send;
+        instance: &HermesInstance,
+    ) -> Result<HermesInstance, ProvisionerError>;
 
-    fn stop_instance(
+    async fn stop_instance(
         &self,
-        instance_id: &str,
-    ) -> impl Future<Output = Result<(), ProvisionerError>> + Send;
+        instance: &HermesInstance,
+    ) -> Result<HermesInstance, ProvisionerError>;
 
-    fn rebuild_instance(
+    async fn rebuild_instance(
         &self,
-        instance_id: &str,
-    ) -> impl Future<Output = Result<HermesInstance, ProvisionerError>> + Send;
+        instance: &HermesInstance,
+        llm_api_key: &str,
+    ) -> Result<HermesInstance, ProvisionerError>;
 }

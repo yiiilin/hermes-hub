@@ -6,14 +6,66 @@ services:
       POSTGRES_USER: hermes_hub
       POSTGRES_PASSWORD: hermes_hub
     ports:
-      - "5432:5432"
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    networks:
+      - hermes-hub-net
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U hermes_hub -d hermes_hub"]
       interval: 5s
       timeout: 3s
       retries: 10
 
+  # 仅用于本地联调便利：当前服务使用源码挂载，不是生产镜像。
+  backend:
+    profiles: ["app-dev"]
+    image: rust:1.82
+    working_dir: /workspace
+    command: ["bash", "-lc", "cargo run -p hermes-hub-backend"]
+    environment:
+      HERMES_HUB_BIND_ADDR: 0.0.0.0:8080
+      DATABASE_URL: postgres://hermes_hub:hermes_hub@postgres:5432/hermes_hub
+      HERMES_HUB_SECRET_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      HERMES_HUB_COOKIE_NAME: hermes_hub_session
+      HERMES_DATA_ROOT: /data/hermes-hub/users
+      HERMES_DOCKER_IMAGE: nousresearch/hermes-agent:latest
+      HERMES_CONTAINER_NETWORK: hermes-hub-net
+      HERMES_CONTAINER_INTERNAL_PORT: 8000
+      HERMES_HUB_LLM_BASE_URL: http://hermes-hub:8080/internal/llm/v1
+    volumes:
+      - ../..:/workspace
+      - hermes_data:/data/hermes-hub
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    networks:
+      hermes-hub-net:
+        aliases:
+          - hermes-hub
+
+  # 仅启动 Vite 开发服务器；不是生产前端镜像。
+  frontend:
+    profiles: ["app-dev"]
+    image: node:24-alpine
+    working_dir: /workspace/frontend
+    command: ["sh", "-lc", "npm install && npm run dev -- --host 0.0.0.0 --port 5173"]
+    volumes:
+      - ../..:/workspace
+    depends_on:
+      - backend
+    ports:
+      - "5173:5173"
+    networks:
+      - hermes-hub-net
+
 volumes:
   postgres_data:
+  hermes_data:
+
+networks:
+  hermes-hub-net:
+    name: hermes-hub-net
