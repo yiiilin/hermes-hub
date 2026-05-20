@@ -2,7 +2,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use crate::model_config::ModelConfig;
+use crate::hermes::docker_provisioner::HermesContainerConnectMode;
+use crate::model_config::{ModelConfig, LLM_MODEL_CONFIG_KIND};
 
 /// 应用启动配置。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,6 +26,9 @@ pub struct HermesDockerConfig {
     pub data_root: PathBuf,
     pub network: String,
     pub internal_port: u16,
+    pub connect_mode: HermesContainerConnectMode,
+    pub published_host_ip: String,
+    pub published_base_url: String,
     pub hub_llm_base_url: String,
     pub memory_limit: Option<String>,
     pub cpu_limit: Option<String>,
@@ -63,10 +67,7 @@ impl AppConfig {
             initial_model_config: model_config_from_env(),
             hermes_docker: hermes_docker_config_from_env(),
             proxy_timeout_seconds: env_u64("HERMES_HUB_PROXY_TIMEOUT_SECONDS", 60),
-            max_proxy_body_bytes: env_usize(
-                "HERMES_HUB_MAX_PROXY_BODY_BYTES",
-                10 * 1024 * 1024,
-            ),
+            max_proxy_body_bytes: env_usize("HERMES_HUB_MAX_PROXY_BODY_BYTES", 10 * 1024 * 1024),
             static_dir: PathBuf::from(
                 std::env::var("HERMES_HUB_STATIC_DIR")
                     .unwrap_or_else(|_| "frontend/dist".to_string()),
@@ -100,6 +101,7 @@ fn model_config_from_env() -> ModelConfig {
         .unwrap_or(true);
 
     ModelConfig {
+        config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
         provider_name: std::env::var("HERMES_HUB_MODEL_PROVIDER_NAME")
             .unwrap_or_else(|_| "openai-compatible".to_string()),
         provider_base_url: std::env::var("HERMES_HUB_MODEL_PROVIDER_BASE_URL")
@@ -124,6 +126,14 @@ fn hermes_docker_config_from_env() -> HermesDockerConfig {
         network: std::env::var("HERMES_CONTAINER_NETWORK")
             .unwrap_or_else(|_| "hermes-hub-net".to_string()),
         internal_port: env_u16("HERMES_CONTAINER_INTERNAL_PORT", 8000),
+        connect_mode: std::env::var("HERMES_CONTAINER_CONNECT_MODE")
+            .ok()
+            .map(|value| HermesContainerConnectMode::parse(&value))
+            .unwrap_or(HermesContainerConnectMode::Network),
+        published_host_ip: std::env::var("HERMES_CONTAINER_PUBLISHED_HOST_IP")
+            .unwrap_or_else(|_| "127.0.0.1".to_string()),
+        published_base_url: std::env::var("HERMES_CONTAINER_PUBLISHED_BASE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1".to_string()),
         hub_llm_base_url: std::env::var("HERMES_HUB_LLM_BASE_URL")
             .unwrap_or_else(|_| "http://hermes-hub:8080/internal/llm/v1".to_string()),
         memory_limit: optional_env("HERMES_CONTAINER_MEMORY_LIMIT").or(Some("1g".to_string())),
@@ -135,6 +145,7 @@ fn hermes_docker_config_from_env() -> HermesDockerConfig {
 
 fn default_model_config() -> ModelConfig {
     ModelConfig {
+        config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
         provider_name: "openai-compatible".to_string(),
         provider_base_url: "https://provider.example/v1".to_string(),
         provider_api_key: "provider-secret".to_string(),
@@ -151,6 +162,9 @@ fn default_hermes_docker_config() -> HermesDockerConfig {
         data_root: PathBuf::from("/tmp/hermes-hub/users"),
         network: "hermes-hub-net".to_string(),
         internal_port: 8000,
+        connect_mode: HermesContainerConnectMode::Network,
+        published_host_ip: "127.0.0.1".to_string(),
+        published_base_url: "http://127.0.0.1".to_string(),
         hub_llm_base_url: "http://hermes-hub:8080/internal/llm/v1".to_string(),
         memory_limit: Some("1g".to_string()),
         cpu_limit: Some("1.0".to_string()),

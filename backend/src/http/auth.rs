@@ -13,10 +13,11 @@ use crate::{
     AppState,
 };
 
-use super::ApiError;
+use super::{workspace, ApiError};
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/api/auth/bootstrap-status", get(bootstrap_status))
         .route("/api/auth/bootstrap-register", post(bootstrap_register))
         .route("/api/auth/register", post(register_with_invite))
         .route("/api/auth/login", post(login))
@@ -48,6 +49,21 @@ struct UserResponse {
     user: PublicUser,
 }
 
+#[derive(Serialize)]
+struct BootstrapStatusResponse {
+    bootstrap_open: bool,
+}
+
+async fn bootstrap_status(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let bootstrap_open = state
+        .store
+        .bootstrap_open()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    Ok(Json(BootstrapStatusResponse { bootstrap_open }))
+}
+
 async fn bootstrap_register(
     State(state): State<AppState>,
     Json(payload): Json<BootstrapRegisterRequest>,
@@ -70,11 +86,13 @@ async fn register_with_invite(
     State(state): State<AppState>,
     Json(payload): Json<InviteRegisterRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    workspace::ensure_required_model_configs(&state).await?;
     let user = state
         .store
         .register_with_invite(&payload.invite_token, &payload.email, &payload.password)
         .await
         .map_err(map_invite_register_error)?;
+    workspace::ensure_managed_hermes_for_user(&state, &user.id).await?;
 
     Ok((
         StatusCode::CREATED,

@@ -161,6 +161,7 @@ async fn admin_workspace_test() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["model_config"]["provider_name"], "custom");
     assert_eq!(body["model_config"]["default_model"], "gpt-4.1");
+    assert_eq!(body["model_config"]["provider_api_key"], "secret-v2");
 
     let status_response = request_empty(
         &app,
@@ -172,6 +173,58 @@ async fn admin_workspace_test() {
     let (status, body) = response_json(status_response).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["hermes_instance"].is_null());
+
+    let blocked_without_title_model = request_empty(
+        &app,
+        Method::POST,
+        "/api/workspace/ensure-hermes",
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(blocked_without_title_model.status(), StatusCode::CONFLICT);
+
+    let blocked_admin_create_without_title_model = request_empty(
+        &app,
+        Method::POST,
+        &format!("/api/admin/users/{admin_id}/hermes-instance/create-managed"),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(
+        blocked_admin_create_without_title_model.status(),
+        StatusCode::CONFLICT
+    );
+
+    let update_title_model = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/model-config",
+        json!({
+            "config_kind": "title",
+            "provider_name": "custom",
+            "provider_base_url": "https://models.example/v1",
+            "provider_api_key": "title-secret-v2",
+            "default_model": "gpt-4.1-mini",
+            "allowed_models": ["gpt-4.1-mini"],
+            "allow_streaming": false,
+            "request_timeout_seconds": 30
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update_title_model.status(), StatusCode::NO_CONTENT);
+
+    let created_by_admin = request_empty(
+        &app,
+        Method::POST,
+        &format!("/api/admin/users/{admin_id}/hermes-instance/create-managed"),
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(created_by_admin).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["hermes_instance"]["kind"], "managed_docker");
+    assert_eq!(body["hermes_instance"]["status"], "running");
 
     let ensured = request_empty(
         &app,

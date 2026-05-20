@@ -11,6 +11,8 @@ use uuid::Uuid;
 
 use crate::db::runtime::block_on_db;
 
+pub const HUB_CHANNEL_NAME: &str = "hermes-hub";
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChannelSessionKind {
@@ -165,39 +167,74 @@ impl ChannelStore {
     }
 
     pub async fn list_channels(&self, user_id: &str) -> Result<Vec<Channel>, ChannelStoreError> {
+        let channel = self.ensure_hub_channel(user_id).await?;
+        Ok(vec![channel])
+    }
+
+    /// Hub 统一维护每个用户唯一的标准 channel，前端不再暴露创建 channel 的入口。
+    pub async fn ensure_hub_channel(&self, user_id: &str) -> Result<Channel, ChannelStoreError> {
         match &self.backend {
             ChannelStoreBackend::Memory(inner) => {
-                let inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
-                let mut channels = inner
+                let mut inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
+                if let Some(channel) = inner
                     .channels_by_id
                     .values()
                     .filter(|channel| channel.user_id == user_id)
+                    .find(|channel| channel.name == HUB_CHANNEL_NAME)
                     .cloned()
-                    .collect::<Vec<_>>();
+                {
+                    return Ok(channel);
+                }
 
-                channels.sort_by(|left, right| right.created_at.cmp(&left.created_at));
-                Ok(channels)
+                let now = unix_now();
+                let channel = Channel {
+                    id: Uuid::new_v4().to_string(),
+                    user_id: user_id.to_string(),
+                    name: HUB_CHANNEL_NAME.to_string(),
+                    description: Some("Hermes Hub default channel".to_string()),
+                    created_at: now,
+                    updated_at: now,
+                };
+                inner
+                    .channels_by_id
+                    .insert(channel.id.clone(), channel.clone());
+                Ok(channel)
             }
             ChannelStoreBackend::Postgres(pool) => block_on_db(async {
-                let rows = sqlx::query(
-                    r#"
-                    select id::text as id,
-                           user_id::text as user_id,
-                           name,
-                           description,
-                           extract(epoch from created_at)::bigint as created_at,
-                           extract(epoch from updated_at)::bigint as updated_at
-                    from channels
-                    where user_id = $1::uuid
-                    order by created_at desc
-                    "#,
+                let instance = sqlx::query(
+                    "select id::text as id from hermes_instances where user_id = $1::uuid limit 1",
                 )
                 .bind(user_id)
-                .fetch_all(pool)
+                .fetch_optional(pool)
+                .await
+                .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+                let instance_id = instance.and_then(|row| row.try_get::<String, _>("id").ok());
+
+                let row = sqlx::query(
+                    r#"
+                    insert into channels (id, user_id, hermes_instance_id, name, description)
+                    values ($1::uuid, $2::uuid, $3::uuid, $4, $5)
+                    on conflict (user_id, name) do update set
+                        hermes_instance_id = coalesce(excluded.hermes_instance_id, channels.hermes_instance_id),
+                        updated_at = now()
+                    returning id::text as id,
+                              user_id::text as user_id,
+                              name,
+                              description,
+                              extract(epoch from created_at)::bigint as created_at,
+                              extract(epoch from updated_at)::bigint as updated_at
+                    "#,
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(user_id)
+                .bind(instance_id)
+                .bind(HUB_CHANNEL_NAME)
+                .bind(Some("Hermes Hub default channel".to_string()))
+                .fetch_one(pool)
                 .await
                 .map_err(|_| ChannelStoreError::DatabaseFailed)?;
 
-                rows.iter().map(row_to_channel).collect()
+                row_to_channel(&row)
             }),
         }
     }
@@ -382,6 +419,57 @@ impl ChannelStore {
                     where id = $1::uuid and channel_id = $2::uuid
                     "#,
                 )
+                .bind(session_id)
+                .bind(channel_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|_| ChannelStoreError::DatabaseFailed)?
+                .ok_or(ChannelStoreError::ChannelNotFound)?;
+
+                row_to_session(&row)
+            }),
+        }
+    }
+
+    pub async fn update_session_title(
+        &self,
+        user_id: &str,
+        channel_id: &str,
+        session_id: &str,
+        title: String,
+    ) -> Result<ChannelSession, ChannelStoreError> {
+        self.get_channel(user_id, channel_id).await?;
+
+        match &self.backend {
+            ChannelStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
+                let session = inner
+                    .sessions_by_id
+                    .get_mut(session_id)
+                    .filter(|session| session.channel_id == channel_id)
+                    .ok_or(ChannelStoreError::ChannelNotFound)?;
+                session.title = Some(title);
+                session.updated_at = unix_now();
+                Ok(session.clone())
+            }
+            ChannelStoreBackend::Postgres(pool) => block_on_db(async {
+                let row = sqlx::query(
+                    r#"
+                    update channel_sessions
+                    set title = $1, updated_at = now()
+                    where id = $2::uuid and channel_id = $3::uuid
+                    returning id::text as id,
+                              channel_id::text as channel_id,
+                              kind,
+                              hermes_session_id,
+                              hermes_response_id,
+                              hermes_run_id,
+                              title,
+                              extract(epoch from created_at)::bigint as created_at,
+                              extract(epoch from updated_at)::bigint as updated_at
+                    "#,
+                )
+                .bind(title)
                 .bind(session_id)
                 .bind(channel_id)
                 .fetch_optional(pool)

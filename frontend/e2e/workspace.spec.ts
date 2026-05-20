@@ -37,6 +37,7 @@ test("renders channel and session workspace panels", async ({ page }) => {
     await route.fulfill({
       json: {
         model_config: {
+          config_kind: "llm",
           provider_name: "openai-compatible",
           provider_base_url: "https://provider.example/v1",
           default_model: "gpt-4.1-mini",
@@ -44,13 +45,44 @@ test("renders channel and session workspace panels", async ({ page }) => {
           allow_streaming: true,
           request_timeout_seconds: 60,
         },
+        model_configs: [
+          {
+            config_kind: "llm",
+            provider_name: "openai-compatible",
+            provider_base_url: "https://provider.example/v1",
+            default_model: "gpt-4.1-mini",
+            allowed_models: ["gpt-4.1-mini"],
+            allow_streaming: true,
+            request_timeout_seconds: 60,
+          },
+          {
+            config_kind: "image",
+            provider_name: "openai-compatible",
+            provider_base_url: "https://provider.example/v1",
+            default_model: "gpt-image-1",
+            allowed_models: ["gpt-image-1"],
+            allow_streaming: false,
+            request_timeout_seconds: 60,
+          },
+          {
+            config_kind: "title",
+            provider_name: "openai-compatible",
+            provider_base_url: "https://provider.example/v1",
+            default_model: "gpt-4.1-mini",
+            allowed_models: ["gpt-4.1-mini"],
+            allow_streaming: false,
+            request_timeout_seconds: 60,
+          },
+        ],
+        required_models_ready: false,
+        missing_required_model_config_kinds: ["llm", "title"],
       },
     });
   });
   await page.route("**/api/channels", async (route) => {
     await route.fulfill({
       json: {
-        channels: [{ id: "channel-1", name: "Research", description: "Default" }],
+        channels: [{ id: "channel-1", name: "hermes-hub", description: "Default" }],
       },
     });
   });
@@ -77,7 +109,8 @@ test("renders channel and session workspace panels", async ({ page }) => {
 
   await page.goto("/");
 
-  await expect(page.getByRole("heading", { name: "Channels" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Hermes instance", exact: true })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Session" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "hermes-hub" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "用户管理" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "模型配置管理" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Hermes 管理" })).toBeVisible();
 });

@@ -1,9 +1,8 @@
-import type { ApiClient, Channel, User } from "./api/client";
+import type { ApiClient, User } from "./api/client";
 import { createApiClient } from "./api/client";
-import { Layout } from "./components/layout";
+import { Layout, type AppView } from "./components/layout";
 import { AdminRoute } from "./routes/admin";
 import { ChannelSessionRoute } from "./routes/channel-session";
-import { ChannelsRoute } from "./routes/channels";
 import { LoginRoute } from "./routes/login";
 import { useEffect, useState } from "react";
 
@@ -13,8 +12,8 @@ type AppProps = {
 
 export function App({ apiClient = createApiClient() }: AppProps) {
   const [user, setUser] = useState<User | null>(null);
-  const [selectedChannel, setSelectedChannel] = useState<Channel | null>(null);
   const [loadingUser, setLoadingUser] = useState(true);
+  const [activeView, setActiveView] = useState<AppView>("chat");
 
   useEffect(() => {
     let alive = true;
@@ -44,34 +43,34 @@ export function App({ apiClient = createApiClient() }: AppProps) {
   async function logout() {
     await apiClient.logout();
     setUser(null);
-    setSelectedChannel(null);
+    setActiveView("chat");
   }
 
   if (loadingUser) {
-    return (
-      <Layout user={null}>
-        <section className="panel">Loading</section>
-      </Layout>
-    );
+    return <main className="auth-shell">Loading</main>;
   }
 
   if (!user) {
-    return (
-      <Layout user={null}>
-        <LoginRoute apiClient={apiClient} onAuthenticated={setUser} />
-      </Layout>
-    );
+    return <LoginRoute apiClient={apiClient} onAuthenticated={setUser} />;
   }
 
   return (
-    <Layout user={user} onLogout={logout}>
-      {user.role === "admin" ? <AdminRoute apiClient={apiClient} currentUser={user} /> : null}
-      <ChannelsRoute
-        apiClient={apiClient}
-        selectedChannelId={selectedChannel?.id ?? null}
-        onSelectChannel={setSelectedChannel}
-      />
-      <ChannelSessionRoute apiClient={apiClient} channel={selectedChannel} />
+    <Layout
+      user={user}
+      activeView={activeView}
+      onNavigate={setActiveView}
+      onLogout={logout}
+    >
+      {activeView === "chat" ? <ChannelSessionRoute apiClient={apiClient} /> : null}
+      {user.role === "admin" && activeView === "admin-users" ? (
+        <AdminRoute apiClient={apiClient} currentUser={user} section="users" />
+      ) : null}
+      {user.role === "admin" && activeView === "admin-models" ? (
+        <AdminRoute apiClient={apiClient} currentUser={user} section="models" />
+      ) : null}
+      {user.role === "admin" && activeView === "admin-hermes" ? (
+        <AdminRoute apiClient={apiClient} currentUser={user} section="hermes" />
+      ) : null}
     </Layout>
   );
 }

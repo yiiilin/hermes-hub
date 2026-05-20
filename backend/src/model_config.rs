@@ -15,16 +15,33 @@ use uuid::Uuid;
 
 use crate::security::crypto::{decrypt_secret, encrypt_secret, SecretCipher};
 
+pub const LLM_MODEL_CONFIG_KIND: &str = "llm";
+pub const IMAGE_MODEL_CONFIG_KIND: &str = "image";
+pub const TITLE_MODEL_CONFIG_KIND: &str = "title";
+pub const MODEL_CONFIG_KINDS: [&str; 3] = [
+    LLM_MODEL_CONFIG_KIND,
+    IMAGE_MODEL_CONFIG_KIND,
+    TITLE_MODEL_CONFIG_KIND,
+];
+pub const REQUIRED_RUNTIME_MODEL_CONFIG_KINDS: [&str; 2] =
+    [LLM_MODEL_CONFIG_KIND, TITLE_MODEL_CONFIG_KIND];
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ModelConfig {
+    pub config_kind: String,
     pub provider_name: String,
     pub provider_base_url: String,
-    #[serde(skip_serializing)]
     pub provider_api_key: String,
     pub default_model: String,
     pub allowed_models: Vec<String>,
     pub allow_streaming: bool,
     pub request_timeout_seconds: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RequiredModelConfigReadiness {
+    pub ready: bool,
+    pub missing_config_kinds: Vec<String>,
 }
 
 /// LLM 配置和 Hermes instance token 注册表。
@@ -49,7 +66,7 @@ struct PostgresModelRegistry {
 
 #[derive(Clone)]
 struct ModelRegistryInner {
-    config: ModelConfig,
+    configs_by_kind: HashMap<String, ModelConfig>,
     instance_tokens_by_hash: HashMap<String, Option<String>>,
 }
 
@@ -84,9 +101,10 @@ pub enum ModelRegistryError {
 
 impl ModelRegistry {
     pub fn new(config: ModelConfig) -> Self {
+        let configs_by_kind = default_config_set(config);
         Self {
             backend: ModelRegistryBackend::Memory(Arc::new(Mutex::new(ModelRegistryInner {
-                config,
+                configs_by_kind,
                 instance_tokens_by_hash: HashMap::new(),
             }))),
         }
@@ -106,6 +124,7 @@ impl ModelRegistry {
 
     pub fn default_for_tests() -> Self {
         Self::new(ModelConfig {
+            config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
             provider_name: "openai-compatible".to_string(),
             provider_base_url: "https://provider.example/v1".to_string(),
             provider_api_key: "provider-secret".to_string(),
@@ -119,7 +138,9 @@ impl ModelRegistry {
     pub fn add_instance_token(&self, token: &str) {
         if let ModelRegistryBackend::Memory(inner) = &self.backend {
             if let Ok(mut inner) = inner.lock() {
-                inner.instance_tokens_by_hash.insert(hash_token(token), None);
+                inner
+                    .instance_tokens_by_hash
+                    .insert(hash_token(token), None);
             }
         }
     }
@@ -207,20 +228,76 @@ impl ModelRegistry {
     }
 
     pub async fn active_config(&self) -> Result<ModelConfig, ModelRegistryError> {
+        self.config_for_kind(LLM_MODEL_CONFIG_KIND).await
+    }
+
+    pub async fn config_for_kind(&self, kind: &str) -> Result<ModelConfig, ModelRegistryError> {
+        validate_config_kind(kind)?;
         match &self.backend {
-            ModelRegistryBackend::Memory(inner) => inner
-                .lock()
-                .map(|inner| inner.config.clone())
-                .map_err(|_| ModelRegistryError::LockFailed),
-            ModelRegistryBackend::Postgres(store) => store.active_config().await,
+            ModelRegistryBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| ModelRegistryError::LockFailed)?;
+                inner
+                    .configs_by_kind
+                    .get(kind)
+                    .cloned()
+                    .ok_or(ModelRegistryError::InvalidRequest)
+            }
+            ModelRegistryBackend::Postgres(store) => store.active_config(kind).await,
         }
     }
 
+    pub async fn all_configs(&self) -> Result<Vec<ModelConfig>, ModelRegistryError> {
+        match &self.backend {
+            ModelRegistryBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| ModelRegistryError::LockFailed)?;
+                MODEL_CONFIG_KINDS
+                    .iter()
+                    .map(|kind| {
+                        inner
+                            .configs_by_kind
+                            .get(*kind)
+                            .cloned()
+                            .ok_or(ModelRegistryError::InvalidRequest)
+                    })
+                    .collect()
+            }
+            ModelRegistryBackend::Postgres(store) => {
+                let mut configs = Vec::with_capacity(MODEL_CONFIG_KINDS.len());
+                for kind in MODEL_CONFIG_KINDS {
+                    configs.push(store.active_config(kind).await?);
+                }
+                Ok(configs)
+            }
+        }
+    }
+
+    pub async fn required_runtime_config_readiness(
+        &self,
+    ) -> Result<RequiredModelConfigReadiness, ModelRegistryError> {
+        let mut missing_config_kinds = Vec::new();
+
+        for kind in REQUIRED_RUNTIME_MODEL_CONFIG_KINDS {
+            let config = self.config_for_kind(kind).await?;
+            if !is_runtime_model_config_ready(&config) {
+                missing_config_kinds.push(kind.to_string());
+            }
+        }
+
+        Ok(RequiredModelConfigReadiness {
+            ready: missing_config_kinds.is_empty(),
+            missing_config_kinds,
+        })
+    }
+
     pub async fn replace(&self, config: ModelConfig) -> Result<(), ModelRegistryError> {
+        validate_config_kind(&config.config_kind)?;
+        let config = normalize_allowed_models(config);
         match &self.backend {
             ModelRegistryBackend::Memory(inner) => {
                 let mut inner = inner.lock().map_err(|_| ModelRegistryError::LockFailed)?;
-                inner.config = config;
+                inner
+                    .configs_by_kind
+                    .insert(config.config_kind.clone(), config);
                 Ok(())
             }
             ModelRegistryBackend::Postgres(store) => store.replace(config).await,
@@ -291,14 +368,18 @@ impl ModelRegistry {
             return Ok(());
         };
 
-        let active: Option<(Uuid,)> =
-            sqlx::query_as("select id from model_configs where is_active = true limit 1")
-                .fetch_optional(&store.pool)
-                .await
-                .map_err(|_| ModelRegistryError::DatabaseFailed)?;
+        for config in default_config_set(default_config).into_values() {
+            let active: Option<(Uuid,)> = sqlx::query_as(
+                "select id from model_configs where is_active = true and config_kind = $1 limit 1",
+            )
+            .bind(&config.config_kind)
+            .fetch_optional(&store.pool)
+            .await
+            .map_err(|_| ModelRegistryError::DatabaseFailed)?;
 
-        if active.is_none() {
-            store.insert_active_config(default_config).await?;
+            if active.is_none() {
+                store.insert_active_config(config).await?;
+            }
         }
 
         Ok(())
@@ -361,12 +442,15 @@ impl PostgresModelRegistry {
         })
     }
 
-    async fn active_config(&self) -> Result<ModelConfig, ModelRegistryError> {
+    async fn active_config(&self, kind: &str) -> Result<ModelConfig, ModelRegistryError> {
+        validate_config_kind(kind)?;
         let row = sqlx::query(
-            "select provider_name, provider_base_url, provider_api_key_secret_ref, default_model, \
+            "select config_kind, provider_name, provider_base_url, provider_api_key_secret_ref, default_model, \
                     allowed_models, allow_streaming, request_timeout_seconds \
-             from model_configs where is_active = true order by updated_at desc limit 1",
+             from model_configs where is_active = true and config_kind = $1 \
+             order by updated_at desc limit 1",
         )
+        .bind(kind)
         .fetch_one(&self.pool)
         .await
         .map_err(|_| ModelRegistryError::DatabaseFailed)?;
@@ -375,13 +459,15 @@ impl PostgresModelRegistry {
     }
 
     async fn replace(&self, config: ModelConfig) -> Result<(), ModelRegistryError> {
+        validate_config_kind(&config.config_kind)?;
+        let config = normalize_allowed_models(config);
         let encrypted_key = encrypt_secret(&self.cipher, &config.provider_api_key);
         let updated = sqlx::query(
             "update model_configs set \
                provider_name = $1, provider_base_url = $2, provider_api_key_secret_ref = $3, \
                default_model = $4, allowed_models = $5, allow_streaming = $6, \
                request_timeout_seconds = $7, updated_at = now() \
-             where is_active = true",
+             where is_active = true and config_kind = $8",
         )
         .bind(&config.provider_name)
         .bind(&config.provider_base_url)
@@ -390,6 +476,7 @@ impl PostgresModelRegistry {
         .bind(json!(config.allowed_models))
         .bind(config.allow_streaming)
         .bind(timeout_as_i32(config.request_timeout_seconds)?)
+        .bind(&config.config_kind)
         .execute(&self.pool)
         .await
         .map_err(|_| ModelRegistryError::DatabaseFailed)?;
@@ -402,13 +489,16 @@ impl PostgresModelRegistry {
     }
 
     async fn insert_active_config(&self, config: ModelConfig) -> Result<(), ModelRegistryError> {
+        validate_config_kind(&config.config_kind)?;
+        let config = normalize_allowed_models(config);
         let encrypted_key = encrypt_secret(&self.cipher, &config.provider_api_key);
         sqlx::query(
             "insert into model_configs \
-             (id, provider_name, provider_base_url, provider_api_key_secret_ref, default_model, allowed_models, allow_streaming, request_timeout_seconds, is_active) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8, true)",
+             (id, config_kind, provider_name, provider_base_url, provider_api_key_secret_ref, default_model, allowed_models, allow_streaming, request_timeout_seconds, is_active) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, true)",
         )
         .bind(Uuid::new_v4())
+        .bind(&config.config_kind)
         .bind(&config.provider_name)
         .bind(&config.provider_base_url)
         .bind(&encrypted_key)
@@ -424,6 +514,25 @@ impl PostgresModelRegistry {
     }
 }
 
+pub fn is_runtime_model_config_ready(config: &ModelConfig) -> bool {
+    // 默认配置只是占位，管理员必须显式保存真实 provider 信息后才能开放用户和 Hermes。
+    let provider_name = config.provider_name.trim();
+    let provider_base_url = config.provider_base_url.trim();
+    let provider_api_key = config.provider_api_key.trim();
+    let default_model = config.default_model.trim();
+
+    !provider_name.is_empty()
+        && !provider_base_url.is_empty()
+        && !provider_api_key.is_empty()
+        && !default_model.is_empty()
+        && config.request_timeout_seconds > 0
+        && provider_base_url != "https://provider.example/v1"
+        && !matches!(
+            provider_api_key,
+            "provider-secret" | "replace-with-provider-key" | "changeme"
+        )
+}
+
 fn row_to_model_config(
     row: &sqlx::postgres::PgRow,
     cipher: &SecretCipher,
@@ -436,6 +545,9 @@ fn row_to_model_config(
         .map_err(|_| ModelRegistryError::DatabaseFailed)?;
 
     Ok(ModelConfig {
+        config_kind: row
+            .try_get("config_kind")
+            .map_err(|_| ModelRegistryError::DatabaseFailed)?,
         provider_name: row
             .try_get("provider_name")
             .map_err(|_| ModelRegistryError::DatabaseFailed)?,
@@ -457,6 +569,47 @@ fn row_to_model_config(
         )
         .map_err(|_| ModelRegistryError::InvalidRequest)?,
     })
+}
+
+fn default_config_set(config: ModelConfig) -> HashMap<String, ModelConfig> {
+    MODEL_CONFIG_KINDS
+        .into_iter()
+        .map(|kind| {
+            let config = default_config_for_kind(&config, kind);
+            (kind.to_string(), config)
+        })
+        .collect()
+}
+
+fn default_config_for_kind(base: &ModelConfig, kind: &str) -> ModelConfig {
+    let mut config = base.clone();
+    config.config_kind = kind.to_string();
+
+    // 图片生成和标题生成第一版复用同一个 provider 接入形态，但各自保存独立模型名。
+    if kind == IMAGE_MODEL_CONFIG_KIND && config.default_model == "gpt-4.1-mini" {
+        config.default_model = "gpt-image-1".to_string();
+    }
+    if kind != LLM_MODEL_CONFIG_KIND {
+        config.allow_streaming = false;
+        config.allowed_models = vec![config.default_model.clone()];
+    }
+
+    normalize_allowed_models(config)
+}
+
+fn normalize_allowed_models(mut config: ModelConfig) -> ModelConfig {
+    if config.allowed_models.is_empty() {
+        config.allowed_models = vec![config.default_model.clone()];
+    }
+    config
+}
+
+fn validate_config_kind(kind: &str) -> Result<(), ModelRegistryError> {
+    if MODEL_CONFIG_KINDS.contains(&kind) {
+        Ok(())
+    } else {
+        Err(ModelRegistryError::InvalidRequest)
+    }
 }
 
 fn random_token() -> Result<String, ModelRegistryError> {

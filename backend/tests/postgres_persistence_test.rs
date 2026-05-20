@@ -14,7 +14,7 @@ use hermes_hub_backend::{
         proxy_client::InMemoryHermesProxyClient,
     },
     llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
-    model_config::{ModelConfig, ModelRegistry},
+    model_config::{ModelConfig, ModelRegistry, LLM_MODEL_CONFIG_KIND},
     security::crypto::SecretCipher,
     session::store::SessionStore,
     AppConfig, AppState,
@@ -62,6 +62,7 @@ async fn test_state(pool: PgPool, provider: InMemoryLlmProviderClient) -> AppSta
     let cipher = SecretCipher::from_master_key(TEST_SECRET_KEY).expect("test cipher is valid");
     let config = AppConfig::for_tests();
     let default_config = ModelConfig {
+        config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
         provider_name: "openai-compatible".to_string(),
         provider_base_url: "https://provider-default.example/v1".to_string(),
         provider_api_key: "provider-default-key".to_string(),
@@ -303,35 +304,43 @@ async fn postgres_state_survives_recreated_router_state() {
         .await
         .expect("instance token can be stored");
 
-    let channel = request_json(
-        &app,
-        Method::POST,
-        "/api/channels",
-        json!({
-            "name": "persisted channel",
-            "description": "Postgres backed"
-        }),
-        Some(&user_cookie),
-        None,
-    )
-    .await;
+    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&user_cookie), None).await;
     let (status, channel_body) = response_json(channel).await;
-    assert_eq!(status, StatusCode::CREATED);
-    let channel_id = channel_body["channel"]["id"].as_str().expect("channel id");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(channel_body["channels"][0]["name"], "hermes-hub");
+    let channel_id = channel_body["channels"][0]["id"]
+        .as_str()
+        .expect("channel id");
 
     let session = request_json(
         &app,
         Method::POST,
         &format!("/api/channels/{channel_id}/sessions"),
         json!({
-            "kind": "agent",
-            "title": "persisted session"
+            "kind": "agent"
         }),
         Some(&user_cookie),
         None,
     )
     .await;
-    assert_eq!(session.status(), StatusCode::CREATED);
+    let (status, session_body) = response_json(session).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let session_id = session_body["session"]["id"].as_str().expect("session id");
+
+    let title = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/title"),
+        json!({
+            "prompt": "persisted session"
+        }),
+        Some(&user_cookie),
+        None,
+    )
+    .await;
+    let (status, title_body) = response_json(title).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(title_body["session"]["title"], "persisted session");
 
     let restarted_state = test_state(pool, provider.clone()).await;
     let restarted_app = test_app(restarted_state);
@@ -370,7 +379,7 @@ async fn postgres_state_survives_recreated_router_state() {
     .await;
     let (status, channels_body) = response_json(channels).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(channels_body["channels"][0]["name"], "persisted channel");
+    assert_eq!(channels_body["channels"][0]["name"], "hermes-hub");
 
     let sessions = request_empty(
         &restarted_app,

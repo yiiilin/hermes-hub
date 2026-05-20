@@ -48,7 +48,8 @@ HERMES_HUB_SECRET_MASTER_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA \
 HERMES_HUB_STATIC_DIR=frontend/dist \
 HERMES_DATA_ROOT="$(pwd)/data/hub/users" \
 HERMES_CONTAINER_NETWORK=hermes-hub-net \
-HERMES_HUB_LLM_BASE_URL=http://hermes-hub:8080/internal/llm/v1 \
+HERMES_CONTAINER_CONNECT_MODE=published-host \
+HERMES_HUB_LLM_BASE_URL=http://<host-ip>:8080/internal/llm/v1 \
 cargo run -p hermes-hub-backend
 ```
 
@@ -71,11 +72,13 @@ The compose file is intentionally source-mounted for local development, not a pr
 
 PostgreSQL data is bind-mounted under project root `./data/postgres`, and Hub-managed Hermes workspace/sandbox/config data is bind-mounted under `./data/hub/users`. The `data/` directory is ignored by git.
 
-Managed Hermes containers use host-path workspace/sandbox/config directories under `HERMES_DATA_ROOT`. Hub creates the Docker network if needed, creates or starts a container named `hermes-user-<user-id>`, does not publish host ports, and injects:
+Managed Hermes containers use host-path workspace/sandbox/config directories under `HERMES_DATA_ROOT`. Hub creates the Docker network if needed, creates or starts a container named `hermes-user-<user-id>`, and injects:
 
 - `OPENAI_BASE_URL=$HERMES_HUB_LLM_BASE_URL`
 - `OPENAI_API_KEY=<instance token>`
 - `OPENAI_MODEL=<admin default model>`
+
+When Hub itself runs in Docker Compose, keep `HERMES_CONTAINER_CONNECT_MODE=network`; Hub reaches Hermes by container name and no host ports are published. When the backend runs directly on the host for local development, use `HERMES_CONTAINER_CONNECT_MODE=published-host`; each Hermes container publishes a random loopback port and Hub stores a local `base_url` such as `http://127.0.0.1:<port>`. In that host mode, `HERMES_HUB_LLM_BASE_URL` must be an address the Hermes container can use to call back into Hub, for example a LAN IP or Docker host-gateway address.
 
 Hermes model traffic should target Hub’s internal `/internal/llm/v1` gateway. Admin model config changes take effect at the gateway without restarting Hermes containers.
 

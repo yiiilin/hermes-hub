@@ -1,5 +1,6 @@
 import type { ApiClient, User } from "../api/client";
-import { FormEvent, useMemo, useState } from "react";
+import { Bot } from "lucide-react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 
 type LoginRouteProps = {
   apiClient: ApiClient;
@@ -14,11 +15,46 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
     return params.get("invite") ?? params.get("invite_token") ?? "";
   }, []);
   const [mode, setMode] = useState<AuthMode>(inviteFromUrl ? "invite" : "login");
+  const [checkingBootstrap, setCheckingBootstrap] = useState(!inviteFromUrl);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [inviteToken, setInviteToken] = useState(inviteFromUrl);
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const isRegistering = mode !== "login";
+
+  useEffect(() => {
+    let alive = true;
+
+    if (inviteFromUrl) {
+      setCheckingBootstrap(false);
+      return () => {
+        alive = false;
+      };
+    }
+
+    void apiClient
+      .bootstrapStatus()
+      .then((status) => {
+        if (alive && status.bootstrap_open) {
+          setMode("bootstrap");
+        }
+      })
+      .catch(() => {
+        if (alive) {
+          setMode("login");
+        }
+      })
+      .finally(() => {
+        if (alive) {
+          setCheckingBootstrap(false);
+        }
+      });
+
+    return () => {
+      alive = false;
+    };
+  }, [apiClient, inviteFromUrl]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -26,11 +62,15 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
     setError(null);
 
     try {
+      if (isRegistering && password !== confirmPassword) {
+        throw new Error("Passwords do not match");
+      }
+
       const user =
         mode === "bootstrap"
           ? await apiClient.bootstrapRegister(email, password)
           : mode === "invite"
-            ? await apiClient.registerWithInvite(inviteToken, email, password)
+            ? await apiClient.registerWithInvite(inviteFromUrl, email, password)
             : await apiClient.login(email, password);
       onAuthenticated(user);
     } catch (cause) {
@@ -41,58 +81,77 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
   }
 
   return (
-    <section className="panel login-panel" aria-labelledby="login-title">
-      <h1 id="login-title">Hermes Hub</h1>
-      <div className="segmented" role="tablist" aria-label="Authentication mode">
-        <button type="button" className={mode === "login" ? "active" : ""} onClick={() => setMode("login")}>
-          Sign in
-        </button>
-        <button type="button" className={mode === "invite" ? "active" : ""} onClick={() => setMode("invite")}>
-          Invite
-        </button>
-        <button type="button" className={mode === "bootstrap" ? "active" : ""} onClick={() => setMode("bootstrap")}>
-          First admin
-        </button>
-      </div>
-      <form className="form" onSubmit={submit}>
-        {mode === "invite" ? (
+    <main className="auth-shell">
+      <section className="auth-card" aria-labelledby="login-title">
+        <div className="auth-brand" aria-hidden="true">
+          <Bot size={28} />
+        </div>
+        <h1 id="login-title">Hermes Hub</h1>
+        <p className="auth-subtitle">
+          {isRegistering ? "Create your account" : "Sign in to your workspace"}
+        </p>
+        <form className="form" onSubmit={submit}>
           <label>
-            Invite token
+            Email
             <input
-              name="invite"
-              value={inviteToken}
-              onChange={(event) => setInviteToken(event.target.value)}
+              name="email"
+              type="email"
+              autoComplete="email"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
               required
             />
           </label>
+          <label>
+            Password
+            <input
+              name="password"
+              type="password"
+              autoComplete={mode === "login" ? "current-password" : "new-password"}
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              required
+            />
+          </label>
+          {isRegistering ? (
+            <label>
+              Confirm password
+              <input
+                name="confirm-password"
+                type="password"
+                autoComplete="new-password"
+                value={confirmPassword}
+                onChange={(event) => setConfirmPassword(event.target.value)}
+                required
+              />
+            </label>
+          ) : null}
+          {error ? <p className="error">{error}</p> : null}
+          <button type="submit" disabled={busy || checkingBootstrap}>
+            {checkingBootstrap
+              ? "Loading"
+              : busy
+                ? "Working"
+                : isRegistering
+                  ? "Create account"
+                  : "Sign in"}
+          </button>
+        </form>
+        {!inviteFromUrl && !checkingBootstrap ? (
+          <button
+            type="button"
+            className="text-button"
+            onClick={() => {
+              setError(null);
+              setPassword("");
+              setConfirmPassword("");
+              setMode(isRegistering ? "login" : "bootstrap");
+            }}
+          >
+            {isRegistering ? "Already have an account? Sign in" : "Need to create the first admin?"}
+          </button>
         ) : null}
-        <label>
-          Email
-          <input
-            name="email"
-            type="email"
-            autoComplete="email"
-            value={email}
-            onChange={(event) => setEmail(event.target.value)}
-            required
-          />
-        </label>
-        <label>
-          Password
-          <input
-            name="password"
-            type="password"
-            autoComplete={mode === "login" ? "current-password" : "new-password"}
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-            required
-          />
-        </label>
-        {error ? <p className="error">{error}</p> : null}
-        <button type="submit" disabled={busy}>
-          {busy ? "Working" : mode === "bootstrap" ? "Create admin" : mode === "invite" ? "Register" : "Sign in"}
-        </button>
-      </form>
-    </section>
+      </section>
+    </main>
   );
 }

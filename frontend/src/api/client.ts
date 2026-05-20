@@ -37,7 +37,10 @@ export type HermesInstance = {
   health_status?: string;
 };
 
+export type ModelConfigKind = "llm" | "image" | "title";
+
 export type ModelConfig = {
+  config_kind: ModelConfigKind;
   provider_name: string;
   provider_base_url: string;
   provider_api_key?: string;
@@ -47,6 +50,39 @@ export type ModelConfig = {
   request_timeout_seconds: number;
 };
 
+export type ModelConfigStatus = {
+  model_config: ModelConfig;
+  model_configs: ModelConfig[];
+  required_models_ready: boolean;
+  missing_required_model_config_kinds: ModelConfigKind[];
+};
+
+export type ModelConfigTestResult = {
+  ok: boolean;
+  status_code: number;
+  message: string;
+  duration_ms: number;
+};
+
+export type HermesAttachment = {
+  name: string;
+  content_type: string;
+  data_url: string;
+  kind: "file" | "image";
+};
+
+type HermesRunStarted = {
+  run_id?: string;
+  status?: string;
+};
+
+type HermesRunEvent = {
+  event?: string;
+  delta?: string;
+  output?: string;
+  error?: string;
+};
+
 export type CreateInviteInput = {
   expires_at: number;
   max_uses: number;
@@ -54,6 +90,7 @@ export type CreateInviteInput = {
 
 export type ApiClient = {
   me: () => Promise<User | null>;
+  bootstrapStatus: () => Promise<{ bootstrap_open: boolean }>;
   login: (email: string, password: string) => Promise<User>;
   bootstrapRegister: (email: string, password: string) => Promise<User>;
   registerWithInvite: (
@@ -69,6 +106,7 @@ export type ApiClient = {
   createInvite: (input: CreateInviteInput) => Promise<{ token: string; invite: Invite }>;
   revokeInvite: (inviteId: string) => Promise<Invite>;
   listHermesInstances: () => Promise<HermesInstance[]>;
+  createHermesInstance: (userId: string) => Promise<HermesInstance>;
   startHermesInstance: (userId: string) => Promise<HermesInstance>;
   stopHermesInstance: (userId: string) => Promise<HermesInstance>;
   rebuildHermesInstance: (userId: string) => Promise<HermesInstance>;
@@ -80,11 +118,24 @@ export type ApiClient = {
     kind: "chat" | "agent",
     title?: string,
   ) => Promise<ChannelSession>;
+  generateSessionTitle: (
+    channelId: string,
+    sessionId: string,
+    prompt: string,
+  ) => Promise<ChannelSession>;
   workspaceStatus: () => Promise<HermesInstance | null>;
   ensureHermes: () => Promise<HermesInstance>;
   modelConfig: () => Promise<ModelConfig>;
+  modelConfigStatus: () => Promise<ModelConfigStatus>;
+  modelConfigs: () => Promise<ModelConfig[]>;
   updateModelConfig: (config: ModelConfig) => Promise<void>;
-  sendHermesPrompt: (prompt: string) => Promise<string>;
+  updateModelConfigs: (configs: ModelConfig[]) => Promise<void>;
+  testModelConfig: (config: ModelConfig) => Promise<ModelConfigTestResult>;
+  sendHermesPrompt: (
+    prompt: string,
+    attachments?: HermesAttachment[],
+    sessionId?: string,
+  ) => Promise<string>;
 };
 
 type RequestOptions = {
@@ -125,6 +176,13 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   return response.json() as Promise<T>;
 }
 
+async function updateModelConfigRequest(config: ModelConfig): Promise<void> {
+  await request<void>("/api/admin/model-config", {
+    method: "PUT",
+    body: { ...config, allowed_models: [config.default_model] },
+  });
+}
+
 export function createApiClient(): ApiClient {
   return {
     async me() {
@@ -132,6 +190,9 @@ export function createApiClient(): ApiClient {
         allowUnauthorized: true,
       });
       return payload?.user ?? null;
+    },
+    async bootstrapStatus() {
+      return request<{ bootstrap_open: boolean }>("/api/auth/bootstrap-status");
     },
     async login(email, password) {
       const payload = await request<{ user: User }>("/api/auth/login", {
@@ -198,6 +259,13 @@ export function createApiClient(): ApiClient {
       );
       return payload.hermes_instances;
     },
+    async createHermesInstance(userId) {
+      const payload = await request<{ hermes_instance: HermesInstance }>(
+        `/api/admin/users/${userId}/hermes-instance/create-managed`,
+        { method: "POST" },
+      );
+      return payload.hermes_instance;
+    },
     async startHermesInstance(userId) {
       const payload = await request<{ hermes_instance: HermesInstance }>(
         `/api/admin/users/${userId}/hermes-instance/start`,
@@ -243,6 +311,13 @@ export function createApiClient(): ApiClient {
       );
       return payload.session;
     },
+    async generateSessionTitle(channelId, sessionId, prompt) {
+      const payload = await request<{ session: ChannelSession }>(
+        `/api/channels/${channelId}/sessions/${sessionId}/title`,
+        { method: "POST", body: { prompt } },
+      );
+      return payload.session;
+    },
     async workspaceStatus() {
       const payload = await request<{ hermes_instance: HermesInstance | null }>(
         "/api/workspace/status",
@@ -257,27 +332,67 @@ export function createApiClient(): ApiClient {
       return payload.hermes_instance;
     },
     async modelConfig() {
-      const payload = await request<{ model_config: ModelConfig }>(
+      const payload = await this.modelConfigStatus();
+      return payload.model_config;
+    },
+    async modelConfigStatus() {
+      const payload = await request<ModelConfigStatus>(
         "/api/admin/model-config",
       );
-      return { ...payload.model_config, provider_api_key: "" };
+      const modelConfigs = payload.model_configs ?? [payload.model_config];
+      return {
+        ...payload,
+        model_config: payload.model_config,
+        model_configs: modelConfigs,
+        required_models_ready: payload.required_models_ready ?? false,
+        missing_required_model_config_kinds:
+          payload.missing_required_model_config_kinds ?? [],
+      };
+    },
+    async modelConfigs() {
+      const payload = await this.modelConfigStatus();
+      return payload.model_configs;
     },
     async updateModelConfig(config) {
-      await request<void>("/api/admin/model-config", {
-        method: "PUT",
-        body: config,
-      });
+      await updateModelConfigRequest(config);
     },
-    async sendHermesPrompt(prompt) {
-      const response = await fetch("/api/hermes/v1/runs?stream=true", {
+    async updateModelConfigs(configs) {
+      // 当前后端逐类保存模型配置；前端只暴露一个提交动作，避免管理员漏保存某一类。
+      for (const config of configs) {
+        await updateModelConfigRequest(config);
+      }
+    },
+    async testModelConfig(config) {
+      return request<ModelConfigTestResult>(
+        `/api/admin/model-config/${config.config_kind}/test`,
+        {
+          method: "POST",
+          body: { ...config, allowed_models: [config.default_model] },
+        },
+      );
+    },
+    async sendHermesPrompt(prompt, attachments = [], sessionId) {
+      const response = await fetch("/api/hermes/v1/runs", {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, stream: true }),
+        body: JSON.stringify({
+          input: hermesRunInput(prompt, attachments),
+          stream: true,
+          session_id: sessionId,
+        }),
       });
 
       if (!response.ok) {
         throw new Error(`Hermes request failed: ${response.status}`);
+      }
+
+      if (response.status === 202) {
+        const started = (await response.json()) as HermesRunStarted;
+        if (!started.run_id) {
+          throw new Error("Hermes run did not return a run_id");
+        }
+        return readHermesRunEvents(started.run_id);
       }
 
       return response.text();
@@ -285,8 +400,91 @@ export function createApiClient(): ApiClient {
   };
 }
 
-export function createMockApiClient(): ApiClient {
-  let currentUser: User | null = {
+function hermesRunInput(prompt: string, attachments: HermesAttachment[]) {
+  if (attachments.length === 0) {
+    return prompt;
+  }
+
+  const content = [];
+  if (prompt.trim()) {
+    content.push({ type: "text", text: prompt.trim() });
+  }
+
+  for (const attachment of attachments) {
+    if (attachment.kind === "image") {
+      content.push({
+        type: "image_url",
+        image_url: { url: attachment.data_url },
+      });
+    } else {
+      // Hermes runs 端点当前不支持通用文件上传；先把文件元信息并入文本上下文。
+      content.push({
+        type: "text",
+        text: `[Attached file: ${attachment.name} (${attachment.content_type})]`,
+      });
+    }
+  }
+
+  return [{ role: "user", content }];
+}
+
+async function readHermesRunEvents(runId: string): Promise<string> {
+  const response = await fetch(`/api/hermes/v1/runs/${encodeURIComponent(runId)}/events`, {
+    method: "GET",
+    credentials: "include",
+    headers: { Accept: "text/event-stream" },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Hermes run events failed: ${response.status}`);
+  }
+
+  const eventStream = await response.text();
+  const events = parseHermesRunEvents(eventStream);
+  let deltaText = "";
+  let completedOutput = "";
+
+  for (const event of events) {
+    if (event.event === "message.delta" && event.delta) {
+      deltaText += event.delta;
+    }
+    if (event.event === "run.completed" && event.output) {
+      completedOutput = event.output;
+    }
+    if (event.event === "run.failed") {
+      throw new Error(event.error || "Hermes run failed");
+    }
+  }
+
+  return completedOutput || deltaText || eventStream;
+}
+
+function parseHermesRunEvents(eventStream: string): HermesRunEvent[] {
+  return eventStream
+    .split("\n")
+    .filter((line) => line.startsWith("data: "))
+    .map((line) => line.slice("data: ".length).trim())
+    .filter(Boolean)
+    .flatMap((line) => {
+      try {
+        return [JSON.parse(line) as HermesRunEvent];
+      } catch {
+        return [];
+      }
+    });
+}
+
+type MockApiClientOptions = {
+  initialUser?: User | null;
+  bootstrapOpen?: boolean;
+  requiredModelsReady?: boolean;
+  missingRequiredModelConfigKinds?: ModelConfigKind[];
+  initialInstance?: HermesInstance | null;
+};
+
+export function createMockApiClient(options: MockApiClientOptions = {}): ApiClient {
+  let hasAnyUser = options.bootstrapOpen === true ? false : true;
+  let currentUser: User | null = "initialUser" in options ? options.initialUser! : {
     id: "user-1",
     email: "admin@example.com",
     role: "admin",
@@ -295,13 +493,13 @@ export function createMockApiClient(): ApiClient {
   let channels: Channel[] = [
     {
       id: "channel-1",
-      name: "Research",
-      description: "Default research channel",
+      name: "hermes-hub",
+      description: "Hermes Hub default channel",
     },
   ];
   let sessions: ChannelSession[] = [{ id: "session-1", channel_id: "channel-1", kind: "agent", title: "Session" }];
   let invites: Invite[] = [];
-  let instance: HermesInstance | null = {
+  let instance: HermesInstance | null = "initialInstance" in options ? options.initialInstance! : {
     id: "instance-1",
     user_id: "user-1",
     kind: "managed_docker",
@@ -309,28 +507,50 @@ export function createMockApiClient(): ApiClient {
     base_url: "http://hermes-user-user-1:8000",
   };
   let modelConfig: ModelConfig = {
+    config_kind: "llm",
     provider_name: "openai-compatible",
-    provider_base_url: "https://provider.example/v1",
-    provider_api_key: "provider-secret",
+    provider_base_url: "https://ready-provider.example/v1",
+    provider_api_key: "ready-provider-key",
     default_model: "gpt-4.1-mini",
     allowed_models: ["gpt-4.1-mini"],
     allow_streaming: true,
     request_timeout_seconds: 60,
   };
+  let modelConfigs: ModelConfig[] = [
+    modelConfig,
+    {
+      ...modelConfig,
+      config_kind: "image",
+      default_model: "gpt-image-1",
+      allowed_models: ["gpt-image-1"],
+      allow_streaming: false,
+    },
+    {
+      ...modelConfig,
+      config_kind: "title",
+      allow_streaming: false,
+    },
+  ];
 
   return {
     async me() {
       return currentUser;
     },
+    async bootstrapStatus() {
+      return { bootstrap_open: !hasAnyUser };
+    },
     async login(email) {
+      hasAnyUser = true;
       currentUser = { id: "user-1", email, role: "admin", status: "active" };
       return currentUser;
     },
     async bootstrapRegister(email) {
+      hasAnyUser = true;
       currentUser = { id: "user-1", email, role: "admin", status: "active" };
       return currentUser;
     },
     async registerWithInvite(_inviteToken, email) {
+      hasAnyUser = true;
       currentUser = { id: "user-2", email, role: "user", status: "active" };
       return currentUser;
     },
@@ -371,6 +591,16 @@ export function createMockApiClient(): ApiClient {
     async listHermesInstances() {
       return instance ? [instance] : [];
     },
+    async createHermesInstance(userId) {
+      instance = {
+        id: "instance-1",
+        user_id: userId,
+        kind: "managed_docker",
+        status: "running",
+        base_url: `http://hermes-user-${userId}:8000`,
+      };
+      return instance;
+    },
     async startHermesInstance() {
       instance = { ...(instance as HermesInstance), status: "running" };
       return instance;
@@ -399,6 +629,18 @@ export function createMockApiClient(): ApiClient {
       sessions = [session, ...sessions];
       return session;
     },
+    async generateSessionTitle(channelId, sessionId, prompt) {
+      const session = sessions.find((item) => item.id === sessionId && item.channel_id === channelId);
+      if (!session) {
+        throw new Error("session not found");
+      }
+      const titled = {
+        ...session,
+        title: prompt.trim().slice(0, 48) || "New conversation",
+      };
+      sessions = sessions.map((item) => (item.id === sessionId ? titled : item));
+      return titled;
+    },
     async workspaceStatus() {
       return instance;
     },
@@ -415,11 +657,42 @@ export function createMockApiClient(): ApiClient {
     async modelConfig() {
       return modelConfig;
     },
+    async modelConfigStatus() {
+      return {
+        model_config: modelConfig,
+        model_configs: modelConfigs,
+        required_models_ready: options.requiredModelsReady ?? true,
+        missing_required_model_config_kinds:
+          options.missingRequiredModelConfigKinds ?? [],
+      };
+    },
+    async modelConfigs() {
+      return modelConfigs;
+    },
     async updateModelConfig(config) {
-      modelConfig = config;
+      modelConfigs = modelConfigs.map((existing) =>
+        existing.config_kind === config.config_kind
+          ? { ...config, allowed_models: [config.default_model] }
+          : existing,
+      );
+      modelConfig =
+        modelConfigs.find((existing) => existing.config_kind === "llm") ?? modelConfig;
+    },
+    async updateModelConfigs(configs) {
+      for (const config of configs) {
+        await this.updateModelConfig(config);
+      }
+    },
+    async testModelConfig() {
+      return {
+        ok: true,
+        status_code: 200,
+        message: "model test succeeded",
+        duration_ms: 12,
+      };
     },
     async sendHermesPrompt(prompt) {
-      return `event: message\ndata: ${prompt}\n\n`;
+      return prompt;
     },
   };
 }

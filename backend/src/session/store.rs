@@ -125,6 +125,29 @@ impl SessionStore {
         }
     }
 
+    /// 判断首个管理员注册是否仍然开放。
+    ///
+    /// 这个状态只用于未登录页面决定默认展示登录还是注册；真正的并发安全仍由
+    /// `create_bootstrap_admin` 内部的锁和事务保证。
+    pub async fn bootstrap_open(&self) -> Result<bool, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                Ok(inner.users_by_id.is_empty())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let count = sqlx::query("select count(*)::bigint as count from users")
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?
+                    .try_get::<i64, _>("count")
+                    .map_err(|_| StoreError::DatabaseFailed)?;
+
+                Ok(count == 0)
+            }),
+        }
+    }
+
     pub async fn create_bootstrap_admin(
         &self,
         email: &str,
@@ -160,9 +183,7 @@ impl SessionStore {
                 let user =
                     postgres_create_user_with_executor(&mut *tx, email, password, UserRole::Admin)
                         .await?;
-                tx.commit()
-                    .await
-                    .map_err(|_| StoreError::DatabaseFailed)?;
+                tx.commit().await.map_err(|_| StoreError::DatabaseFailed)?;
                 Ok(user)
             }),
         }
@@ -198,18 +219,14 @@ impl SessionStore {
                 if invite.expires_at <= now {
                     mark_invite_status_with_executor(&mut *tx, &invite.id, InviteStatus::Expired)
                         .await?;
-                    tx.commit()
-                        .await
-                        .map_err(|_| StoreError::DatabaseFailed)?;
+                    tx.commit().await.map_err(|_| StoreError::DatabaseFailed)?;
                     return Err(StoreError::InviteExpired);
                 }
                 if invite.used_count >= invite.max_uses || invite.status == InviteStatus::Exhausted
                 {
                     mark_invite_status_with_executor(&mut *tx, &invite.id, InviteStatus::Exhausted)
                         .await?;
-                    tx.commit()
-                        .await
-                        .map_err(|_| StoreError::DatabaseFailed)?;
+                    tx.commit().await.map_err(|_| StoreError::DatabaseFailed)?;
                     return Err(StoreError::InviteExhausted);
                 }
                 if postgres_user_id_by_email_with_executor(&mut *tx, email)
@@ -251,9 +268,7 @@ impl SessionStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| StoreError::DatabaseFailed)?;
-                tx.commit()
-                    .await
-                    .map_err(|_| StoreError::DatabaseFailed)?;
+                tx.commit().await.map_err(|_| StoreError::DatabaseFailed)?;
 
                 Ok(user)
             }),

@@ -163,6 +163,30 @@ async fn bootstrap_admin(app: &Router) -> String {
     cookie_from(&login)
 }
 
+async fn configure_required_model_configs(app: &Router, admin_cookie: &str) {
+    for (config_kind, model) in [("llm", "gpt-4.1-mini"), ("title", "gpt-4.1-mini")] {
+        let response = request_json(
+            app,
+            Method::PUT,
+            "/api/admin/model-config",
+            json!({
+                "config_kind": config_kind,
+                "provider_name": "openai-compatible",
+                "provider_base_url": "https://provider-ready.example/v1",
+                "provider_api_key": "provider-ready-key",
+                "default_model": model,
+                "allowed_models": [model],
+                "allow_streaming": config_kind == "llm",
+                "request_timeout_seconds": 30
+            }),
+            Some(admin_cookie),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+}
+
 async fn invite_user(app: &Router, admin_cookie: &str) -> String {
     let invite = request_json(
         app,
@@ -227,6 +251,7 @@ async fn integration_test() {
     let app = test_app(state.clone());
 
     let admin_cookie = bootstrap_admin(&app).await;
+    configure_required_model_configs(&app, &admin_cookie).await;
     let user_cookie = invite_user(&app, &admin_cookie).await;
 
     let update_model = request_json(
@@ -247,6 +272,60 @@ async fn integration_test() {
     )
     .await;
     assert_eq!(update_model.status(), StatusCode::NO_CONTENT);
+
+    let test_llm_model = request_json(
+        &app,
+        Method::POST,
+        "/api/admin/model-config/llm/test",
+        json!({
+            "provider_name": "openai-compatible",
+            "provider_base_url": "https://provider-one.example/v1",
+            "provider_api_key": "provider-key-one",
+            "default_model": "gpt-4.1-mini",
+            "allowed_models": ["gpt-4.1-mini", "gpt-4.1"],
+            "allow_streaming": true,
+            "request_timeout_seconds": 30
+        }),
+        Some(&admin_cookie),
+        None,
+    )
+    .await;
+    let (status, body) = response_json(test_llm_model).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["status_code"], 200);
+    let forwarded = provider.last_request().expect("llm test provider request");
+    assert_eq!(forwarded.path, "/chat/completions");
+    assert_eq!(forwarded.authorization, "Bearer provider-key-one");
+    let forwarded_body: Value = serde_json::from_slice(&forwarded.body).expect("provider json");
+    assert_eq!(forwarded_body["model"], "gpt-4.1-mini");
+
+    let test_image_model = request_json(
+        &app,
+        Method::POST,
+        "/api/admin/model-config/image/test",
+        json!({
+            "provider_name": "openai-compatible",
+            "provider_base_url": "https://provider-image.example/v1",
+            "provider_api_key": "provider-image-key",
+            "default_model": "gpt-image-1",
+            "allowed_models": ["gpt-image-1"],
+            "allow_streaming": false,
+            "request_timeout_seconds": 30
+        }),
+        Some(&admin_cookie),
+        None,
+    )
+    .await;
+    let (status, body) = response_json(test_image_model).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+    let forwarded = provider
+        .last_request()
+        .expect("image test provider request");
+    assert_eq!(forwarded.path, "/images/generations");
+    assert_eq!(forwarded.authorization, "Bearer provider-image-key");
+    assert_eq!(forwarded.timeout_seconds, 180);
 
     let ensured = request_empty(
         &app,
@@ -277,29 +356,18 @@ async fn integration_test() {
         .llm_api_key
         .expect("instance token is stored for the managed hermes runtime");
 
-    let channel = request_json(
-        &app,
-        Method::POST,
-        "/api/channels",
-        json!({
-            "name": "agent work",
-            "description": "Integration channel"
-        }),
-        Some(&user_cookie),
-        None,
-    )
-    .await;
+    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&user_cookie), None).await;
     let (status, body) = response_json(channel).await;
-    assert_eq!(status, StatusCode::CREATED);
-    let channel_id = body["channel"]["id"].as_str().expect("channel id");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["channels"][0]["name"], "hermes-hub");
+    let channel_id = body["channels"][0]["id"].as_str().expect("channel id");
 
     let session = request_json(
         &app,
         Method::POST,
         &format!("/api/channels/{channel_id}/sessions"),
         json!({
-            "kind": "agent",
-            "title": "First run"
+            "kind": "agent"
         }),
         Some(&user_cookie),
         None,
@@ -322,7 +390,10 @@ async fn integration_test() {
     assert_eq!(hermes.status(), StatusCode::OK);
     let forwarded = proxy.last_request().expect("hermes proxy request");
     assert_eq!(forwarded.path_and_query, "/v1/runs?stream=true");
-    assert_eq!(forwarded.authorization, None);
+    assert_eq!(
+        forwarded.authorization,
+        Some(format!("Bearer {instance_llm_token}"))
+    );
 
     // Hermes 容器调用 Hub 内部 LLM Gateway，使用 Hub 下发的实例 token。
     let llm_response = request_json(

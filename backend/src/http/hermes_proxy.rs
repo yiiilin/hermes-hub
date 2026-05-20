@@ -9,10 +9,10 @@ use std::time::Instant;
 
 use crate::{
     hermes::{
-        instance::HermesInstanceStatus,
+        instance::{HermesInstanceKind, HermesInstanceStatus},
         proxy_client::{HermesProxyError, HermesProxyRequest},
     },
-    http::{auth::current_user, ApiError},
+    http::{auth::current_user, workspace::ensure_managed_hermes_for_user, ApiError},
     session::store::ProxyAuditEvent,
     AppState,
 };
@@ -31,11 +31,15 @@ pub async fn proxy(
         return Err(ApiError::Forbidden);
     }
 
-    let instance = state
+    let mut instance = state
         .store
         .hermes_instance_for_user(&user.id)
         .await
         .map_err(|_| ApiError::NotFound("hermes instance not found"))?;
+
+    if instance.kind == HermesInstanceKind::ManagedDocker {
+        instance = ensure_managed_hermes_for_user(&state, &user.id).await?;
+    }
 
     if instance.status != HermesInstanceStatus::Running {
         return Err(ApiError::Conflict("hermes instance is not running"));
@@ -63,10 +67,7 @@ pub async fn proxy(
     };
 
     let started = Instant::now();
-    let proxied = state
-        .hermes_proxy
-        .send(request)
-        .await;
+    let proxied = state.hermes_proxy.send(request).await;
 
     match proxied {
         Ok(response) => {

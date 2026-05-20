@@ -19,7 +19,7 @@ use hermes_hub_backend::{
         },
     },
     llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
-    model_config::ModelRegistry,
+    model_config::{ModelConfig, ModelRegistry, LLM_MODEL_CONFIG_KIND},
     session::store::SessionStore,
     AppConfig, AppState,
 };
@@ -43,7 +43,7 @@ fn test_state_with_proxy(store: SessionStore, proxy: DynHermesProxyClient) -> Ap
         store,
         channel_store: ChannelStore::default(),
         hermes_proxy: proxy,
-        model_registry: ModelRegistry::default_for_tests(),
+        model_registry: ready_model_registry(),
         llm_provider: InMemoryLlmProviderClient::new(LlmProviderResponse {
             status: StatusCode::OK,
             content_type: Some("application/json".to_string()),
@@ -51,6 +51,19 @@ fn test_state_with_proxy(store: SessionStore, proxy: DynHermesProxyClient) -> Ap
         })
         .shared(),
     }
+}
+
+fn ready_model_registry() -> ModelRegistry {
+    ModelRegistry::new(ModelConfig {
+        config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
+        provider_name: "openai-compatible".to_string(),
+        provider_base_url: "https://ready-provider.example/v1".to_string(),
+        provider_api_key: "ready-provider-key".to_string(),
+        default_model: "gpt-4.1-mini".to_string(),
+        allowed_models: vec!["gpt-4.1-mini".to_string()],
+        allow_streaming: true,
+        request_timeout_seconds: 60,
+    })
 }
 
 fn test_app(store: SessionStore, proxy: InMemoryHermesProxyClient) -> Router {
@@ -175,8 +188,13 @@ fn managed_instance_for(user_id: &str) -> HermesInstance {
     }
 }
 
-fn managed_instance_with_base_url(user_id: &str, base_url: String) -> HermesInstance {
+fn external_instance_with_base_url(user_id: &str, base_url: String) -> HermesInstance {
     HermesInstance {
+        kind: HermesInstanceKind::External,
+        container_id: None,
+        host_workspace_path: None,
+        host_sandbox_path: None,
+        host_config_path: None,
         base_url,
         ..managed_instance_for(user_id)
     }
@@ -255,24 +273,19 @@ async fn hermes_proxy_test() {
         .await
         .expect("instance can be bound");
 
-    let create_channel = request_json(
-        &app,
-        Method::POST,
-        "/api/channels",
-        json!({ "name": "research", "description": "Research channel" }),
-        Some(&cookie),
-    )
-    .await;
+    let create_channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
     let (status, channel_body) = response_json(create_channel).await;
-    assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(channel_body["channel"]["name"], "research");
-    let channel_id = channel_body["channel"]["id"].as_str().expect("channel id");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(channel_body["channels"][0]["name"], "hermes-hub");
+    let channel_id = channel_body["channels"][0]["id"]
+        .as_str()
+        .expect("channel id");
 
     let create_session = request_json(
         &app,
         Method::POST,
         &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent", "title": "first run" }),
+        json!({ "kind": "agent" }),
         Some(&cookie),
     )
     .await;
@@ -347,13 +360,11 @@ async fn hermes_proxy_uses_real_http_client_and_records_audit() {
         .expect("user can be read from session")
         .id;
 
-    let real_state = test_state_with_proxy(
-        store.clone(),
-        ReqwestHermesProxyClient::default().shared(),
-    );
+    let real_state =
+        test_state_with_proxy(store.clone(), ReqwestHermesProxyClient::default().shared());
     let real_app = build_router_with_state(real_state);
     store
-        .bind_hermes_instance(managed_instance_with_base_url(&user_id, hermes_base_url))
+        .bind_hermes_instance(external_instance_with_base_url(&user_id, hermes_base_url))
         .await
         .expect("instance can be bound");
 
@@ -372,11 +383,7 @@ async fn hermes_proxy_uses_real_http_client_and_records_audit() {
         .expect("stream body can be read");
     assert_eq!(bytes, "event: message\ndata: real-hermes\n\n");
     assert_eq!(
-        captured
-            .authorization
-            .lock()
-            .expect("auth lock")
-            .as_deref(),
+        captured.authorization.lock().expect("auth lock").as_deref(),
         Some("Bearer hermes-secret-token")
     );
     assert_eq!(
@@ -384,12 +391,13 @@ async fn hermes_proxy_uses_real_http_client_and_records_audit() {
         Some("/v1/runs?stream=true")
     );
     assert_eq!(
-        captured.body.lock().expect("body lock").as_ref().expect("body")
-            ["prompt"],
+        captured
+            .body
+            .lock()
+            .expect("body lock")
+            .as_ref()
+            .expect("body")["prompt"],
         "hello"
     );
-    assert_eq!(
-        store.proxy_audit_count().await.expect("audit count"),
-        1
-    );
+    assert_eq!(store.proxy_audit_count().await.expect("audit count"), 1);
 }

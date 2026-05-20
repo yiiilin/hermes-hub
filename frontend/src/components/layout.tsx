@@ -1,14 +1,18 @@
 import type { ReactNode } from "react";
 import type { User } from "../api/client";
-import { Bot, LogOut, Settings, Users } from "lucide-react";
+import { Bot, Cpu, LogOut, MessageSquare, Settings, Users } from "lucide-react";
+
+export type AppView = "chat" | "admin-users" | "admin-models" | "admin-hermes";
 
 type LayoutProps = {
   children: ReactNode;
   user: User | null;
+  activeView: AppView;
+  onNavigate: (view: AppView) => void;
   onLogout?: () => void;
 };
 
-export function Layout({ children, user, onLogout }: LayoutProps) {
+export function Layout({ children, user, activeView, onNavigate, onLogout }: LayoutProps) {
   return (
     <div className="shell">
       <aside className="sidebar" aria-label="Primary">
@@ -17,17 +21,44 @@ export function Layout({ children, user, onLogout }: LayoutProps) {
           <span>Hermes Hub</span>
         </div>
         <nav>
-          {user?.role === "admin" ? (
-            <a href="#admin">
-              <Users aria-hidden="true" size={18} />
-              Admin
-            </a>
-          ) : null}
           {user ? (
-            <a href="#workspace">
-              <Settings aria-hidden="true" size={18} />
-              Workspace
-            </a>
+            <button
+              type="button"
+              className={activeView === "chat" ? "nav-link active" : "nav-link"}
+              onClick={() => onNavigate("chat")}
+            >
+              <MessageSquare aria-hidden="true" size={18} />
+              对话
+            </button>
+          ) : null}
+          {user?.role === "admin" ? (
+            <div className="nav-group">
+              <span className="nav-label">管理</span>
+              <button
+                type="button"
+                className={activeView === "admin-users" ? "nav-link active" : "nav-link"}
+                onClick={() => onNavigate("admin-users")}
+              >
+                <Users aria-hidden="true" size={18} />
+                用户管理
+              </button>
+              <button
+                type="button"
+                className={activeView === "admin-models" ? "nav-link active" : "nav-link"}
+                onClick={() => onNavigate("admin-models")}
+              >
+                <Settings aria-hidden="true" size={18} />
+                模型配置管理
+              </button>
+              <button
+                type="button"
+                className={activeView === "admin-hermes" ? "nav-link active" : "nav-link"}
+                onClick={() => onNavigate("admin-hermes")}
+              >
+                <Cpu aria-hidden="true" size={18} />
+                Hermes 管理
+              </button>
+            </div>
           ) : null}
         </nav>
         {user ? (

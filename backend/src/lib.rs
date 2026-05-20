@@ -144,12 +144,18 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
-pub fn docker_config_from_app(config: &AppConfig, default_model: String) -> DockerProvisionerConfig {
+pub fn docker_config_from_app(
+    config: &AppConfig,
+    default_model: String,
+) -> DockerProvisionerConfig {
     DockerProvisionerConfig {
         image: config.hermes_docker.image.clone(),
         data_root: config.hermes_docker.data_root.clone(),
         network: config.hermes_docker.network.clone(),
         internal_port: config.hermes_docker.internal_port,
+        connect_mode: config.hermes_docker.connect_mode.clone(),
+        published_host_ip: config.hermes_docker.published_host_ip.clone(),
+        published_base_url: config.hermes_docker.published_base_url.clone(),
         hub_llm_base_url: config.hermes_docker.hub_llm_base_url.clone(),
         default_model,
         memory_limit: config.hermes_docker.memory_limit.clone(),

@@ -66,6 +66,7 @@ create table if not exists instance_tokens (
 
 create table if not exists model_configs (
     id uuid primary key,
+    config_kind text not null default 'llm' check (config_kind in ('llm', 'image', 'title')),
     provider_name text not null,
     provider_base_url text not null,
     provider_api_key_secret_ref text not null,
@@ -77,6 +78,8 @@ create table if not exists model_configs (
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
+
+alter table model_configs add column if not exists config_kind text not null default 'llm';
 
 create table if not exists proxy_audit_logs (
     id uuid primary key,

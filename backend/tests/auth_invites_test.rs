@@ -142,6 +142,30 @@ async fn create_invite(app: &Router, admin_cookie: &str, expires_at: u64, max_us
     value
 }
 
+async fn configure_required_model_configs(app: &Router, admin_cookie: &str) {
+    for (config_kind, model) in [("llm", "gpt-4.1-mini"), ("title", "gpt-4.1-mini")] {
+        let response = request_json(
+            app,
+            Method::PUT,
+            "/api/admin/model-config",
+            json!({
+                "config_kind": config_kind,
+                "provider_name": "openai-compatible",
+                "provider_base_url": "https://ready-provider.example/v1",
+                "provider_api_key": "ready-provider-key",
+                "default_model": model,
+                "allowed_models": [model],
+                "allow_streaming": config_kind == "llm",
+                "request_timeout_seconds": 30
+            }),
+            Some(admin_cookie),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+}
+
 async fn redeem_invite(app: &Router, token: &str, email: &str) -> Response<Body> {
     request_json(
         app,
@@ -160,6 +184,12 @@ async fn redeem_invite(app: &Router, token: &str, email: &str) -> Response<Body>
 #[tokio::test]
 async fn first_user_bootstrap_registers_admin_and_blocks_second_bootstrap() {
     let app = test_app();
+
+    let response = request_empty(&app, Method::GET, "/api/auth/bootstrap-status", None).await;
+    let (status, value) = response_json(response).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["bootstrap_open"], true);
 
     let response = request_json(
         &app,
@@ -191,6 +221,12 @@ async fn first_user_bootstrap_registers_admin_and_blocks_second_bootstrap() {
     .await;
 
     assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let response = request_empty(&app, Method::GET, "/api/auth/bootstrap-status", None).await;
+    let (status, value) = response_json(response).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["bootstrap_open"], false);
 }
 
 #[tokio::test]
@@ -277,6 +313,7 @@ async fn invite_creation_requires_expiry_and_max_uses() {
     .await;
     assert_eq!(missing_max_uses.status(), StatusCode::BAD_REQUEST);
 
+    configure_required_model_configs(&app, &admin_cookie).await;
     let created = create_invite(&app, &admin_cookie, unix_now() + 86_400, 1).await;
 
     assert!(created["token"].as_str().expect("token exists").len() >= 32);
@@ -285,10 +322,95 @@ async fn invite_creation_requires_expiry_and_max_uses() {
 }
 
 #[tokio::test]
+async fn invite_creation_requires_ready_llm_and_title_model_configs() {
+    let app = test_app();
+    bootstrap_admin(&app).await;
+    let admin_cookie = login(&app, "admin@example.com", "admin-password-123").await;
+
+    let not_ready = request_json(
+        &app,
+        Method::POST,
+        "/api/invites",
+        json!({
+            "expires_at": unix_now() + 86_400,
+            "max_uses": 1
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(not_ready.status(), StatusCode::CONFLICT);
+
+    let llm_only = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/model-config",
+        json!({
+            "config_kind": "llm",
+            "provider_name": "openai-compatible",
+            "provider_base_url": "https://ready-provider.example/v1",
+            "provider_api_key": "ready-provider-key",
+            "default_model": "gpt-4.1-mini",
+            "allowed_models": ["gpt-4.1-mini"],
+            "allow_streaming": true,
+            "request_timeout_seconds": 30
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(llm_only.status(), StatusCode::NO_CONTENT);
+
+    let still_not_ready = request_json(
+        &app,
+        Method::POST,
+        "/api/invites",
+        json!({
+            "expires_at": unix_now() + 86_400,
+            "max_uses": 1
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(still_not_ready.status(), StatusCode::CONFLICT);
+
+    let title = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/model-config",
+        json!({
+            "config_kind": "title",
+            "provider_name": "openai-compatible",
+            "provider_base_url": "https://ready-provider.example/v1",
+            "provider_api_key": "ready-provider-key",
+            "default_model": "gpt-4.1-mini",
+            "allowed_models": ["gpt-4.1-mini"],
+            "allow_streaming": false,
+            "request_timeout_seconds": 30
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(title.status(), StatusCode::NO_CONTENT);
+
+    let ready = request_json(
+        &app,
+        Method::POST,
+        "/api/invites",
+        json!({
+            "expires_at": unix_now() + 86_400,
+            "max_uses": 1
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(ready.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
 async fn invite_redemption_obeys_expiry_and_max_uses() {
     let app = test_app();
     bootstrap_admin(&app).await;
     let admin_cookie = login(&app, "admin@example.com", "admin-password-123").await;
+    configure_required_model_configs(&app, &admin_cookie).await;
 
     let invite = create_invite(&app, &admin_cookie, unix_now() + 86_400, 2).await;
     let token = invite["token"].as_str().expect("token exists");
@@ -314,6 +436,7 @@ async fn revoked_invites_cannot_be_redeemed() {
     let app = test_app();
     bootstrap_admin(&app).await;
     let admin_cookie = login(&app, "admin@example.com", "admin-password-123").await;
+    configure_required_model_configs(&app, &admin_cookie).await;
     let invite = create_invite(&app, &admin_cookie, unix_now() + 86_400, 1).await;
     let invite_id = invite["invite"]["id"].as_str().expect("invite id exists");
     let token = invite["token"].as_str().expect("token exists");
@@ -329,4 +452,35 @@ async fn revoked_invites_cannot_be_redeemed() {
 
     let response = redeem_invite(&app, token, "revoked@example.com").await;
     assert_eq!(response.status(), StatusCode::GONE);
+}
+
+#[tokio::test]
+async fn invite_registration_provisions_a_managed_hermes_instance() {
+    let app = test_app();
+    bootstrap_admin(&app).await;
+    let admin_cookie = login(&app, "admin@example.com", "admin-password-123").await;
+    configure_required_model_configs(&app, &admin_cookie).await;
+    let invite = create_invite(&app, &admin_cookie, unix_now() + 86_400, 1).await;
+    let token = invite["token"].as_str().expect("token exists");
+
+    let response = redeem_invite(&app, token, "test@example.com").await;
+    let (status, registered) = response_json(response).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let user_id = registered["user"]["id"]
+        .as_str()
+        .expect("registered user id");
+
+    let instances = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/hermes-instances",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(instances).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["hermes_instances"][0]["user_id"], user_id);
+    assert_eq!(body["hermes_instances"][0]["kind"], "managed_docker");
+    assert_eq!(body["hermes_instances"][0]["status"], "running");
 }

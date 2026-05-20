@@ -8,9 +8,7 @@ use axum::{
 use serde::Serialize;
 
 use crate::{
-    hermes::{
-        instance::{HermesInstance, HermesInstanceKind},
-    },
+    hermes::instance::{HermesInstance, HermesInstanceKind},
     http::{auth::current_user, ApiError},
     AppState,
 };
@@ -50,22 +48,64 @@ async fn ensure_hermes(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = current_user(&state, &headers).await?;
-    if let Ok(instance) = state.store.hermes_instance_for_user(&user.id).await {
+    let instance = ensure_managed_hermes_for_user(&state, &user.id).await?;
+
+    Ok(Json(HermesInstanceResponse {
+        hermes_instance: instance,
+    }))
+}
+
+pub async fn ensure_required_model_configs(state: &AppState) -> Result<(), ApiError> {
+    let readiness = state
+        .model_registry
+        .required_runtime_config_readiness()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    if !readiness.ready {
+        return Err(ApiError::Conflict(
+            "available llm and title model configs are required before this operation",
+        ));
+    }
+
+    Ok(())
+}
+
+pub async fn ensure_managed_hermes_for_user(
+    state: &AppState,
+    user_id: &str,
+) -> Result<HermesInstance, ApiError> {
+    if let Ok(instance) = state.store.hermes_instance_for_user(user_id).await {
         if instance.kind != HermesInstanceKind::ManagedDocker {
-            return Ok(Json(HermesInstanceResponse {
-                hermes_instance: instance,
-            }));
+            return Ok(instance);
         }
 
-        // 数据库里的容器状态可能滞后于 Docker daemon；ensure 操作会幂等检查并启动容器。
-        let llm_api_key = state
+        ensure_required_model_configs(state).await?;
+        let default_model = state
             .model_registry
-            .issue_instance_token_for_instance(&instance.id)
+            .active_config()
             .await
-            .map_err(|_| ApiError::Internal)?;
+            .map_err(|_| ApiError::Internal)?
+            .default_model;
+        // 数据库里的容器状态可能滞后于 Docker daemon；ensure 操作会幂等检查并启动容器。
+        let llm_api_key = match instance.api_token_secret_ref.as_deref() {
+            Some(existing_token) => {
+                state
+                    .model_registry
+                    .add_instance_token_for_instance(&instance.id, existing_token)
+                    .await
+                    .map_err(|_| ApiError::Internal)?;
+                existing_token.to_string()
+            }
+            None => state
+                .model_registry
+                .issue_instance_token_for_instance(&instance.id)
+                .await
+                .map_err(|_| ApiError::Internal)?,
+        };
         let ensured = state
             .docker_provisioner
-            .ensure_container(&instance, &llm_api_key)
+            .ensure_container_with_default_model(&instance, &llm_api_key, &default_model)
             .await
             .map_err(|_| ApiError::Internal)?;
         state
@@ -74,12 +114,17 @@ async fn ensure_hermes(
             .await
             .map_err(|_| ApiError::Internal)?;
 
-        return Ok(Json(HermesInstanceResponse {
-            hermes_instance: ensured,
-        }));
+        return Ok(ensured);
     }
 
-    let instance = state.docker_provisioner.prepare_instance(&user.id);
+    ensure_required_model_configs(state).await?;
+    let default_model = state
+        .model_registry
+        .active_config()
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .default_model;
+    let instance = state.docker_provisioner.prepare_instance(user_id);
     state
         .store
         .bind_hermes_instance(instance.clone())
@@ -92,7 +137,7 @@ async fn ensure_hermes(
         .map_err(|_| ApiError::Internal)?;
     let instance = state
         .docker_provisioner
-        .ensure_container(&instance, &llm_api_key)
+        .ensure_container_with_default_model(&instance, &llm_api_key, &default_model)
         .await
         .map_err(|_| ApiError::Internal)?;
     state
@@ -101,9 +146,7 @@ async fn ensure_hermes(
         .await
         .map_err(|_| ApiError::Internal)?;
 
-    Ok(Json(HermesInstanceResponse {
-        hermes_instance: instance,
-    }))
+    Ok(instance)
 }
 
 async fn current_hermes_instance(

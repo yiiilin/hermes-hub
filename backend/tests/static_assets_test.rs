@@ -9,11 +9,17 @@ use tower::ServiceExt;
 #[tokio::test]
 async fn backend_serves_frontend_static_assets_and_spa_fallback() {
     let static_dir = tempdir().expect("static dir can be created");
-    std::fs::write(static_dir.path().join("index.html"), "<main>Hermes Hub App</main>")
-        .expect("index can be written");
+    std::fs::write(
+        static_dir.path().join("index.html"),
+        "<main>Hermes Hub App</main>",
+    )
+    .expect("index can be written");
     std::fs::create_dir_all(static_dir.path().join("assets")).expect("assets dir can be created");
-    std::fs::write(static_dir.path().join("assets/app.js"), "console.log('hub')")
-        .expect("asset can be written");
+    std::fs::write(
+        static_dir.path().join("assets/app.js"),
+        "console.log('hub')",
+    )
+    .expect("asset can be written");
 
     let mut config = AppConfig::for_tests();
     config.static_dir = static_dir.path().to_path_buf();

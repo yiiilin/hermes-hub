@@ -1,11 +1,14 @@
 use axum::{
+    body::to_bytes,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::time::Instant;
 
 use crate::{
     domain::user::{PublicUser, UserListItem},
@@ -13,8 +16,13 @@ use crate::{
         instance::{HermesInstance, HermesInstanceKind, HermesInstanceStatus},
         provisioner::{HermesProvisioner, ProvisionerError},
     },
-    http::{auth::require_admin, ApiError},
-    model_config::ModelConfig,
+    http::{
+        auth::require_admin,
+        workspace::{ensure_managed_hermes_for_user, ensure_required_model_configs},
+        ApiError,
+    },
+    llm_proxy::{LlmProviderError, LlmProviderRequest},
+    model_config::{ModelConfig, IMAGE_MODEL_CONFIG_KIND, LLM_MODEL_CONFIG_KIND},
     AppState,
 };
 
@@ -27,6 +35,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/admin/users/{user_id}/hermes-instance/bind-external",
             post(bind_external_hermes_instance),
+        )
+        .route(
+            "/api/admin/users/{user_id}/hermes-instance/create-managed",
+            post(create_managed_hermes_instance),
         )
         .route(
             "/api/admin/users/{user_id}/hermes-instance/rebuild-managed",
@@ -43,6 +55,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/admin/model-config",
             get(get_model_config).put(update_model_config),
+        )
+        .route(
+            "/api/admin/model-config/{config_kind}/test",
+            post(test_model_config),
         )
 }
 
@@ -69,17 +85,29 @@ struct HermesInstanceResponse {
 #[derive(Serialize)]
 struct ModelConfigResponse {
     model_config: ModelConfig,
+    model_configs: Vec<ModelConfig>,
+    required_models_ready: bool,
+    missing_required_model_config_kinds: Vec<String>,
 }
 
 #[derive(Deserialize)]
 struct UpdateModelConfigRequest {
+    config_kind: Option<String>,
     provider_name: String,
     provider_base_url: String,
     provider_api_key: String,
     default_model: String,
-    allowed_models: Vec<String>,
+    allowed_models: Option<Vec<String>>,
     allow_streaming: bool,
     request_timeout_seconds: u64,
+}
+
+#[derive(Serialize)]
+struct ModelConfigTestResponse {
+    ok: bool,
+    status_code: u16,
+    message: String,
+    duration_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -158,6 +186,7 @@ async fn bind_external_hermes_instance(
     Json(payload): Json<BindExternalHermesRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
+    ensure_required_model_configs(&state).await?;
     let instance = HermesInstance {
         id: uuid::Uuid::new_v4().to_string(),
         user_id: user_id.clone(),
@@ -182,12 +211,40 @@ async fn bind_external_hermes_instance(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn create_managed_hermes_instance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    ensure_required_model_configs(&state).await?;
+    let users = state
+        .store
+        .list_users()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    if !users.iter().any(|user| user.id == user_id) {
+        return Err(ApiError::NotFound("user not found"));
+    }
+    if let Ok(instance) = state.store.hermes_instance_for_user(&user_id).await {
+        reject_external_instance(&instance)?;
+    }
+
+    // 管理员补建和用户工作区 ensure 共用同一条幂等编排路径，避免两套 Docker 创建逻辑漂移。
+    let instance = ensure_managed_hermes_for_user(&state, &user_id).await?;
+
+    Ok(Json(HermesInstanceResponse {
+        hermes_instance: instance,
+    }))
+}
+
 async fn rebuild_managed_hermes_instance(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(user_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
+    ensure_required_model_configs(&state).await?;
     let instance = state
         .store
         .hermes_instance_for_user(&user_id)
@@ -204,9 +261,15 @@ async fn rebuild_managed_hermes_instance(
         .issue_instance_token_for_instance(&instance.id)
         .await
         .map_err(|_| ApiError::Internal)?;
+    let default_model = state
+        .model_registry
+        .active_config()
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .default_model;
     let instance = state
         .docker_provisioner
-        .rebuild_instance(&instance, &llm_api_key)
+        .rebuild_instance_with_default_model(&instance, &llm_api_key, &default_model)
         .await
         .map_err(map_provisioner_error)?;
     state
@@ -252,22 +315,14 @@ async fn start_managed_hermes_instance(
     Path(user_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
+    ensure_required_model_configs(&state).await?;
     let instance = state
         .store
         .hermes_instance_for_user(&user_id)
         .await
         .map_err(|_| ApiError::NotFound("hermes instance not found"))?;
     reject_external_instance(&instance)?;
-    let instance = state
-        .docker_provisioner
-        .start_instance(&instance)
-        .await
-        .map_err(map_provisioner_error)?;
-    state
-        .store
-        .bind_hermes_instance(instance.clone())
-        .await
-        .map_err(|_| ApiError::Internal)?;
+    let instance = ensure_managed_hermes_for_user(&state, &user_id).await?;
     Ok(Json(HermesInstanceResponse {
         hermes_instance: instance,
     }))
@@ -278,12 +333,27 @@ async fn get_model_config(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
+    let model_configs = state
+        .model_registry
+        .all_configs()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let model_config = model_configs
+        .iter()
+        .find(|config| config.config_kind == LLM_MODEL_CONFIG_KIND)
+        .cloned()
+        .ok_or(ApiError::Internal)?;
+    let readiness = state
+        .model_registry
+        .required_runtime_config_readiness()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
     Ok(Json(ModelConfigResponse {
-        model_config: state
-            .model_registry
-            .active_config()
-            .await
-            .map_err(|_| ApiError::Internal)?,
+        model_config,
+        model_configs,
+        required_models_ready: readiness.ready,
+        missing_required_model_config_kinds: readiness.missing_config_kinds,
     }))
 }
 
@@ -293,21 +363,149 @@ async fn update_model_config(
     Json(payload): Json<UpdateModelConfigRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
+    let config_kind = payload.config_kind.clone();
+    let config = model_config_from_payload(&state, config_kind.as_deref(), payload).await?;
     state
         .model_registry
-        .replace(ModelConfig {
-            provider_name: payload.provider_name,
-            provider_base_url: payload.provider_base_url,
-            provider_api_key: payload.provider_api_key,
-            default_model: payload.default_model,
-            allowed_models: payload.allowed_models,
-            allow_streaming: payload.allow_streaming,
-            request_timeout_seconds: payload.request_timeout_seconds,
-        })
+        .replace(config)
         .await
         .map_err(|_| ApiError::Internal)?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn test_model_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(config_kind): Path<String>,
+    Json(payload): Json<UpdateModelConfigRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    let config = model_config_from_payload(&state, Some(&config_kind), payload).await?;
+    let (path, body) = model_test_request(&config)?;
+    let request = LlmProviderRequest {
+        method: Method::POST,
+        provider_base_url: config.provider_base_url.clone(),
+        path,
+        authorization: format!("Bearer {}", config.provider_api_key),
+        content_type: "application/json".to_string(),
+        body,
+        timeout_seconds: model_test_timeout_seconds(&config),
+    };
+    let started = Instant::now();
+    let response = state
+        .llm_provider
+        .send(request)
+        .await
+        .map_err(map_model_test_provider_error)?;
+    let status = response.status();
+    let message = if status.is_success() {
+        "model test succeeded".to_string()
+    } else {
+        let bytes = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|_| ApiError::BadGateway("provider test response could not be read"))?;
+        test_response_message(status, &bytes)
+    };
+
+    Ok(Json(ModelConfigTestResponse {
+        ok: status.is_success(),
+        status_code: status.as_u16(),
+        message,
+        duration_ms: started.elapsed().as_millis() as u64,
+    }))
+}
+
+async fn model_config_from_payload(
+    state: &AppState,
+    config_kind: Option<&str>,
+    payload: UpdateModelConfigRequest,
+) -> Result<ModelConfig, ApiError> {
+    let config_kind = config_kind
+        .map(ToOwned::to_owned)
+        .or(payload.config_kind)
+        .unwrap_or_else(|| LLM_MODEL_CONFIG_KIND.to_string());
+    let provider_api_key = if payload.provider_api_key.trim().is_empty() {
+        // 空字符串表示沿用已保存密钥，方便管理员只改模型名或 Base URL。
+        state
+            .model_registry
+            .config_for_kind(&config_kind)
+            .await
+            .map_err(|_| ApiError::BadRequest("invalid model config kind"))?
+            .provider_api_key
+    } else {
+        payload.provider_api_key
+    };
+
+    Ok(ModelConfig {
+        config_kind,
+        provider_name: payload.provider_name,
+        provider_base_url: payload.provider_base_url,
+        provider_api_key,
+        default_model: payload.default_model,
+        allowed_models: payload.allowed_models.unwrap_or_default(),
+        allow_streaming: payload.allow_streaming,
+        request_timeout_seconds: payload.request_timeout_seconds,
+    })
+}
+
+fn model_test_request(config: &ModelConfig) -> Result<(String, Vec<u8>), ApiError> {
+    let body = if config.config_kind == IMAGE_MODEL_CONFIG_KIND {
+        json!({
+            "model": config.default_model,
+            "prompt": "Hermes Hub model connectivity test",
+            "n": 1,
+            "size": "1024x1024"
+        })
+    } else {
+        json!({
+            "model": config.default_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Reply with exactly: ok"
+                }
+            ],
+            "stream": false,
+            "max_tokens": 8
+        })
+    };
+    let path = if config.config_kind == IMAGE_MODEL_CONFIG_KIND {
+        "/images/generations"
+    } else {
+        "/chat/completions"
+    };
+    let bytes = serde_json::to_vec(&body).map_err(|_| ApiError::Internal)?;
+
+    Ok((path.to_string(), bytes))
+}
+
+fn model_test_timeout_seconds(config: &ModelConfig) -> u64 {
+    if config.config_kind == IMAGE_MODEL_CONFIG_KIND {
+        // 图片生成天然比文本补全慢；测试按钮关注连通性，给图片模型一个更实用的下限。
+        config.request_timeout_seconds.max(180)
+    } else {
+        config.request_timeout_seconds
+    }
+}
+
+fn test_response_message(status: StatusCode, bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes).trim().to_string();
+    if text.is_empty() {
+        format!("provider returned HTTP {}", status.as_u16())
+    } else {
+        text.chars().take(500).collect()
+    }
+}
+
+fn map_model_test_provider_error(error: LlmProviderError) -> ApiError {
+    match error {
+        LlmProviderError::InvalidUrl => ApiError::BadGateway("provider url is invalid"),
+        LlmProviderError::Timeout => ApiError::GatewayTimeout("provider test timed out"),
+        LlmProviderError::LockFailed | LlmProviderError::Failed(_) => {
+            ApiError::BadGateway("provider test failed")
+        }
+    }
 }
 
 fn reject_external_instance(instance: &HermesInstance) -> Result<(), ApiError> {

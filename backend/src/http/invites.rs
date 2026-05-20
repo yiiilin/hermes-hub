@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{domain::invite::PublicInvite, session::store::StoreError, AppState};
 
-use super::{auth::require_admin, ApiError};
+use super::{auth::require_admin, workspace::ensure_required_model_configs, ApiError};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -56,6 +56,7 @@ async fn create_invite(
         return Err(ApiError::BadRequest("max_uses must be greater than zero"));
     }
 
+    ensure_required_model_configs(&state).await?;
     let created = state
         .store
         .create_invite(&admin.id, expires_at, max_uses)

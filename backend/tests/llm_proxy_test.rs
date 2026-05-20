@@ -18,7 +18,7 @@ use hermes_hub_backend::{
         DynLlmProviderClient, InMemoryLlmProviderClient, LlmProviderResponse,
         ReqwestLlmProviderClient,
     },
-    model_config::{ModelConfig, ModelRegistry},
+    model_config::{ModelConfig, ModelRegistry, LLM_MODEL_CONFIG_KIND},
     session::store::SessionStore,
     AppConfig, AppState,
 };
@@ -53,6 +53,7 @@ fn test_app(provider: InMemoryLlmProviderClient, registry: ModelRegistry) -> Rou
 
 fn test_registry() -> ModelRegistry {
     ModelRegistry::new(ModelConfig {
+        config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
         provider_name: "openai-compatible".to_string(),
         provider_base_url: "https://provider.example/v1".to_string(),
         provider_api_key: "provider-secret".to_string(),
@@ -139,8 +140,7 @@ async fn provider_handler(
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
-    *captured.body.lock().expect("body lock") =
-        serde_json::from_slice::<Value>(&bytes).ok();
+    *captured.body.lock().expect("body lock") = serde_json::from_slice::<Value>(&bytes).ok();
 
     (
         StatusCode::OK,
@@ -257,6 +257,7 @@ async fn llm_proxy_uses_real_http_provider_and_records_usage() {
     let captured = CapturedProviderRequest::default();
     let provider_base_url = format!("{}/v1", spawn_provider_server(captured.clone()).await);
     let registry = ModelRegistry::new(ModelConfig {
+        config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
         provider_name: "local-provider".to_string(),
         provider_base_url,
         provider_api_key: "real-provider-token".to_string(),
@@ -296,20 +297,17 @@ async fn llm_proxy_uses_real_http_provider_and_records_usage() {
         .expect("response body can be read");
     assert_eq!(bytes, "data: real-provider\n\n");
     assert_eq!(
-        captured
-            .authorization
-            .lock()
-            .expect("auth lock")
-            .as_deref(),
+        captured.authorization.lock().expect("auth lock").as_deref(),
         Some("Bearer real-provider-token")
     );
     assert_eq!(
-        captured.body.lock().expect("body lock").as_ref().expect("body")
-            ["model"],
+        captured
+            .body
+            .lock()
+            .expect("body lock")
+            .as_ref()
+            .expect("body")["model"],
         "gpt-4.1-mini"
     );
-    assert_eq!(
-        state.store.llm_usage_count().await.expect("usage count"),
-        1
-    );
+    assert_eq!(state.store.llm_usage_count().await.expect("usage count"), 1);
 }
