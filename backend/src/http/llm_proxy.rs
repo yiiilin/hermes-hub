@@ -12,7 +12,7 @@ use std::time::Instant;
 use crate::{
     http::ApiError,
     llm_proxy::{LlmProviderError, LlmProviderRequest},
-    model_config::ModelRegistryError,
+    model_config::{ModelRegistryError, CHAT_COMPLETIONS_API_TYPE, RESPONSES_API_TYPE},
     session::store::LlmUsageEvent,
     AppState,
 };
@@ -43,7 +43,14 @@ async fn chat_completions(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
-    proxy_model_request(state, headers, "/chat/completions", body).await
+    proxy_model_request(
+        state,
+        headers,
+        "/chat/completions",
+        CHAT_COMPLETIONS_API_TYPE,
+        body,
+    )
+    .await
 }
 
 async fn responses(
@@ -51,13 +58,14 @@ async fn responses(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
-    proxy_model_request(state, headers, "/responses", body).await
+    proxy_model_request(state, headers, "/responses", RESPONSES_API_TYPE, body).await
 }
 
 async fn proxy_model_request(
     state: AppState,
     headers: HeaderMap,
     path: &str,
+    api_type: &str,
     body: Body,
 ) -> Result<Response, ApiError> {
     let token = bearer_token(&headers)?;
@@ -73,7 +81,7 @@ async fn proxy_model_request(
         .map_err(|_| ApiError::BadRequest("request body must be json"))?;
     let prepared = state
         .model_registry
-        .prepare_request_body(value)
+        .prepare_request_body(value, api_type)
         .await
         .map_err(map_model_error)?;
     let config = prepared.config.clone();

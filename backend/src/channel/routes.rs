@@ -1,6 +1,6 @@
 use axum::{
     body::to_bytes,
-    extract::{Path, State},
+    extract::{Multipart, Path, State},
     http::{HeaderMap, Method},
     response::IntoResponse,
     routing::{get, post},
@@ -11,8 +11,11 @@ use serde_json::{json, Value};
 use std::time::Instant;
 
 use crate::{
-    channel::service::{Channel, ChannelSession, ChannelSessionKind, ChannelStoreError},
-    http::{auth::current_user, ApiError},
+    channel::service::{
+        Channel, ChannelAttachment, ChannelAttachmentDirection, ChannelMessage, ChannelMessageRole,
+        ChannelSession, ChannelSessionKind, ChannelStoreError,
+    },
+    http::{attachments::upload_session_attachments, auth::current_user, ApiError},
     llm_proxy::LlmProviderRequest,
     model_config::TITLE_MODEL_CONFIG_KIND,
     session::store::LlmUsageEvent,
@@ -32,6 +35,14 @@ pub fn router() -> Router<AppState> {
             get(get_session),
         )
         .route(
+            "/api/channels/{channel_id}/sessions/{session_id}/attachments",
+            post(upload_attachments),
+        )
+        .route(
+            "/api/channels/{channel_id}/sessions/{session_id}/messages",
+            get(list_session_messages).post(append_session_message),
+        )
+        .route(
             "/api/channels/{channel_id}/sessions/{session_id}/title",
             post(generate_session_title),
         )
@@ -47,6 +58,13 @@ struct GenerateTitleRequest {
     prompt: String,
 }
 
+#[derive(Deserialize)]
+struct AppendMessageRequest {
+    role: String,
+    content: String,
+    attachments: Option<Value>,
+}
+
 #[derive(Serialize)]
 struct ChannelListResponse {
     channels: Vec<Channel>,
@@ -60,6 +78,21 @@ struct SessionResponse {
 #[derive(Serialize)]
 struct SessionListResponse {
     sessions: Vec<ChannelSession>,
+}
+
+#[derive(Serialize)]
+struct MessageResponse {
+    message: ChannelMessage,
+}
+
+#[derive(Serialize)]
+struct MessageListResponse {
+    messages: Vec<ChannelMessage>,
+}
+
+#[derive(Serialize)]
+struct AttachmentListResponse {
+    attachments: Vec<ChannelAttachment>,
 }
 
 async fn list_channels(
@@ -141,6 +174,71 @@ async fn get_session(
     Ok(Json(SessionResponse { session }))
 }
 
+async fn list_session_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((channel_id, session_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = current_user(&state, &headers).await?;
+    let messages = state
+        .channel_store
+        .list_session_messages(&user.id, &channel_id, &session_id)
+        .await
+        .map_err(map_channel_error)?;
+
+    Ok(Json(MessageListResponse { messages }))
+}
+
+async fn append_session_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((channel_id, session_id)): Path<(String, String)>,
+    Json(payload): Json<AppendMessageRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = current_user(&state, &headers).await?;
+    let role = ChannelMessageRole::parse(&payload.role).map_err(map_channel_error)?;
+    let message = state
+        .channel_store
+        .append_session_message(
+            &user.id,
+            &channel_id,
+            &session_id,
+            role,
+            payload.content,
+            payload.attachments.unwrap_or_else(|| json!([])),
+        )
+        .await
+        .map_err(map_channel_error)?;
+
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(MessageResponse { message }),
+    ))
+}
+
+async fn upload_attachments(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((channel_id, session_id)): Path<(String, String)>,
+    multipart: Multipart,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = current_user(&state, &headers).await?;
+    let attachments = upload_session_attachments(
+        &state,
+        &user.id,
+        &channel_id,
+        &session_id,
+        ChannelAttachmentDirection::Input,
+        multipart,
+    )
+    .await?;
+
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(AttachmentListResponse { attachments }),
+    ))
+}
+
 async fn generate_session_title(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -173,24 +271,11 @@ async fn model_generated_title(state: &AppState, user_id: &str, prompt: &str) ->
     else {
         return fallback;
     };
-    let body = json!({
-        "model": config.default_model,
-        "stream": false,
-        "messages": [
-            {
-                "role": "system",
-                "content": "Generate a concise conversation title. Return only the title."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
-    });
+    let (path, body) = title_generation_request(&config, prompt);
     let request = LlmProviderRequest {
         method: Method::POST,
         provider_base_url: config.provider_base_url.clone(),
-        path: "/chat/completions".to_string(),
+        path,
         authorization: format!("Bearer {}", config.provider_api_key),
         content_type: "application/json".to_string(),
         body: serde_json::to_vec(&body).unwrap_or_default(),
@@ -234,6 +319,52 @@ fn parse_title_response(bytes: &[u8]) -> Option<String> {
     clean_title(title)
 }
 
+fn title_generation_request(
+    config: &crate::model_config::ModelConfig,
+    prompt: &str,
+) -> (String, Value) {
+    if config.api_type == crate::model_config::RESPONSES_API_TYPE {
+        let mut body = json!({
+            "model": config.default_model,
+            "stream": false,
+            "input": [
+                {
+                    "role": "system",
+                    "content": "Generate a concise conversation title. Return only the title."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        });
+        if let Some(effort) = config.reasoning_effort.as_deref() {
+            body["reasoning"] = json!({ "effort": effort });
+        }
+        return ("/responses".to_string(), body);
+    }
+
+    let mut body = json!({
+        "model": config.default_model,
+        "stream": false,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Generate a concise conversation title. Return only the title."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    });
+    if let Some(effort) = config.reasoning_effort.as_deref() {
+        body["reasoning_effort"] = json!(effort);
+    }
+
+    ("/chat/completions".to_string(), body)
+}
+
 fn fallback_title(prompt: &str) -> String {
     clean_title(prompt).unwrap_or_else(|| "New conversation".to_string())
 }
@@ -260,6 +391,9 @@ fn map_channel_error(error: ChannelStoreError) -> ApiError {
     match error {
         ChannelStoreError::ChannelNotFound => ApiError::NotFound("channel not found"),
         ChannelStoreError::InvalidSessionKind => ApiError::BadRequest("invalid session kind"),
+        ChannelStoreError::InvalidMessageRole => ApiError::BadRequest("invalid message role"),
+        ChannelStoreError::InvalidAttachment => ApiError::BadRequest("invalid attachment"),
+        ChannelStoreError::AttachmentNotFound => ApiError::NotFound("attachment not found"),
         ChannelStoreError::LockFailed | ChannelStoreError::DatabaseFailed => ApiError::Internal,
     }
 }

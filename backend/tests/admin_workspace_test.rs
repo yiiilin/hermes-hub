@@ -142,6 +142,8 @@ async fn admin_workspace_test() {
             "provider_api_key": "secret-v2",
             "default_model": "gpt-4.1",
             "allowed_models": ["gpt-4.1"],
+            "api_type": "responses",
+            "reasoning_effort": "medium",
             "allow_streaming": true,
             "request_timeout_seconds": 30
         }),
@@ -162,6 +164,8 @@ async fn admin_workspace_test() {
     assert_eq!(body["model_config"]["provider_name"], "custom");
     assert_eq!(body["model_config"]["default_model"], "gpt-4.1");
     assert_eq!(body["model_config"]["provider_api_key"], "secret-v2");
+    assert_eq!(body["model_config"]["api_type"], "responses");
+    assert_eq!(body["model_config"]["reasoning_effort"], "medium");
 
     let status_response = request_empty(
         &app,
@@ -270,4 +274,18 @@ async fn admin_workspace_test() {
     let (status, body) = response_json(instances).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["hermes_instances"][0]["user_id"], admin_id);
+
+    let update_managed_config = request_json(
+        &app,
+        Method::PUT,
+        &format!("/api/admin/users/{admin_id}/hermes-instance/external-config"),
+        json!({
+            "name": "admin external",
+            "base_url": "https://external.example",
+            "api_token": "external-token"
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update_managed_config.status(), StatusCode::CONFLICT);
 }

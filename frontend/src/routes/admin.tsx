@@ -2,8 +2,10 @@ import type {
   ApiClient,
   HermesInstance,
   Invite,
+  ModelApiType,
   ModelConfig,
   ModelConfigKind,
+  ReasoningEffort,
   User,
 } from "../api/client";
 import { FormEvent, useEffect, useMemo, useState } from "react";
@@ -22,6 +24,12 @@ const modelLabels: Record<ModelConfigKind, string> = {
   image: "图片生成模型",
   title: "标题生成模型",
 };
+const apiTypeLabels: Record<ModelApiType, string> = {
+  chat_completions: "Chat Completions",
+  responses: "Responses",
+  images_generations: "Images",
+};
+const reasoningEfforts: Array<ReasoningEffort | ""> = ["", "minimal", "low", "medium", "high"];
 
 export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps) {
   const [users, setUsers] = useState<User[]>([]);
@@ -37,6 +45,12 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
     Partial<Record<ModelConfigKind, string>>
   >({});
   const [testingModel, setTestingModel] = useState<ModelConfigKind | null>(null);
+  const [editingExternalUserId, setEditingExternalUserId] = useState<string | null>(null);
+  const [externalDraft, setExternalDraft] = useState({
+    name: "",
+    base_url: "",
+    api_token: "",
+  });
   const [error, setError] = useState<string | null>(null);
 
   const instancesByUserId = useMemo(
@@ -158,6 +172,26 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
     await refresh();
   }
 
+  function openExternalEditor(instance: HermesInstance) {
+    setEditingExternalUserId(instance.user_id);
+    setExternalDraft({
+      name: instance.name ?? "",
+      base_url: instance.base_url,
+      api_token: "",
+    });
+  }
+
+  async function saveExternalHermesConfig(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!editingExternalUserId) {
+      return;
+    }
+    await apiClient.updateExternalHermesInstanceConfig(editingExternalUserId, externalDraft);
+    setEditingExternalUserId(null);
+    setExternalDraft({ name: "", base_url: "", api_token: "" });
+    await refresh();
+  }
+
   const missingRequiredModelNames =
     missingRequiredModels.length > 0
       ? missingRequiredModels.map((kind) => modelLabels[kind]).join("、")
@@ -204,72 +238,115 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                   </p>
                 ) : null}
                 <div className="form">
-                <label>
-                  Provider
-                  <input
-                    value={config.provider_name}
-                    onChange={(event) =>
-                      updateModel(config.config_kind, { provider_name: event.target.value })
-                    }
-                  />
-                </label>
-                <label>
-                  Base URL
-                  <input
-                    value={config.provider_base_url}
-                    onChange={(event) =>
-                      updateModel(config.config_kind, {
-                        provider_base_url: event.target.value,
-                      })
-                    }
-                  />
-                </label>
-                <label>
-                  API key
-                  <input
-                    type="password"
-                    value={config.provider_api_key ?? ""}
-                    onChange={(event) =>
-                      updateModel(config.config_kind, { provider_api_key: event.target.value })
-                    }
-                  />
-                </label>
-                <label>
-                  Model
-                  <input
-                    value={config.default_model}
-                    onChange={(event) =>
-                      updateModel(config.config_kind, { default_model: event.target.value })
-                    }
-                  />
-                </label>
-                <label>
-                  Timeout seconds
-                  <input
-                    type="number"
-                    min={1}
-                    value={config.request_timeout_seconds}
-                    onChange={(event) =>
-                      updateModel(config.config_kind, {
-                        request_timeout_seconds: Number(event.target.value),
-                      })
-                    }
-                  />
-                </label>
-                {config.config_kind === "llm" ? (
-                  <label className="checkbox-row">
+                  <label>
+                    Provider
                     <input
-                      type="checkbox"
-                      checked={config.allow_streaming}
+                      value={config.provider_name}
+                      onChange={(event) =>
+                        updateModel(config.config_kind, { provider_name: event.target.value })
+                      }
+                    />
+                  </label>
+                  <label>
+                    Base URL
+                    <input
+                      value={config.provider_base_url}
                       onChange={(event) =>
                         updateModel(config.config_kind, {
-                          allow_streaming: event.target.checked,
+                          provider_base_url: event.target.value,
                         })
                       }
                     />
-                    Streaming
                   </label>
-                ) : null}
+                  <label>
+                    API key
+                    <input
+                      type="password"
+                      value={config.provider_api_key ?? ""}
+                      onChange={(event) =>
+                        updateModel(config.config_kind, { provider_api_key: event.target.value })
+                      }
+                    />
+                  </label>
+                  <label>
+                    Model
+                    <input
+                      value={config.default_model}
+                      onChange={(event) =>
+                        updateModel(config.config_kind, { default_model: event.target.value })
+                      }
+                    />
+                  </label>
+                  <label>
+                    API
+                    <select
+                      value={config.api_type}
+                      disabled={config.config_kind === "image"}
+                      onChange={(event) =>
+                        updateModel(config.config_kind, {
+                          api_type: event.target.value as ModelApiType,
+                        })
+                      }
+                    >
+                      {(config.config_kind === "image"
+                        ? ["images_generations"]
+                        : ["chat_completions", "responses"]
+                      ).map((apiType) => (
+                        <option key={apiType} value={apiType}>
+                          {apiTypeLabels[apiType as ModelApiType]}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  {config.config_kind !== "image" ? (
+                    <label>
+                      思考等级
+                      <select
+                        value={config.reasoning_effort ?? ""}
+                        onChange={(event) =>
+                          updateModel(config.config_kind, {
+                            reasoning_effort:
+                              event.target.value === ""
+                                ? null
+                                : (event.target.value as ReasoningEffort),
+                          })
+                        }
+                      >
+                        {reasoningEfforts.map((effort) => (
+                          <option key={effort || "none"} value={effort}>
+                            {effort || "不设置"}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
+                  <label>
+                    Timeout seconds
+                    <input
+                      type="number"
+                      min={1}
+                      value={config.request_timeout_seconds}
+                      onChange={(event) =>
+                        updateModel(config.config_kind, {
+                          request_timeout_seconds: Number(event.target.value),
+                        })
+                      }
+                    />
+                  </label>
+                  {config.config_kind === "llm" ? (
+                    <label className="checkbox-row">
+                      <input
+                        type="checkbox"
+                        checked={config.allow_streaming}
+                        onChange={(event) =>
+                          updateModel(config.config_kind, {
+                            allow_streaming: event.target.checked,
+                          })
+                        }
+                      />
+                      Streaming
+                    </label>
+                  ) : null}
                 </div>
               </section>
             ))}
@@ -346,7 +423,15 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                             Rebuild
                           </button>
                         </div>
-                      ) : null}
+                      ) : (
+                        <button
+                          type="button"
+                          className="secondary"
+                          onClick={() => openExternalEditor(instance)}
+                        >
+                          Edit
+                        </button>
+                      )}
                     </td>
                   </tr>
                 );
@@ -354,6 +439,54 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
             </tbody>
           </table>
         </div>
+        {editingExternalUserId ? (
+          <form className="panel form" onSubmit={(event) => void saveExternalHermesConfig(event)}>
+            <div className="panel-heading">
+              <h2>Hermes 配置</h2>
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => setEditingExternalUserId(null)}
+              >
+                Cancel
+              </button>
+            </div>
+            <label>
+              Name
+              <input
+                value={externalDraft.name}
+                onChange={(event) =>
+                  setExternalDraft((draft) => ({ ...draft, name: event.target.value }))
+                }
+                required
+              />
+            </label>
+            <label>
+              Base URL
+              <input
+                value={externalDraft.base_url}
+                onChange={(event) =>
+                  setExternalDraft((draft) => ({ ...draft, base_url: event.target.value }))
+                }
+                required
+              />
+            </label>
+            <label>
+              API token
+              <input
+                type="password"
+                value={externalDraft.api_token}
+                onChange={(event) =>
+                  setExternalDraft((draft) => ({ ...draft, api_token: event.target.value }))
+                }
+                placeholder="留空表示沿用已有 token"
+              />
+            </label>
+            <div className="button-row">
+              <button type="submit">Save config</button>
+            </div>
+          </form>
+        ) : null}
       </section>
     );
   }

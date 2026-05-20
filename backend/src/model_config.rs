@@ -7,7 +7,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use getrandom::fill as getrandom_fill;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use thiserror::Error;
@@ -25,6 +25,10 @@ pub const MODEL_CONFIG_KINDS: [&str; 3] = [
 ];
 pub const REQUIRED_RUNTIME_MODEL_CONFIG_KINDS: [&str; 2] =
     [LLM_MODEL_CONFIG_KIND, TITLE_MODEL_CONFIG_KIND];
+pub const CHAT_COMPLETIONS_API_TYPE: &str = "chat_completions";
+pub const RESPONSES_API_TYPE: &str = "responses";
+pub const IMAGES_GENERATIONS_API_TYPE: &str = "images_generations";
+pub const REASONING_EFFORTS: [&str; 4] = ["minimal", "low", "medium", "high"];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ModelConfig {
@@ -34,6 +38,8 @@ pub struct ModelConfig {
     pub provider_api_key: String,
     pub default_model: String,
     pub allowed_models: Vec<String>,
+    pub api_type: String,
+    pub reasoning_effort: Option<String>,
     pub allow_streaming: bool,
     pub request_timeout_seconds: u64,
 }
@@ -130,6 +136,8 @@ impl ModelRegistry {
             provider_api_key: "provider-secret".to_string(),
             default_model: "gpt-4.1-mini".to_string(),
             allowed_models: vec!["gpt-4.1-mini".to_string()],
+            api_type: CHAT_COMPLETIONS_API_TYPE.to_string(),
+            reasoning_effort: None,
             allow_streaming: true,
             request_timeout_seconds: 60,
         })
@@ -291,7 +299,7 @@ impl ModelRegistry {
 
     pub async fn replace(&self, config: ModelConfig) -> Result<(), ModelRegistryError> {
         validate_config_kind(&config.config_kind)?;
-        let config = normalize_allowed_models(config);
+        let config = normalize_model_config(config)?;
         match &self.backend {
             ModelRegistryBackend::Memory(inner) => {
                 let mut inner = inner.lock().map_err(|_| ModelRegistryError::LockFailed)?;
@@ -321,8 +329,10 @@ impl ModelRegistry {
     pub async fn prepare_request_body(
         &self,
         mut body: Value,
+        api_type: &str,
     ) -> Result<PreparedModelRequest, ModelRegistryError> {
         let config = self.active_config().await?;
+        validate_api_type_for_kind(LLM_MODEL_CONFIG_KIND, api_type)?;
         let object = body
             .as_object_mut()
             .ok_or(ModelRegistryError::InvalidRequest)?;
@@ -341,6 +351,7 @@ impl ModelRegistry {
         }
 
         object.insert("model".to_string(), Value::String(model.clone()));
+        apply_reasoning_config(object, &config, api_type);
         if object
             .get("stream")
             .and_then(|value| value.as_bool())
@@ -445,8 +456,8 @@ impl PostgresModelRegistry {
     async fn active_config(&self, kind: &str) -> Result<ModelConfig, ModelRegistryError> {
         validate_config_kind(kind)?;
         let row = sqlx::query(
-            "select config_kind, provider_name, provider_base_url, provider_api_key_secret_ref, default_model, \
-                    allowed_models, allow_streaming, request_timeout_seconds \
+                "select config_kind, provider_name, provider_base_url, provider_api_key_secret_ref, default_model, \
+                    allowed_models, api_type, reasoning_effort, allow_streaming, request_timeout_seconds \
              from model_configs where is_active = true and config_kind = $1 \
              order by updated_at desc limit 1",
         )
@@ -460,20 +471,22 @@ impl PostgresModelRegistry {
 
     async fn replace(&self, config: ModelConfig) -> Result<(), ModelRegistryError> {
         validate_config_kind(&config.config_kind)?;
-        let config = normalize_allowed_models(config);
+        let config = normalize_model_config(config)?;
         let encrypted_key = encrypt_secret(&self.cipher, &config.provider_api_key);
         let updated = sqlx::query(
             "update model_configs set \
                provider_name = $1, provider_base_url = $2, provider_api_key_secret_ref = $3, \
-               default_model = $4, allowed_models = $5, allow_streaming = $6, \
-               request_timeout_seconds = $7, updated_at = now() \
-             where is_active = true and config_kind = $8",
+               default_model = $4, allowed_models = $5, api_type = $6, reasoning_effort = $7, \
+               allow_streaming = $8, request_timeout_seconds = $9, updated_at = now() \
+             where is_active = true and config_kind = $10",
         )
         .bind(&config.provider_name)
         .bind(&config.provider_base_url)
         .bind(&encrypted_key)
         .bind(&config.default_model)
         .bind(json!(config.allowed_models))
+        .bind(&config.api_type)
+        .bind(&config.reasoning_effort)
         .bind(config.allow_streaming)
         .bind(timeout_as_i32(config.request_timeout_seconds)?)
         .bind(&config.config_kind)
@@ -490,12 +503,12 @@ impl PostgresModelRegistry {
 
     async fn insert_active_config(&self, config: ModelConfig) -> Result<(), ModelRegistryError> {
         validate_config_kind(&config.config_kind)?;
-        let config = normalize_allowed_models(config);
+        let config = normalize_model_config(config)?;
         let encrypted_key = encrypt_secret(&self.cipher, &config.provider_api_key);
         sqlx::query(
             "insert into model_configs \
-             (id, config_kind, provider_name, provider_base_url, provider_api_key_secret_ref, default_model, allowed_models, allow_streaming, request_timeout_seconds, is_active) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, true)",
+             (id, config_kind, provider_name, provider_base_url, provider_api_key_secret_ref, default_model, allowed_models, api_type, reasoning_effort, allow_streaming, request_timeout_seconds, is_active) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true)",
         )
         .bind(Uuid::new_v4())
         .bind(&config.config_kind)
@@ -504,6 +517,8 @@ impl PostgresModelRegistry {
         .bind(&encrypted_key)
         .bind(&config.default_model)
         .bind(json!(config.allowed_models))
+        .bind(&config.api_type)
+        .bind(&config.reasoning_effort)
         .bind(config.allow_streaming)
         .bind(timeout_as_i32(config.request_timeout_seconds)?)
         .execute(&self.pool)
@@ -543,11 +558,18 @@ fn row_to_model_config(
     let allowed_models = row
         .try_get::<Value, _>("allowed_models")
         .map_err(|_| ModelRegistryError::DatabaseFailed)?;
+    let config_kind = row
+        .try_get::<String, _>("config_kind")
+        .map_err(|_| ModelRegistryError::DatabaseFailed)?;
+    let api_type = row
+        .try_get::<String, _>("api_type")
+        .unwrap_or_else(|_| default_api_type_for_kind(&config_kind).to_string());
+    let reasoning_effort = row
+        .try_get::<Option<String>, _>("reasoning_effort")
+        .unwrap_or(None);
 
-    Ok(ModelConfig {
-        config_kind: row
-            .try_get("config_kind")
-            .map_err(|_| ModelRegistryError::DatabaseFailed)?,
+    normalize_model_config(ModelConfig {
+        config_kind,
         provider_name: row
             .try_get("provider_name")
             .map_err(|_| ModelRegistryError::DatabaseFailed)?,
@@ -560,6 +582,8 @@ fn row_to_model_config(
             .map_err(|_| ModelRegistryError::DatabaseFailed)?,
         allowed_models: serde_json::from_value(allowed_models)
             .map_err(|_| ModelRegistryError::InvalidRequest)?,
+        api_type,
+        reasoning_effort,
         allow_streaming: row
             .try_get("allow_streaming")
             .map_err(|_| ModelRegistryError::DatabaseFailed)?,
@@ -584,6 +608,7 @@ fn default_config_set(config: ModelConfig) -> HashMap<String, ModelConfig> {
 fn default_config_for_kind(base: &ModelConfig, kind: &str) -> ModelConfig {
     let mut config = base.clone();
     config.config_kind = kind.to_string();
+    config.api_type = default_api_type_for_kind(kind).to_string();
 
     // 图片生成和标题生成第一版复用同一个 provider 接入形态，但各自保存独立模型名。
     if kind == IMAGE_MODEL_CONFIG_KIND && config.default_model == "gpt-4.1-mini" {
@@ -594,19 +619,90 @@ fn default_config_for_kind(base: &ModelConfig, kind: &str) -> ModelConfig {
         config.allowed_models = vec![config.default_model.clone()];
     }
 
-    normalize_allowed_models(config)
+    normalize_model_config(config).unwrap_or_else(|_| base.clone())
 }
 
-fn normalize_allowed_models(mut config: ModelConfig) -> ModelConfig {
+fn normalize_model_config(mut config: ModelConfig) -> Result<ModelConfig, ModelRegistryError> {
+    validate_config_kind(&config.config_kind)?;
     if config.allowed_models.is_empty() {
         config.allowed_models = vec![config.default_model.clone()];
     }
-    config
+    if config.api_type.trim().is_empty() {
+        config.api_type = default_api_type_for_kind(&config.config_kind).to_string();
+    }
+    if config.config_kind == IMAGE_MODEL_CONFIG_KIND {
+        config.api_type = IMAGES_GENERATIONS_API_TYPE.to_string();
+        config.reasoning_effort = None;
+        config.allow_streaming = false;
+    }
+    validate_api_type_for_kind(&config.config_kind, &config.api_type)?;
+    config.reasoning_effort = normalize_reasoning_effort(config.reasoning_effort)?;
+    Ok(config)
+}
+
+fn apply_reasoning_config(object: &mut Map<String, Value>, config: &ModelConfig, api_type: &str) {
+    let Some(effort) = config.reasoning_effort.as_deref() else {
+        return;
+    };
+
+    // OpenAI Chat Completions 使用顶层 reasoning_effort；Responses 使用 reasoning.effort。
+    if api_type == RESPONSES_API_TYPE {
+        let mut reasoning = object
+            .remove("reasoning")
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        reasoning.insert("effort".to_string(), Value::String(effort.to_string()));
+        object.insert("reasoning".to_string(), Value::Object(reasoning));
+    } else {
+        object.insert(
+            "reasoning_effort".to_string(),
+            Value::String(effort.to_string()),
+        );
+    }
 }
 
 fn validate_config_kind(kind: &str) -> Result<(), ModelRegistryError> {
     if MODEL_CONFIG_KINDS.contains(&kind) {
         Ok(())
+    } else {
+        Err(ModelRegistryError::InvalidRequest)
+    }
+}
+
+pub fn default_api_type_for_kind(kind: &str) -> &'static str {
+    if kind == IMAGE_MODEL_CONFIG_KIND {
+        IMAGES_GENERATIONS_API_TYPE
+    } else {
+        CHAT_COMPLETIONS_API_TYPE
+    }
+}
+
+pub fn validate_api_type_for_kind(kind: &str, api_type: &str) -> Result<(), ModelRegistryError> {
+    validate_config_kind(kind)?;
+    let valid = if kind == IMAGE_MODEL_CONFIG_KIND {
+        api_type == IMAGES_GENERATIONS_API_TYPE
+    } else {
+        matches!(api_type, CHAT_COMPLETIONS_API_TYPE | RESPONSES_API_TYPE)
+    };
+
+    if valid {
+        Ok(())
+    } else {
+        Err(ModelRegistryError::InvalidRequest)
+    }
+}
+
+pub fn normalize_reasoning_effort(
+    effort: Option<String>,
+) -> Result<Option<String>, ModelRegistryError> {
+    let Some(effort) = effort.map(|value| value.trim().to_ascii_lowercase()) else {
+        return Ok(None);
+    };
+    if effort.is_empty() || effort == "off" || effort == "none" {
+        return Ok(None);
+    }
+    if REASONING_EFFORTS.contains(&effort.as_str()) {
+        Ok(Some(effort))
     } else {
         Err(ModelRegistryError::InvalidRequest)
     }

@@ -14,9 +14,10 @@ use hermes_hub_backend::{
         proxy_client::InMemoryHermesProxyClient,
     },
     llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
-    model_config::{ModelConfig, ModelRegistry, LLM_MODEL_CONFIG_KIND},
+    model_config::{ModelConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND},
     security::crypto::SecretCipher,
     session::store::SessionStore,
+    storage::InMemoryObjectStorage,
     AppConfig, AppState,
 };
 use serde_json::{json, Value};
@@ -68,6 +69,8 @@ async fn test_state(pool: PgPool, provider: InMemoryLlmProviderClient) -> AppSta
         provider_api_key: "provider-default-key".to_string(),
         default_model: "gpt-4.1-mini".to_string(),
         allowed_models: vec!["gpt-4.1-mini".to_string()],
+        api_type: CHAT_COMPLETIONS_API_TYPE.to_string(),
+        reasoning_effort: None,
         allow_streaming: true,
         request_timeout_seconds: 60,
     };
@@ -77,7 +80,7 @@ async fn test_state(pool: PgPool, provider: InMemoryLlmProviderClient) -> AppSta
 
     AppState {
         docker_provisioner: DockerProvisioner::new_with_runtime(
-            docker_config_from_app(&config, config.initial_model_config.default_model.clone()),
+            docker_config_from_app(&config, &config.initial_model_config),
             Arc::new(NoopDockerRuntime),
         ),
         config,
@@ -86,6 +89,7 @@ async fn test_state(pool: PgPool, provider: InMemoryLlmProviderClient) -> AppSta
         hermes_proxy: InMemoryHermesProxyClient::default().shared(),
         model_registry,
         llm_provider: provider.shared(),
+        object_storage: InMemoryObjectStorage::default().shared(),
     }
 }
 
@@ -342,6 +346,29 @@ async fn postgres_state_survives_recreated_router_state() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(title_body["session"]["title"], "persisted session");
 
+    let message = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        json!({
+            "role": "user",
+            "content": "persisted message",
+            "attachments": [
+                {
+                    "id": "attachment-json-only",
+                    "name": "note.txt",
+                    "content_type": "text/plain",
+                    "kind": "file",
+                    "size": 12
+                }
+            ]
+        }),
+        Some(&user_cookie),
+        None,
+    )
+    .await;
+    assert_eq!(message.status(), StatusCode::CREATED);
+
     let restarted_state = test_state(pool, provider.clone()).await;
     let restarted_app = test_app(restarted_state);
 
@@ -392,6 +419,22 @@ async fn postgres_state_survives_recreated_router_state() {
     let (status, sessions_body) = response_json(sessions).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(sessions_body["sessions"][0]["title"], "persisted session");
+
+    let messages = request_empty(
+        &restarted_app,
+        Method::GET,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        Some(&user_cookie),
+        None,
+    )
+    .await;
+    let (status, messages_body) = response_json(messages).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(messages_body["messages"][0]["content"], "persisted message");
+    assert_eq!(
+        messages_body["messages"][0]["attachments"][0]["name"],
+        "note.txt"
+    );
 
     let workspace = request_empty(
         &restarted_app,

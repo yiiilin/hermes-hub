@@ -22,7 +22,11 @@ use crate::{
         ApiError,
     },
     llm_proxy::{LlmProviderError, LlmProviderRequest},
-    model_config::{ModelConfig, IMAGE_MODEL_CONFIG_KIND, LLM_MODEL_CONFIG_KIND},
+    model_config::{
+        default_api_type_for_kind, validate_api_type_for_kind, ModelConfig,
+        CHAT_COMPLETIONS_API_TYPE, IMAGE_MODEL_CONFIG_KIND, LLM_MODEL_CONFIG_KIND,
+        RESPONSES_API_TYPE,
+    },
     AppState,
 };
 
@@ -35,6 +39,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/admin/users/{user_id}/hermes-instance/bind-external",
             post(bind_external_hermes_instance),
+        )
+        .route(
+            "/api/admin/users/{user_id}/hermes-instance/external-config",
+            axum::routing::put(update_external_hermes_instance_config),
         )
         .route(
             "/api/admin/users/{user_id}/hermes-instance/create-managed",
@@ -98,6 +106,8 @@ struct UpdateModelConfigRequest {
     provider_api_key: String,
     default_model: String,
     allowed_models: Option<Vec<String>>,
+    api_type: Option<String>,
+    reasoning_effort: Option<String>,
     allow_streaming: bool,
     request_timeout_seconds: u64,
 }
@@ -112,6 +122,13 @@ struct ModelConfigTestResponse {
 
 #[derive(Deserialize)]
 struct BindExternalHermesRequest {
+    name: String,
+    base_url: String,
+    api_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UpdateExternalHermesConfigRequest {
     name: String,
     base_url: String,
     api_token: Option<String>,
@@ -187,6 +204,7 @@ async fn bind_external_hermes_instance(
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
     ensure_required_model_configs(&state).await?;
+    ensure_user_exists(&state, &user_id).await?;
     let instance = HermesInstance {
         id: uuid::Uuid::new_v4().to_string(),
         user_id: user_id.clone(),
@@ -211,6 +229,46 @@ async fn bind_external_hermes_instance(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn update_external_hermes_instance_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    Json(payload): Json<UpdateExternalHermesConfigRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    ensure_user_exists(&state, &user_id).await?;
+    let mut instance = state
+        .store
+        .hermes_instance_for_user(&user_id)
+        .await
+        .map_err(|_| ApiError::NotFound("hermes instance not found"))?;
+
+    if instance.kind != HermesInstanceKind::External {
+        return Err(ApiError::Conflict(
+            "managed hermes runtime config is controlled by hub",
+        ));
+    }
+
+    instance.name = payload.name;
+    instance.base_url = payload.base_url;
+    if let Some(api_token) = payload.api_token {
+        // 空字符串表示沿用已保存 token，便于管理员只修改名称或地址。
+        if !api_token.trim().is_empty() {
+            instance.api_token_secret_ref = Some(api_token);
+        }
+    }
+    instance.status = HermesInstanceStatus::Running;
+    state
+        .store
+        .bind_hermes_instance(instance.clone())
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    Ok(Json(HermesInstanceResponse {
+        hermes_instance: instance,
+    }))
+}
+
 async fn create_managed_hermes_instance(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -218,14 +276,7 @@ async fn create_managed_hermes_instance(
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
     ensure_required_model_configs(&state).await?;
-    let users = state
-        .store
-        .list_users()
-        .await
-        .map_err(|_| ApiError::Internal)?;
-    if !users.iter().any(|user| user.id == user_id) {
-        return Err(ApiError::NotFound("user not found"));
-    }
+    ensure_user_exists(&state, &user_id).await?;
     if let Ok(instance) = state.store.hermes_instance_for_user(&user_id).await {
         reject_external_instance(&instance)?;
     }
@@ -236,6 +287,19 @@ async fn create_managed_hermes_instance(
     Ok(Json(HermesInstanceResponse {
         hermes_instance: instance,
     }))
+}
+
+async fn ensure_user_exists(state: &AppState, user_id: &str) -> Result<(), ApiError> {
+    let users = state
+        .store
+        .list_users()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    if users.iter().any(|user| user.id == user_id) {
+        Ok(())
+    } else {
+        Err(ApiError::NotFound("user not found"))
+    }
 }
 
 async fn rebuild_managed_hermes_instance(
@@ -261,15 +325,19 @@ async fn rebuild_managed_hermes_instance(
         .issue_instance_token_for_instance(&instance.id)
         .await
         .map_err(|_| ApiError::Internal)?;
-    let default_model = state
+    let llm_config = state
         .model_registry
         .active_config()
         .await
-        .map_err(|_| ApiError::Internal)?
-        .default_model;
+        .map_err(|_| ApiError::Internal)?;
     let instance = state
         .docker_provisioner
-        .rebuild_instance_with_default_model(&instance, &llm_api_key, &default_model)
+        .rebuild_instance_with_default_model(
+            &instance,
+            &llm_api_key,
+            &llm_config.default_model,
+            &llm_config.api_type,
+        )
         .await
         .map_err(map_provisioner_error)?;
     state
@@ -438,6 +506,10 @@ async fn model_config_from_payload(
     };
 
     Ok(ModelConfig {
+        api_type: payload
+            .api_type
+            .unwrap_or_else(|| default_api_type_for_kind(&config_kind).to_string()),
+        reasoning_effort: payload.reasoning_effort,
         config_kind,
         provider_name: payload.provider_name,
         provider_base_url: payload.provider_base_url,
@@ -450,6 +522,8 @@ async fn model_config_from_payload(
 }
 
 fn model_test_request(config: &ModelConfig) -> Result<(String, Vec<u8>), ApiError> {
+    validate_api_type_for_kind(&config.config_kind, &config.api_type)
+        .map_err(|_| ApiError::BadRequest("invalid model api type"))?;
     let body = if config.config_kind == IMAGE_MODEL_CONFIG_KIND {
         json!({
             "model": config.default_model,
@@ -457,8 +531,19 @@ fn model_test_request(config: &ModelConfig) -> Result<(String, Vec<u8>), ApiErro
             "n": 1,
             "size": "1024x1024"
         })
+    } else if config.api_type == RESPONSES_API_TYPE {
+        let mut body = json!({
+            "model": config.default_model,
+            "input": "Reply with exactly: ok",
+            "stream": false,
+            "max_output_tokens": 8
+        });
+        if let Some(effort) = config.reasoning_effort.as_deref() {
+            body["reasoning"] = json!({ "effort": effort });
+        }
+        body
     } else {
-        json!({
+        let mut body = json!({
             "model": config.default_model,
             "messages": [
                 {
@@ -468,12 +553,20 @@ fn model_test_request(config: &ModelConfig) -> Result<(String, Vec<u8>), ApiErro
             ],
             "stream": false,
             "max_tokens": 8
-        })
+        });
+        if let Some(effort) = config.reasoning_effort.as_deref() {
+            body["reasoning_effort"] = json!(effort);
+        }
+        body
     };
     let path = if config.config_kind == IMAGE_MODEL_CONFIG_KIND {
         "/images/generations"
-    } else {
+    } else if config.api_type == RESPONSES_API_TYPE {
+        "/responses"
+    } else if config.api_type == CHAT_COMPLETIONS_API_TYPE {
         "/chat/completions"
+    } else {
+        return Err(ApiError::BadRequest("invalid model api type"));
     };
     let bytes = serde_json::to_vec(&body).map_err(|_| ApiError::Internal)?;
 

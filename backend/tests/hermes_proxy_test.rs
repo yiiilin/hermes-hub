@@ -19,8 +19,9 @@ use hermes_hub_backend::{
         },
     },
     llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
-    model_config::{ModelConfig, ModelRegistry, LLM_MODEL_CONFIG_KIND},
+    model_config::{ModelConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND},
     session::store::SessionStore,
+    storage::InMemoryObjectStorage,
     AppConfig, AppState,
 };
 use serde_json::{json, Value};
@@ -36,7 +37,7 @@ fn test_state_with_proxy(store: SessionStore, proxy: DynHermesProxyClient) -> Ap
     let config = AppConfig::for_tests();
     AppState {
         docker_provisioner: DockerProvisioner::new_with_runtime(
-            docker_config_from_app(&config, config.initial_model_config.default_model.clone()),
+            docker_config_from_app(&config, &config.initial_model_config),
             Arc::new(NoopDockerRuntime),
         ),
         config,
@@ -50,6 +51,7 @@ fn test_state_with_proxy(store: SessionStore, proxy: DynHermesProxyClient) -> Ap
             body: b"{}".to_vec(),
         })
         .shared(),
+        object_storage: InMemoryObjectStorage::default().shared(),
     }
 }
 
@@ -61,6 +63,8 @@ fn ready_model_registry() -> ModelRegistry {
         provider_api_key: "ready-provider-key".to_string(),
         default_model: "gpt-4.1-mini".to_string(),
         allowed_models: vec!["gpt-4.1-mini".to_string()],
+        api_type: CHAT_COMPLETIONS_API_TYPE.to_string(),
+        reasoning_effort: None,
         allow_streaming: true,
         request_timeout_seconds: 60,
     })
@@ -110,6 +114,38 @@ async fn request_empty(
 
     app.clone()
         .oneshot(builder.body(Body::empty()).expect("request can be built"))
+        .await
+        .expect("router responds")
+}
+
+async fn request_raw(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    content_type: &str,
+    body: Vec<u8>,
+    cookie: Option<&str>,
+    bearer: Option<&str>,
+) -> Response<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, content_type);
+
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+
+    if let Some(bearer) = bearer {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+    }
+
+    app.clone()
+        .oneshot(
+            builder
+                .body(Body::from(body))
+                .expect("request can be built"),
+        )
         .await
         .expect("router responds")
 }
@@ -400,4 +436,242 @@ async fn hermes_proxy_uses_real_http_client_and_records_audit() {
         "hello"
     );
     assert_eq!(store.proxy_audit_count().await.expect("audit count"), 1);
+}
+
+#[tokio::test]
+async fn admin_can_update_external_hermes_config_used_by_proxy() {
+    let first = CapturedHermesRequest::default();
+    let first_base_url = spawn_hermes_server(first).await;
+    let second = CapturedHermesRequest::default();
+    let second_base_url = spawn_hermes_server(second.clone()).await;
+    let store = SessionStore::default();
+    let state = test_state_with_proxy(store.clone(), ReqwestHermesProxyClient::default().shared());
+    let app = build_router_with_state(state);
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    store
+        .bind_hermes_instance(external_instance_with_base_url(&user_id, first_base_url))
+        .await
+        .expect("external instance can be bound");
+
+    let updated = request_json(
+        &app,
+        Method::PUT,
+        &format!("/api/admin/users/{user_id}/hermes-instance/external-config"),
+        json!({
+            "name": "admin external",
+            "base_url": second_base_url,
+            "api_token": "rotated-token"
+        }),
+        Some(&cookie),
+    )
+    .await;
+    let (status, body) = response_json(updated).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["hermes_instance"]["name"], "admin external");
+
+    let proxied = request_json(
+        &app,
+        Method::POST,
+        "/api/hermes/v1/runs?stream=true",
+        json!({ "prompt": "hello" }),
+        Some(&cookie),
+    )
+    .await;
+
+    assert_eq!(proxied.status(), StatusCode::OK);
+    assert_eq!(
+        second.authorization.lock().expect("auth lock").as_deref(),
+        Some("Bearer rotated-token")
+    );
+}
+
+#[tokio::test]
+async fn channel_messages_and_attachments_are_hub_owned() {
+    let proxy = InMemoryHermesProxyClient::default();
+    let store = SessionStore::default();
+    let app = test_app(store.clone(), proxy);
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    store
+        .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
+        .expect("instance can be bound");
+
+    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
+    let (_, channel_body) = response_json(channel).await;
+    let channel_id = channel_body["channels"][0]["id"]
+        .as_str()
+        .expect("channel id");
+
+    let session = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions"),
+        json!({ "kind": "agent" }),
+        Some(&cookie),
+    )
+    .await;
+    let (_, session_body) = response_json(session).await;
+    let session_id = session_body["session"]["id"].as_str().expect("session id");
+
+    let boundary = "hermes-hub-test-boundary";
+    let upload_body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"note.txt\"\r\n\
+         Content-Type: text/plain\r\n\r\n\
+         hello attachment\r\n\
+         --{boundary}--\r\n"
+    )
+    .into_bytes();
+    let upload = request_raw(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/attachments"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload_body,
+        Some(&cookie),
+        None,
+    )
+    .await;
+    let (status, upload_body) = response_json(upload).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let attachment_id = upload_body["attachments"][0]["id"]
+        .as_str()
+        .expect("attachment id");
+    assert_eq!(upload_body["attachments"][0]["name"], "note.txt");
+    assert_eq!(upload_body["attachments"][0]["size"], 16);
+
+    let appended = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        json!({
+            "role": "user",
+            "content": "see attachment",
+            "attachments": upload_body["attachments"].clone()
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(appended.status(), StatusCode::CREATED);
+
+    let messages = request_empty(
+        &app,
+        Method::GET,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        Some(&cookie),
+    )
+    .await;
+    let (status, messages_body) = response_json(messages).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        messages_body["messages"][0]["attachments"][0]["id"],
+        attachment_id
+    );
+
+    let download = request_empty(
+        &app,
+        Method::GET,
+        &format!("/api/attachments/{attachment_id}/download"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(download.status(), StatusCode::OK);
+    assert_eq!(
+        download
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/plain")
+    );
+    let bytes = to_bytes(download.into_body(), usize::MAX)
+        .await
+        .expect("download body can be read");
+    assert_eq!(&bytes[..], b"hello attachment");
+}
+
+#[tokio::test]
+async fn hermes_instance_can_deliver_channel_message_to_hub() {
+    let proxy = InMemoryHermesProxyClient::default();
+    let store = SessionStore::default();
+    let state = test_state(store.clone(), proxy);
+    let instance_token = "instance-channel-token";
+    state
+        .model_registry
+        .add_instance_token_for_instance("instance-1", instance_token)
+        .await
+        .expect("instance token can be registered");
+    let app = build_router_with_state(state);
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    store
+        .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
+        .expect("instance can be bound");
+
+    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
+    let (_, channel_body) = response_json(channel).await;
+    let channel_id = channel_body["channels"][0]["id"]
+        .as_str()
+        .expect("channel id");
+    let session = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions"),
+        json!({ "kind": "agent" }),
+        Some(&cookie),
+    )
+    .await;
+    let (_, session_body) = response_json(session).await;
+    let session_id = session_body["session"]["id"].as_str().expect("session id");
+
+    let delivered = request_json(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/messages"),
+        json!({
+            "role": "assistant",
+            "content": "artifact ready",
+            "attachments": []
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(delivered.status(), StatusCode::UNAUTHORIZED);
+
+    let delivered = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/messages"),
+        "application/json",
+        br#"{"role":"assistant","content":"artifact ready","attachments":[]}"#.to_vec(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    assert_eq!(delivered.status(), StatusCode::CREATED);
+
+    let messages = request_empty(
+        &app,
+        Method::GET,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        Some(&cookie),
+    )
+    .await;
+    let (_, messages_body) = response_json(messages).await;
+    assert_eq!(messages_body["messages"][0]["role"], "assistant");
+    assert_eq!(messages_body["messages"][0]["content"], "artifact ready");
 }

@@ -7,6 +7,7 @@ pub mod llm_proxy;
 pub mod model_config;
 pub mod model_registry;
 pub mod security;
+pub mod storage;
 pub mod session {
     pub mod store;
 }
@@ -22,10 +23,11 @@ use hermes::{
     proxy_client::{DynHermesProxyClient, InMemoryHermesProxyClient, ReqwestHermesProxyClient},
 };
 use llm_proxy::{DynLlmProviderClient, InMemoryLlmProviderClient, ReqwestLlmProviderClient};
-use model_config::ModelRegistry;
+use model_config::{ModelConfig, ModelRegistry};
 use serde::Serialize;
 use session::store::SessionStore;
 use std::sync::Arc;
+use storage::{object_storage_from_config, DynObjectStorage};
 use thiserror::Error;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -44,6 +46,7 @@ pub struct AppState {
     pub model_registry: ModelRegistry,
     pub llm_provider: DynLlmProviderClient,
     pub docker_provisioner: DockerProvisioner,
+    pub object_storage: DynObjectStorage,
 }
 
 #[derive(Debug, Error)]
@@ -66,9 +69,10 @@ struct HealthResponse {
 /// Build the backend HTTP router.
 pub fn build_router(config: AppConfig) -> Router {
     let docker_provisioner = DockerProvisioner::new_with_runtime(
-        docker_config_from_app(&config, config.initial_model_config.default_model.clone()),
+        docker_config_from_app(&config, &config.initial_model_config),
         Arc::new(NoopDockerRuntime),
     );
+    let object_storage = object_storage_from_config(&config.object_storage);
     let state = AppState {
         model_registry: ModelRegistry::new(config.initial_model_config.clone()),
         config,
@@ -77,6 +81,7 @@ pub fn build_router(config: AppConfig) -> Router {
         hermes_proxy: InMemoryHermesProxyClient::default().shared(),
         llm_provider: InMemoryLlmProviderClient::default().shared(),
         docker_provisioner,
+        object_storage,
     };
 
     build_router_with_state(state)
@@ -86,8 +91,9 @@ pub fn build_router(config: AppConfig) -> Router {
 pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppInitError> {
     let docker_provisioner = DockerProvisioner::new(docker_config_from_app(
         &config,
-        config.initial_model_config.default_model.clone(),
+        &config.initial_model_config,
     ));
+    let object_storage = object_storage_from_config(&config.object_storage);
 
     let Some(database_url) = config.database_url.clone() else {
         let state = AppState {
@@ -98,6 +104,7 @@ pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppIn
             hermes_proxy: ReqwestHermesProxyClient::default().shared(),
             llm_provider: ReqwestLlmProviderClient::default().shared(),
             docker_provisioner,
+            object_storage,
         };
         return Ok(build_router_with_state(state));
     };
@@ -122,6 +129,7 @@ pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppIn
         model_registry,
         llm_provider: ReqwestLlmProviderClient::default().shared(),
         docker_provisioner,
+        object_storage,
     };
 
     Ok(build_router_with_state(state))
@@ -146,7 +154,7 @@ async fn health() -> Json<HealthResponse> {
 
 pub fn docker_config_from_app(
     config: &AppConfig,
-    default_model: String,
+    model_config: &ModelConfig,
 ) -> DockerProvisionerConfig {
     DockerProvisionerConfig {
         image: config.hermes_docker.image.clone(),
@@ -157,7 +165,8 @@ pub fn docker_config_from_app(
         published_host_ip: config.hermes_docker.published_host_ip.clone(),
         published_base_url: config.hermes_docker.published_base_url.clone(),
         hub_llm_base_url: config.hermes_docker.hub_llm_base_url.clone(),
-        default_model,
+        default_model: model_config.default_model.clone(),
+        api_mode: model_config.api_type.clone(),
         memory_limit: config.hermes_docker.memory_limit.clone(),
         cpu_limit: config.hermes_docker.cpu_limit.clone(),
         docker_binary: config.hermes_docker.docker_binary.clone(),

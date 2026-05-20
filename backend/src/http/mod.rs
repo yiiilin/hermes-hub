@@ -1,5 +1,7 @@
 pub mod admin;
+pub mod attachments;
 pub mod auth;
+pub mod channel_protocol;
 pub mod hermes_proxy;
 pub mod invites;
 pub mod llm_proxy;
@@ -20,6 +22,8 @@ pub fn router() -> Router<AppState> {
         .merge(auth::router())
         .merge(admin::router())
         .merge(invites::router())
+        .merge(attachments::router())
+        .merge(channel_protocol::router())
         .merge(llm_proxy::router())
         .merge(workspace::router())
         .merge(crate::channel::routes::router())

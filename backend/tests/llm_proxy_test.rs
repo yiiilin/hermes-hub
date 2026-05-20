@@ -18,8 +18,12 @@ use hermes_hub_backend::{
         DynLlmProviderClient, InMemoryLlmProviderClient, LlmProviderResponse,
         ReqwestLlmProviderClient,
     },
-    model_config::{ModelConfig, ModelRegistry, LLM_MODEL_CONFIG_KIND},
+    model_config::{
+        ModelConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND,
+        RESPONSES_API_TYPE,
+    },
     session::store::SessionStore,
+    storage::InMemoryObjectStorage,
     AppConfig, AppState,
 };
 use serde_json::{json, Value};
@@ -35,7 +39,7 @@ fn test_state_with_provider(provider: DynLlmProviderClient, registry: ModelRegis
     let config = AppConfig::for_tests();
     AppState {
         docker_provisioner: DockerProvisioner::new_with_runtime(
-            docker_config_from_app(&config, config.initial_model_config.default_model.clone()),
+            docker_config_from_app(&config, &config.initial_model_config),
             Arc::new(NoopDockerRuntime),
         ),
         config,
@@ -44,6 +48,7 @@ fn test_state_with_provider(provider: DynLlmProviderClient, registry: ModelRegis
         hermes_proxy: InMemoryHermesProxyClient::default().shared(),
         model_registry: registry,
         llm_provider: provider,
+        object_storage: InMemoryObjectStorage::default().shared(),
     }
 }
 
@@ -59,6 +64,8 @@ fn test_registry() -> ModelRegistry {
         provider_api_key: "provider-secret".to_string(),
         default_model: "gpt-4.1-mini".to_string(),
         allowed_models: vec!["gpt-4.1-mini".to_string(), "gpt-4.1".to_string()],
+        api_type: CHAT_COMPLETIONS_API_TYPE.to_string(),
+        reasoning_effort: None,
         allow_streaming: true,
         request_timeout_seconds: 60,
     })
@@ -253,6 +260,58 @@ async fn llm_proxy_test() {
 }
 
 #[tokio::test]
+async fn llm_proxy_injects_reasoning_for_chat_and_responses_requests() {
+    let provider = InMemoryLlmProviderClient::new(LlmProviderResponse {
+        status: StatusCode::OK,
+        content_type: Some("application/json".to_string()),
+        body: b"{}".to_vec(),
+    });
+    let registry = ModelRegistry::new(ModelConfig {
+        config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
+        provider_name: "openai-compatible".to_string(),
+        provider_base_url: "https://provider.example/v1".to_string(),
+        provider_api_key: "provider-secret".to_string(),
+        default_model: "gpt-5.5".to_string(),
+        allowed_models: vec!["gpt-5.5".to_string()],
+        api_type: RESPONSES_API_TYPE.to_string(),
+        reasoning_effort: Some("high".to_string()),
+        allow_streaming: true,
+        request_timeout_seconds: 60,
+    });
+    registry.add_instance_token("instance-token");
+    let app = test_app(provider.clone(), registry);
+
+    let responses = request_json(
+        &app,
+        Method::POST,
+        "/internal/llm/v1/responses",
+        json!({ "input": "hello", "stream": true }),
+        Some("instance-token"),
+    )
+    .await;
+    assert_eq!(responses.status(), StatusCode::OK);
+    let forwarded = provider.last_request().expect("provider request");
+    assert_eq!(forwarded.path, "/responses");
+    let forwarded_body: Value = serde_json::from_slice(&forwarded.body).expect("json forwarded");
+    assert_eq!(forwarded_body["model"], "gpt-5.5");
+    assert_eq!(forwarded_body["reasoning"]["effort"], "high");
+
+    let chat = request_json(
+        &app,
+        Method::POST,
+        "/internal/llm/v1/chat/completions",
+        json!({ "messages": [] }),
+        Some("instance-token"),
+    )
+    .await;
+    assert_eq!(chat.status(), StatusCode::OK);
+    let forwarded = provider.last_request().expect("provider request");
+    assert_eq!(forwarded.path, "/chat/completions");
+    let forwarded_body: Value = serde_json::from_slice(&forwarded.body).expect("json forwarded");
+    assert_eq!(forwarded_body["reasoning_effort"], "high");
+}
+
+#[tokio::test]
 async fn llm_proxy_uses_real_http_provider_and_records_usage() {
     let captured = CapturedProviderRequest::default();
     let provider_base_url = format!("{}/v1", spawn_provider_server(captured.clone()).await);
@@ -263,6 +322,8 @@ async fn llm_proxy_uses_real_http_provider_and_records_usage() {
         provider_api_key: "real-provider-token".to_string(),
         default_model: "gpt-4.1-mini".to_string(),
         allowed_models: vec!["gpt-4.1-mini".to_string()],
+        api_type: CHAT_COMPLETIONS_API_TYPE.to_string(),
+        reasoning_effort: None,
         allow_streaming: true,
         request_timeout_seconds: 5,
     });

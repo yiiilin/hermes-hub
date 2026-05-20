@@ -100,6 +100,7 @@ fn test_config() -> DockerProvisionerConfig {
         published_base_url: "http://127.0.0.1".to_string(),
         hub_llm_base_url: "http://hermes-hub:8080/internal/llm/v1".to_string(),
         default_model: "gpt-4.1-mini".to_string(),
+        api_mode: "chat_completions".to_string(),
         memory_limit: Some("1g".to_string()),
         cpu_limit: Some("1.0".to_string()),
         docker_binary: "docker".to_string(),

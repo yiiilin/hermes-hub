@@ -1,8 +1,13 @@
-import type { ReactNode } from "react";
+import type { Dispatch, ReactNode, SetStateAction } from "react";
 import type { User } from "../api/client";
-import { Bot, Cpu, LogOut, MessageSquare, Settings, Users } from "lucide-react";
+import { Bot, Cpu, LogOut, Settings, Users } from "lucide-react";
+import { createContext, useContext, useState } from "react";
 
 export type AppView = "chat" | "admin-users" | "admin-models" | "admin-hermes";
+
+type ChatSidebarSetter = Dispatch<SetStateAction<ReactNode>>;
+
+const ChatSidebarContext = createContext<ChatSidebarSetter | null>(null);
 
 type LayoutProps = {
   children: ReactNode;
@@ -13,24 +18,18 @@ type LayoutProps = {
 };
 
 export function Layout({ children, user, activeView, onNavigate, onLogout }: LayoutProps) {
+  const [chatSidebar, setChatSidebar] = useState<ReactNode>(null);
+
   return (
-    <div className="shell">
-      <aside className="sidebar" aria-label="Primary">
-        <div className="brand">
-          <Bot aria-hidden="true" size={22} />
-          <span>Hermes Hub</span>
-        </div>
-        <nav>
-          {user ? (
-            <button
-              type="button"
-              className={activeView === "chat" ? "nav-link active" : "nav-link"}
-              onClick={() => onNavigate("chat")}
-            >
-              <MessageSquare aria-hidden="true" size={18} />
-              对话
-            </button>
-          ) : null}
+    <ChatSidebarContext.Provider value={setChatSidebar}>
+      <div className="shell">
+        <aside className="sidebar" aria-label="Primary">
+          <button type="button" className="brand brand-button" onClick={() => onNavigate("chat")}>
+            <Bot aria-hidden="true" size={22} />
+            <span>Hermes Hub</span>
+          </button>
+          {user ? <div className="sidebar-chat">{chatSidebar}</div> : null}
+          <nav className="sidebar-bottom">
           {user?.role === "admin" ? (
             <div className="nav-group">
               <span className="nav-label">管理</span>
@@ -60,17 +59,24 @@ export function Layout({ children, user, activeView, onNavigate, onLogout }: Lay
               </button>
             </div>
           ) : null}
+          {user ? (
+            <div className="account">
+              <span>{user.email}</span>
+              <button type="button" className="icon-button" onClick={onLogout} aria-label="Sign out">
+                <LogOut aria-hidden="true" size={17} />
+              </button>
+            </div>
+          ) : null}
         </nav>
-        {user ? (
-          <div className="account">
-            <span>{user.email}</span>
-            <button type="button" className="icon-button" onClick={onLogout} aria-label="Sign out">
-              <LogOut aria-hidden="true" size={17} />
-            </button>
-          </div>
-        ) : null}
-      </aside>
-      <main className="content">{children}</main>
-    </div>
+        </aside>
+        <main className={activeView === "chat" ? "content chat-content" : "content"}>
+          {children}
+        </main>
+      </div>
+    </ChatSidebarContext.Provider>
   );
+}
+
+export function useChatSidebar() {
+  return useContext(ChatSidebarContext);
 }

@@ -26,6 +26,51 @@ services:
       timeout: 3s
       retries: 20
 
+  rustfs-perms:
+    image: alpine:3.20
+    command: ["sh", "-lc", "mkdir -p /data && chown -R 10001:10001 /data"]
+    volumes:
+      - ./data/rustfs:/data
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    restart: unless-stopped
+    depends_on:
+      rustfs-perms:
+        condition: service_completed_successfully
+    command: ["/data"]
+    environment:
+      RUSTFS_ACCESS_KEY: ${HERMES_OBJECT_STORAGE_ACCESS_KEY:?set HERMES_OBJECT_STORAGE_ACCESS_KEY}
+      RUSTFS_SECRET_KEY: ${HERMES_OBJECT_STORAGE_SECRET_KEY:?set HERMES_OBJECT_STORAGE_SECRET_KEY}
+      RUSTFS_CONSOLE_ENABLE: ${RUSTFS_CONSOLE_ENABLE:-false}
+    volumes:
+      - ./data/rustfs:/data
+    networks:
+      - hermes-hub-net
+
+  rustfs-init:
+    image: minio/mc:latest
+    depends_on:
+      rustfs:
+        condition: service_started
+    environment:
+      HERMES_OBJECT_STORAGE_ACCESS_KEY: ${HERMES_OBJECT_STORAGE_ACCESS_KEY:?set HERMES_OBJECT_STORAGE_ACCESS_KEY}
+      HERMES_OBJECT_STORAGE_SECRET_KEY: ${HERMES_OBJECT_STORAGE_SECRET_KEY:?set HERMES_OBJECT_STORAGE_SECRET_KEY}
+      HERMES_OBJECT_STORAGE_BUCKET: ${HERMES_OBJECT_STORAGE_BUCKET:-hermes-hub}
+    entrypoint:
+      - /bin/sh
+      - -lc
+      - |
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+          mc alias set rustfs http://rustfs:9000 "${HERMES_OBJECT_STORAGE_ACCESS_KEY:?set HERMES_OBJECT_STORAGE_ACCESS_KEY}" "${HERMES_OBJECT_STORAGE_SECRET_KEY:?set HERMES_OBJECT_STORAGE_SECRET_KEY}" &&
+          mc mb -p --ignore-existing "rustfs/${HERMES_OBJECT_STORAGE_BUCKET:-hermes-hub}" &&
+          exit 0
+          sleep 2
+        done
+        exit 1
+    networks:
+      - hermes-hub-net
+
   backend:
     build:
       context: .
@@ -35,6 +80,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      rustfs-init:
+        condition: service_completed_successfully
     environment:
       HERMES_HUB_BIND_ADDR: 0.0.0.0:8080
       HERMES_HUB_COOKIE_NAME: ${HERMES_HUB_COOKIE_NAME:-hermes_hub_session}
@@ -50,6 +97,8 @@ services:
       HERMES_HUB_ALLOWED_MODELS: ${HERMES_HUB_ALLOWED_MODELS:?set HERMES_HUB_ALLOWED_MODELS}
       HERMES_HUB_MODEL_ALLOW_STREAMING: ${HERMES_HUB_MODEL_ALLOW_STREAMING:-true}
       HERMES_HUB_MODEL_REQUEST_TIMEOUT_SECONDS: ${HERMES_HUB_MODEL_REQUEST_TIMEOUT_SECONDS:-60}
+      HERMES_HUB_MODEL_API_TYPE: ${HERMES_HUB_MODEL_API_TYPE:-responses}
+      HERMES_HUB_MODEL_REASONING_EFFORT: ${HERMES_HUB_MODEL_REASONING_EFFORT:-medium}
 
       # backend 通过宿主机 Docker daemon 创建兄弟 Hermes 容器；
       # 这里必须使用宿主机绝对路径，才能让 Docker bind mount 找到真实目录。
@@ -64,6 +113,14 @@ services:
       HERMES_DOCKER_BINARY: ${HERMES_DOCKER_BINARY:-docker}
       HERMES_HUB_PROXY_TIMEOUT_SECONDS: ${HERMES_HUB_PROXY_TIMEOUT_SECONDS:-60}
       HERMES_HUB_MAX_PROXY_BODY_BYTES: ${HERMES_HUB_MAX_PROXY_BODY_BYTES:-10485760}
+      HERMES_OBJECT_STORAGE_ENDPOINT: ${HERMES_OBJECT_STORAGE_ENDPOINT:-http://rustfs:9000}
+      HERMES_OBJECT_STORAGE_BUCKET: ${HERMES_OBJECT_STORAGE_BUCKET:-hermes-hub}
+      HERMES_OBJECT_STORAGE_REGION: ${HERMES_OBJECT_STORAGE_REGION:-us-east-1}
+      HERMES_OBJECT_STORAGE_ACCESS_KEY: ${HERMES_OBJECT_STORAGE_ACCESS_KEY:?set HERMES_OBJECT_STORAGE_ACCESS_KEY}
+      HERMES_OBJECT_STORAGE_SECRET_KEY: ${HERMES_OBJECT_STORAGE_SECRET_KEY:?set HERMES_OBJECT_STORAGE_SECRET_KEY}
+      HERMES_OBJECT_STORAGE_FORCE_PATH_STYLE: ${HERMES_OBJECT_STORAGE_FORCE_PATH_STYLE:-true}
+      HERMES_OBJECT_STORAGE_PREFIX: ${HERMES_OBJECT_STORAGE_PREFIX:-attachments}
+      HERMES_OBJECT_STORAGE_MAX_UPLOAD_BYTES: ${HERMES_OBJECT_STORAGE_MAX_UPLOAD_BYTES:-26214400}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./data/hub/users:${PWD}/data/hub/users

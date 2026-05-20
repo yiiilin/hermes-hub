@@ -81,12 +81,11 @@ pub async fn ensure_managed_hermes_for_user(
         }
 
         ensure_required_model_configs(state).await?;
-        let default_model = state
+        let llm_config = state
             .model_registry
             .active_config()
             .await
-            .map_err(|_| ApiError::Internal)?
-            .default_model;
+            .map_err(|_| ApiError::Internal)?;
         // 数据库里的容器状态可能滞后于 Docker daemon；ensure 操作会幂等检查并启动容器。
         let llm_api_key = match instance.api_token_secret_ref.as_deref() {
             Some(existing_token) => {
@@ -105,7 +104,12 @@ pub async fn ensure_managed_hermes_for_user(
         };
         let ensured = state
             .docker_provisioner
-            .ensure_container_with_default_model(&instance, &llm_api_key, &default_model)
+            .ensure_container_with_default_model(
+                &instance,
+                &llm_api_key,
+                &llm_config.default_model,
+                &llm_config.api_type,
+            )
             .await
             .map_err(|_| ApiError::Internal)?;
         state
@@ -118,12 +122,11 @@ pub async fn ensure_managed_hermes_for_user(
     }
 
     ensure_required_model_configs(state).await?;
-    let default_model = state
+    let llm_config = state
         .model_registry
         .active_config()
         .await
-        .map_err(|_| ApiError::Internal)?
-        .default_model;
+        .map_err(|_| ApiError::Internal)?;
     let instance = state.docker_provisioner.prepare_instance(user_id);
     state
         .store
@@ -137,7 +140,12 @@ pub async fn ensure_managed_hermes_for_user(
         .map_err(|_| ApiError::Internal)?;
     let instance = state
         .docker_provisioner
-        .ensure_container_with_default_model(&instance, &llm_api_key, &default_model)
+        .ensure_container_with_default_model(
+            &instance,
+            &llm_api_key,
+            &llm_config.default_model,
+            &llm_config.api_type,
+        )
         .await
         .map_err(|_| ApiError::Internal)?;
     state

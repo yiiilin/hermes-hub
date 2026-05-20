@@ -8,6 +8,10 @@ fn schema_migrations_include_initial_tables() {
     assert!(sql.contains("create table if not exists invites"));
     assert!(sql.contains("create table if not exists hermes_instances"));
     assert!(sql.contains("create table if not exists llm_usage_events"));
+    assert!(sql.contains("create table if not exists channels"));
+    assert!(sql.contains("create table if not exists channel_sessions"));
+    assert!(sql.contains("create table if not exists channel_session_messages"));
+    assert!(sql.contains("create table if not exists channel_attachments"));
 }
 
 fn secret_cipher_round_trips_plaintext() {

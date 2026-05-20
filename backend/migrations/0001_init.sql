@@ -72,6 +72,8 @@ create table if not exists model_configs (
     provider_api_key_secret_ref text not null,
     default_model text not null,
     allowed_models jsonb not null default '[]'::jsonb,
+    api_type text not null default 'chat_completions' check (api_type in ('chat_completions', 'responses', 'images_generations')),
+    reasoning_effort text check (reasoning_effort in ('minimal', 'low', 'medium', 'high')),
     allow_streaming boolean not null default true,
     request_timeout_seconds integer not null default 60,
     is_active boolean not null default true,
@@ -80,6 +82,8 @@ create table if not exists model_configs (
 );
 
 alter table model_configs add column if not exists config_kind text not null default 'llm';
+alter table model_configs add column if not exists api_type text not null default 'chat_completions';
+alter table model_configs add column if not exists reasoning_effort text;
 
 create table if not exists proxy_audit_logs (
     id uuid primary key,
@@ -129,6 +133,29 @@ create table if not exists channel_sessions (
     title text,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
+);
+
+create table if not exists channel_session_messages (
+    id uuid primary key,
+    session_id uuid not null references channel_sessions(id) on delete cascade,
+    role text not null check (role in ('user', 'assistant')),
+    content text not null,
+    attachments jsonb not null default '[]'::jsonb,
+    created_at timestamptz not null default now()
+);
+
+create table if not exists channel_attachments (
+    id uuid primary key,
+    session_id uuid not null references channel_sessions(id) on delete cascade,
+    message_id uuid references channel_session_messages(id) on delete set null,
+    direction text not null check (direction in ('input', 'output')),
+    bucket text not null,
+    object_key text not null unique,
+    name text not null,
+    content_type text not null,
+    size_bytes bigint not null check (size_bytes >= 0),
+    kind text not null check (kind in ('file', 'image')),
+    created_at timestamptz not null default now()
 );
 
 -- 保持现有 API 语义：用户可以先创建 channel，再绑定或创建 Hermes 实例。

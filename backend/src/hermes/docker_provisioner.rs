@@ -25,6 +25,7 @@ pub struct DockerProvisionerConfig {
     pub published_base_url: String,
     pub hub_llm_base_url: String,
     pub default_model: String,
+    pub api_mode: String,
     pub memory_limit: Option<String>,
     pub cpu_limit: Option<String>,
     pub docker_binary: String,
@@ -301,9 +302,11 @@ impl DockerProvisioner {
         instance: &HermesInstance,
         llm_api_key: &str,
         default_model: &str,
+        api_mode: &str,
     ) -> Result<HermesInstance, ProvisionerError> {
         let mut provisioner = self.clone();
         provisioner.config.default_model = default_model.to_string();
+        provisioner.config.api_mode = api_mode.to_string();
         provisioner.ensure_container(instance, llm_api_key).await
     }
 
@@ -312,9 +315,11 @@ impl DockerProvisioner {
         instance: &HermesInstance,
         llm_api_key: &str,
         default_model: &str,
+        api_mode: &str,
     ) -> Result<HermesInstance, ProvisionerError> {
         let mut provisioner = self.clone();
         provisioner.config.default_model = default_model.to_string();
+        provisioner.config.api_mode = api_mode.to_string();
         provisioner.rebuild_instance(instance, llm_api_key).await
     }
 
@@ -520,6 +525,7 @@ impl DockerProvisioner {
         let model = yaml_string(&self.config.default_model)?;
         let base_url = yaml_string(&self.config.hub_llm_base_url)?;
         let api_key = yaml_string(instance.llm_api_key.as_deref().unwrap_or(""))?;
+        let api_mode = yaml_string(&self.config.api_mode)?;
         let content = format!(
             "# Managed by Hermes Hub. Do not edit model settings inside this container.\n\
              model:\n\
@@ -527,7 +533,7 @@ impl DockerProvisioner {
              \x20\x20provider: \"custom\"\n\
              \x20\x20base_url: {base_url}\n\
              \x20\x20api_key: {api_key}\n\
-             \x20\x20api_mode: \"chat_completions\"\n"
+             \x20\x20api_mode: {api_mode}\n"
         );
         let config_file = PathBuf::from(config_path).join("config.yaml");
         if std::fs::read_to_string(&config_file).ok().as_deref() == Some(content.as_str()) {

@@ -1,22 +1,17 @@
 import type {
   ApiClient,
   Channel,
+  ChannelMessage,
   ChannelSession,
   HermesAttachment,
   HermesInstance,
 } from "../api/client";
+import { useChatSidebar } from "../components/layout";
 import { Bot, FileText, Image, Paperclip, Plus, Send } from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
 
 type ChannelSessionRouteProps = {
   apiClient: ApiClient;
-};
-
-type ChatMessage = {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-  attachments?: HermesAttachment[];
 };
 
 type BrowserCrypto = {
@@ -25,16 +20,18 @@ type BrowserCrypto = {
 };
 
 export function ChannelSessionRoute({ apiClient }: ChannelSessionRouteProps) {
+  const setChatSidebar = useChatSidebar();
   const [channel, setChannel] = useState<Channel | null>(null);
   const [sessions, setSessions] = useState<ChannelSession[]>([]);
   const [selectedSession, setSelectedSession] = useState<ChannelSession | null>(null);
   const [instance, setInstance] = useState<HermesInstance | null>(null);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messages, setMessages] = useState<ChannelMessage[]>([]);
   const [prompt, setPrompt] = useState("");
   const [attachments, setAttachments] = useState<HermesAttachment[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const messageListRef = useRef<HTMLDivElement | null>(null);
 
   async function refreshWorkspace() {
     setError(null);
@@ -50,7 +47,16 @@ export function ChannelSessionRoute({ apiClient }: ChannelSessionRouteProps) {
       if (hubChannel) {
         const nextSessions = await apiClient.listSessions(hubChannel.id);
         setSessions(nextSessions);
-        setSelectedSession((current) => current ?? nextSessions[0] ?? null);
+        const nextSelected =
+          nextSessions.find((session) => session.id === selectedSession?.id) ??
+          nextSessions[0] ??
+          null;
+        setSelectedSession(nextSelected);
+        if (nextSelected) {
+          setMessages(await apiClient.listSessionMessages(hubChannel.id, nextSelected.id));
+        } else {
+          setMessages([]);
+        }
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Workspace data could not be loaded");
@@ -61,6 +67,28 @@ export function ChannelSessionRoute({ apiClient }: ChannelSessionRouteProps) {
     void refreshWorkspace();
   }, []);
 
+  useEffect(() => {
+    const node = messageListRef.current;
+    if (node) {
+      node.scrollTop = node.scrollHeight;
+    }
+  }, [messages]);
+
+  useEffect(() => {
+    setChatSidebar?.(
+      <ChatSidebar
+        channel={channel}
+        instance={instance}
+        sessions={sessions}
+        selectedSession={selectedSession}
+        onCreate={() => void createSession()}
+        onSelect={(session) => void selectSession(session)}
+      />,
+    );
+
+    return () => setChatSidebar?.(null);
+  }, [channel, instance, sessions, selectedSession, setChatSidebar]);
+
   async function createSession() {
     if (!channel) {
       return null;
@@ -70,6 +98,14 @@ export function ChannelSessionRoute({ apiClient }: ChannelSessionRouteProps) {
     setSelectedSession(session);
     setMessages([]);
     return session;
+  }
+
+  async function selectSession(session: ChannelSession) {
+    if (!channel) {
+      return;
+    }
+    setSelectedSession(session);
+    setMessages(await apiClient.listSessionMessages(channel.id, session.id));
   }
 
   async function sendPrompt(event: FormEvent<HTMLFormElement>) {
@@ -92,29 +128,62 @@ export function ChannelSessionRoute({ apiClient }: ChannelSessionRouteProps) {
         throw new Error("Session could not be created");
       }
 
-      setMessages((current) => [
-        ...current,
-        {
-          id: createClientMessageId(),
-          role: "user",
-          content: text,
-          attachments: nextAttachments,
-        },
-      ]);
+      const userMessage = await apiClient.appendSessionMessage(channel.id, session.id, {
+        role: "user",
+        content: text,
+        attachments: nextAttachments,
+      });
+      setMessages((current) => [...current, userMessage]);
 
       if (!instance || instance.status !== "running") {
         setInstance(await apiClient.ensureHermes());
       }
 
-      const response = await apiClient.sendHermesPrompt(text, nextAttachments, session.id);
+      const assistantMessageId = createClientMessageId();
+      let assistantContent = "";
       setMessages((current) => [
         ...current,
         {
-          id: createClientMessageId(),
+          id: assistantMessageId,
+          session_id: session.id,
           role: "assistant",
-          content: response || "Hermes returned an empty response.",
+          content: "",
+          attachments: [],
+          created_at: Date.now(),
         },
       ]);
+      const response = await apiClient.sendHermesPrompt(text, nextAttachments, session.id, {
+        onDelta(delta) {
+          assistantContent += delta;
+          setMessages((current) =>
+            current.map((message) =>
+              message.id === assistantMessageId
+                ? { ...message, content: message.content + delta }
+                : message,
+            ),
+          );
+        },
+        onOutput(output) {
+          assistantContent = output;
+          setMessages((current) =>
+            current.map((message) =>
+              message.id === assistantMessageId ? { ...message, content: output } : message,
+            ),
+          );
+        },
+      });
+      const finalAssistantContent =
+        response || assistantContent || "Hermes returned an empty response.";
+      const assistantMessage = await apiClient.appendSessionMessage(channel.id, session.id, {
+        role: "assistant",
+        content: finalAssistantContent,
+        attachments: [],
+      });
+      setMessages((current) =>
+        current.map((message) =>
+          message.id === assistantMessageId ? assistantMessage : message,
+        ),
+      );
       if (text && !session.title) {
         const titled = await apiClient.generateSessionTitle(channel.id, session.id, text);
         setSelectedSession(titled);
@@ -134,43 +203,27 @@ export function ChannelSessionRoute({ apiClient }: ChannelSessionRouteProps) {
     if (!files?.length) {
       return;
     }
-    const selected = await Promise.all(Array.from(files).map(fileToAttachment));
-    setAttachments((current) => [...current, ...selected]);
-    if (fileInputRef.current) {
-      fileInputRef.current.value = "";
+    if (!channel) {
+      return;
+    }
+    setError(null);
+    try {
+      const session = selectedSession ?? (await createSession());
+      if (!session) {
+        throw new Error("Session could not be created");
+      }
+      const selected = await apiClient.uploadSessionAttachments(channel.id, session.id, Array.from(files));
+      setAttachments((current) => [...current, ...selected]);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Attachment upload failed");
     }
   }
 
   return (
     <section className="chat-workspace">
-      <aside className="session-sidebar">
-        <div>
-          <span className="eyebrow">Channel</span>
-          <h1>{channel?.name ?? "hermes-hub"}</h1>
-          <p>{instance?.status ?? "Hermes not provisioned"}</p>
-        </div>
-        <button type="button" onClick={() => void createSession()}>
-          <Plus aria-hidden="true" size={17} />
-          New chat
-        </button>
-        <ul className="session-list">
-          {sessions.map((session) => (
-            <li key={session.id}>
-              <button
-                type="button"
-                className={selectedSession?.id === session.id ? "active" : ""}
-                onClick={() => {
-                  setSelectedSession(session);
-                  setMessages([]);
-                }}
-              >
-                {session.title ?? "New conversation"}
-              </button>
-            </li>
-          ))}
-        </ul>
-      </aside>
-
       <main className="chat-panel" aria-labelledby="chat-title">
         <header className="chat-header">
           <div>
@@ -182,7 +235,7 @@ export function ChannelSessionRoute({ apiClient }: ChannelSessionRouteProps) {
           </button>
         </header>
 
-        <div className="message-list">
+        <div className="message-list" ref={messageListRef}>
           {messages.length === 0 ? (
             <div className="empty-chat">
               <Bot aria-hidden="true" size={30} />
@@ -198,7 +251,7 @@ export function ChannelSessionRoute({ apiClient }: ChannelSessionRouteProps) {
           {attachments.length > 0 ? (
             <div className="attachment-row">
               {attachments.map((attachment) => (
-                <span key={`${attachment.name}-${attachment.data_url.length}`}>
+                <span key={`${attachment.id ?? attachment.name}-${attachment.size ?? 0}`}>
                   {attachment.kind === "image" ? <Image size={15} /> : <FileText size={15} />}
                   {attachment.name}
                 </span>
@@ -251,41 +304,73 @@ export function createClientMessageId(source: BrowserCrypto | undefined = global
   return `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
-function MessageBubble({ message }: { message: ChatMessage }) {
+function ChatSidebar({
+  channel,
+  instance,
+  sessions,
+  selectedSession,
+  onCreate,
+  onSelect,
+}: {
+  channel: Channel | null;
+  instance: HermesInstance | null;
+  sessions: ChannelSession[];
+  selectedSession: ChannelSession | null;
+  onCreate: () => void;
+  onSelect: (session: ChannelSession) => void;
+}) {
+  return (
+    <div className="chat-sidebar-menu">
+      <div>
+        <span className="eyebrow">Channel</span>
+        <h1>{channel?.name ?? "hermes-hub"}</h1>
+        <p>{instance?.status ?? "Hermes not provisioned"}</p>
+      </div>
+      <button type="button" onClick={onCreate}>
+        <Plus aria-hidden="true" size={17} />
+        New chat
+      </button>
+      <ul className="session-list">
+        {sessions.map((session) => (
+          <li key={session.id}>
+            <button
+              type="button"
+              className={selectedSession?.id === session.id ? "active" : ""}
+              onClick={() => onSelect(session)}
+            >
+              {session.title ?? "New conversation"}
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function MessageBubble({ message }: { message: ChannelMessage }) {
   return (
     <article className={`message-bubble ${message.role}`}>
       <span>{message.role === "user" ? "You" : "Hermes"}</span>
       {message.attachments?.length ? (
         <div className="message-attachments">
-          {message.attachments.map((attachment) =>
-            attachment.kind === "image" ? (
-              <img key={attachment.data_url} src={attachment.data_url} alt={attachment.name} />
+          {message.attachments.map((attachment) => {
+            const imageSrc = attachment.data_url ?? attachment.download_url;
+            return attachment.kind === "image" && imageSrc ? (
+              <img key={attachment.id ?? imageSrc} src={imageSrc} alt={attachment.name} />
             ) : (
-              <div key={attachment.data_url} className="file-chip">
+              <a
+                key={attachment.id ?? attachment.name}
+                className="file-chip"
+                href={attachment.download_url}
+              >
                 <FileText aria-hidden="true" size={16} />
                 {attachment.name}
-              </div>
-            ),
-          )}
+              </a>
+            );
+          })}
         </div>
       ) : null}
       <pre>{message.content}</pre>
     </article>
   );
-}
-
-function fileToAttachment(file: File): Promise<HermesAttachment> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.addEventListener("load", () => {
-      resolve({
-        name: file.name,
-        content_type: file.type || "application/octet-stream",
-        data_url: String(reader.result),
-        kind: file.type.startsWith("image/") ? "image" : "file",
-      });
-    });
-    reader.addEventListener("error", () => reject(reader.error));
-    reader.readAsDataURL(file);
-  });
 }

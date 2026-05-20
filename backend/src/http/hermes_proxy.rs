@@ -5,7 +5,7 @@ use axum::{
     response::Response,
 };
 use percent_encoding::percent_decode_str;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::{
     hermes::{
@@ -67,7 +67,7 @@ pub async fn proxy(
     };
 
     let started = Instant::now();
-    let proxied = state.hermes_proxy.send(request).await;
+    let proxied = send_hermes_request_with_cold_start_retry(&state, &instance.kind, request).await;
 
     match proxied {
         Ok(response) => {
@@ -105,6 +105,32 @@ pub async fn proxy(
             Err(mapped)
         }
     }
+}
+
+async fn send_hermes_request_with_cold_start_retry(
+    state: &AppState,
+    instance_kind: &HermesInstanceKind,
+    request: HermesProxyRequest,
+) -> Result<Response, HermesProxyError> {
+    let max_attempts = if *instance_kind == HermesInstanceKind::ManagedDocker {
+        8
+    } else {
+        1
+    };
+
+    for attempt in 1..=max_attempts {
+        match state.hermes_proxy.send(request.clone()).await {
+            Ok(response) => return Ok(response),
+            Err(error @ HermesProxyError::Failed(_)) if attempt < max_attempts => {
+                // 托管容器刚重建后，Docker 已经 running 但 gateway 端口可能还没 ready。
+                tokio::time::sleep(Duration::from_millis(750)).await;
+                let _ = error;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    state.hermes_proxy.send(request).await
 }
 
 fn hermes_path_and_query(original_uri: &str) -> Result<String, ApiError> {

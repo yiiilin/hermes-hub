@@ -26,6 +26,15 @@ export type ChannelSession = {
   title?: string | null;
 };
 
+export type ChannelMessage = {
+  id: string;
+  session_id: string;
+  role: "user" | "assistant";
+  content: string;
+  attachments: HermesAttachment[];
+  created_at: number;
+};
+
 export type HermesInstance = {
   id: string;
   user_id: string;
@@ -38,6 +47,8 @@ export type HermesInstance = {
 };
 
 export type ModelConfigKind = "llm" | "image" | "title";
+export type ModelApiType = "chat_completions" | "responses" | "images_generations";
+export type ReasoningEffort = "minimal" | "low" | "medium" | "high";
 
 export type ModelConfig = {
   config_kind: ModelConfigKind;
@@ -46,6 +57,8 @@ export type ModelConfig = {
   provider_api_key?: string;
   default_model: string;
   allowed_models: string[];
+  api_type: ModelApiType;
+  reasoning_effort?: ReasoningEffort | null;
   allow_streaming: boolean;
   request_timeout_seconds: number;
 };
@@ -65,10 +78,13 @@ export type ModelConfigTestResult = {
 };
 
 export type HermesAttachment = {
+  id?: string;
   name: string;
   content_type: string;
-  data_url: string;
   kind: "file" | "image";
+  size?: number;
+  download_url?: string;
+  data_url?: string;
 };
 
 type HermesRunStarted = {
@@ -81,6 +97,11 @@ type HermesRunEvent = {
   delta?: string;
   output?: string;
   error?: string;
+};
+
+export type HermesStreamHandlers = {
+  onDelta?: (delta: string) => void;
+  onOutput?: (output: string) => void;
 };
 
 export type CreateInviteInput = {
@@ -110,6 +131,10 @@ export type ApiClient = {
   startHermesInstance: (userId: string) => Promise<HermesInstance>;
   stopHermesInstance: (userId: string) => Promise<HermesInstance>;
   rebuildHermesInstance: (userId: string) => Promise<HermesInstance>;
+  updateExternalHermesInstanceConfig: (
+    userId: string,
+    input: { name: string; base_url: string; api_token?: string },
+  ) => Promise<HermesInstance>;
   listChannels: () => Promise<Channel[]>;
   createChannel: (name: string, description?: string) => Promise<Channel>;
   listSessions: (channelId: string) => Promise<ChannelSession[]>;
@@ -118,6 +143,21 @@ export type ApiClient = {
     kind: "chat" | "agent",
     title?: string,
   ) => Promise<ChannelSession>;
+  listSessionMessages: (channelId: string, sessionId: string) => Promise<ChannelMessage[]>;
+  appendSessionMessage: (
+    channelId: string,
+    sessionId: string,
+    input: {
+      role: "user" | "assistant";
+      content: string;
+      attachments?: HermesAttachment[];
+    },
+  ) => Promise<ChannelMessage>;
+  uploadSessionAttachments: (
+    channelId: string,
+    sessionId: string,
+    files: File[],
+  ) => Promise<HermesAttachment[]>;
   generateSessionTitle: (
     channelId: string,
     sessionId: string,
@@ -135,6 +175,7 @@ export type ApiClient = {
     prompt: string,
     attachments?: HermesAttachment[],
     sessionId?: string,
+    handlers?: HermesStreamHandlers,
   ) => Promise<string>;
 };
 
@@ -179,8 +220,17 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
 async function updateModelConfigRequest(config: ModelConfig): Promise<void> {
   await request<void>("/api/admin/model-config", {
     method: "PUT",
-    body: { ...config, allowed_models: [config.default_model] },
+    body: normalizedModelConfig(config),
   });
+}
+
+function normalizedModelConfig(config: ModelConfig): ModelConfig {
+  return {
+    ...config,
+    api_type: config.config_kind === "image" ? "images_generations" : config.api_type,
+    reasoning_effort: config.config_kind === "image" ? null : config.reasoning_effort,
+    allowed_models: [config.default_model],
+  };
 }
 
 export function createApiClient(): ApiClient {
@@ -287,6 +337,13 @@ export function createApiClient(): ApiClient {
       );
       return payload.hermes_instance;
     },
+    async updateExternalHermesInstanceConfig(userId, input) {
+      const payload = await request<{ hermes_instance: HermesInstance }>(
+        `/api/admin/users/${userId}/hermes-instance/external-config`,
+        { method: "PUT", body: input },
+      );
+      return payload.hermes_instance;
+    },
     async listChannels() {
       const payload = await request<{ channels: Channel[] }>("/api/channels");
       return payload.channels;
@@ -310,6 +367,52 @@ export function createApiClient(): ApiClient {
         { method: "POST", body: { kind, title } },
       );
       return payload.session;
+    },
+    async listSessionMessages(channelId, sessionId) {
+      const payload = await request<{ messages: ChannelMessage[] }>(
+        `/api/channels/${channelId}/sessions/${sessionId}/messages`,
+      );
+      return payload.messages;
+    },
+    async appendSessionMessage(channelId, sessionId, input) {
+      const payload = await request<{ message: ChannelMessage }>(
+        `/api/channels/${channelId}/sessions/${sessionId}/messages`,
+        {
+          method: "POST",
+          body: {
+            role: input.role,
+            content: input.content,
+            attachments: stripAttachmentPreviews(input.attachments ?? []),
+          },
+        },
+      );
+      return payload.message;
+    },
+    async uploadSessionAttachments(channelId, sessionId, files) {
+      const form = new FormData();
+      for (const file of files) {
+        form.append("file", file, file.name);
+      }
+
+      const response = await fetch(
+        `/api/channels/${channelId}/sessions/${sessionId}/attachments`,
+        {
+          method: "POST",
+          credentials: "include",
+          body: form,
+        },
+      );
+
+      if (!response.ok) {
+        const message = await response
+          .json()
+          .then((value) => value.message ?? value.error ?? response.statusText)
+          .catch(() => response.statusText);
+        throw new Error(String(message));
+      }
+
+      const payload = (await response.json()) as { attachments: HermesAttachment[] };
+      return payload.attachments;
     },
     async generateSessionTitle(channelId, sessionId, prompt) {
       const payload = await request<{ session: ChannelSession }>(
@@ -367,11 +470,11 @@ export function createApiClient(): ApiClient {
         `/api/admin/model-config/${config.config_kind}/test`,
         {
           method: "POST",
-          body: { ...config, allowed_models: [config.default_model] },
+          body: normalizedModelConfig(config),
         },
       );
     },
-    async sendHermesPrompt(prompt, attachments = [], sessionId) {
+    async sendHermesPrompt(prompt, attachments = [], sessionId, handlers) {
       const response = await fetch("/api/hermes/v1/runs", {
         method: "POST",
         credentials: "include",
@@ -392,10 +495,12 @@ export function createApiClient(): ApiClient {
         if (!started.run_id) {
           throw new Error("Hermes run did not return a run_id");
         }
-        return readHermesRunEvents(started.run_id);
+        return readHermesRunEvents(started.run_id, handlers);
       }
 
-      return response.text();
+      const text = await response.text();
+      handlers?.onOutput?.(text);
+      return text;
     },
   };
 }
@@ -411,16 +516,19 @@ function hermesRunInput(prompt: string, attachments: HermesAttachment[]) {
   }
 
   for (const attachment of attachments) {
-    if (attachment.kind === "image") {
+    const url = attachment.data_url ?? absoluteAttachmentUrl(attachment.download_url);
+    if (attachment.kind === "image" && url) {
       content.push({
         type: "image_url",
-        image_url: { url: attachment.data_url },
+        image_url: { url },
       });
     } else {
-      // Hermes runs 端点当前不支持通用文件上传；先把文件元信息并入文本上下文。
+      // Hermes runs 端点当前没有稳定的通用文件上传字段；先把 Hub 附件引用并入文本上下文。
       content.push({
         type: "text",
-        text: `[Attached file: ${attachment.name} (${attachment.content_type})]`,
+        text: `[Attached file: ${attachment.name} (${attachment.content_type})${
+          attachment.download_url ? ` ${attachment.download_url}` : ""
+        }]`,
       });
     }
   }
@@ -428,7 +536,24 @@ function hermesRunInput(prompt: string, attachments: HermesAttachment[]) {
   return [{ role: "user", content }];
 }
 
-async function readHermesRunEvents(runId: string): Promise<string> {
+function absoluteAttachmentUrl(url: string | undefined) {
+  if (!url) {
+    return undefined;
+  }
+  if (/^https?:\/\//i.test(url) || url.startsWith("data:")) {
+    return url;
+  }
+  return `${globalThis.location?.origin ?? ""}${url}`;
+}
+
+function stripAttachmentPreviews(attachments: HermesAttachment[]): HermesAttachment[] {
+  return attachments.map(({ data_url: _dataUrl, ...attachment }) => attachment);
+}
+
+async function readHermesRunEvents(
+  runId: string,
+  handlers?: HermesStreamHandlers,
+): Promise<string> {
   const response = await fetch(`/api/hermes/v1/runs/${encodeURIComponent(runId)}/events`, {
     method: "GET",
     credentials: "include",
@@ -439,8 +564,61 @@ async function readHermesRunEvents(runId: string): Promise<string> {
     throw new Error(`Hermes run events failed: ${response.status}`);
   }
 
+  if (response.body) {
+    return readHermesRunEventsFromBody(response.body, handlers);
+  }
+
   const eventStream = await response.text();
-  const events = parseHermesRunEvents(eventStream);
+  const events = parseHermesRunEventLines(eventStream.split(/\r?\n/), handlers);
+  const result = reduceHermesRunEvents(events);
+  if (result.completedOutput) {
+    handlers?.onOutput?.(result.completedOutput);
+  }
+  return result.completedOutput || result.deltaText || eventStream;
+}
+
+async function readHermesRunEventsFromBody(
+  body: ReadableStream<Uint8Array>,
+  handlers?: HermesStreamHandlers,
+): Promise<string> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let deltaText = "";
+  let completedOutput = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() ?? "";
+    const result = reduceHermesRunEvents(parseHermesRunEventLines(lines, handlers));
+    deltaText += result.deltaText;
+    if (result.completedOutput) {
+      completedOutput = result.completedOutput;
+    }
+  }
+
+  buffer += decoder.decode();
+  if (buffer) {
+    const result = reduceHermesRunEvents(parseHermesRunEventLines(buffer.split(/\r?\n/), handlers));
+    deltaText += result.deltaText;
+    if (result.completedOutput) {
+      completedOutput = result.completedOutput;
+    }
+  }
+
+  if (completedOutput) {
+    handlers?.onOutput?.(completedOutput);
+  }
+  return completedOutput || deltaText;
+}
+
+function reduceHermesRunEvents(events: HermesRunEvent[]) {
   let deltaText = "";
   let completedOutput = "";
 
@@ -456,18 +634,24 @@ async function readHermesRunEvents(runId: string): Promise<string> {
     }
   }
 
-  return completedOutput || deltaText || eventStream;
+  return { deltaText, completedOutput };
 }
 
-function parseHermesRunEvents(eventStream: string): HermesRunEvent[] {
-  return eventStream
-    .split("\n")
+function parseHermesRunEventLines(
+  lines: string[],
+  handlers?: HermesStreamHandlers,
+): HermesRunEvent[] {
+  return lines
     .filter((line) => line.startsWith("data: "))
     .map((line) => line.slice("data: ".length).trim())
     .filter(Boolean)
     .flatMap((line) => {
       try {
-        return [JSON.parse(line) as HermesRunEvent];
+        const event = JSON.parse(line) as HermesRunEvent;
+        if (event.event === "message.delta" && event.delta) {
+          handlers?.onDelta?.(event.delta);
+        }
+        return [event];
       } catch {
         return [];
       }
@@ -498,6 +682,9 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     },
   ];
   let sessions: ChannelSession[] = [{ id: "session-1", channel_id: "channel-1", kind: "agent", title: "Session" }];
+  let messagesBySessionId: Record<string, ChannelMessage[]> = {
+    "session-1": [],
+  };
   let invites: Invite[] = [];
   let instance: HermesInstance | null = "initialInstance" in options ? options.initialInstance! : {
     id: "instance-1",
@@ -513,6 +700,8 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     provider_api_key: "ready-provider-key",
     default_model: "gpt-4.1-mini",
     allowed_models: ["gpt-4.1-mini"],
+    api_type: "chat_completions",
+    reasoning_effort: null,
     allow_streaming: true,
     request_timeout_seconds: 60,
   };
@@ -523,11 +712,14 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       config_kind: "image",
       default_model: "gpt-image-1",
       allowed_models: ["gpt-image-1"],
+      api_type: "images_generations",
+      reasoning_effort: null,
       allow_streaming: false,
     },
     {
       ...modelConfig,
       config_kind: "title",
+      api_type: "chat_completions",
       allow_streaming: false,
     },
   ];
@@ -613,6 +805,15 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       instance = { ...(instance as HermesInstance), status: "running" };
       return instance;
     },
+    async updateExternalHermesInstanceConfig(_userId, input) {
+      instance = {
+        ...(instance as HermesInstance),
+        kind: "external",
+        name: input.name,
+        base_url: input.base_url,
+      };
+      return instance;
+    },
     async listChannels() {
       return channels;
     },
@@ -627,7 +828,33 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     async createSession(channelId, kind, title) {
       const session = { id: `session-${sessions.length + 1}`, channel_id: channelId, kind, title };
       sessions = [session, ...sessions];
+      messagesBySessionId[session.id] = [];
       return session;
+    },
+    async listSessionMessages(_channelId, sessionId) {
+      return messagesBySessionId[sessionId] ?? [];
+    },
+    async appendSessionMessage(_channelId, sessionId, input) {
+      const message: ChannelMessage = {
+        id: `message-${(messagesBySessionId[sessionId] ?? []).length + 1}`,
+        session_id: sessionId,
+        role: input.role,
+        content: input.content,
+        attachments: input.attachments ?? [],
+        created_at: Date.now(),
+      };
+      messagesBySessionId[sessionId] = [...(messagesBySessionId[sessionId] ?? []), message];
+      return message;
+    },
+    async uploadSessionAttachments(_channelId, sessionId, files) {
+      return files.map((file, index) => ({
+        id: `attachment-${sessionId}-${index + 1}`,
+        name: file.name,
+        content_type: file.type || "application/octet-stream",
+        kind: file.type.startsWith("image/") ? "image" : "file",
+        size: file.size,
+        download_url: `/api/attachments/attachment-${sessionId}-${index + 1}/download`,
+      }));
     },
     async generateSessionTitle(channelId, sessionId, prompt) {
       const session = sessions.find((item) => item.id === sessionId && item.channel_id === channelId);
@@ -670,9 +897,10 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       return modelConfigs;
     },
     async updateModelConfig(config) {
+      const normalized = normalizedModelConfig(config);
       modelConfigs = modelConfigs.map((existing) =>
         existing.config_kind === config.config_kind
-          ? { ...config, allowed_models: [config.default_model] }
+          ? normalized
           : existing,
       );
       modelConfig =
@@ -691,7 +919,10 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
         duration_ms: 12,
       };
     },
-    async sendHermesPrompt(prompt) {
+    async sendHermesPrompt(prompt, _attachments, _sessionId, handlers) {
+      // 让 mock 行为接近真实 fetch 流：delta 会在调用栈释放后到达。
+      await Promise.resolve();
+      handlers?.onDelta?.(prompt);
       return prompt;
     },
   };

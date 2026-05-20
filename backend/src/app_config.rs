@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use crate::hermes::docker_provisioner::HermesContainerConnectMode;
-use crate::model_config::{ModelConfig, LLM_MODEL_CONFIG_KIND};
+use crate::model_config::{
+    normalize_reasoning_effort, ModelConfig, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND,
+};
 
 /// 应用启动配置。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -14,6 +16,7 @@ pub struct AppConfig {
     pub secret_master_key: Option<String>,
     pub initial_model_config: ModelConfig,
     pub hermes_docker: HermesDockerConfig,
+    pub object_storage: ObjectStorageConfig,
     pub proxy_timeout_seconds: u64,
     pub max_proxy_body_bytes: usize,
     pub static_dir: PathBuf,
@@ -35,6 +38,19 @@ pub struct HermesDockerConfig {
     pub docker_binary: String,
 }
 
+/// Hub 文件服务使用的 S3-compatible 对象存储配置。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectStorageConfig {
+    pub endpoint: Option<String>,
+    pub bucket: String,
+    pub region: String,
+    pub access_key: Option<String>,
+    pub secret_key: Option<String>,
+    pub force_path_style: bool,
+    pub prefix: String,
+    pub max_upload_bytes: usize,
+}
+
 impl AppConfig {
     /// 测试环境使用固定的本地配置，避免依赖真实端口和外部环境变量。
     pub fn for_tests() -> Self {
@@ -45,6 +61,7 @@ impl AppConfig {
             secret_master_key: None,
             initial_model_config: default_model_config(),
             hermes_docker: default_hermes_docker_config(),
+            object_storage: default_object_storage_config(),
             proxy_timeout_seconds: 60,
             max_proxy_body_bytes: 10 * 1024 * 1024,
             static_dir: PathBuf::from("frontend/dist"),
@@ -66,6 +83,7 @@ impl AppConfig {
             secret_master_key: std::env::var("HERMES_HUB_SECRET_MASTER_KEY").ok(),
             initial_model_config: model_config_from_env(),
             hermes_docker: hermes_docker_config_from_env(),
+            object_storage: object_storage_config_from_env(),
             proxy_timeout_seconds: env_u64("HERMES_HUB_PROXY_TIMEOUT_SECONDS", 60),
             max_proxy_body_bytes: env_usize("HERMES_HUB_MAX_PROXY_BODY_BYTES", 10 * 1024 * 1024),
             static_dir: PathBuf::from(
@@ -73,6 +91,25 @@ impl AppConfig {
                     .unwrap_or_else(|_| "frontend/dist".to_string()),
             ),
         }
+    }
+}
+
+fn object_storage_config_from_env() -> ObjectStorageConfig {
+    ObjectStorageConfig {
+        endpoint: optional_env("HERMES_OBJECT_STORAGE_ENDPOINT"),
+        bucket: std::env::var("HERMES_OBJECT_STORAGE_BUCKET")
+            .unwrap_or_else(|_| "hermes-hub".to_string()),
+        region: std::env::var("HERMES_OBJECT_STORAGE_REGION")
+            .unwrap_or_else(|_| "us-east-1".to_string()),
+        access_key: optional_env("HERMES_OBJECT_STORAGE_ACCESS_KEY"),
+        secret_key: optional_env("HERMES_OBJECT_STORAGE_SECRET_KEY"),
+        force_path_style: std::env::var("HERMES_OBJECT_STORAGE_FORCE_PATH_STYLE")
+            .ok()
+            .and_then(|value| value.parse::<bool>().ok())
+            .unwrap_or(true),
+        prefix: std::env::var("HERMES_OBJECT_STORAGE_PREFIX")
+            .unwrap_or_else(|_| "attachments".to_string()),
+        max_upload_bytes: env_usize("HERMES_OBJECT_STORAGE_MAX_UPLOAD_BYTES", 25 * 1024 * 1024),
     }
 }
 
@@ -99,6 +136,11 @@ fn model_config_from_env() -> ModelConfig {
         .ok()
         .and_then(|value| value.parse::<bool>().ok())
         .unwrap_or(true);
+    let api_type = std::env::var("HERMES_HUB_MODEL_API_TYPE")
+        .unwrap_or_else(|_| CHAT_COMPLETIONS_API_TYPE.to_string());
+    let reasoning_effort =
+        normalize_reasoning_effort(std::env::var("HERMES_HUB_MODEL_REASONING_EFFORT").ok())
+            .unwrap_or(None);
 
     ModelConfig {
         config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
@@ -110,6 +152,8 @@ fn model_config_from_env() -> ModelConfig {
             .unwrap_or_else(|_| "provider-secret".to_string()),
         default_model,
         allowed_models,
+        api_type,
+        reasoning_effort,
         allow_streaming,
         request_timeout_seconds,
     }
@@ -151,6 +195,8 @@ fn default_model_config() -> ModelConfig {
         provider_api_key: "provider-secret".to_string(),
         default_model: "gpt-4.1-mini".to_string(),
         allowed_models: vec!["gpt-4.1-mini".to_string()],
+        api_type: CHAT_COMPLETIONS_API_TYPE.to_string(),
+        reasoning_effort: None,
         allow_streaming: true,
         request_timeout_seconds: 60,
     }
@@ -169,6 +215,19 @@ fn default_hermes_docker_config() -> HermesDockerConfig {
         memory_limit: Some("1g".to_string()),
         cpu_limit: Some("1.0".to_string()),
         docker_binary: "docker".to_string(),
+    }
+}
+
+fn default_object_storage_config() -> ObjectStorageConfig {
+    ObjectStorageConfig {
+        endpoint: None,
+        bucket: "hermes-hub-test".to_string(),
+        region: "us-east-1".to_string(),
+        access_key: None,
+        secret_key: None,
+        force_path_style: true,
+        prefix: "attachments".to_string(),
+        max_upload_bytes: 25 * 1024 * 1024,
     }
 }
 

@@ -15,6 +15,7 @@ use hermes_hub_backend::{
     llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
     model_config::ModelRegistry,
     session::store::SessionStore,
+    storage::InMemoryObjectStorage,
     AppConfig, AppState,
 };
 use serde_json::{json, Value};
@@ -28,7 +29,7 @@ fn test_state(provider: InMemoryLlmProviderClient, proxy: InMemoryHermesProxyCli
     let config = AppConfig::for_tests();
     AppState {
         docker_provisioner: DockerProvisioner::new_with_runtime(
-            docker_config_from_app(&config, config.initial_model_config.default_model.clone()),
+            docker_config_from_app(&config, &config.initial_model_config),
             Arc::new(NoopDockerRuntime),
         ),
         config,
@@ -37,6 +38,7 @@ fn test_state(provider: InMemoryLlmProviderClient, proxy: InMemoryHermesProxyCli
         hermes_proxy: proxy.shared(),
         model_registry: ModelRegistry::default_for_tests(),
         llm_provider: provider.shared(),
+        object_storage: InMemoryObjectStorage::default().shared(),
     }
 }
 
@@ -264,6 +266,8 @@ async fn integration_test() {
             "provider_api_key": "provider-key-one",
             "default_model": "gpt-4.1-mini",
             "allowed_models": ["gpt-4.1-mini", "gpt-4.1"],
+            "api_type": "responses",
+            "reasoning_effort": "low",
             "allow_streaming": true,
             "request_timeout_seconds": 30
         }),
@@ -283,6 +287,8 @@ async fn integration_test() {
             "provider_api_key": "provider-key-one",
             "default_model": "gpt-4.1-mini",
             "allowed_models": ["gpt-4.1-mini", "gpt-4.1"],
+            "api_type": "responses",
+            "reasoning_effort": "low",
             "allow_streaming": true,
             "request_timeout_seconds": 30
         }),
@@ -295,10 +301,11 @@ async fn integration_test() {
     assert_eq!(body["ok"], true);
     assert_eq!(body["status_code"], 200);
     let forwarded = provider.last_request().expect("llm test provider request");
-    assert_eq!(forwarded.path, "/chat/completions");
+    assert_eq!(forwarded.path, "/responses");
     assert_eq!(forwarded.authorization, "Bearer provider-key-one");
     let forwarded_body: Value = serde_json::from_slice(&forwarded.body).expect("provider json");
     assert_eq!(forwarded_body["model"], "gpt-4.1-mini");
+    assert_eq!(forwarded_body["reasoning"]["effort"], "low");
 
     let test_image_model = request_json(
         &app,
@@ -416,6 +423,7 @@ async fn integration_test() {
     assert_eq!(forwarded.authorization, "Bearer provider-key-one");
     let forwarded_body: Value = serde_json::from_slice(&forwarded.body).expect("provider json");
     assert_eq!(forwarded_body["model"], "gpt-4.1-mini");
+    assert_eq!(forwarded_body["reasoning"]["effort"], "low");
 
     let rotate_model = request_json(
         &app,

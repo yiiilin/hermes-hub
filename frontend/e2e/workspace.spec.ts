@@ -42,6 +42,8 @@ test("renders channel and session workspace panels", async ({ page }) => {
           provider_base_url: "https://provider.example/v1",
           default_model: "gpt-4.1-mini",
           allowed_models: ["gpt-4.1-mini"],
+          api_type: "chat_completions",
+          reasoning_effort: null,
           allow_streaming: true,
           request_timeout_seconds: 60,
         },
@@ -52,6 +54,8 @@ test("renders channel and session workspace panels", async ({ page }) => {
             provider_base_url: "https://provider.example/v1",
             default_model: "gpt-4.1-mini",
             allowed_models: ["gpt-4.1-mini"],
+            api_type: "chat_completions",
+            reasoning_effort: null,
             allow_streaming: true,
             request_timeout_seconds: 60,
           },
@@ -61,6 +65,8 @@ test("renders channel and session workspace panels", async ({ page }) => {
             provider_base_url: "https://provider.example/v1",
             default_model: "gpt-image-1",
             allowed_models: ["gpt-image-1"],
+            api_type: "images_generations",
+            reasoning_effort: null,
             allow_streaming: false,
             request_timeout_seconds: 60,
           },
@@ -70,6 +76,8 @@ test("renders channel and session workspace panels", async ({ page }) => {
             provider_base_url: "https://provider.example/v1",
             default_model: "gpt-4.1-mini",
             allowed_models: ["gpt-4.1-mini"],
+            api_type: "chat_completions",
+            reasoning_effort: null,
             allow_streaming: false,
             request_timeout_seconds: 60,
           },
@@ -106,11 +114,32 @@ test("renders channel and session workspace panels", async ({ page }) => {
       },
     });
   });
+  await page.route("**/api/channels/channel-1/sessions/session-1/messages", async (route) => {
+    await route.fulfill({
+      json: {
+        messages: [
+          {
+            id: "message-1",
+            session_id: "session-1",
+            role: "assistant",
+            content: "stored answer",
+            attachments: [],
+            created_at: 1,
+          },
+        ],
+      },
+    });
+  });
 
   await page.goto("/");
 
   await expect(page.getByRole("heading", { name: "hermes-hub" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "对话" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "New chat" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Run" })).toBeVisible();
+  await expect(page.getByText("stored answer")).toBeVisible();
   await expect(page.getByRole("button", { name: "用户管理" })).toBeVisible();
   await expect(page.getByRole("button", { name: "模型配置管理" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Hermes 管理" })).toBeVisible();
+  await expect(page.locator(".message-list")).toHaveCSS("overflow-y", "auto");
 });

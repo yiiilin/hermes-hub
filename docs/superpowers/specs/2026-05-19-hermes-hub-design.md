@@ -78,6 +78,7 @@ A concrete interaction thread inside a channel.
 - The Hub stores the mapping to Hermes response/run identifiers
 - Chat-style sessions map cleanly to Hermes `conversation` and `previous_response_id`
 - Agent-style sessions map to Hermes `run_id` and SSE run events
+- The Hub stores UI message snapshots and attachment metadata so session history remains stable even when Hermes does not expose a stable history REST API
 
 ### Model Config
 Admin-managed global model settings.
@@ -114,6 +115,8 @@ Minimal v1 tables:
 - `model_configs`
 - `proxy_audit_logs`
 - `llm_usage_events`
+- `channel_session_messages`
+- `channel_attachments`
 
 Secrets are stored encrypted in PostgreSQL with an application-level master key supplied through environment variables.
 
@@ -154,6 +157,16 @@ Secrets are stored encrypted in PostgreSQL with an application-level master key 
 - `GET /api/channels/:channel_id/sessions`
 - `POST /api/channels/:channel_id/sessions`
 - `GET /api/channels/:channel_id/sessions/:session_id`
+- `GET /api/channels/:channel_id/sessions/:session_id/messages`
+- `POST /api/channels/:channel_id/sessions/:session_id/messages`
+- `POST /api/channels/:channel_id/sessions/:session_id/attachments`
+- `GET /api/attachments/:attachment_id/download`
+
+### Hermes Channel Protocol
+- `POST /internal/channel/v1/sessions/:session_id/attachments`
+- `POST /internal/channel/v1/sessions/:session_id/messages`
+
+The internal channel protocol is authenticated with the Hermes instance token. It lets Hermes-side platform adapters upload generated files/images and deliver assistant messages back to Hub without Hub reading Hermes container mount paths.
 
 ### Hermes Proxy
 - `/api/hermes/{path...}`
@@ -185,6 +198,7 @@ The proxy enforces the admin model allowlist and returns an error if the request
 - Rust backend with Axum, Tokio, SQLx
 - React frontend
 - PostgreSQL
+- S3-compatible object storage for session-bound attachments, with RustFS as the Compose default
 - Docker socket access for v1 provisioning
 
 ## Security

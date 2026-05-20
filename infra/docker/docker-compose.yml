@@ -17,6 +17,53 @@ services:
       timeout: 3s
       retries: 10
 
+  rustfs-perms:
+    image: alpine:3.20
+    command: ["sh", "-lc", "mkdir -p /data && chown -R 10001:10001 /data"]
+    volumes:
+      - ./data/rustfs:/data
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    depends_on:
+      rustfs-perms:
+        condition: service_completed_successfully
+    command: ["/data"]
+    environment:
+      RUSTFS_ACCESS_KEY: ${HERMES_OBJECT_STORAGE_ACCESS_KEY:-rustfsadmin}
+      RUSTFS_SECRET_KEY: ${HERMES_OBJECT_STORAGE_SECRET_KEY:-rustfsadmin}
+      RUSTFS_CONSOLE_ENABLE: "true"
+    ports:
+      - "${RUSTFS_API_HOST_PORT:-9000}:9000"
+      - "${RUSTFS_CONSOLE_HOST_PORT:-9001}:9001"
+    volumes:
+      - ./data/rustfs:/data
+    networks:
+      - hermes-hub-net
+
+  rustfs-init:
+    image: minio/mc:latest
+    depends_on:
+      rustfs:
+        condition: service_started
+    environment:
+      HERMES_OBJECT_STORAGE_ACCESS_KEY: ${HERMES_OBJECT_STORAGE_ACCESS_KEY:-rustfsadmin}
+      HERMES_OBJECT_STORAGE_SECRET_KEY: ${HERMES_OBJECT_STORAGE_SECRET_KEY:-rustfsadmin}
+      HERMES_OBJECT_STORAGE_BUCKET: ${HERMES_OBJECT_STORAGE_BUCKET:-hermes-hub}
+    entrypoint:
+      - /bin/sh
+      - -lc
+      - |
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+          mc alias set rustfs http://rustfs:9000 "${HERMES_OBJECT_STORAGE_ACCESS_KEY:-rustfsadmin}" "${HERMES_OBJECT_STORAGE_SECRET_KEY:-rustfsadmin}" &&
+          mc mb -p --ignore-existing "rustfs/${HERMES_OBJECT_STORAGE_BUCKET:-hermes-hub}" &&
+          exit 0
+          sleep 2
+        done
+        exit 1
+    networks:
+      - hermes-hub-net
+
   # 仅用于本地联调便利：当前服务使用源码挂载，不是生产镜像。
   backend:
     profiles: ["app-dev"]
@@ -36,6 +83,13 @@ services:
       HERMES_CONTAINER_INTERNAL_PORT: 8000
       HERMES_CONTAINER_CONNECT_MODE: network
       HERMES_HUB_LLM_BASE_URL: http://hermes-hub:8080/internal/llm/v1
+      HERMES_OBJECT_STORAGE_ENDPOINT: http://rustfs:9000
+      HERMES_OBJECT_STORAGE_BUCKET: ${HERMES_OBJECT_STORAGE_BUCKET:-hermes-hub}
+      HERMES_OBJECT_STORAGE_REGION: ${HERMES_OBJECT_STORAGE_REGION:-us-east-1}
+      HERMES_OBJECT_STORAGE_ACCESS_KEY: ${HERMES_OBJECT_STORAGE_ACCESS_KEY:-rustfsadmin}
+      HERMES_OBJECT_STORAGE_SECRET_KEY: ${HERMES_OBJECT_STORAGE_SECRET_KEY:-rustfsadmin}
+      HERMES_OBJECT_STORAGE_FORCE_PATH_STYLE: "true"
+      HERMES_OBJECT_STORAGE_PREFIX: ${HERMES_OBJECT_STORAGE_PREFIX:-attachments}
     volumes:
       - .:/workspace
       - ./data/hub/users:${PWD}/data/hub/users
@@ -43,6 +97,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      rustfs-init:
+        condition: service_completed_successfully
     ports:
       - "8080:8080"
     networks:

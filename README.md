@@ -10,6 +10,7 @@ Hermes Hub is an invite-only multi-user control plane for isolated Hermes agent 
 - In-memory runtime mode remains available when `DATABASE_URL` is not set, mainly for lightweight tests and demos.
 - Docker CLI based Hermes provisioner for one isolated Hermes container per user.
 - Managed Hermes receives an internal OpenAI-compatible gateway URL plus an instance token; the browser API does not expose that token.
+- Hub-owned session message snapshots and S3-compatible attachment storage, with RustFS wired in the Compose files.
 - Proxy audit logs and LLM usage metadata are written without storing prompt bodies.
 
 ## Development
@@ -59,7 +60,7 @@ You can still run `npm run dev` during UI development; that is only a local deve
 
 ```bash
 docker compose --project-directory . -f infra/docker/docker-compose.yml config
-docker compose --project-directory . -f infra/docker/docker-compose.yml up -d postgres
+docker compose --project-directory . -f infra/docker/docker-compose.yml up -d postgres rustfs rustfs-init
 
 # If local port 5432 is already in use:
 POSTGRES_HOST_PORT=55432 docker compose --project-directory . -f infra/docker/docker-compose.yml up -d postgres
@@ -70,7 +71,7 @@ docker compose --project-directory . -f infra/docker/docker-compose.yml --profil
 
 The compose file is intentionally source-mounted for local development, not a production image build. The backend service mounts `/var/run/docker.sock` so it can create per-user Hermes containers on the `hermes-hub-net` network. That socket is a high-trust deployment boundary; in production, run the backend only where Docker daemon access is intended.
 
-PostgreSQL data is bind-mounted under project root `./data/postgres`, and Hub-managed Hermes workspace/sandbox/config data is bind-mounted under `./data/hub/users`. The `data/` directory is ignored by git.
+PostgreSQL data is bind-mounted under project root `./data/postgres`, RustFS object data is bind-mounted under `./data/rustfs`, and Hub-managed Hermes workspace/sandbox/config data is bind-mounted under `./data/hub/users`. The `data/` directory is ignored by git.
 
 Managed Hermes containers use host-path workspace/sandbox/config directories under `HERMES_DATA_ROOT`. Hub creates the Docker network if needed, creates or starts a container named `hermes-user-<user-id>`, and injects:
 
@@ -81,6 +82,25 @@ Managed Hermes containers use host-path workspace/sandbox/config directories und
 When Hub itself runs in Docker Compose, keep `HERMES_CONTAINER_CONNECT_MODE=network`; Hub reaches Hermes by container name and no host ports are published. When the backend runs directly on the host for local development, use `HERMES_CONTAINER_CONNECT_MODE=published-host`; each Hermes container publishes a random loopback port and Hub stores a local `base_url` such as `http://127.0.0.1:<port>`. In that host mode, `HERMES_HUB_LLM_BASE_URL` must be an address the Hermes container can use to call back into Hub, for example a LAN IP or Docker host-gateway address.
 
 Hermes model traffic should target Hub’s internal `/internal/llm/v1` gateway. Admin model config changes take effect at the gateway without restarting Hermes containers.
+
+### Files and Channel Delivery
+
+Browser uploads go through Hub, are stored through the configured S3-compatible backend, and are returned as Hub attachment records with `/api/attachments/<id>/download` URLs. The first Compose target is RustFS, but the backend only depends on S3-compatible settings:
+
+- `HERMES_OBJECT_STORAGE_ENDPOINT`
+- `HERMES_OBJECT_STORAGE_BUCKET`
+- `HERMES_OBJECT_STORAGE_REGION`
+- `HERMES_OBJECT_STORAGE_ACCESS_KEY`
+- `HERMES_OBJECT_STORAGE_SECRET_KEY`
+- `HERMES_OBJECT_STORAGE_FORCE_PATH_STYLE`
+- `HERMES_OBJECT_STORAGE_PREFIX`
+
+Hermes-side channel adapters should use the internal protocol with the instance token that Hub already issues to each Hermes instance:
+
+- `POST /internal/channel/v1/sessions/{session_id}/attachments` with `multipart/form-data`
+- `POST /internal/channel/v1/sessions/{session_id}/messages` with `{ role, content, attachments }`
+
+This keeps file lifecycle bound to the Hub session and avoids reading files directly from Hermes container bind mounts.
 
 ## Hub Deployment Compose
 
@@ -95,6 +115,8 @@ HERMES_HUB_MODEL_PROVIDER_BASE_URL=https://api.openai.com/v1
 HERMES_HUB_MODEL_PROVIDER_API_KEY=sk-...
 HERMES_HUB_DEFAULT_MODEL=gpt-4.1-mini
 HERMES_HUB_ALLOWED_MODELS=gpt-4.1-mini,gpt-4.1
+HERMES_OBJECT_STORAGE_ACCESS_KEY=rustfsadmin
+HERMES_OBJECT_STORAGE_SECRET_KEY=change-me-rustfs-secret
 HERMES_HUB_HTTP_PORT=8080
 ```
 
@@ -105,7 +127,7 @@ docker compose --project-directory . --env-file .env -f infra/docker/docker-comp
 docker compose --project-directory . --env-file .env -f infra/docker/docker-compose.hub.yml up -d --build
 ```
 
-Run the compose commands from the project root. With `--project-directory .`, both compose files store PostgreSQL under `./data/postgres` and Hub/Hermes runtime data under `./data/hub/users`.
+Run the compose commands from the project root. With `--project-directory .`, both compose files store PostgreSQL under `./data/postgres`, RustFS object data under `./data/rustfs`, and Hub/Hermes runtime data under `./data/hub/users`.
 
 ## Verification Boundary
 

@@ -14,6 +14,9 @@ describe("App", () => {
     render(<App apiClient={createMockApiClient()} />);
 
     expect(await screen.findByRole("heading", { name: "hermes-hub" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "对话" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "New chat" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Session" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "用户管理" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "模型配置管理" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Hermes 管理" })).toBeInTheDocument();
@@ -26,6 +29,8 @@ describe("App", () => {
     await waitFor(() => {
       expect(screen.getAllByText("hello")).toHaveLength(2);
     });
+    fireEvent.click(screen.getByRole("button", { name: "Session" }));
+    expect(screen.getAllByText("hello")).toHaveLength(2);
 
     fireEvent.click(screen.getByRole("button", { name: "用户管理" }));
     expect(await screen.findByRole("heading", { name: "用户管理" })).toBeInTheDocument();
@@ -158,6 +163,8 @@ describe("App", () => {
           provider_api_key: "stored-provider-key",
           default_model: "gpt-4.1-mini",
           allowed_models: ["gpt-4.1-mini"],
+          api_type: "responses",
+          reasoning_effort: "medium",
           allow_streaming: true,
           request_timeout_seconds: 60,
         },
@@ -189,22 +196,119 @@ describe("App", () => {
       }
 
       expect(path).toBe("/api/hermes/v1/runs/run-1/events");
+      const encoder = new TextEncoder();
       return {
         ok: true,
         status: 200,
-        text: async () =>
-          [
-            'data: {"event":"message.delta","delta":"he"}',
-            'data: {"event":"message.delta","delta":"llo"}',
-            'data: {"event":"run.completed","output":"hello"}',
-            "",
-          ].join("\n"),
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(encoder.encode('data: {"event":"message.delta","delta":"he"}\n'));
+            controller.enqueue(
+              encoder.encode('data: {"event":"message.delta","delta":"llo"}\n'),
+            );
+            controller.enqueue(
+              encoder.encode('data: {"event":"run.completed","output":"hello"}\n\n'),
+            );
+            controller.close();
+          },
+        }),
       } as Response;
     });
 
-    await expect(createApiClient().sendHermesPrompt("hello", [], "session-1")).resolves.toBe(
-      "hello",
-    );
+    const deltas: string[] = [];
+    await expect(
+      createApiClient().sendHermesPrompt("hello", [], "session-1", {
+        onDelta(delta) {
+          deltas.push(delta);
+        },
+      }),
+    ).resolves.toBe("hello");
+    expect(deltas).toEqual(["he", "llo"]);
+    fetchMock.mockRestore();
+  });
+
+  it("uploads attachments and reads persisted messages in the real API client", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (path, init) => {
+      if (path === "/api/channels/channel-1/sessions/session-1/attachments") {
+        expect(init?.method).toBe("POST");
+        expect(init?.body).toBeInstanceOf(FormData);
+        return {
+          ok: true,
+          status: 201,
+          json: async () => ({
+            attachments: [
+              {
+                id: "attachment-1",
+                name: "note.txt",
+                content_type: "text/plain",
+                kind: "file",
+                size: 5,
+                download_url: "/api/attachments/attachment-1/download",
+              },
+            ],
+          }),
+        } as Response;
+      }
+
+      if (path === "/api/channels/channel-1/sessions/session-1/messages") {
+        if (init?.method === "POST") {
+          return {
+            ok: true,
+            status: 201,
+            json: async () => ({
+              message: {
+                id: "message-2",
+                session_id: "session-1",
+                role: "user",
+                content: "hello",
+                attachments: [],
+                created_at: 1,
+              },
+            }),
+          } as Response;
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            messages: [
+              {
+                id: "message-1",
+                session_id: "session-1",
+                role: "assistant",
+                content: "stored answer",
+                attachments: [],
+                created_at: 1,
+              },
+            ],
+          }),
+        } as Response;
+      }
+
+      throw new Error(`unexpected fetch ${String(path)}`);
+    });
+
+    const client = createApiClient() as any;
+    await expect(
+      client.uploadSessionAttachments("channel-1", "session-1", [
+        new File(["hello"], "note.txt", { type: "text/plain" }),
+      ]),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        id: "attachment-1",
+        download_url: "/api/attachments/attachment-1/download",
+      }),
+    ]);
+    await expect(client.listSessionMessages("channel-1", "session-1")).resolves.toEqual([
+      expect.objectContaining({ content: "stored answer" }),
+    ]);
+    await expect(
+      client.appendSessionMessage("channel-1", "session-1", {
+        role: "user",
+        content: "hello",
+        attachments: [],
+      }),
+    ).resolves.toEqual(expect.objectContaining({ content: "hello" }));
     fetchMock.mockRestore();
   });
 

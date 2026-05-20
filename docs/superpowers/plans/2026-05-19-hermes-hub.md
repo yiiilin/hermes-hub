@@ -438,3 +438,78 @@ Document production adapter defaults, Docker socket/data-root/network requiremen
 Run: `cargo test --workspace && cd frontend && npm test && npm run build && npm run test:e2e && cd .. && docker compose -f infra/docker/docker-compose.yml config`
 
 Expected: pass, with any real-Hermes/manual-provider gaps explicitly documented.
+
+### Task 12: Add Hub-owned chat history, S3-backed attachments, and channel delivery protocol
+
+**Files:**
+- Modify: `backend/Cargo.toml`
+- Modify: `Cargo.toml`
+- Modify: `backend/migrations/0001_init.sql`
+- Modify: `backend/src/app_config.rs`
+- Modify: `backend/src/lib.rs`
+- Modify: `backend/src/http/mod.rs`
+- Modify: `backend/src/channel/routes.rs`
+- Modify: `backend/src/channel/service.rs`
+- Create: `backend/src/storage.rs`
+- Create: `backend/src/http/attachments.rs`
+- Create: `backend/src/http/channel_protocol.rs`
+- Modify: `backend/tests/hermes_proxy_test.rs`
+- Modify: `backend/tests/postgres_persistence_test.rs`
+- Modify: `backend/tests/schema_test.rs`
+- Modify: `frontend/src/api/client.ts`
+- Modify: `frontend/src/components/layout.tsx`
+- Modify: `frontend/src/routes/channel-session.tsx`
+- Modify: `frontend/src/app.tsx`
+- Modify: `frontend/src/styles.css`
+- Modify: `frontend/src/app.test.tsx`
+- Modify: `frontend/e2e/workspace.spec.ts`
+- Modify: `infra/docker/docker-compose.yml`
+- Modify: `infra/docker/docker-compose.hub.yml`
+- Modify: `.env.example`
+- Modify: `README.md`
+
+- [x] **Step 1: Write failing backend tests for message history and attachment protocol**
+
+Add tests for persisted session messages, object-backed attachment upload/download, and instance-token-authenticated channel delivery from Hermes into a Hub session.
+
+Run: `cargo test -p hermes-hub-backend --test hermes_proxy_test --test postgres_persistence_test --test schema_test`
+
+Expected: fail until storage, attachment routes, and channel protocol routes are implemented.
+
+- [x] **Step 2: Implement storage, attachment metadata, and channel protocol routes**
+
+Add a provider-neutral `ObjectStorage` abstraction with in-memory and S3-compatible implementations, store attachment metadata in PostgreSQL, expose browser upload/download routes, and expose internal Hermes channel routes authenticated by existing instance tokens.
+
+Run: `cargo test -p hermes-hub-backend --test hermes_proxy_test --test postgres_persistence_test --test schema_test`
+
+Expected: pass.
+
+- [x] **Step 3: Write failing frontend tests for sidebar sessions, history loading, and attachments**
+
+Add React and Playwright tests proving the global sidebar contains `New chat` and session rows, selecting a session loads stored messages, the chat pane scrolls instead of expanding the page, and uploaded attachments render from Hub download URLs.
+
+Run: `cd frontend && npm test -- --run && npm run test:e2e`
+
+Expected: fail until the UI and API client use the new routes.
+
+- [x] **Step 4: Implement the frontend chat layout and API integration**
+
+Move session navigation into the global sidebar via a chat slot, remove the inner chat sidebar, load/persist messages through Hub APIs, upload attachments before sending, and keep the right pane as a fixed-height scrollable chat surface.
+
+Run: `cd frontend && npm test -- --run && npm run build && npm run test:e2e`
+
+Expected: pass.
+
+- [x] **Step 5: Add RustFS deployment wiring and release documentation**
+
+Add RustFS plus bucket initialization to both Compose files under `./data/rustfs`, document required S3-compatible environment variables, and record Hermes channel/file protocol expectations.
+
+Run: `docker compose -f infra/docker/docker-compose.yml config && docker compose --project-directory . -f infra/docker/docker-compose.hub.yml config`
+
+Expected: pass.
+
+- [x] **Step 6: Verify the full project and commit**
+
+Run: `cargo test --workspace && cd frontend && npm test -- --run && npm run build && npm run test:e2e && cd .. && git diff --check`
+
+Expected: pass. Then commit all Task 12 changes.
