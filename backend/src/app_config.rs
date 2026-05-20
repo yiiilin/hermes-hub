@@ -15,6 +15,7 @@ pub struct AppConfig {
     pub hermes_docker: HermesDockerConfig,
     pub proxy_timeout_seconds: u64,
     pub max_proxy_body_bytes: usize,
+    pub static_dir: PathBuf,
 }
 
 /// Hub 托管 Hermes 容器时使用的 Docker 配置。
@@ -42,6 +43,7 @@ impl AppConfig {
             hermes_docker: default_hermes_docker_config(),
             proxy_timeout_seconds: 60,
             max_proxy_body_bytes: 10 * 1024 * 1024,
+            static_dir: PathBuf::from("frontend/dist"),
         }
     }
 
@@ -64,6 +66,10 @@ impl AppConfig {
             max_proxy_body_bytes: env_usize(
                 "HERMES_HUB_MAX_PROXY_BODY_BYTES",
                 10 * 1024 * 1024,
+            ),
+            static_dir: PathBuf::from(
+                std::env::var("HERMES_HUB_STATIC_DIR")
+                    .unwrap_or_else(|_| "frontend/dist".to_string()),
             ),
         }
     }

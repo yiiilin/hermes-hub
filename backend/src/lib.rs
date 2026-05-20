@@ -27,6 +27,7 @@ use serde::Serialize;
 use session::store::SessionStore;
 use std::sync::Arc;
 use thiserror::Error;
+use tower_http::services::{ServeDir, ServeFile};
 
 pub use app_config::AppConfig;
 
@@ -127,9 +128,15 @@ pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppIn
 }
 
 pub fn build_router_with_state(state: AppState) -> Router {
+    let static_dir = state.config.static_dir.clone();
+    let index_file = static_dir.join("index.html");
+    // 后端作为 Web 服务器托管前端构建产物；SPA 深链统一回落到 index.html。
+    let static_assets = ServeDir::new(static_dir).fallback(ServeFile::new(index_file));
+
     Router::new()
         .route("/health", get(health))
         .merge(http::router())
+        .fallback_service(static_assets)
         .with_state(state)
 }
 

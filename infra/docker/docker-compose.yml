@@ -8,7 +8,7 @@ services:
     ports:
       - "${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - ./data/postgres:/var/lib/postgresql/data
     networks:
       - hermes-hub-net
     healthcheck:
@@ -28,14 +28,16 @@ services:
       DATABASE_URL: postgres://hermes_hub:hermes_hub@postgres:5432/hermes_hub
       HERMES_HUB_SECRET_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
       HERMES_HUB_COOKIE_NAME: hermes_hub_session
-      HERMES_DATA_ROOT: /data/hermes-hub/users
+      # backend 通过宿主机 Docker daemon 创建兄弟 Hermes 容器；
+      # 这里必须使用宿主机绝对路径，才能让 Docker bind mount 找到真实目录。
+      HERMES_DATA_ROOT: ${PWD}/data/hub/users
       HERMES_DOCKER_IMAGE: nousresearch/hermes-agent:latest
       HERMES_CONTAINER_NETWORK: hermes-hub-net
       HERMES_CONTAINER_INTERNAL_PORT: 8000
       HERMES_HUB_LLM_BASE_URL: http://hermes-hub:8080/internal/llm/v1
     volumes:
-      - ../..:/workspace
-      - hermes_data:/data/hermes-hub
+      - .:/workspace
+      - ./data/hub/users:${PWD}/data/hub/users
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       postgres:
@@ -54,17 +56,13 @@ services:
     working_dir: /workspace/frontend
     command: ["sh", "-lc", "npm install && npm run dev -- --host 0.0.0.0 --port 5173"]
     volumes:
-      - ../..:/workspace
+      - .:/workspace
     depends_on:
       - backend
     ports:
       - "5173:5173"
     networks:
       - hermes-hub-net
-
-volumes:
-  postgres_data:
-  hermes_data:
 
 networks:
   hermes-hub-net:

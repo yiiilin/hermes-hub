@@ -1,0 +1,11 @@
+.git
+target
+frontend/node_modules
+frontend/dist
+frontend/test-results
+frontend/playwright-report
+node_modules
+dist
+.env
+.env.*
+!.env.example

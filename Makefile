@@ -9,4 +9,4 @@ frontend-test:
 	cd frontend && npm test
 
 dev-db:
-	docker compose -f infra/docker/docker-compose.yml up -d postgres
+	docker compose --project-directory . -f infra/docker/docker-compose.yml up -d postgres
