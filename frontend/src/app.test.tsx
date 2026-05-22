@@ -554,13 +554,65 @@ describe("App", () => {
       target: { value: "draft next prompt" },
     });
     expect(composer).toHaveValue("draft next prompt");
-    expect(fireEvent.keyDown(composer, { key: "Enter" })).toBe(true);
 
     deferred.resolve();
     await waitFor(() => {
       expect(screen.getByText("done")).toBeInTheDocument();
     });
     expect(composer).toHaveValue("draft next prompt");
+  });
+
+  it("allows sending a second prompt while Hermes is still responding", async () => {
+    let createCount = 0;
+    const client = createMockApiClient({
+      async createChannelRun(_channelId, sessionId, input) {
+        createCount += 1;
+        const userMessage: ChannelMessage = {
+          id: `message-user-${createCount}`,
+          session_id: sessionId,
+          role: "user",
+          client_message_key: input.clientMessageKey,
+          content: input.content,
+          attachments: input.attachments ?? [],
+          created_at: Date.now(),
+        };
+        const run: ChannelRun = {
+          id: `run-storage-id-${createCount}`,
+          run_id: `hub-run-${createCount}`,
+          session_id: sessionId,
+          user_message_id: userMessage.id,
+          status: "running",
+          input: input.content,
+          input_attachments: input.attachments ?? [],
+          created_at: Date.now(),
+          updated_at: Date.now(),
+        };
+        return { message: userMessage, run };
+      },
+    });
+
+    render(<App apiClient={client} />);
+
+    const composer = await screen.findByLabelText("Message");
+    fireEvent.change(composer, {
+      target: { value: "first prompt" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expectPendingLoader());
+    expect(composer).toHaveFocus();
+
+    fireEvent.change(composer, {
+      target: { value: "draft next prompt" },
+    });
+    const sendButton = screen.getByRole("button", { name: "Send" });
+    expect(sendButton).toBeEnabled();
+    fireEvent.click(sendButton);
+
+    await waitFor(() => {
+      expect(createCount).toBe(2);
+    });
+    expect(composer).toHaveValue("");
   });
 
   it("keeps the pending loader on streamed assistant content until the run clears", async () => {

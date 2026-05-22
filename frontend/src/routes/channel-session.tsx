@@ -995,7 +995,7 @@ export function ChannelSessionRoute({
               if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) {
                 return;
               }
-              if (!busy && !runInProgress) {
+              if (!busy) {
                 event.preventDefault();
                 void submitPrompt();
               }
@@ -1028,7 +1028,7 @@ export function ChannelSessionRoute({
             </button>
             <button
               type="submit"
-              disabled={busy || runInProgress || (!prompt.trim() && attachments.length === 0)}
+              disabled={busy || (!prompt.trim() && attachments.length === 0)}
             >
               <Send aria-hidden="true" size={17} />
               {t("chat.send")}
