@@ -41,6 +41,16 @@ describe("App", () => {
     };
   }
 
+  function expectPendingLoader() {
+    expect(document.querySelector(".typing-indicator .typing-dots")).toBeInTheDocument();
+    expect(screen.queryByText("Hermes is typing")).not.toBeInTheDocument();
+    expect(screen.queryByText("Hermes is responding")).not.toBeInTheDocument();
+  }
+
+  function expectNoPendingLoader() {
+    expect(document.querySelector(".typing-dots")).not.toBeInTheDocument();
+  }
+
   function createHubRunMock(
     options: {
       answer?: string;
@@ -219,7 +229,7 @@ describe("App", () => {
 
     render(<App apiClient={client} />);
 
-    expect(await screen.findByText("Hermes is typing")).toBeInTheDocument();
+    await waitFor(() => expectPendingLoader());
     activeRun = {
       ...activeRun,
       status: "failed",
@@ -436,13 +446,134 @@ describe("App", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
-    expect(await screen.findByText("Hermes is typing")).toBeInTheDocument();
+    await waitFor(() => expectPendingLoader());
     expect(hubRun.createCalled()).toBe(true);
 
     deferred.resolve();
     await waitFor(() => {
-      expect(screen.queryByText("Hermes is typing")).not.toBeInTheDocument();
+      expectNoPendingLoader();
       expect(screen.getByText("pong")).toBeInTheDocument();
+    });
+  });
+
+  it("keeps the pending loader on streamed assistant content until the run clears", async () => {
+    const eventListeners = new Set<(event: ChannelSessionEvent) => void>();
+    const run: ChannelRun = {
+      id: "run-storage-id",
+      run_id: "hub-run-streaming-answer",
+      session_id: "session-1",
+      user_message_id: "message-user",
+      status: "running",
+      input: "stream",
+      input_attachments: [],
+      created_at: Date.now(),
+      updated_at: Date.now(),
+    };
+    const client = createMockApiClient({
+      async createChannelRun(_channelId, sessionId, input) {
+        const userMessage: ChannelMessage = {
+          id: "message-user",
+          session_id: sessionId,
+          role: "user",
+          client_message_key: input.clientMessageKey,
+          content: input.content,
+          attachments: input.attachments ?? [],
+          created_at: Date.now(),
+        };
+        return { message: userMessage, run };
+      },
+    });
+    client.subscribeSessionEvents = (_channelId, _sessionId, onEvent) => {
+      eventListeners.add(onEvent);
+      return () => eventListeners.delete(onEvent);
+    };
+
+    render(<App apiClient={client} />);
+
+    fireEvent.change(await screen.findByLabelText("Message"), {
+      target: { value: "stream" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expectPendingLoader());
+    const assistantMessage: ChannelMessage = {
+      id: "message-assistant-streaming",
+      session_id: "session-1",
+      role: "assistant",
+      client_message_key: "hermes-run:hub-run-streaming-answer",
+      content: "partial answer",
+      attachments: [],
+      created_at: Date.now(),
+    };
+    for (const listener of eventListeners) {
+      listener({ type: "message_created", message: assistantMessage });
+    }
+
+    expect(await screen.findByText("partial answer")).toBeInTheDocument();
+    await waitFor(() => expectPendingLoader());
+
+    for (const listener of eventListeners) {
+      listener({ type: "run_cleared", session_id: "session-1" });
+    }
+    await waitFor(() => expectNoPendingLoader());
+  });
+
+  it("does not render an empty assistant run message before formal content arrives", async () => {
+    const eventListeners = new Set<(event: ChannelSessionEvent) => void>();
+    const run: ChannelRun = {
+      id: "run-storage-id",
+      run_id: "hub-run-empty-assistant",
+      session_id: "session-1",
+      user_message_id: "message-user",
+      status: "running",
+      input: "empty first",
+      input_attachments: [],
+      created_at: Date.now(),
+      updated_at: Date.now(),
+    };
+    const client = createMockApiClient({
+      async createChannelRun(_channelId, sessionId, input) {
+        const userMessage: ChannelMessage = {
+          id: "message-user",
+          session_id: sessionId,
+          role: "user",
+          client_message_key: input.clientMessageKey,
+          content: input.content,
+          attachments: input.attachments ?? [],
+          created_at: Date.now(),
+        };
+        return { message: userMessage, run };
+      },
+    });
+    client.subscribeSessionEvents = (_channelId, _sessionId, onEvent) => {
+      eventListeners.add(onEvent);
+      return () => eventListeners.delete(onEvent);
+    };
+
+    render(<App apiClient={client} />);
+
+    fireEvent.change(await screen.findByLabelText("Message"), {
+      target: { value: "empty first" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expectPendingLoader());
+
+    const emptyAssistantMessage: ChannelMessage = {
+      id: "message-assistant-empty",
+      session_id: "session-1",
+      role: "assistant",
+      client_message_key: "hermes-run:hub-run-empty-assistant",
+      content: "",
+      attachments: [],
+      created_at: Date.now(),
+    };
+    for (const listener of eventListeners) {
+      listener({ type: "message_created", message: emptyAssistantMessage });
+    }
+
+    await waitFor(() => {
+      expect(document.querySelector(".message-bubble.assistant.empty-body")).not.toBeInTheDocument();
+      expectPendingLoader();
     });
   });
 
@@ -459,7 +590,7 @@ describe("App", () => {
       target: { value: "finish cleanly" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
-    expect(await screen.findByText("Hermes is typing")).toBeInTheDocument();
+    await waitFor(() => expectPendingLoader());
 
     deferred.resolve();
     expect(await screen.findByText("final answer")).toBeInTheDocument();
@@ -491,6 +622,39 @@ describe("App", () => {
 
     expect(await screen.findByText("call image generation：{\"prompt\":\"cat\"}")).toBeInTheDocument();
     expect(screen.getByLabelText("Hermes run log")).toBeInTheDocument();
+
+    deferred.resolve();
+    await waitFor(() => {
+      expect(screen.getByText("done")).toBeInTheDocument();
+    });
+  });
+
+  it("keeps live tool calls complete but truncates long tool results", async () => {
+    const deferred = createDeferred<void>();
+    const longToolCall = "write report " + "x".repeat(60);
+    const longToolResult = "result " + "y".repeat(60);
+    const hubRun = createHubRunMock({
+      answer: "done",
+      answerDelay: deferred.promise,
+      executionEvents: [
+        { kind: "tool.call", tool: "terminal", detail: longToolCall },
+        { kind: "tool.completed", tool: "terminal", detail: longToolResult },
+      ],
+    });
+
+    render(<App apiClient={hubRun.client} />);
+
+    fireEvent.change(await screen.findByLabelText("Message"), {
+      target: { value: "run long tool" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText(`call terminal：${longToolCall}`)).toBeInTheDocument();
+    const expectedResult = `completed terminal：${Array.from(longToolResult).slice(0, 50).join("")}…`;
+    expect(screen.getByText(expectedResult)).toBeInTheDocument();
+    expect(screen.queryByText(`completed terminal：${longToolResult}`)).not.toBeInTheDocument();
+    const pendingBubble = document.querySelector(".message-bubble.assistant.pending");
+    expect(pendingBubble?.lastElementChild).toHaveClass("typing-indicator");
 
     deferred.resolve();
     await waitFor(() => {
@@ -656,7 +820,7 @@ describe("App", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
-    expect(await screen.findByText("Hermes is typing")).toBeInTheDocument();
+    await waitFor(() => expectPendingLoader());
     expect(screen.queryByText("new answer")).not.toBeInTheDocument();
 
     deferred.resolve();
@@ -848,14 +1012,14 @@ describe("App", () => {
       />,
     );
 
-    expect(await screen.findByText("Hermes is typing")).toBeInTheDocument();
+    await waitFor(() => expectPendingLoader());
     const stopButton = screen.getByRole("button", { name: "Stop" });
     expect(stopButton).not.toBeDisabled();
 
     fireEvent.click(stopButton);
     await waitFor(() => {
       expect(stopHermesRun).toHaveBeenCalledWith("channel-1", "session-1");
-      expect(screen.queryByText("Hermes is typing")).not.toBeInTheDocument();
+      expectNoPendingLoader();
     });
   });
 
@@ -901,7 +1065,7 @@ describe("App", () => {
     await waitFor(() => {
       expect(clearHermesRun).toHaveBeenCalledWith("channel-1", "session-1");
     });
-    expect(screen.queryByText("Hermes is typing")).not.toBeInTheDocument();
+    expectNoPendingLoader();
   });
 
   it("shows explicit Hermes run errors as assistant messages", async () => {
@@ -915,7 +1079,7 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
     expect(await screen.findByText("Hermes run failed: tool failed")).toBeInTheDocument();
-    expect(screen.queryByText("Hermes is typing")).not.toBeInTheDocument();
+    expectNoPendingLoader();
   });
 
   it("deletes a session from the sidebar", async () => {

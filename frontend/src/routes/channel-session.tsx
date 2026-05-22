@@ -325,6 +325,8 @@ export function ChannelSessionRoute({
     if (isTerminalHermesRun(run)) {
       await persistTerminalRun(channelId, session.id, run, currentMessages);
       await apiClient.clearHermesRun(channelId, session.id);
+      attachedRunIdsRef.current.delete(run.run_id);
+      delete pendingAssistantIdsByRunRef.current[run.run_id];
       if (selectedSessionIdRef.current === session.id) {
         setActiveRun(null);
         setPendingAssistantMessageId(null);
@@ -369,19 +371,35 @@ export function ChannelSessionRoute({
       const pendingId = runId ? pendingAssistantIdsByRunRef.current[runId] : undefined;
       updateMessagesForSession(session.id, (current) => {
         const withoutPending =
-          message.role === "assistant"
+          message.role === "assistant" && hasRenderableMessageBody(message)
             ? removePendingAssistantForMessage(current, message, pendingId)
             : current;
         return mergeMessagesById(withoutPending, [message]);
       });
       if (message.role === "assistant") {
         const run = activeRunRef.current;
-        if (run && message.client_message_key === hermesRunMessageKey(run.run_id)) {
-          attachedRunIdsRef.current.delete(run.run_id);
-          delete pendingAssistantIdsByRunRef.current[run.run_id];
-          setPendingAssistantMessageId(null);
-          setPendingAssistantSessionId(null);
-          resetVerboseEvents();
+        const activeRunId = run?.run_id ?? runId;
+        const runStillActive = Boolean(activeRunId && (!run || !isTerminalHermesRun(run)));
+        if (activeRunId && runStillActive) {
+          if (isExecutionHistoryContent(message.content)) {
+            // 执行日志本身就是当前可见的 loading 气泡，避免再保留一个空回复气泡。
+            pendingAssistantIdsByRunRef.current[activeRunId] = message.id;
+            if (selectedSessionIdRef.current === message.session_id) {
+              setPendingAssistantMessageId(message.id);
+              setPendingAssistantSessionId(message.session_id);
+            }
+          } else if (
+            message.client_message_key === hermesRunMessageKey(activeRunId) &&
+            hasRenderableMessageBody(message)
+          ) {
+            // 正式回复开始流式出现后，把 loading 挂到真实回复气泡上，直到 run 结束。
+            pendingAssistantIdsByRunRef.current[activeRunId] = message.id;
+            if (selectedSessionIdRef.current === message.session_id) {
+              setPendingAssistantMessageId(message.id);
+              setPendingAssistantSessionId(message.session_id);
+              resetVerboseEvents();
+            }
+          }
         }
       }
       return;
@@ -393,6 +411,8 @@ export function ChannelSessionRoute({
       if (isTerminalHermesRun(run)) {
         await persistTerminalRun(channelId, session.id, run, messagesRef.current);
         await apiClient.clearHermesRun(channelId, session.id);
+        attachedRunIdsRef.current.delete(run.run_id);
+        delete pendingAssistantIdsByRunRef.current[run.run_id];
         setActiveRun(null);
         setPendingAssistantMessageId(null);
         setPendingAssistantSessionId(null);
@@ -404,6 +424,10 @@ export function ChannelSessionRoute({
     }
 
     if (event.type === "run_cleared") {
+      if (activeRunRef.current) {
+        attachedRunIdsRef.current.delete(activeRunRef.current.run_id);
+        delete pendingAssistantIdsByRunRef.current[activeRunRef.current.run_id];
+      }
       setActiveRun(null);
       setPendingAssistantMessageId(null);
       setPendingAssistantSessionId(null);
@@ -893,7 +917,15 @@ export function ChannelSessionRoute({
             </div>
           ) : (
             renderedMessages.map((message) => {
-              if (liveExecutionVisible && isExecutionHistoryContent(message.content)) {
+              const isPendingMessage = message.id === pendingAssistantMessageId;
+              if (
+                liveExecutionVisible &&
+                isExecutionHistoryContent(message.content) &&
+                !isPendingMessage
+              ) {
+                return null;
+              }
+              if (!shouldRenderMessageBubble(message, isPendingMessage)) {
                 return null;
               }
 
@@ -901,9 +933,9 @@ export function ChannelSessionRoute({
                 <MessageBubble
                   key={message.id}
                   message={message}
-                  pending={message.id === pendingAssistantMessageId}
+                  pending={isPendingMessage}
                   executionEvents={
-                    message.id === pendingAssistantMessageId ? verboseEvents : undefined
+                    isPendingMessage && verboseEvents.length > 0 ? verboseEvents : undefined
                   }
                   onPreviewImage={setPreviewAttachment}
                   t={t}
@@ -1098,6 +1130,16 @@ function compactExecutionDisplayLine(message: string) {
 
   const chars = Array.from(normalized);
   return chars.length > 50 ? `${chars.slice(0, 49).join("")}…` : normalized;
+}
+
+function compactToolResultDetail(message: string) {
+  const normalized = message.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return "";
+  }
+
+  const chars = Array.from(normalized);
+  return chars.length > 50 ? `${chars.slice(0, 50).join("")}…` : normalized;
 }
 
 function executionHistoryContent(events: ExecutionHistoryEntry[]) {
@@ -1329,6 +1371,21 @@ function activeRunFromChannelRun(run: ChannelRun): HermesActiveRun {
   };
 }
 
+function hasRenderableMessageBody(message: ChannelMessage) {
+  return Boolean(
+    message.content.trim() ||
+      (message.attachments ?? []).length > 0 ||
+      isExecutionHistoryContent(message.content),
+  );
+}
+
+function shouldRenderMessageBubble(message: ChannelMessage, pending: boolean) {
+  if (message.role !== "assistant") {
+    return true;
+  }
+  return pending || hasRenderableMessageBody(message);
+}
+
 function removePendingAssistantForMessage(
   messages: ChannelMessage[],
   message: ChannelMessage,
@@ -1396,7 +1453,9 @@ function MessageBubble({
 }) {
   const executionEvents = executionEventsOverride ?? executionHistoryEvents(message.content);
   const hasExecutionEvents = Array.isArray(executionEvents) && executionEvents.length > 0;
-  const hasVisibleBody = Boolean(message.content || message.attachments?.length || hasExecutionEvents);
+  const hasVisibleBody = Boolean(
+    message.content || message.attachments?.length || hasExecutionEvents || pending,
+  );
   const attachments = message.attachments ?? [];
 
   return (
@@ -1435,16 +1494,17 @@ function MessageBubble({
         />
       ) : null}
       {pending ? (
-        <>
-          <div className="typing-indicator" aria-live="polite">
-            <span>{message.content ? t("chat.replying") : t("chat.typing")}</span>
-            <span className="typing-dots" aria-hidden="true">
-              <i />
-              <i />
-              <i />
-            </span>
-          </div>
-        </>
+        <div
+          className="typing-indicator"
+          aria-label={message.content ? t("chat.replying") : t("chat.typing")}
+          aria-live="polite"
+        >
+          <span className="typing-dots" aria-hidden="true">
+            <i />
+            <i />
+            <i />
+          </span>
+        </div>
       ) : null}
     </article>
   );
@@ -1540,11 +1600,11 @@ function formatExecutionEntry(event: ExecutionHistoryEntry, t: Translate) {
     );
   }
   if (event.kind === "tool.call") {
-    return compactExecutionDisplayLine(joinExecutionParts(`${t("execution.call")} ${tool}`, detail));
+    return joinExecutionParts(`${t("execution.call")} ${tool}`, detail);
   }
   if (event.kind === "tool.completed") {
     const action = event.failed ? t("execution.failed") : t("execution.completed");
-    return compactExecutionDisplayLine(joinExecutionParts(`${action} ${tool}`, detail));
+    return joinExecutionParts(`${action} ${tool}`, compactToolResultDetail(detail));
   }
   if (event.kind === "tool.progress") {
     return compactExecutionDisplayLine(joinExecutionParts(`${t("execution.progress")} ${tool}`, detail));

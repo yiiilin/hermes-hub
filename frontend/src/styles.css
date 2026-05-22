@@ -989,12 +989,6 @@ td {
   width: fit-content;
 }
 
-.typing-indicator span:first-child {
-  color: #55707a;
-  font-size: 12px;
-  font-weight: 700;
-}
-
 .typing-dots {
   align-items: center;
   display: inline-flex;
