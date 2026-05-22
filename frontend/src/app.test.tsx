@@ -295,6 +295,86 @@ describe("App", () => {
     await expect(client.listSessionMessages("channel-1", "session-1")).resolves.toHaveLength(1);
   });
 
+  it("loads a completed run output message with attachments when the live message event was missed", async () => {
+    const eventListeners = new Set<(event: ChannelSessionEvent) => void>();
+    let includeFinalMessage = false;
+    let activeRun: HermesActiveRun | null = {
+      run_id: "hub-run-output-attachment",
+      status: "running",
+      created_at: 1,
+      updated_at: 1,
+    };
+    const finalMessage: ChannelMessage = {
+      id: "message-output-attachment",
+      session_id: "session-1",
+      role: "assistant",
+      client_message_key: "hermes-run:hub-run-output-attachment",
+      content: "文件已生成",
+      attachments: [
+        {
+          id: "attachment-output",
+          name: "result.txt",
+          content_type: "text/plain",
+          kind: "file",
+          size: 12,
+          download_url: "/api/attachments/attachment-output/download",
+        },
+      ],
+      created_at: 2,
+    };
+    const clearHermesRun = vi.fn(async () => {
+      activeRun = null;
+    });
+    const client = createMockApiClient({
+      activeRunsBySessionId: {
+        "session-1": activeRun,
+      },
+    });
+    client.activeHermesRun = async () => activeRun;
+    client.listSessionMessages = async (_channelId, sessionId) =>
+      includeFinalMessage && sessionId === "session-1" ? [finalMessage] : [];
+    client.subscribeSessionEvents = (_channelId, _sessionId, onEvent) => {
+      eventListeners.add(onEvent);
+      queueMicrotask(() => {
+        onEvent({
+          type: "messages_snapshot",
+          messages: [],
+          active_run: activeRun,
+        });
+      });
+      return () => eventListeners.delete(onEvent);
+    };
+    client.clearHermesRun = clearHermesRun;
+
+    render(<App apiClient={client} />);
+
+    await waitFor(() => expectPendingLoader());
+    includeFinalMessage = true;
+    for (const listener of eventListeners) {
+      listener({
+        type: "run_updated",
+        run: {
+          id: "run-storage-id",
+          run_id: "hub-run-output-attachment",
+          session_id: "session-1",
+          status: "completed",
+          input: "make file",
+          input_attachments: [],
+          output_message_id: finalMessage.id,
+          created_at: 1,
+          updated_at: 2,
+        },
+      });
+    }
+
+    expect(await screen.findByText("文件已生成")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Download file result.txt" })).toHaveAttribute(
+      "href",
+      "/api/attachments/attachment-output/download",
+    );
+    expect(clearHermesRun).toHaveBeenCalledWith("channel-1", "session-1");
+  });
+
   it("renders the authenticated admin workspace and can send a Hermes prompt", async () => {
     render(<App apiClient={createMockApiClient()} />);
 

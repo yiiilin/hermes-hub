@@ -490,6 +490,19 @@ export function ChannelSessionRoute({
         updateMessagesForSession(sessionId, (current) => upsertMessage(current, outputMessage));
         return;
       }
+
+      // 最终 message_created 可能比 completed run_updated 更早、更晚，甚至被本次 SSE 连接错过。
+      // completed 事件已经给出了 output_message_id 时，主动拉一次历史，才能拿到附件等完整字段。
+      const latestMessages = await apiClient.listSessionMessages(channelId, sessionId);
+      const latestOutputMessage = latestMessages.find(
+        (message) => message.id === run.output_message_id,
+      );
+      if (latestOutputMessage) {
+        updateMessagesForSession(sessionId, (current) =>
+          mergeMessagesById(current, [latestOutputMessage]),
+        );
+        return;
+      }
     }
 
     const existing = currentMessages.find(
