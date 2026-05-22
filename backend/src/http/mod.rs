@@ -36,7 +36,7 @@ pub enum ApiError {
     Unauthorized,
     Forbidden,
     Conflict(&'static str),
-    ConflictMessage(String),
+    SessionLimitExceeded { max_sessions_per_user: u32 },
     Gone(&'static str),
     NotFound(&'static str),
     BadGateway(&'static str),
@@ -48,45 +48,77 @@ pub enum ApiError {
 struct ErrorBody {
     error: &'static str,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_sessions_per_user: Option<u32>,
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, error, message) = match self {
-            ApiError::BadRequest(message) => {
-                (StatusCode::BAD_REQUEST, "bad_request", message.to_string())
-            }
+        let (status, error, message, max_sessions_per_user) = match self {
+            ApiError::BadRequest(message) => (
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                message.to_string(),
+                None,
+            ),
             ApiError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
                 "authentication required".to_string(),
+                None,
             ),
             ApiError::Forbidden => (
                 StatusCode::FORBIDDEN,
                 "forbidden",
                 "admin access required".to_string(),
+                None,
             ),
-            ApiError::Conflict(message) => (StatusCode::CONFLICT, "conflict", message.to_string()),
-            ApiError::ConflictMessage(message) => (StatusCode::CONFLICT, "conflict", message),
-            ApiError::Gone(message) => (StatusCode::GONE, "gone", message.to_string()),
-            ApiError::NotFound(message) => {
-                (StatusCode::NOT_FOUND, "not_found", message.to_string())
+            ApiError::Conflict(message) => {
+                (StatusCode::CONFLICT, "conflict", message.to_string(), None)
             }
-            ApiError::BadGateway(message) => {
-                (StatusCode::BAD_GATEWAY, "bad_gateway", message.to_string())
-            }
+            ApiError::SessionLimitExceeded {
+                max_sessions_per_user,
+            } => (
+                StatusCode::CONFLICT,
+                "session_limit_exceeded",
+                "session limit exceeded".to_string(),
+                Some(max_sessions_per_user),
+            ),
+            ApiError::Gone(message) => (StatusCode::GONE, "gone", message.to_string(), None),
+            ApiError::NotFound(message) => (
+                StatusCode::NOT_FOUND,
+                "not_found",
+                message.to_string(),
+                None,
+            ),
+            ApiError::BadGateway(message) => (
+                StatusCode::BAD_GATEWAY,
+                "bad_gateway",
+                message.to_string(),
+                None,
+            ),
             ApiError::GatewayTimeout(message) => (
                 StatusCode::GATEWAY_TIMEOUT,
                 "gateway_timeout",
                 message.to_string(),
+                None,
             ),
             ApiError::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
                 "internal server error".to_string(),
+                None,
             ),
         };
 
-        (status, Json(ErrorBody { error, message })).into_response()
+        (
+            status,
+            Json(ErrorBody {
+                error,
+                message,
+                max_sessions_per_user,
+            }),
+        )
+            .into_response()
     }
 }

@@ -10,6 +10,7 @@ import type {
   HermesInstance,
   HermesVerboseEvent,
 } from "../api/client";
+import { ApiRequestError } from "../api/client";
 import { useChatSidebar, useSidebarCollapsed } from "../components/layout";
 import { useI18n } from "../i18n";
 import {
@@ -292,7 +293,7 @@ export function ChannelSessionRoute({
         throw new Error(t("chat.sessionCreateFailed"));
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : t("chat.sessionCreateFailed"));
+      setError(userFacingErrorMessage(cause, t("chat.sessionCreateFailed"), t));
     }
   }
 
@@ -643,7 +644,7 @@ export function ChannelSessionRoute({
         );
       }
     } catch (cause) {
-      const message = hermesRunErrorMessage(cause, t("chat.requestFailed"));
+      const message = hermesRunErrorMessage(cause, t("chat.requestFailed"), t);
       if (sessionForRequest && assistantMessageId) {
         await appendHermesErrorMessage(channel.id, sessionForRequest.id, assistantMessageId, message);
         await apiClient.clearHermesRun(channel.id, sessionForRequest.id);
@@ -909,7 +910,7 @@ export function ChannelSessionRoute({
         fileInputRef.current.value = "";
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : t("chat.attachmentUploadFailed"));
+      setError(userFacingErrorMessage(cause, t("chat.attachmentUploadFailed"), t));
     }
   }
 
@@ -1444,7 +1445,27 @@ function removePendingAssistantForMessage(
   );
 }
 
-function hermesRunErrorMessage(cause: unknown, fallback = "Hermes request failed") {
+function hermesRunErrorMessage(
+  cause: unknown,
+  fallback = "Hermes request failed",
+  t?: Translate,
+) {
+  if (t) {
+    return userFacingErrorMessage(cause, fallback, t);
+  }
+
+  if (cause instanceof Error && cause.message.trim()) {
+    return cause.message;
+  }
+
+  return fallback;
+}
+
+function userFacingErrorMessage(cause: unknown, fallback: string, t: Translate) {
+  if (cause instanceof ApiRequestError && cause.code === "session_limit_exceeded") {
+    return t("chat.sessionLimitExceeded", { count: cause.maxSessionsPerUser ?? 20 });
+  }
+
   if (cause instanceof Error && cause.message.trim()) {
     return cause.message;
   }

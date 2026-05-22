@@ -314,6 +314,25 @@ type RequestOptions = {
   allowUnauthorized?: boolean;
 };
 
+type ApiErrorPayload = {
+  error?: string;
+  message?: string;
+  max_sessions_per_user?: number;
+};
+
+// 保留后端错误码和参数，页面才能按当前语言生成用户可读提示。
+export class ApiRequestError extends Error {
+  readonly code?: string;
+  readonly maxSessionsPerUser?: number;
+
+  constructor(message: string, payload: ApiErrorPayload = {}) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.code = payload.error;
+    this.maxSessionsPerUser = payload.max_sessions_per_user;
+  }
+}
+
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const response = await fetch(path, {
     method: options.method ?? "GET",
@@ -332,11 +351,16 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   }
 
   if (!response.ok) {
-    const message = await response
+    const payload: ApiErrorPayload = await response
       .json()
-      .then((value) => value.message ?? value.error ?? response.statusText)
-      .catch(() => response.statusText);
-    throw new Error(String(message));
+      .then((value): ApiErrorPayload =>
+        value && typeof value === "object"
+          ? (value as ApiErrorPayload)
+          : { message: response.statusText },
+      )
+      .catch((): ApiErrorPayload => ({ message: response.statusText }));
+    const message = payload.message ?? payload.error ?? response.statusText;
+    throw new ApiRequestError(String(message), payload);
   }
 
   if (response.status === 204) {

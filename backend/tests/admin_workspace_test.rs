@@ -374,8 +374,7 @@ async fn admin_can_configure_per_user_session_limit() {
     .await;
     let (status, body) = response_json(blocked).await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(
-        body["message"],
-        "每个用户最多2个会话，你得先删除一个会话才能创建新会话"
-    );
+    assert_eq!(body["error"], "session_limit_exceeded");
+    assert_eq!(body["message"], "session limit exceeded");
+    assert_eq!(body["max_sessions_per_user"], 2);
 }

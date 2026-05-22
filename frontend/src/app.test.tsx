@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./app";
 import {
+  ApiRequestError,
   createApiClient,
   createMockApiClient,
   type ApiClient,
@@ -1320,7 +1321,10 @@ describe("App", () => {
   it("shows the configured session limit message when a new session is blocked", async () => {
     const client = createMockApiClient({
       createSession: async () => {
-        throw new Error("每个用户最多2个会话，你得先删除一个会话才能创建新会话");
+        throw new ApiRequestError("session limit exceeded", {
+          error: "session_limit_exceeded",
+          max_sessions_per_user: 2,
+        });
       },
     });
 
@@ -1328,6 +1332,31 @@ describe("App", () => {
 
     await screen.findByRole("button", { name: "Session" });
     fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(
+          "Each user can have at most 2 sessions. Delete a session before creating a new one.",
+        ),
+      ).toBeInTheDocument();
+    });
+  });
+
+  it("localizes the configured session limit message in Chinese", async () => {
+    localStorage.setItem("hermes-hub-language", "zh");
+    const client = createMockApiClient({
+      createSession: async () => {
+        throw new ApiRequestError("session limit exceeded", {
+          error: "session_limit_exceeded",
+          max_sessions_per_user: 2,
+        });
+      },
+    });
+
+    render(<App apiClient={client} />);
+
+    await screen.findByRole("button", { name: "Session" });
+    fireEvent.click(screen.getByRole("button", { name: "新建对话" }));
 
     await waitFor(() => {
       expect(
