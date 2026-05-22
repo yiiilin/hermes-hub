@@ -141,6 +141,16 @@ async fn deliver_message(
         ));
     }
     let client_message_key = payload.client_message_key;
+    let heartbeat_run_id = payload
+        .run_id
+        .as_deref()
+        .and_then(normalize_protocol_run_id)
+        .or_else(|| {
+            client_message_key
+                .as_deref()
+                .and_then(hermes_run_id_from_client_message_key)
+        })
+        .map(str::to_string);
     reject_late_terminal_output(
         &state,
         &token_context,
@@ -161,6 +171,15 @@ async fn deliver_message(
         )
         .await
         .map_err(map_channel_error)?;
+    if let Some(run_id) = heartbeat_run_id.as_deref() {
+        // Hermes 的执行步骤、状态文本和最终输出都代表任务仍然活跃；
+        // 刷新 run 心跳，避免长任务超过恢复窗口后被重复派发。
+        let _ = state
+            .channel_store
+            .heartbeat_run_for_session(&session_id, run_id)
+            .await
+            .map_err(map_channel_error)?;
+    }
     state.session_events.publish(SessionEvent::MessageCreated {
         message: message.clone(),
     });
@@ -274,6 +293,18 @@ async fn update_message(
         )
         .await
         .map_err(map_channel_error)?;
+    if let Some(run_id) = payload
+        .run_id
+        .as_deref()
+        .and_then(normalize_protocol_run_id)
+    {
+        // 同一条执行步骤消息会被 adapter 持续编辑；编辑也必须刷新 run 心跳。
+        let _ = state
+            .channel_store
+            .heartbeat_run_for_session(&session_id, run_id)
+            .await
+            .map_err(map_channel_error)?;
+    }
     state.session_events.publish(SessionEvent::MessageUpdated {
         message: message.clone(),
     });

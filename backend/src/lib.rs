@@ -17,6 +17,7 @@ pub mod domain {
 }
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{any, get},
     Json, Router,
 };
@@ -150,6 +151,11 @@ pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppIn
 pub fn build_router_with_state(state: AppState) -> Router {
     let static_dir = state.config.static_dir.clone();
     let index_file = static_dir.join("index.html");
+    let request_body_limit = state
+        .config
+        .object_storage
+        .max_upload_bytes
+        .saturating_add(1024 * 1024);
     // 后端作为 Web 服务器托管前端构建产物；SPA 深链统一回落到 index.html。
     let static_assets = ServeDir::new(static_dir).fallback(ServeFile::new(index_file));
 
@@ -159,6 +165,8 @@ pub fn build_router_with_state(state: AppState) -> Router {
         .route("/api", any(api_not_found))
         .route("/api/{*path}", any(api_not_found))
         .fallback_service(static_assets)
+        // Axum multipart 默认只允许约 2MB；Hub 的真实文件上限由对象存储配置控制。
+        .layer(DefaultBodyLimit::max(request_body_limit))
         .with_state(state)
 }
 

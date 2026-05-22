@@ -1324,6 +1324,74 @@ impl ChannelStore {
         }
     }
 
+    pub async fn heartbeat_run_for_session(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<Option<ChannelRun>, ChannelStoreError> {
+        match &self.backend {
+            ChannelStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
+                let now = unix_now();
+                let Some(run) = inner
+                    .runs_by_id
+                    .values_mut()
+                    .find(|run| run.session_id == session_id && run_matches(run, run_id))
+                    .filter(|run| !run.status.is_terminal())
+                else {
+                    return Ok(None);
+                };
+                // Hermes 仍在向 Hub 输出消息时，刷新运行心跳，避免长任务被恢复逻辑重复派发。
+                run.updated_at = now;
+                let updated = run.clone();
+                if let Some(session) = inner.sessions_by_id.get_mut(session_id) {
+                    session.updated_at = now;
+                }
+                Ok(Some(updated))
+            }
+            ChannelStoreBackend::Postgres(pool) => block_on_db(async {
+                let row = sqlx::query(
+                    r#"
+                    update channel_runs
+                    set updated_at = now()
+                    where session_id = $1::uuid
+                      and (id = $2::uuid or concat('hub-run-', id::text) = $3)
+                      and status in ('queued', 'leased', 'running')
+                    returning id::text as id,
+                              session_id::text as session_id,
+                              user_message_id::text as user_message_id,
+                              status,
+                              input,
+                              input_attachments,
+                              output_message_id::text as output_message_id,
+                              error,
+                              attempt_count,
+                              extract(epoch from created_at)::bigint as created_at,
+                              extract(epoch from updated_at)::bigint as updated_at,
+                              extract(epoch from completed_at)::bigint as completed_at
+                    "#,
+                )
+                .bind(session_id)
+                .bind(run_storage_id(run_id))
+                .bind(run_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                let run = row_to_run(&row)?;
+                sqlx::query("update channel_sessions set updated_at = now() where id = $1::uuid")
+                    .bind(session_id)
+                    .execute(pool)
+                    .await
+                    .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+                Ok(Some(run))
+            }),
+        }
+    }
+
     pub async fn update_run_status_for_session(
         &self,
         session_id: &str,

@@ -21,7 +21,7 @@ use super::{
 
 /// Hub 托管 Hermes 容器规格版本。只要 env、挂载、工作目录或安全策略有变化，
 /// 就提升这个值，确保已存在的旧容器会被重建并拿到新行为。
-const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-22-hermes-hub-image-model";
+const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-22-hermes-hub-attachment-filenames";
 const MANAGED_CONTAINER_SPEC_LABEL: &str = "hermes_hub_spec_version";
 const HUB_INBOX_PATH: &str = "/internal/channel/v1/inbox";
 const HUB_INBOX_TIMEOUT_SECONDS: u16 = 25;
@@ -57,9 +57,10 @@ import json
 import logging
 import mimetypes
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode
 
 try:
     import aiohttp
@@ -112,8 +113,8 @@ class HermesHubAdapter(BasePlatformAdapter):
         self._poll_task: asyncio.Task | None = None
         self._closed = asyncio.Event()
         # Hermes 会把 thread_id 作为通用路由 metadata 传给所有输出；
-        # Hub 只用它追踪最后一条输出消息，不在 send() 阶段结束 run。
-        self._last_output_messages: dict[str, str] = {}
+        # Hub 追踪最后一条输出消息，便于图片/文件回传时更新同一气泡。
+        self._last_output_messages: dict[str, dict[str, Any]] = {}
 
     @property
     def name(self) -> str:
@@ -166,12 +167,18 @@ class HermesHubAdapter(BasePlatformAdapter):
     ) -> SendResult:
         del reply_to
         session_id = self._session_id(chat_id, metadata)
+        run_id = self._run_id(metadata)
+        if run_id and (metadata or {}).get("notify"):
+            merged = await self._merge_text_into_last_attachment_output(
+                chat_id, content, metadata
+            )
+            if merged is not None:
+                return merged
         payload = {
             "role": "assistant",
             "content": content,
             "attachments": (metadata or {}).get("attachments") or [],
         }
-        run_id = self._run_id(metadata)
         if run_id:
             payload["run_id"] = run_id
         client_message_key = self._client_message_key(metadata)
@@ -361,26 +368,142 @@ class HermesHubAdapter(BasePlatformAdapter):
         session_id = self._session_id(chat_id, metadata)
         try:
             attachment = await self._upload_attachment(session_id, file_path, file_name)
-            content = caption or ""
-            download_url = attachment.get("download_url")
-            if download_url:
-                display_name = attachment.get("name") or Path(file_path).name
-                content = f"{content}\n\n[{display_name}]({download_url})".strip()
+            merged = await self._merge_attachment_into_last_output(
+                chat_id, file_path, caption, attachment, metadata
+            )
+            if merged is not None:
+                return merged
+            content = self._content_with_attachment("", caption, attachment, file_path)
             next_metadata = dict(metadata or {})
             next_metadata["attachments"] = [attachment]
             run_id = self._run_id(metadata)
             attachment_id = attachment.get("id")
             if run_id and attachment_id:
+                # 如果 Hermes 先发文件再发最终文本，这条附件消息先独立落库；
+                # 后续 notify 文本会用 _merge_text_into_last_attachment_output 合并回同一气泡。
                 next_metadata["client_message_key"] = f"hermes-run:{run_id}:attachment:{attachment_id}"
             return await self.send(chat_id, content, metadata=next_metadata)
         except Exception as error:
             logger.warning("Hermes Hub attachment send failed: %s", error)
             return SendResult(success=False, error=str(error), retryable=True)
 
+    async def _merge_attachment_into_last_output(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str],
+        attachment: dict[str, Any],
+        metadata: Optional[Dict[str, Any]],
+    ) -> Optional[SendResult]:
+        run_id = self._run_id(metadata)
+        if not run_id:
+            return None
+        existing = self._last_output_message(run_id)
+        if not existing or not self._message_accepts_attachment_merge(run_id, existing):
+            return None
+        message_id = str(existing.get("id") or "")
+        if not message_id:
+            return None
+        merged_content = self._content_with_attachment(
+            str(existing.get("content") or ""), caption, attachment, file_path
+        )
+        merged_attachments = self._merge_attachments(
+            existing.get("attachments") or [], [attachment]
+        )
+        next_metadata = dict(metadata or {})
+        next_metadata["attachments"] = merged_attachments
+        # 文件/图片是 run 输出的一部分时，更新同一条 Hub 消息；这样历史快照和实时
+        # 事件都只有一个最终气泡，附件也天然嵌入在文本位置。
+        return await self.edit_message(
+            chat_id, message_id, merged_content, metadata=next_metadata
+        )
+
+    async def _merge_text_into_last_attachment_output(
+        self,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> Optional[SendResult]:
+        run_id = self._run_id(metadata)
+        existing = self._last_output_message(run_id) if run_id else None
+        if not existing:
+            return None
+        existing_attachments = existing.get("attachments") or []
+        message_id = str(existing.get("id") or "")
+        if not message_id or not existing_attachments:
+            return None
+        merged_content = self._join_message_parts(content, str(existing.get("content") or ""))
+        next_metadata = dict(metadata or {})
+        next_metadata["attachments"] = existing_attachments
+        return await self.edit_message(
+            chat_id, message_id, merged_content, metadata=next_metadata
+        )
+
+    def _content_with_attachment(
+        self,
+        existing_content: str,
+        caption: Optional[str],
+        attachment: dict[str, Any],
+        file_path: str,
+    ) -> str:
+        content = self._join_message_parts(existing_content, caption or "")
+        download_url = str(attachment.get("download_url") or "")
+        if not download_url:
+            return content
+        # Hermes 生图有时先输出空图片 markdown，再单独发送文件；这里把空地址补成
+        # Hub 下载地址，前端才能在原文位置预览图片。
+        if re.search(r"!\[[^\]]*\]\(\s*\)", content):
+            return re.sub(
+                r"!\[([^\]]*)\]\(\s*\)",
+                lambda match: f"![{match.group(1)}]({download_url})",
+                content,
+                count=1,
+            )
+        if download_url in content:
+            return content
+        display_name = str(attachment.get("name") or Path(file_path).name)
+        content_type = str(attachment.get("content_type") or "")
+        kind = str(attachment.get("kind") or "")
+        if kind == "image" or content_type.startswith("image/"):
+            markdown = f"![{display_name}]({download_url})"
+        else:
+            markdown = f"[{display_name}]({download_url})"
+        return self._join_message_parts(content, markdown)
+
+    def _join_message_parts(self, *parts: str) -> str:
+        cleaned = [str(part).strip() for part in parts if str(part or "").strip()]
+        return "\n\n".join(cleaned)
+
+    def _merge_attachments(
+        self, existing: list[dict[str, Any]], incoming: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for attachment in [*existing, *incoming]:
+            if not isinstance(attachment, dict):
+                continue
+            attachment_id = str(attachment.get("id") or "")
+            dedupe_key = attachment_id or json.dumps(attachment, sort_keys=True, ensure_ascii=False)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            merged.append(attachment)
+        return merged
+
+    def _message_accepts_attachment_merge(self, run_id: str, message: dict[str, Any]) -> bool:
+        client_key = str(message.get("client_message_key") or "")
+        if client_key == f"hermes-run:{run_id}":
+            return True
+        if message.get("attachments"):
+            return True
+        return bool(re.search(r"!\[[^\]]*\]\(\s*\)", str(message.get("content") or "")))
+
     async def _upload_attachment(
         self, session_id: str, file_path: str, file_name: Optional[str] = None
     ) -> dict[str, Any]:
-        upload_name = file_name or Path(file_path).name
+        # Hermes 工具链里有时会把中文文件名先做 URL 编码；Hub 端应恢复成可读名称，
+        # 否则最终下载名会变成一串百分号编码。
+        upload_name = unquote(file_name or Path(file_path).name)
         content_type = mimetypes.guess_type(upload_name)[0] or "application/octet-stream"
         data = aiohttp.FormData()
         # 附件只由 adapter 主动上传到 Hub，Hub 不读取容器挂载路径。
@@ -501,10 +624,14 @@ class HermesHubAdapter(BasePlatformAdapter):
         message_id = str(message.get("id") or "")
         if not run_id or not message_id:
             return
-        self._last_output_messages[run_id] = message_id
+        self._last_output_messages[run_id] = message
 
     def _last_output_message_id(self, run_id: str) -> str:
-        return self._last_output_messages.get(run_id, "")
+        message = self._last_output_message(run_id)
+        return str((message or {}).get("id") or "")
+
+    def _last_output_message(self, run_id: str) -> Optional[dict[str, Any]]:
+        return self._last_output_messages.get(run_id)
 
     def _client_message_key(self, metadata: Optional[Dict[str, Any]]) -> str:
         metadata = metadata or {}

@@ -1536,6 +1536,33 @@ async fn channel_messages_and_attachments_are_hub_owned() {
     assert!(disposition.contains(
         "filename*=UTF-8''%E5%B0%8F%E5%AD%A610%E4%BB%A5%E5%86%85%E5%8A%A0%E5%87%8F%E6%B3%95_6%E9%A1%B5%E9%85%8D%E5%9B%BE.pptx"
     ));
+
+    let encoded_ppt_name =
+        "%E5%B0%8F%E5%AD%A610%E4%BB%A5%E5%86%85%E5%8A%A0%E5%87%8F%E6%B3%95_6%E9%A1%B5%E9%85%8D%E5%9B%BE.pptx";
+    let upload_body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"{encoded_ppt_name}\"\r\n\
+         Content-Type: application/vnd.openxmlformats-officedocument.presentationml.presentation\r\n\r\n\
+         encoded pptx bytes\r\n\
+         --{boundary}--\r\n"
+    )
+    .into_bytes();
+    let upload = request_raw(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/attachments"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload_body,
+        Some(&cookie),
+        None,
+    )
+    .await;
+    let (status, encoded_upload_body) = response_json(upload).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        encoded_upload_body["attachments"][0]["name"],
+        "小学10以内加减法_6页配图.pptx"
+    );
 }
 
 #[tokio::test]
@@ -2385,6 +2412,72 @@ async fn hermes_channel_protocol_uploads_output_file_before_delivering_message()
         .await
         .expect("download body");
     assert_eq!(&bytes[..], b"123");
+}
+
+#[tokio::test]
+async fn hermes_channel_protocol_accepts_large_output_files_within_config_limit() {
+    let proxy = InMemoryHermesProxyClient::default();
+    let store = SessionStore::default();
+    let state = test_state(store.clone(), proxy);
+    let instance_token = "instance-channel-large-file-token";
+    state
+        .model_registry
+        .add_instance_token_for_instance("instance-1", instance_token)
+        .await
+        .expect("instance token can be registered");
+    let app = build_router_with_state(state);
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    store
+        .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
+        .expect("instance can be bound");
+
+    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
+    let (_, channel_body) = response_json(channel).await;
+    let channel_id = channel_body["channels"][0]["id"]
+        .as_str()
+        .expect("channel id");
+    let session = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions"),
+        json!({ "kind": "agent" }),
+        Some(&cookie),
+    )
+    .await;
+    let (_, session_body) = response_json(session).await;
+    let session_id = session_body["session"]["id"].as_str().expect("session id");
+
+    let boundary = "hermes-channel-large-file-boundary";
+    let mut upload_body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"large.pptx\"\r\n\
+         Content-Type: application/vnd.openxmlformats-officedocument.presentationml.presentation\r\n\r\n"
+    )
+    .into_bytes();
+    // 真实 PPT 回归约 12MB；这里用超过 Axum 默认 2MB、低于业务 25MB 上限的载荷覆盖路由体限制。
+    let payload = vec![b'a'; 3 * 1024 * 1024];
+    upload_body.extend_from_slice(&payload);
+    upload_body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let upload = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/attachments"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload_body,
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, upload_body) = response_json(upload).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(upload_body["attachments"][0]["size"], payload.len());
 }
 
 #[tokio::test]

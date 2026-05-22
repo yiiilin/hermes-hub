@@ -6,7 +6,7 @@ use axum::{
 };
 use hermes_hub_backend::{
     build_router_with_state,
-    channel::service::{ChannelRunStatus, ChannelSessionKind, ChannelStore},
+    channel::service::{ChannelMessageRole, ChannelRunStatus, ChannelSessionKind, ChannelStore},
     db::migrations::run_migrations,
     docker_config_from_app,
     hermes::{
@@ -150,6 +150,38 @@ async fn request_empty(
 
     app.clone()
         .oneshot(builder.body(Body::empty()).expect("request can be built"))
+        .await
+        .expect("router responds")
+}
+
+async fn request_raw(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    content_type: &str,
+    body: Vec<u8>,
+    cookie: Option<&str>,
+    bearer: Option<&str>,
+) -> Response<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, content_type);
+
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+
+    if let Some(bearer) = bearer {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+    }
+
+    app.clone()
+        .oneshot(
+            builder
+                .body(Body::from(body))
+                .expect("request can be built"),
+        )
         .await
         .expect("router responds")
 }
@@ -349,6 +381,28 @@ async fn postgres_state_survives_recreated_router_state() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(title_body["session"]["title"], "persisted session");
 
+    let boundary = "postgres-persistence-attachment-boundary";
+    let upload_body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"note.txt\"\r\n\
+         Content-Type: text/plain\r\n\r\n\
+         persisted note\r\n\
+         --{boundary}--\r\n"
+    )
+    .into_bytes();
+    let upload = request_raw(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/attachments"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload_body,
+        Some(&user_cookie),
+        None,
+    )
+    .await;
+    let (status, upload_body) = response_json(upload).await;
+    assert_eq!(status, StatusCode::CREATED);
+
     let message = request_json(
         &app,
         Method::POST,
@@ -356,15 +410,7 @@ async fn postgres_state_survives_recreated_router_state() {
         json!({
             "role": "user",
             "content": "persisted message",
-            "attachments": [
-                {
-                    "id": "attachment-json-only",
-                    "name": "note.txt",
-                    "content_type": "text/plain",
-                    "kind": "file",
-                    "size": 12
-                }
-            ]
+            "attachments": upload_body["attachments"].clone()
         }),
         Some(&user_cookie),
         None,
@@ -500,7 +546,20 @@ async fn postgres_adapter_can_poll_when_channel_predates_instance() {
     )
     .await;
     assert_eq!(created.status(), StatusCode::CREATED);
-    let cookie = cookie_from(&created);
+    let logged_in = request_json(
+        &app,
+        Method::POST,
+        "/api/auth/login",
+        json!({
+            "email": "admin@example.com",
+            "password": "admin-password-123"
+        }),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(logged_in.status(), StatusCode::OK);
+    let cookie = cookie_from(&logged_in);
 
     let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie), None).await;
     let (status, channel_body) = response_json(channel).await;
@@ -613,7 +672,20 @@ async fn postgres_adapter_releases_stale_running_runs() {
     )
     .await;
     assert_eq!(created.status(), StatusCode::CREATED);
-    let cookie = cookie_from(&created);
+    let logged_in = request_json(
+        &app,
+        Method::POST,
+        "/api/auth/login",
+        json!({
+            "email": "admin@example.com",
+            "password": "admin-password-123"
+        }),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(logged_in.status(), StatusCode::OK);
+    let cookie = cookie_from(&logged_in);
 
     let ensured = request_empty(
         &app,
@@ -707,6 +779,217 @@ async fn postgres_adapter_releases_stale_running_runs() {
     assert_eq!(leased.len(), 1);
     assert_eq!(leased[0].run_id, run.run_id);
     assert_eq!(leased[0].status, ChannelRunStatus::Leased);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_adapter_output_heartbeats_running_runs() {
+    let Some(pool) = postgres_pool().await else {
+        eprintln!(
+            "skipping postgres running run heartbeat test: HERMES_HUB_TEST_DATABASE_URL is not set"
+        );
+        return;
+    };
+    run_migrations(&pool).await.expect("migrations can run");
+
+    let provider = InMemoryLlmProviderClient::new(LlmProviderResponse {
+        status: StatusCode::OK,
+        content_type: Some("application/json".to_string()),
+        body: br#"{"id":"provider-response"}"#.to_vec(),
+    });
+    let state = test_state(pool.clone(), provider).await;
+    let app = test_app(state.clone());
+
+    let created = request_json(
+        &app,
+        Method::POST,
+        "/api/auth/bootstrap-register",
+        json!({
+            "email": "admin@example.com",
+            "password": "admin-password-123"
+        }),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let logged_in = request_json(
+        &app,
+        Method::POST,
+        "/api/auth/login",
+        json!({
+            "email": "admin@example.com",
+            "password": "admin-password-123"
+        }),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(logged_in.status(), StatusCode::OK);
+    let cookie = cookie_from(&logged_in);
+
+    let ensured = request_empty(
+        &app,
+        Method::POST,
+        "/api/workspace/ensure-hermes",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    let (status, ensured_body) = response_json(ensured).await;
+    assert_eq!(status, StatusCode::OK);
+    let user_id = ensured_body["hermes_instance"]["user_id"]
+        .as_str()
+        .expect("user id")
+        .to_string();
+    let instance_id = ensured_body["hermes_instance"]["id"]
+        .as_str()
+        .expect("instance id")
+        .to_string();
+    state
+        .model_registry
+        .add_instance_token_for_instance(&instance_id, "heartbeat-instance-token")
+        .await
+        .expect("instance token can be stored");
+
+    let channel = state
+        .channel_store
+        .ensure_hub_channel(&user_id)
+        .await
+        .expect("hub channel can be ensured");
+    let session = state
+        .channel_store
+        .create_session(&user_id, &channel.id, ChannelSessionKind::Agent, None)
+        .await
+        .expect("session can be created");
+    let user_message = state
+        .channel_store
+        .append_session_message(
+            &user_id,
+            &channel.id,
+            &session.id,
+            ChannelMessageRole::User,
+            Some("heartbeat-turn".to_string()),
+            "long task".to_string(),
+            json!([]),
+        )
+        .await
+        .expect("message can be appended");
+    let run = state
+        .channel_store
+        .create_channel_run(
+            &user_id,
+            &channel.id,
+            &session.id,
+            &user_message.id,
+            "long task".to_string(),
+            json!([]),
+        )
+        .await
+        .expect("run can be created");
+    let initial_lease = state
+        .channel_store
+        .lease_runs_for_instance(Some(&instance_id), 4)
+        .await
+        .expect("queued run can be leased");
+    assert_eq!(initial_lease.len(), 1);
+    assert_eq!(initial_lease[0].run_id, run.run_id);
+    assert_eq!(initial_lease[0].attempt_count, 1);
+    state
+        .channel_store
+        .update_run_status_for_session(
+            &session.id,
+            &run.run_id,
+            ChannelRunStatus::Running,
+            None,
+            None,
+        )
+        .await
+        .expect("run can be marked running");
+    sqlx::query(
+        "update channel_runs set updated_at = now() - interval '11 minutes' where id = $1::uuid",
+    )
+    .bind(&run.id)
+    .execute(&pool)
+    .await
+    .expect("run timestamp can be aged");
+
+    // Hermes 长任务只要还在向 Hub 输出进度，就不是失联任务；否则 10 分钟恢复逻辑会重复投递。
+    let progress = request_json(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{}/messages", session.id),
+        json!({
+            "role": "assistant",
+            "content": "🔧 terminal([\"command\"])\n{\"command\":\"node build.js\"}",
+            "attachments": [],
+            "run_id": run.run_id
+        }),
+        None,
+        Some("heartbeat-instance-token"),
+    )
+    .await;
+    assert_eq!(progress.status(), StatusCode::CREATED);
+    let (_, progress_body) = response_json(progress).await;
+    let progress_message_id = progress_body["message"]["id"]
+        .as_str()
+        .expect("progress message id")
+        .to_string();
+
+    let leased = state
+        .channel_store
+        .lease_runs_for_instance(Some(&instance_id), 4)
+        .await
+        .expect("active running run can be checked");
+    assert!(
+        leased.is_empty(),
+        "recent adapter output must refresh running run heartbeat and prevent duplicate leasing"
+    );
+
+    let active = state
+        .channel_store
+        .get_active_run_for_session(&user_id, &channel.id, &session.id)
+        .await
+        .expect("active run can be loaded")
+        .expect("run remains visible");
+    assert_eq!(active.run_id, run.run_id);
+    assert_eq!(active.status, ChannelRunStatus::Running);
+    assert_eq!(active.attempt_count, 1);
+
+    sqlx::query(
+        "update channel_runs set updated_at = now() - interval '11 minutes' where id = $1::uuid",
+    )
+    .bind(&run.id)
+    .execute(&pool)
+    .await
+    .expect("run timestamp can be aged again");
+
+    let progress_edit = request_json(
+        &app,
+        Method::PUT,
+        &format!(
+            "/internal/channel/v1/sessions/{}/messages/{progress_message_id}",
+            session.id
+        ),
+        json!({
+            "content": "🔧 terminal([\"command\"])\n{\"command\":\"node build.js\"}\n✅ terminal completed",
+            "attachments": [],
+            "run_id": run.run_id
+        }),
+        None,
+        Some("heartbeat-instance-token"),
+    )
+    .await;
+    assert_eq!(progress_edit.status(), StatusCode::OK);
+
+    let leased = state
+        .channel_store
+        .lease_runs_for_instance(Some(&instance_id), 4)
+        .await
+        .expect("edited active running run can be checked");
+    assert!(
+        leased.is_empty(),
+        "adapter message edits must also refresh running run heartbeat"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

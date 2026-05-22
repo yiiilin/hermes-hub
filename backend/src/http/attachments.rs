@@ -7,6 +7,8 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
+use percent_encoding::percent_decode_str;
+use std::path::Path as StdPath;
 use uuid::Uuid;
 
 use crate::{
@@ -41,10 +43,7 @@ pub async fn upload_session_attachments(
         .await
         .map_err(|_| ApiError::BadRequest("multipart body is invalid"))?
     {
-        let file_name = field
-            .file_name()
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| "attachment.bin".to_string());
+        let file_name = normalized_multipart_file_name(field.file_name());
         let content_type = field
             .content_type()
             .map(ToOwned::to_owned)
@@ -73,6 +72,30 @@ pub async fn upload_session_attachments(
     }
 
     Ok(attachments)
+}
+
+fn normalized_multipart_file_name(file_name: Option<&str>) -> String {
+    let raw_name = file_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("attachment.bin");
+    let raw_name = raw_name
+        .strip_prefix("UTF-8''")
+        .or_else(|| raw_name.strip_prefix("utf-8''"))
+        .unwrap_or(raw_name);
+    // 有些客户端会把 multipart filename 里的中文做百分号编码；
+    // Hub 在入库边界恢复成人可读文件名，下载头再统一按 RFC 5987 编码。
+    let decoded = percent_decode_str(raw_name)
+        .decode_utf8()
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|_| raw_name.to_string());
+    let base_name = StdPath::new(decoded.trim())
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("attachment.bin");
+
+    base_name.to_string()
 }
 
 pub async fn create_session_attachment_from_bytes(

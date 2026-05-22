@@ -490,7 +490,7 @@ async fn docker_provisioner_test() {
         .iter()
         .any(|entry| entry == "HERMES_ACCEPT_HOOKS=1"));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version" && value == "2026-05-22-hermes-hub-image-model"
+        key == "hermes_hub_spec_version" && value == "2026-05-22-hermes-hub-attachment-filenames"
     }));
     assert!(spec
         .mounts
@@ -567,7 +567,7 @@ async fn docker_provisioner_test() {
     assert!(plugin_adapter.contains("async def on_processing_complete("));
     assert!(plugin_adapter.contains("ProcessingOutcome.CANCELLED"));
     assert!(plugin_adapter.contains("MAX_MESSAGE_LENGTH = 8000"));
-    assert!(plugin_adapter.contains("self._last_output_messages: dict[str, str] = {}"));
+    assert!(plugin_adapter.contains("self._last_output_messages: dict[str, dict[str, Any]] = {}"));
     assert!(plugin_adapter.contains("self._remember_output_message(metadata, message)"));
     assert!(
         plugin_adapter.contains("run_id = metadata.get(\"run_id\") or metadata.get(\"thread_id\")")
@@ -578,7 +578,11 @@ async fn docker_provisioner_test() {
     assert!(plugin_adapter.contains("\"output_message_id\": output_message_id"));
     assert!(plugin_adapter.contains("payload[\"client_message_key\"] = client_message_key"));
     assert!(plugin_adapter.contains("payload[\"run_id\"] = run_id"));
-    assert!(plugin_adapter.contains("hermes-run:{run_id}:attachment:{attachment_id}"));
+    assert!(plugin_adapter.contains("await self._merge_attachment_into_last_output("));
+    assert!(plugin_adapter.contains("def _content_with_attachment("));
+    assert!(plugin_adapter.contains("def _merge_attachments("));
+    assert!(plugin_adapter.contains("from urllib.parse import unquote, urlencode"));
+    assert!(plugin_adapter.contains("upload_name = unquote(file_name or Path(file_path).name)"));
     assert!(plugin_adapter.contains("def _client_message_key("));
     assert!(plugin_adapter.contains("return f\"hermes-run:{run_id}\""));
     assert!(plugin_adapter.contains("f\"/inbox/{run_id}/ack\""));
@@ -627,7 +631,7 @@ async fn docker_provisioner_test() {
     assert!(
         create_call.windows(2).any(|args| {
             args[0] == "--label"
-                && args[1] == "hermes_hub_spec_version=2026-05-22-hermes-hub-image-model"
+                && args[1] == "hermes_hub_spec_version=2026-05-22-hermes-hub-attachment-filenames"
         }),
         "managed Hermes containers must carry the current spec label"
     );
