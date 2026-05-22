@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::{
     hermes::{
+        event_streams::HermesRunReference,
         instance::{HermesInstanceKind, HermesInstanceStatus},
         proxy_client::{HermesProxyError, HermesProxyRequest},
     },
@@ -38,6 +39,8 @@ pub async fn proxy(
         .map_err(|_| ApiError::NotFound("hermes instance not found"))?;
 
     if instance.kind == HermesInstanceKind::ManagedDocker {
+        // 托管 Hermes 必须先通过统一的 ensure 流程确认配置和 adapter 版本。
+        // 直连代理不再绕过该约束，否则会重新引入和 Hub channel run 不一致的旧路径。
         instance = ensure_managed_hermes_for_user(&state, &user.id).await?;
     }
 
@@ -48,26 +51,46 @@ pub async fn proxy(
     let body = to_bytes(body, state.config.max_proxy_body_bytes)
         .await
         .map_err(|_| ApiError::BadRequest("request body could not be read"))?;
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
     let authorization = instance
         .api_token_secret_ref
         .as_ref()
         .map(|token| format!("Bearer {token}"));
     let method_for_audit = method.to_string();
+    let event_stream_key = hermes_run_events_key(&user.id, &instance.id, &method, &path_and_query);
+    let event_stream_run_ref =
+        hermes_run_reference(&user.id, &instance.id, &method, &path_and_query);
+    let received_event_bytes = event_stream_key
+        .as_ref()
+        .and_then(|_| hermes_hub_received_bytes(&headers));
     let request = HermesProxyRequest {
         method,
-        instance_base_url: instance.base_url,
+        instance_base_url: instance.base_url.clone(),
         path_and_query: path_and_query.clone(),
         authorization,
-        content_type: headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(ToOwned::to_owned),
+        content_type,
         body: body.to_vec(),
         timeout_seconds: state.config.proxy_timeout_seconds,
     };
 
     let started = Instant::now();
-    let proxied = send_hermes_request_with_cold_start_retry(&state, &instance.kind, request).await;
+    let proxied = if let Some(event_stream_key) = event_stream_key {
+        state
+            .hermes_event_streams
+            .open(
+                event_stream_key,
+                received_event_bytes.unwrap_or(0),
+                state.hermes_proxy.clone(),
+                request,
+                event_stream_run_ref,
+            )
+            .await
+    } else {
+        send_hermes_request_with_cold_start_retry(&state, &instance.kind, request).await
+    };
 
     match proxied {
         Ok(response) => {
@@ -182,4 +205,65 @@ fn map_proxy_error(error: HermesProxyError) -> ApiError {
             ApiError::BadGateway("hermes request failed")
         }
     }
+}
+
+fn hermes_run_events_key(
+    user_id: &str,
+    instance_id: &str,
+    method: &axum::http::Method,
+    path_and_query: &str,
+) -> Option<String> {
+    if method.as_str() != "GET" {
+        return None;
+    }
+
+    let path = path_and_query.split('?').next().unwrap_or(path_and_query);
+    let parts = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() == 4 && parts[0] == "v1" && parts[1] == "runs" && parts[3] == "events" {
+        return Some(hermes_run_events_cache_key(user_id, instance_id, path));
+    }
+
+    None
+}
+
+fn hermes_run_events_cache_key(user_id: &str, instance_id: &str, path: &str) -> String {
+    format!("{user_id}:{instance_id}:{path}")
+}
+
+fn hermes_run_reference(
+    user_id: &str,
+    instance_id: &str,
+    method: &axum::http::Method,
+    path_and_query: &str,
+) -> Option<HermesRunReference> {
+    if method.as_str() != "GET" {
+        return None;
+    }
+
+    let path = path_and_query.split('?').next().unwrap_or(path_and_query);
+    let parts = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() == 4 && parts[0] == "v1" && parts[1] == "runs" && parts[3] == "events" {
+        return Some(HermesRunReference {
+            user_id: user_id.to_string(),
+            instance_id: instance_id.to_string(),
+            run_id: parts[2].to_string(),
+        });
+    }
+
+    None
+}
+
+fn hermes_hub_received_bytes(headers: &HeaderMap) -> Option<usize> {
+    headers
+        .get("x-hermes-hub-received-bytes")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
 }

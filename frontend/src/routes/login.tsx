@@ -1,4 +1,5 @@
 import type { ApiClient, User } from "../api/client";
+import { useI18n } from "../i18n";
 import { Bot } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
@@ -10,6 +11,7 @@ type LoginRouteProps = {
 type AuthMode = "login" | "bootstrap" | "invite";
 
 export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
+  const { t } = useI18n();
   const inviteFromUrl = useMemo(() => {
     const params = new URLSearchParams(window.location.search);
     return params.get("invite") ?? params.get("invite_token") ?? "";
@@ -63,7 +65,7 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
 
     try {
       if (isRegistering && password !== confirmPassword) {
-        throw new Error("Passwords do not match");
+        throw new Error(t("auth.passwordMismatch"));
       }
 
       const user =
@@ -74,7 +76,7 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
             : await apiClient.login(email, password);
       onAuthenticated(user);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Authentication failed");
+      setError(cause instanceof Error ? cause.message : t("auth.authFailed"));
     } finally {
       setBusy(false);
     }
@@ -88,11 +90,11 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
         </div>
         <h1 id="login-title">Hermes Hub</h1>
         <p className="auth-subtitle">
-          {isRegistering ? "Create your account" : "Sign in to your workspace"}
+          {isRegistering ? t("auth.createSubtitle") : t("auth.signInSubtitle")}
         </p>
         <form className="form" onSubmit={submit}>
           <label>
-            Email
+            {t("auth.email")}
             <input
               name="email"
               type="email"
@@ -103,7 +105,7 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
             />
           </label>
           <label>
-            Password
+            {t("auth.password")}
             <input
               name="password"
               type="password"
@@ -115,7 +117,7 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
           </label>
           {isRegistering ? (
             <label>
-              Confirm password
+              {t("auth.confirmPassword")}
               <input
                 name="confirm-password"
                 type="password"
@@ -129,12 +131,12 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
           {error ? <p className="error">{error}</p> : null}
           <button type="submit" disabled={busy || checkingBootstrap}>
             {checkingBootstrap
-              ? "Loading"
+              ? t("auth.loading")
               : busy
-                ? "Working"
+                ? t("auth.working")
                 : isRegistering
-                  ? "Create account"
-                  : "Sign in"}
+                  ? t("auth.createAccount")
+                  : t("auth.signIn")}
           </button>
         </form>
         {!inviteFromUrl && !checkingBootstrap ? (
@@ -148,7 +150,7 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
               setMode(isRegistering ? "login" : "bootstrap");
             }}
           >
-            {isRegistering ? "Already have an account? Sign in" : "Need to create the first admin?"}
+            {isRegistering ? t("auth.accountExists") : t("auth.bootstrapHint")}
           </button>
         ) : null}
       </section>

@@ -1,6 +1,7 @@
 import type { ApiClient, User } from "./api/client";
 import { createApiClient } from "./api/client";
 import { Layout, type AppView } from "./components/layout";
+import { I18nProvider, useI18n } from "./i18n";
 import { AdminRoute } from "./routes/admin";
 import { ChannelSessionRoute } from "./routes/channel-session";
 import { LoginRoute } from "./routes/login";
@@ -11,6 +12,15 @@ type AppProps = {
 };
 
 export function App({ apiClient = createApiClient() }: AppProps) {
+  return (
+    <I18nProvider>
+      <AppContent apiClient={apiClient} />
+    </I18nProvider>
+  );
+}
+
+function AppContent({ apiClient }: Required<AppProps>) {
+  const { t } = useI18n();
   const [user, setUser] = useState<User | null>(null);
   const [loadingUser, setLoadingUser] = useState(true);
   const [activeView, setActiveView] = useState<AppView>("chat");
@@ -47,7 +57,7 @@ export function App({ apiClient = createApiClient() }: AppProps) {
   }
 
   if (loadingUser) {
-    return <main className="auth-shell">Loading</main>;
+    return <main className="auth-shell">{t("common.loading")}</main>;
   }
 
   if (!user) {
@@ -61,7 +71,11 @@ export function App({ apiClient = createApiClient() }: AppProps) {
       onNavigate={setActiveView}
       onLogout={logout}
     >
-      {activeView === "chat" ? <ChannelSessionRoute apiClient={apiClient} /> : null}
+      <ChannelSessionRoute
+        active={activeView === "chat"}
+        apiClient={apiClient}
+        onOpenChat={() => setActiveView("chat")}
+      />
       {user.role === "admin" && activeView === "admin-users" ? (
         <AdminRoute apiClient={apiClient} currentUser={user} section="users" />
       ) : null}

@@ -140,7 +140,7 @@ impl LlmProviderClient for ReqwestLlmProviderClient {
         let url = join_base_and_path(&request.provider_base_url, &request.path)?;
         let method = reqwest::Method::from_bytes(request.method.as_str().as_bytes())
             .map_err(|error| LlmProviderError::Failed(error.to_string()))?;
-        let timeout = Duration::from_secs(request.timeout_seconds.max(1));
+        let timeout = provider_request_timeout(&request);
         let upstream = self
             .client
             .request(method, url)
@@ -154,6 +154,23 @@ impl LlmProviderClient for ReqwestLlmProviderClient {
 
         response_from_reqwest(upstream).await
     }
+}
+
+fn provider_request_timeout(request: &LlmProviderRequest) -> Duration {
+    if provider_request_is_streaming(&request.body) {
+        // 流式 LLM 响应可能持续数分钟。这里保留管理员配置对普通请求的约束，
+        // 但对 stream=true 的请求使用长超时，避免 Hub 在 60 秒处截断 Hermes 的上游流。
+        return Duration::from_secs(request.timeout_seconds.max(3600));
+    }
+
+    Duration::from_secs(request.timeout_seconds.max(1))
+}
+
+fn provider_request_is_streaming(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("stream").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
 }
 
 pub fn in_memory_client(response: LlmProviderResponse) -> InMemoryLlmProviderClient {

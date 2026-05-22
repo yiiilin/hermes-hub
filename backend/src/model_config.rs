@@ -328,11 +328,21 @@ impl ModelRegistry {
 
     pub async fn prepare_request_body(
         &self,
-        mut body: Value,
+        body: Value,
         api_type: &str,
     ) -> Result<PreparedModelRequest, ModelRegistryError> {
-        let config = self.active_config().await?;
-        validate_api_type_for_kind(LLM_MODEL_CONFIG_KIND, api_type)?;
+        self.prepare_request_body_for_kind(body, LLM_MODEL_CONFIG_KIND, api_type)
+            .await
+    }
+
+    pub async fn prepare_request_body_for_kind(
+        &self,
+        mut body: Value,
+        config_kind: &str,
+        api_type: &str,
+    ) -> Result<PreparedModelRequest, ModelRegistryError> {
+        let config = self.config_for_kind(config_kind).await?;
+        validate_api_type_for_kind(config_kind, api_type)?;
         let object = body
             .as_object_mut()
             .ok_or(ModelRegistryError::InvalidRequest)?;
@@ -340,7 +350,19 @@ impl ModelRegistry {
             .get("model")
             .and_then(|value| value.as_str())
             .map(ToOwned::to_owned);
-        let model = requested.unwrap_or_else(|| config.default_model.clone());
+        let model = match requested {
+            Some(model)
+                if config
+                    .allowed_models
+                    .iter()
+                    .any(|allowed| allowed == &model) =>
+            {
+                model
+            }
+            Some(_) if config_kind == IMAGE_MODEL_CONFIG_KIND => config.default_model.clone(),
+            Some(_) => return Err(ModelRegistryError::ModelNotAllowed),
+            None => config.default_model.clone(),
+        };
 
         if !config
             .allowed_models
@@ -351,7 +373,11 @@ impl ModelRegistry {
         }
 
         object.insert("model".to_string(), Value::String(model.clone()));
-        apply_reasoning_config(object, &config, api_type);
+        if config_kind != IMAGE_MODEL_CONFIG_KIND {
+            apply_reasoning_config(object, &config, api_type);
+        } else {
+            sanitize_image_generation_request(object);
+        }
         if object
             .get("stream")
             .and_then(|value| value.as_bool())
@@ -638,6 +664,15 @@ fn normalize_model_config(mut config: ModelConfig) -> Result<ModelConfig, ModelR
     validate_api_type_for_kind(&config.config_kind, &config.api_type)?;
     config.reasoning_effort = normalize_reasoning_effort(config.reasoning_effort)?;
     Ok(config)
+}
+
+fn sanitize_image_generation_request(object: &mut Map<String, Value>) {
+    // Hermes 的 OpenAI 图片插件会附带 quality 这一类 OpenAI 专有参数；
+    // 许多 OpenAI-compatible 网关会直接 502。Hub 以管理员的图片模型配置为准，
+    // 第一版只转发通用图片生成字段，保证兼容性优先。
+    for key in ["quality", "background", "output_format", "moderation"] {
+        object.remove(key);
+    }
 }
 
 fn apply_reasoning_config(object: &mut Map<String, Value>, config: &ModelConfig, api_type: &str) {

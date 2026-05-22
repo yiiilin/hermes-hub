@@ -139,10 +139,16 @@ create table if not exists channel_session_messages (
     id uuid primary key,
     session_id uuid not null references channel_sessions(id) on delete cascade,
     role text not null check (role in ('user', 'assistant')),
+    client_message_key text,
     content text not null,
     attachments jsonb not null default '[]'::jsonb,
     created_at timestamptz not null default now()
 );
+
+alter table channel_session_messages add column if not exists client_message_key text;
+create unique index if not exists channel_session_messages_client_key_idx
+    on channel_session_messages(session_id, client_message_key)
+    where client_message_key is not null;
 
 create table if not exists channel_attachments (
     id uuid primary key,
@@ -157,6 +163,32 @@ create table if not exists channel_attachments (
     kind text not null check (kind in ('file', 'image')),
     created_at timestamptz not null default now()
 );
+
+create table if not exists channel_runs (
+    id uuid primary key,
+    session_id uuid not null references channel_sessions(id) on delete cascade,
+    user_message_id uuid references channel_session_messages(id) on delete set null,
+    status text not null default 'queued' check (
+        status in ('queued', 'leased', 'running', 'completed', 'failed', 'cancelled', 'expired')
+    ),
+    input text not null default '',
+    input_attachments jsonb not null default '[]'::jsonb,
+    output_message_id uuid references channel_session_messages(id) on delete set null,
+    error text,
+    lease_expires_at timestamptz,
+    attempt_count integer not null default 0 check (attempt_count >= 0),
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    completed_at timestamptz
+);
+
+create unique index if not exists channel_runs_user_message_idx
+    on channel_runs(user_message_id)
+    where user_message_id is not null;
+
+create index if not exists channel_runs_ready_idx
+    on channel_runs(session_id, created_at)
+    where status in ('queued', 'leased', 'running');
 
 -- 保持现有 API 语义：用户可以先创建 channel，再绑定或创建 Hermes 实例。
 alter table channels alter column hermes_instance_id drop not null;

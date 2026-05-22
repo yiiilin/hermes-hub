@@ -97,10 +97,10 @@ Browser uploads go through Hub, are stored through the configured S3-compatible 
 
 Hermes-side channel adapters should use the internal protocol with the instance token that Hub already issues to each Hermes instance:
 
-- `POST /internal/channel/v1/sessions/{session_id}/attachments` with `multipart/form-data`
-- `POST /internal/channel/v1/sessions/{session_id}/messages` with `{ role, content, attachments }`
+- `POST /internal/channel/v1/sessions/{session_id}/attachments` with `multipart/form-data`; Hub returns attachment metadata including `download_url`.
+- `POST /internal/channel/v1/sessions/{session_id}/messages` with `{ "role": "assistant", "content": "文件：[name](download_url)", "attachments": [...] }`.
 
-This keeps file lifecycle bound to the Hub session and avoids reading files directly from Hermes container bind mounts.
+The message endpoint only accepts assistant messages from Hermes. Each attachment item must reference an attachment id returned by the upload endpoint for the same session; Hub rebuilds attachment metadata from its database and rejects unknown, cross-session, or wrong-direction attachment ids. Managed Hermes containers receive `HERMES_HUB_CHANNEL_BASE_URL` and `HERMES_HUB_CHANNEL_TOKEN` for this protocol. This keeps file lifecycle bound to the Hub session and avoids reading files directly from Hermes container bind mounts.
 
 ## Hub Deployment Compose
 

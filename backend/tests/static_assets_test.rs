@@ -43,6 +43,7 @@ async fn backend_serves_frontend_static_assets_and_spa_fallback() {
     assert_eq!(body, "console.log('hub')");
 
     let spa = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::GET)
@@ -57,4 +58,23 @@ async fn backend_serves_frontend_static_assets_and_spa_fallback() {
         .await
         .expect("spa body");
     assert_eq!(body, "<main>Hermes Hub App</main>");
+
+    let api_miss = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/not-a-real-route")
+                .body(Body::empty())
+                .expect("request can be built"),
+        )
+        .await
+        .expect("api miss response");
+    assert_eq!(api_miss.status(), StatusCode::NOT_FOUND);
+    let body = to_bytes(api_miss.into_body(), usize::MAX)
+        .await
+        .expect("api miss body");
+    assert!(
+        String::from_utf8_lossy(&body).contains("api route not found"),
+        "未知 API 路径必须返回 JSON 404，不能落到 SPA fallback 变成含糊的 405"
+    );
 }

@@ -7,9 +7,12 @@ use hermes_hub_backend::hermes::{
     provisioner::HermesProvisioner,
 };
 use std::{
+    os::unix::fs::PermissionsExt,
     path::PathBuf,
+    process::Command,
     sync::{Arc, Mutex},
 };
+use uuid::Uuid;
 
 #[derive(Clone, Default)]
 struct FakeDockerRuntime {
@@ -148,6 +151,186 @@ async fn docker_provisioner_publishes_random_host_port_for_host_development() {
 }
 
 #[tokio::test]
+async fn docker_provisioner_recreates_running_container_without_current_managed_spec_label() {
+    let runtime = FakeDockerRuntime::default();
+    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime.clone()));
+
+    // 第一次启动会写出当前 config.yaml 和 hermes_hub platform plugin；
+    // 第二次启动时文件不再变化，只有容器规格标签能暴露旧容器缺少新插件行为的问题。
+    provisioner
+        .ensure_instance("user-spec-label", "instance-token")
+        .await
+        .expect("instance can be created");
+    runtime.calls.lock().expect("calls lock").clear();
+
+    provisioner
+        .ensure_instance("user-spec-label", "instance-token")
+        .await
+        .expect("old container can be recreated");
+
+    let calls = runtime.calls.lock().expect("calls lock").clone();
+    assert!(
+        calls.iter().any(|args| args
+            == &vec![
+                "rm".to_string(),
+                "-f".to_string(),
+                "hermes-user-user-spec-label".to_string(),
+            ]),
+        "old managed Hermes containers without the current spec label must be removed"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|args| args.first().map(String::as_str) == Some("create")),
+        "old managed Hermes containers without the current spec label must be recreated"
+    );
+}
+
+#[tokio::test]
+async fn docker_provisioner_writes_codex_responses_api_mode_for_responses_models() {
+    let runtime = FakeDockerRuntime::default();
+    let mut config = test_config();
+    config.api_mode = "responses".to_string();
+    let provisioner = DockerProvisioner::new_with_runtime(config, Arc::new(runtime.clone()));
+
+    provisioner
+        .ensure_instance("user-responses", "instance-token")
+        .await
+        .expect("instance can be created");
+
+    let managed_config =
+        std::fs::read_to_string("/tmp/hermes-hub-test/users/user-responses/config/config.yaml")
+            .expect("managed Hermes config is written");
+    assert!(managed_config.contains("api_mode: \"codex_responses\""));
+}
+
+#[tokio::test]
+async fn docker_provisioner_derives_channel_base_url_from_hub_origin() {
+    let runtime = FakeDockerRuntime::default();
+    let mut config = test_config();
+    config.hub_llm_base_url = "http://hermes-hub:8080".to_string();
+    let provisioner = DockerProvisioner::new_with_runtime(config, Arc::new(runtime.clone()));
+
+    let instance = provisioner
+        .ensure_instance("user-root-hub-url", "instance-token")
+        .await
+        .expect("instance can be created");
+    let spec = provisioner
+        .container_spec_for(&instance)
+        .expect("container spec can be rendered");
+
+    assert!(
+        spec.env
+            .iter()
+            .any(|entry| entry == "HERMES_HUB_CHANNEL_BASE_URL=http://hermes-hub:8080/internal/channel/v1"),
+        "channel adapter must call the Hub internal channel API, even when the LLM base URL is configured as the Hub origin"
+    );
+    let managed_config =
+        std::fs::read_to_string("/tmp/hermes-hub-test/users/user-root-hub-url/config/config.yaml")
+            .expect("managed Hermes config is written");
+    assert!(managed_config.contains("base_url: \"http://hermes-hub:8080/internal/channel/v1\""));
+}
+
+#[tokio::test]
+async fn docker_provisioner_pre_approves_hermes_hub_pairing_for_managed_users() {
+    let runtime = FakeDockerRuntime::default();
+    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime));
+    let user_id = format!("user-pairing-{}", Uuid::new_v4());
+
+    let instance = provisioner
+        .ensure_instance(&user_id, "instance-token")
+        .await
+        .expect("instance can be created");
+
+    let config_path = PathBuf::from(
+        instance
+            .host_config_path
+            .expect("managed config path is set"),
+    );
+    for approved_path in [
+        config_path.join("pairing/hermes_hub-approved.json"),
+        config_path.join("platforms/pairing/hermes_hub-approved.json"),
+    ] {
+        let approved: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&approved_path)
+                .expect("Hermes Hub approved pairing is written"),
+        )
+        .expect("approved pairing is valid json");
+        let user_entry = approved
+            .get(&user_id)
+            .expect("Hub user is pre-approved for hermes_hub");
+
+        assert_eq!(user_entry["user_name"], "Hub user");
+        assert!(
+            user_entry["approved_at"].as_f64().unwrap_or_default() > 0.0,
+            "Hermes pairing store expects an approval timestamp"
+        );
+    }
+}
+
+#[tokio::test]
+async fn docker_provisioner_preserves_approved_pairing_and_clears_stale_pending_pairing() {
+    let runtime = FakeDockerRuntime::default();
+    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime));
+    let user_id = format!("user-pairing-state-{}", Uuid::new_v4());
+    let prepared = provisioner.prepare_instance(&user_id);
+    let config_path = PathBuf::from(
+        prepared
+            .host_config_path
+            .as_ref()
+            .expect("managed config path is set"),
+    );
+    let pairing_dir = config_path.join("pairing");
+    std::fs::create_dir_all(&pairing_dir).expect("pairing directory can be created");
+    let approved_path = pairing_dir.join("hermes_hub-approved.json");
+    let pending_path = pairing_dir.join("hermes_hub-pending.json");
+
+    // Hermes 自己的 pairing store 以 platform 分文件保存状态。Hub 重写托管配置时
+    // 不能刷新既有 approved_at，否则升级/重建容器会造成无意义状态漂移。
+    std::fs::write(
+        &approved_path,
+        format!(
+            r#"{{
+                "{user_id}": {{"user_name": "Existing Hub user", "approved_at": 12345.0}},
+                "other-user": {{"user_name": "Other", "approved_at": 67890.0}}
+            }}"#
+        ),
+    )
+    .expect("approved pairing fixture can be written");
+    std::fs::write(
+        &pending_path,
+        format!(
+            r#"{{
+                "STALE": {{"user_id": "{user_id}", "user_name": "Hub user", "created_at": 1.0}},
+                "KEEP": {{"user_id": "other-user", "user_name": "Other", "created_at": 2.0}}
+            }}"#
+        ),
+    )
+    .expect("pending pairing fixture can be written");
+
+    provisioner
+        .ensure_instance(&user_id, "instance-token")
+        .await
+        .expect("instance can be created");
+
+    let approved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&approved_path).expect("approved exists"))
+            .expect("approved pairing is valid json");
+    assert_eq!(approved[&user_id]["user_name"], "Existing Hub user");
+    assert_eq!(approved[&user_id]["approved_at"], 12345.0);
+    assert_eq!(approved["other-user"]["approved_at"], 67890.0);
+
+    let pending: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&pending_path).expect("pending exists"))
+            .expect("pending pairing is valid json");
+    assert!(
+        pending.get("STALE").is_none(),
+        "stale pending code for the already approved Hub user must be removed"
+    );
+    assert_eq!(pending["KEEP"]["user_id"], "other-user");
+}
+
+#[tokio::test]
 async fn docker_provisioner_test() {
     let runtime = FakeDockerRuntime::default();
     let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime.clone()));
@@ -173,6 +356,24 @@ async fn docker_provisioner_test() {
         instance.host_config_path.as_deref(),
         Some("/tmp/hermes-hub-test/users/user-123/config")
     );
+    let workspace_mode = std::fs::metadata("/tmp/hermes-hub-test/users/user-123/workspace")
+        .expect("workspace exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    let sandbox_mode = std::fs::metadata("/tmp/hermes-hub-test/users/user-123/sandbox")
+        .expect("sandbox exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    let config_mode = std::fs::metadata("/tmp/hermes-hub-test/users/user-123/config")
+        .expect("config exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(workspace_mode, 0o777);
+    assert_eq!(sandbox_mode, 0o777);
+    assert_eq!(config_mode, 0o777);
 
     let spec = provisioner
         .container_spec_for(&instance)
@@ -216,10 +417,62 @@ async fn docker_provisioner_test() {
         .env
         .iter()
         .any(|entry| entry == "OPENAI_API_KEY=instance-token"));
+    assert!(spec.env.iter().any(|entry| {
+        entry == "HERMES_HUB_CHANNEL_BASE_URL=http://hermes-hub:8080/internal/channel/v1"
+    }));
+    assert!(spec
+        .env
+        .iter()
+        .any(|entry| entry == "HERMES_HUB_CHANNEL_TOKEN=instance-token"));
+    assert!(spec
+        .env
+        .iter()
+        .any(|entry| entry == &format!("HERMES_HUB_INSTANCE_ID={}", instance.id)));
+    assert!(spec
+        .env
+        .iter()
+        .any(|entry| entry == "HERMES_HUB_USER_ID=user-123"));
+    assert!(spec
+        .env
+        .iter()
+        .any(|entry| entry == "HERMES_HUB_INBOUND_PORT=8000"));
+    assert!(spec
+        .env
+        .iter()
+        .any(|entry| entry == "HERMES_HUB_INBOX_PATH=/internal/channel/v1/inbox"));
+    assert!(spec
+        .env
+        .iter()
+        .any(|entry| entry == "HERMES_HUB_INBOX_TIMEOUT_SECONDS=25"));
+    assert!(spec
+        .env
+        .iter()
+        .any(|entry| entry == "HERMES_HUB_INBOX_LIMIT=4"));
+    assert!(spec
+        .env
+        .iter()
+        .any(|entry| entry == "OPENAI_IMAGE_MODEL=gpt-image-2-medium"));
+    assert!(spec
+        .env
+        .iter()
+        .any(|entry| entry == "HERMES_TOOL_PROGRESS_MODE=verbose"));
+    assert!(spec.env.iter().any(|entry| entry == "HERMES_YOLO_MODE=1"));
+    assert!(spec
+        .env
+        .iter()
+        .any(|entry| entry == "HERMES_ACCEPT_HOOKS=1"));
+    assert!(spec.labels.iter().any(|(key, value)| {
+        key == "hermes_hub_spec_version" && value == "2026-05-21-hermes-hub-platform-2"
+    }));
     assert!(spec
         .mounts
         .iter()
         .any(|mount| mount.container_path == "/config" && !mount.read_only));
+    assert!(spec.mounts.iter().any(|mount| {
+        mount.container_path == "/opt/data"
+            && mount.host_path == "/tmp/hermes-hub-test/users/user-123/sandbox"
+            && !mount.read_only
+    }));
     assert_eq!(instance.container_id.as_deref(), Some("container-created"));
     assert_eq!(
         instance.api_token_secret_ref.as_deref(),
@@ -228,9 +481,102 @@ async fn docker_provisioner_test() {
     let managed_config =
         std::fs::read_to_string("/tmp/hermes-hub-test/users/user-123/config/config.yaml")
             .expect("managed Hermes config is written");
+    let plugin_yaml = std::fs::read_to_string(
+        "/tmp/hermes-hub-test/users/user-123/config/plugins/platforms/hermes_hub/plugin.yaml",
+    )
+    .expect("hermes_hub platform plugin metadata is written");
+    let plugin_init = std::fs::read_to_string(
+        "/tmp/hermes-hub-test/users/user-123/config/plugins/platforms/hermes_hub/__init__.py",
+    )
+    .expect("hermes_hub platform plugin package marker is written");
+    let plugin_adapter = std::fs::read_to_string(
+        "/tmp/hermes-hub-test/users/user-123/config/plugins/platforms/hermes_hub/adapter.py",
+    )
+    .expect("hermes_hub platform adapter is written");
     assert!(managed_config.contains("provider: \"custom\""));
     assert!(managed_config.contains("default: \"gpt-4.1-mini\""));
     assert!(managed_config.contains("api_key: \"instance-token\""));
+    assert!(managed_config.contains("plugins:"));
+    assert!(managed_config.contains("enabled: [platforms/hermes_hub]"));
+    assert!(managed_config.contains("gateway:"));
+    assert!(managed_config.contains("platforms:"));
+    assert!(managed_config.contains("hermes_hub:"));
+    assert!(managed_config.contains("enabled: true"));
+    assert!(managed_config.contains("extra:"));
+    assert!(managed_config.contains("base_url: \"http://hermes-hub:8080/internal/channel/v1\""));
+    assert!(managed_config.contains("inbox_path: \"/internal/channel/v1/inbox\""));
+    assert!(managed_config.contains(&format!("instance_id: \"{}\"", instance.id)));
+    assert!(managed_config.contains("user_id: \"user-123\""));
+    assert!(managed_config.contains("timeout_seconds: 25"));
+    assert!(managed_config.contains("limit: 4"));
+    assert!(managed_config.contains("image_gen:"));
+    assert!(managed_config.contains("provider: \"openai\""));
+    assert!(managed_config.contains("model: \"gpt-image-2-medium\""));
+    assert!(managed_config.contains("display:"));
+    assert!(managed_config.contains("tool_progress: \"verbose\""));
+    assert!(managed_config.contains("tool_progress_command: true"));
+    assert!(managed_config.contains("approvals:"));
+    assert!(managed_config.contains("mode: \"off\""));
+    assert!(managed_config.contains("cron_mode: \"approve\""));
+    assert!(managed_config.contains("mcp_reload_confirm: false"));
+    assert!(managed_config.contains("destructive_slash_confirm: false"));
+    assert!(plugin_yaml.contains("name: hermes-hub-platform"));
+    assert!(plugin_yaml.contains("kind: platform"));
+    assert!(plugin_yaml.contains("HERMES_HUB_CHANNEL_BASE_URL"));
+    assert!(plugin_yaml.contains("HERMES_HUB_CHANNEL_TOKEN"));
+    assert!(plugin_init.contains("Hermes Hub platform plugin"));
+    assert!(plugin_init.contains("from .adapter import register"));
+    assert!(plugin_adapter.contains("class HermesHubAdapter"));
+    assert!(plugin_adapter.contains("/internal/channel/v1/inbox?timeout_seconds=25&limit=4"));
+    assert!(plugin_adapter.contains("async def connect("));
+    assert!(plugin_adapter.contains("MessageEvent("));
+    assert!(plugin_adapter.contains("text=content"));
+    assert!(plugin_adapter.contains("HERMES_HUB_HOME_CHANNEL"));
+    assert!(plugin_adapter.contains("self.build_source("));
+    assert!(plugin_adapter.contains("thread_id=run_id"));
+    assert!(plugin_adapter.contains("raw_message[\"run_id\"] = run_id"));
+    assert!(plugin_adapter.contains("await self.handle_message(event)"));
+    assert!(plugin_adapter.contains("async def on_processing_complete("));
+    assert!(plugin_adapter.contains("ProcessingOutcome.CANCELLED"));
+    assert!(plugin_adapter.contains("MAX_MESSAGE_LENGTH = 8000"));
+    assert!(plugin_adapter.contains("self._last_output_messages: dict[str, str] = {}"));
+    assert!(plugin_adapter.contains("self._remember_output_message(metadata, message)"));
+    assert!(
+        plugin_adapter.contains("run_id = metadata.get(\"run_id\") or metadata.get(\"thread_id\")")
+    );
+    assert!(plugin_adapter.contains("return self._normalize_run_id(run_id)"));
+    assert!(plugin_adapter.contains("def _normalize_run_id(self, run_id: Any) -> str:"));
+    assert!(plugin_adapter.contains("return f\"hub-run-{value}\""));
+    assert!(plugin_adapter.contains("\"output_message_id\": output_message_id"));
+    assert!(plugin_adapter.contains("payload[\"client_message_key\"] = client_message_key"));
+    assert!(plugin_adapter.contains("def _client_message_key("));
+    assert!(plugin_adapter.contains("return f\"hermes-run:{run_id}\""));
+    assert!(!plugin_adapter.contains("payload[\"run_id\"] = run_id"));
+    assert!(plugin_adapter.contains("f\"/inbox/{run_id}/ack\""));
+    assert!(plugin_adapter.contains("media_types.append(content_type)"));
+    assert!(plugin_adapter.contains("startswith(\"image/\")"));
+    assert!(plugin_adapter.contains("async def send("));
+    assert!(plugin_adapter.contains("async def edit_message("));
+    assert!(plugin_adapter.contains("async def send_document("));
+    assert!(plugin_adapter.contains("async def send_image_file("));
+    assert!(plugin_adapter.contains("async def _wait_after_empty_poll("));
+    assert!(
+        plugin_adapter.contains("#"),
+        "adapter.py must include Chinese comments explaining Hub queue behavior"
+    );
+    let compile_output = Command::new("python3")
+        .args([
+            "-m",
+            "py_compile",
+            "/tmp/hermes-hub-test/users/user-123/config/plugins/platforms/hermes_hub/adapter.py",
+        ])
+        .output()
+        .expect("python3 is available to compile generated adapter");
+    assert!(
+        compile_output.status.success(),
+        "generated adapter.py must be valid Python: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
 
     let calls = runtime.calls.lock().expect("calls lock").clone();
     assert!(calls.iter().any(|args| args
@@ -249,6 +595,36 @@ async fn docker_provisioner_test() {
             .any(|arg| arg == "-p" || arg == "--publish"),
         "managed Hermes must not publish host ports"
     );
+    assert!(
+        create_call.windows(2).any(|args| {
+            args[0] == "--label"
+                && args[1] == "hermes_hub_spec_version=2026-05-21-hermes-hub-platform-2"
+        }),
+        "managed Hermes containers must carry the current spec label"
+    );
+    assert!(
+        create_call.windows(2).any(|args| {
+            args[0] == "--mount"
+                && args[1]
+                    == "type=bind,src=/tmp/hermes-hub-test/users/user-123/sandbox,dst=/opt/data"
+        }),
+        "managed Hermes must expose /opt/data through a Hub-owned host directory"
+    );
+    for path in [
+        "/tmp/hermes-hub-test/users/user-123/workspace",
+        "/tmp/hermes-hub-test/users/user-123/sandbox",
+        "/tmp/hermes-hub-test/users/user-123/config",
+    ] {
+        let mode = std::fs::metadata(path)
+            .expect("managed writable directory exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o777,
+            "Hermes tool directories must be writable by the container user"
+        );
+    }
 
     provisioner
         .stop_instance(&instance)

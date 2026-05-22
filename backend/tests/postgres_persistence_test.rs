@@ -6,11 +6,12 @@ use axum::{
 };
 use hermes_hub_backend::{
     build_router_with_state,
-    channel::service::ChannelStore,
+    channel::service::{ChannelSessionKind, ChannelStore},
     db::migrations::run_migrations,
     docker_config_from_app,
     hermes::{
         docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
+        event_streams::HermesEventStreamRegistry,
         proxy_client::InMemoryHermesProxyClient,
     },
     llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
@@ -87,6 +88,7 @@ async fn test_state(pool: PgPool, provider: InMemoryLlmProviderClient) -> AppSta
         store: SessionStore::postgres(pool.clone(), cipher),
         channel_store: ChannelStore::postgres(pool),
         hermes_proxy: InMemoryHermesProxyClient::default().shared(),
+        hermes_event_streams: HermesEventStreamRegistry::default(),
         model_registry,
         llm_provider: provider.shared(),
         object_storage: InMemoryObjectStorage::default().shared(),
@@ -464,4 +466,80 @@ async fn postgres_state_survives_recreated_router_state() {
         "https://provider-persisted.example/v1"
     );
     assert_eq!(forwarded.authorization, "Bearer provider-persisted-key");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_channel_session_persists_hermes_anchors() {
+    let Some(pool) = postgres_pool().await else {
+        eprintln!("skipping postgres persistence test: HERMES_HUB_TEST_DATABASE_URL is not set");
+        return;
+    };
+    run_migrations(&pool).await.expect("migrations can run");
+
+    let cipher = SecretCipher::from_master_key(TEST_SECRET_KEY).expect("test cipher is valid");
+    let store = SessionStore::postgres(pool.clone(), cipher.clone());
+    let channel_store = ChannelStore::postgres(pool);
+
+    let user = store
+        .create_bootstrap_admin("adapter@example.com", "adapter-password-123")
+        .await
+        .expect("bootstrap admin can be created");
+    let channel = channel_store
+        .ensure_hub_channel(&user.id)
+        .await
+        .expect("hub channel can be ensured");
+    let session = channel_store
+        .create_session(&user.id, &channel.id, ChannelSessionKind::Agent, None)
+        .await
+        .expect("session can be created");
+
+    let updated = channel_store
+        .update_session_hermes_anchors(
+            &user.id,
+            &channel.id,
+            &session.id,
+            Some("hermes-session-1"),
+            Some("hermes-response-1"),
+            Some("hermes-run-1"),
+        )
+        .await
+        .expect("hermes anchors can be persisted");
+
+    assert_eq!(
+        updated.hermes_session_id.as_deref(),
+        Some("hermes-session-1")
+    );
+    assert_eq!(
+        updated.hermes_response_id.as_deref(),
+        Some("hermes-response-1")
+    );
+    assert_eq!(updated.hermes_run_id.as_deref(), Some("hermes-run-1"));
+
+    let fetched = channel_store
+        .get_session(&user.id, &channel.id, &session.id)
+        .await
+        .expect("session can be reloaded");
+    assert_eq!(
+        fetched.hermes_session_id.as_deref(),
+        Some("hermes-session-1")
+    );
+    assert_eq!(
+        fetched.hermes_response_id.as_deref(),
+        Some("hermes-response-1")
+    );
+    assert_eq!(fetched.hermes_run_id.as_deref(), Some("hermes-run-1"));
+
+    let cleared = channel_store
+        .clear_session_hermes_run_id(&user.id, &channel.id, &session.id)
+        .await
+        .expect("hermes run anchor can be cleared");
+    assert!(cleared.hermes_run_id.is_none());
+    assert_eq!(
+        cleared.hermes_session_id.as_deref(),
+        Some("hermes-session-1")
+    );
+    assert_eq!(
+        cleared.hermes_response_id.as_deref(),
+        Some("hermes-response-1")
+    );
 }

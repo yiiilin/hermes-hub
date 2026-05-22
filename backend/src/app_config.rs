@@ -84,7 +84,7 @@ impl AppConfig {
             initial_model_config: model_config_from_env(),
             hermes_docker: hermes_docker_config_from_env(),
             object_storage: object_storage_config_from_env(),
-            proxy_timeout_seconds: env_u64("HERMES_HUB_PROXY_TIMEOUT_SECONDS", 60),
+            proxy_timeout_seconds: env_u64("HERMES_HUB_PROXY_TIMEOUT_SECONDS", 300),
             max_proxy_body_bytes: env_usize("HERMES_HUB_MAX_PROXY_BODY_BYTES", 10 * 1024 * 1024),
             static_dir: PathBuf::from(
                 std::env::var("HERMES_HUB_STATIC_DIR")
@@ -96,20 +96,47 @@ impl AppConfig {
 
 fn object_storage_config_from_env() -> ObjectStorageConfig {
     ObjectStorageConfig {
-        endpoint: optional_env("HERMES_OBJECT_STORAGE_ENDPOINT"),
-        bucket: std::env::var("HERMES_OBJECT_STORAGE_BUCKET")
-            .unwrap_or_else(|_| "hermes-hub".to_string()),
-        region: std::env::var("HERMES_OBJECT_STORAGE_REGION")
-            .unwrap_or_else(|_| "us-east-1".to_string()),
-        access_key: optional_env("HERMES_OBJECT_STORAGE_ACCESS_KEY"),
-        secret_key: optional_env("HERMES_OBJECT_STORAGE_SECRET_KEY"),
-        force_path_style: std::env::var("HERMES_OBJECT_STORAGE_FORCE_PATH_STYLE")
-            .ok()
-            .and_then(|value| value.parse::<bool>().ok())
-            .unwrap_or(true),
-        prefix: std::env::var("HERMES_OBJECT_STORAGE_PREFIX")
-            .unwrap_or_else(|_| "attachments".to_string()),
-        max_upload_bytes: env_usize("HERMES_OBJECT_STORAGE_MAX_UPLOAD_BYTES", 25 * 1024 * 1024),
+        endpoint: optional_env_any(&[
+            "HERMES_OBJECT_STORAGE_ENDPOINT",
+            "HERMES_HUB_OBJECT_STORAGE_ENDPOINT",
+        ]),
+        bucket: env_any(&[
+            "HERMES_OBJECT_STORAGE_BUCKET",
+            "HERMES_HUB_OBJECT_STORAGE_BUCKET",
+        ])
+        .unwrap_or_else(|_| "hermes-hub".to_string()),
+        region: env_any(&[
+            "HERMES_OBJECT_STORAGE_REGION",
+            "HERMES_HUB_OBJECT_STORAGE_REGION",
+        ])
+        .unwrap_or_else(|_| "us-east-1".to_string()),
+        access_key: optional_env_any(&[
+            "HERMES_OBJECT_STORAGE_ACCESS_KEY",
+            "HERMES_HUB_OBJECT_STORAGE_ACCESS_KEY",
+        ]),
+        secret_key: optional_env_any(&[
+            "HERMES_OBJECT_STORAGE_SECRET_KEY",
+            "HERMES_HUB_OBJECT_STORAGE_SECRET_KEY",
+        ]),
+        force_path_style: env_any(&[
+            "HERMES_OBJECT_STORAGE_FORCE_PATH_STYLE",
+            "HERMES_HUB_OBJECT_STORAGE_FORCE_PATH_STYLE",
+        ])
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(true),
+        prefix: env_any(&[
+            "HERMES_OBJECT_STORAGE_PREFIX",
+            "HERMES_HUB_OBJECT_STORAGE_PREFIX",
+        ])
+        .unwrap_or_else(|_| "attachments".to_string()),
+        max_upload_bytes: env_usize_any(
+            &[
+                "HERMES_OBJECT_STORAGE_MAX_UPLOAD_BYTES",
+                "HERMES_HUB_OBJECT_STORAGE_MAX_UPLOAD_BYTES",
+            ],
+            25 * 1024 * 1024,
+        ),
     }
 }
 
@@ -131,7 +158,7 @@ fn model_config_from_env() -> ModelConfig {
     let request_timeout_seconds = std::env::var("HERMES_HUB_MODEL_REQUEST_TIMEOUT_SECONDS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(60);
+        .unwrap_or(300);
     let allow_streaming = std::env::var("HERMES_HUB_MODEL_ALLOW_STREAMING")
         .ok()
         .and_then(|value| value.parse::<bool>().ok())
@@ -238,6 +265,17 @@ fn optional_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn optional_env_any(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| optional_env(name))
+}
+
+fn env_any(names: &[&str]) -> Result<String, std::env::VarError> {
+    names
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .ok_or(std::env::VarError::NotPresent)
+}
+
 fn env_u16(name: &str, default: u16) -> u16 {
     std::env::var(name)
         .ok()
@@ -257,4 +295,93 @@ fn env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default)
+}
+
+fn env_usize_any(names: &[&str], default: usize) -> usize {
+    names
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{model_config_from_env, object_storage_config_from_env};
+
+    #[test]
+    fn object_storage_accepts_hub_prefixed_env_aliases() {
+        const NAMES: &[&str] = &[
+            "HERMES_OBJECT_STORAGE_ENDPOINT",
+            "HERMES_OBJECT_STORAGE_BUCKET",
+            "HERMES_OBJECT_STORAGE_REGION",
+            "HERMES_OBJECT_STORAGE_ACCESS_KEY",
+            "HERMES_OBJECT_STORAGE_SECRET_KEY",
+            "HERMES_OBJECT_STORAGE_FORCE_PATH_STYLE",
+            "HERMES_OBJECT_STORAGE_PREFIX",
+            "HERMES_OBJECT_STORAGE_MAX_UPLOAD_BYTES",
+            "HERMES_HUB_OBJECT_STORAGE_ENDPOINT",
+            "HERMES_HUB_OBJECT_STORAGE_BUCKET",
+            "HERMES_HUB_OBJECT_STORAGE_REGION",
+            "HERMES_HUB_OBJECT_STORAGE_ACCESS_KEY",
+            "HERMES_HUB_OBJECT_STORAGE_SECRET_KEY",
+            "HERMES_HUB_OBJECT_STORAGE_FORCE_PATH_STYLE",
+            "HERMES_HUB_OBJECT_STORAGE_PREFIX",
+            "HERMES_HUB_OBJECT_STORAGE_MAX_UPLOAD_BYTES",
+        ];
+
+        let saved = NAMES
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect::<Vec<_>>();
+        for name in NAMES {
+            std::env::remove_var(name);
+        }
+
+        // 本地调试和旧部署命令可能使用 HERMES_HUB_OBJECT_STORAGE_*；
+        // 后端需要兼容该前缀，避免附件存储静默退回内存实现。
+        std::env::set_var(
+            "HERMES_HUB_OBJECT_STORAGE_ENDPOINT",
+            "http://127.0.0.1:9000",
+        );
+        std::env::set_var("HERMES_HUB_OBJECT_STORAGE_BUCKET", "hub-bucket");
+        std::env::set_var("HERMES_HUB_OBJECT_STORAGE_REGION", "local");
+        std::env::set_var("HERMES_HUB_OBJECT_STORAGE_ACCESS_KEY", "access");
+        std::env::set_var("HERMES_HUB_OBJECT_STORAGE_SECRET_KEY", "secret");
+        std::env::set_var("HERMES_HUB_OBJECT_STORAGE_FORCE_PATH_STYLE", "false");
+        std::env::set_var("HERMES_HUB_OBJECT_STORAGE_PREFIX", "files");
+        std::env::set_var("HERMES_HUB_OBJECT_STORAGE_MAX_UPLOAD_BYTES", "123");
+
+        let config = object_storage_config_from_env();
+        assert_eq!(config.endpoint.as_deref(), Some("http://127.0.0.1:9000"));
+        assert_eq!(config.bucket, "hub-bucket");
+        assert_eq!(config.region, "local");
+        assert_eq!(config.access_key.as_deref(), Some("access"));
+        assert_eq!(config.secret_key.as_deref(), Some("secret"));
+        assert!(!config.force_path_style);
+        assert_eq!(config.prefix, "files");
+        assert_eq!(config.max_upload_bytes, 123);
+
+        for (name, value) in saved {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+    }
+
+    #[test]
+    fn llm_model_config_uses_long_default_request_timeout() {
+        let saved = std::env::var("HERMES_HUB_MODEL_REQUEST_TIMEOUT_SECONDS").ok();
+        std::env::remove_var("HERMES_HUB_MODEL_REQUEST_TIMEOUT_SECONDS");
+
+        // Hermes 的 agent 任务会长期持有流式模型连接；默认值不能按普通短请求的 60 秒处理。
+        let config = model_config_from_env();
+        assert_eq!(config.request_timeout_seconds, 300);
+
+        if let Some(value) = saved {
+            std::env::set_var("HERMES_HUB_MODEL_REQUEST_TIMEOUT_SECONDS", value);
+        }
+    }
 }

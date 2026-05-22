@@ -1,0 +1,309 @@
+import { createContext, ReactNode, useContext, useMemo, useState } from "react";
+
+export type Language = "zh" | "en";
+
+type TranslationValues = Record<string, string | number>;
+
+type I18nContextValue = {
+  language: Language;
+  setLanguage: (language: Language) => void;
+  t: (key: TranslationKey, values?: TranslationValues) => string;
+};
+
+const storageKey = "hermes-hub-language";
+
+const translations = {
+  zh: {
+    "admin.action": "操作",
+    "admin.api": "API",
+    "admin.apiKey": "API key",
+    "admin.baseUrl": "Base URL",
+    "admin.cancel": "取消",
+    "admin.create": "创建",
+    "admin.createInvite": "创建邀请",
+    "admin.disable": "禁用",
+    "admin.edit": "编辑",
+    "admin.email": "邮箱",
+    "admin.enable": "启用",
+    "admin.expiresAt": "过期时间",
+    "admin.externalTokenHint": "留空表示沿用已有 token",
+    "admin.hermesConfig": "Hermes 配置",
+    "admin.hours": "小时",
+    "admin.imageModel": "图片生成模型",
+    "admin.invites": "邀请",
+    "admin.kind": "类型",
+    "admin.llm": "大模型",
+    "admin.model": "模型",
+    "admin.modelConfig": "模型配置管理",
+    "admin.modelGate": "请先在模型配置管理中保存可用的{models}。",
+    "admin.modelTestFailed": "模型测试失败",
+    "admin.modelTesting": "测试中...",
+    "admin.name": "名称",
+    "admin.noReasoning": "不设置",
+    "admin.owner": "归属用户",
+    "admin.provider": "Provider",
+    "admin.reasoning": "思考等级",
+    "admin.rebuild": "重建",
+    "admin.refresh": "刷新",
+    "admin.revoke": "撤销",
+    "admin.role": "角色",
+    "admin.save": "保存",
+    "admin.saveConfig": "保存配置",
+    "admin.start": "启动",
+    "admin.status": "状态",
+    "admin.stop": "停止",
+    "admin.streaming": "流式输出",
+    "admin.test": "测试",
+    "admin.timeout": "超时秒数",
+    "admin.title": "Hermes 管理",
+    "admin.titleModel": "标题生成模型",
+    "admin.used": "已使用",
+    "admin.userManagement": "用户管理",
+    "admin.users": "用户",
+    "admin.uses": "使用次数",
+    "auth.accountExists": "已有账号？去登录",
+    "auth.authFailed": "认证失败",
+    "auth.bootstrapHint": "需要创建第一个管理员？",
+    "auth.confirmPassword": "确认密码",
+    "auth.createAccount": "创建账号",
+    "auth.createSubtitle": "创建你的账号",
+    "auth.email": "邮箱",
+    "auth.loading": "加载中",
+    "auth.password": "密码",
+    "auth.passwordMismatch": "两次密码不一致",
+    "auth.signIn": "登录",
+    "auth.signInSubtitle": "登录工作区",
+    "auth.working": "处理中",
+    "chat.attach": "附件",
+    "chat.attachmentUploadFailed": "附件上传失败",
+    "chat.deleteFailed": "会话删除失败",
+    "chat.deleteSession": "删除会话",
+    "chat.empty": "开始和 Hermes 对话",
+    "chat.emptyResponse": "Hermes 返回了空响应。",
+    "chat.executionSteps": "执行步骤",
+    "chat.hermesLog": "Hermes 运行日志",
+    "chat.imagePreview": "图片预览",
+    "chat.markdownImage": "放大图片 {name}",
+    "chat.messageLabel": "消息",
+    "chat.messagePlaceholder": "给 Hermes 发消息",
+    "chat.newChat": "新建对话",
+    "chat.newConversation": "新会话",
+    "chat.previewBackdrop": "点击背景关闭预览",
+    "chat.previewClose": "关闭图片预览",
+    "chat.refresh": "刷新",
+    "chat.requestFailed": "Hermes 请求失败",
+    "chat.requestStillRunning": "Hermes 仍在运行，请稍后刷新会话",
+    "chat.runFailed": "Hermes 运行失败：{message}",
+    "chat.session": "Hermes 会话",
+    "chat.sessionCreateFailed": "无法创建会话",
+    "chat.send": "发送",
+    "chat.start": "开始对话",
+    "chat.stop": "停止",
+    "chat.stopFailed": "Hermes 停止失败",
+    "chat.typing": "Hermes 正在输入",
+    "chat.replying": "Hermes 正在回复",
+    "chat.workspaceLoadFailed": "工作区数据加载失败",
+    "chat.you": "你",
+    "common.loading": "加载中",
+    "file.download": "下载文件 {name}",
+    "tool.browser": "浏览器",
+    "tool.command": "命令",
+    "tool.file": "文件",
+    "tool.imageGenerate": "图片生成",
+    "tool.skillView": "技能查看",
+    "tool.shell": "Shell",
+    "tool.terminal": "终端",
+    "tool.unknown": "工具",
+    "execution.approved": "已批准",
+    "execution.call": "调用",
+    "execution.completed": "完成",
+    "execution.failed": "失败",
+    "execution.progress": "处理中",
+    "execution.started": "开始",
+    "execution.waiting": "待批准",
+    "i18n.chinese": "中文",
+    "i18n.english": "English",
+    "i18n.language": "语言",
+    "layout.closeMenu": "关闭菜单",
+    "layout.collapseSidebar": "收起侧边栏",
+    "layout.expandSidebar": "展开侧边栏",
+    "layout.management": "管理",
+    "layout.openMenu": "打开菜单",
+    "layout.personalization": "个性化设置",
+    "layout.primary": "主导航",
+    "layout.signOut": "退出",
+  },
+  en: {
+    "admin.action": "Action",
+    "admin.api": "API",
+    "admin.apiKey": "API key",
+    "admin.baseUrl": "Base URL",
+    "admin.cancel": "Cancel",
+    "admin.create": "Create",
+    "admin.createInvite": "Create invite",
+    "admin.disable": "Disable",
+    "admin.edit": "Edit",
+    "admin.email": "Email",
+    "admin.enable": "Enable",
+    "admin.expiresAt": "expires",
+    "admin.externalTokenHint": "Leave empty to keep the existing token",
+    "admin.hermesConfig": "Hermes config",
+    "admin.hours": "Hours",
+    "admin.imageModel": "Image model",
+    "admin.invites": "Invites",
+    "admin.kind": "Kind",
+    "admin.llm": "Large language model",
+    "admin.model": "Model",
+    "admin.modelConfig": "Model configuration",
+    "admin.modelGate": "Save usable {models} in model configuration first.",
+    "admin.modelTestFailed": "Model test failed",
+    "admin.modelTesting": "Testing...",
+    "admin.name": "Name",
+    "admin.noReasoning": "Not set",
+    "admin.owner": "Owner",
+    "admin.provider": "Provider",
+    "admin.reasoning": "Reasoning effort",
+    "admin.rebuild": "Rebuild",
+    "admin.refresh": "Refresh",
+    "admin.revoke": "Revoke",
+    "admin.role": "Role",
+    "admin.save": "Save",
+    "admin.saveConfig": "Save config",
+    "admin.start": "Start",
+    "admin.status": "Status",
+    "admin.stop": "Stop",
+    "admin.streaming": "Streaming",
+    "admin.test": "Test",
+    "admin.timeout": "Timeout seconds",
+    "admin.title": "Hermes management",
+    "admin.titleModel": "Title model",
+    "admin.used": "used",
+    "admin.userManagement": "User management",
+    "admin.users": "Users",
+    "admin.uses": "Uses",
+    "auth.accountExists": "Already have an account? Sign in",
+    "auth.authFailed": "Authentication failed",
+    "auth.bootstrapHint": "Need to create the first admin?",
+    "auth.confirmPassword": "Confirm password",
+    "auth.createAccount": "Create account",
+    "auth.createSubtitle": "Create your account",
+    "auth.email": "Email",
+    "auth.loading": "Loading",
+    "auth.password": "Password",
+    "auth.passwordMismatch": "Passwords do not match",
+    "auth.signIn": "Sign in",
+    "auth.signInSubtitle": "Sign in to your workspace",
+    "auth.working": "Working",
+    "chat.attach": "Attach",
+    "chat.attachmentUploadFailed": "Attachment upload failed",
+    "chat.deleteFailed": "Session could not be deleted",
+    "chat.deleteSession": "Delete session",
+    "chat.empty": "Start a Hermes conversation",
+    "chat.emptyResponse": "Hermes returned an empty response.",
+    "chat.executionSteps": "Execution steps",
+    "chat.hermesLog": "Hermes run log",
+    "chat.imagePreview": "Image preview",
+    "chat.markdownImage": "Preview image {name}",
+    "chat.messageLabel": "Message",
+    "chat.messagePlaceholder": "Message Hermes",
+    "chat.newChat": "New chat",
+    "chat.newConversation": "New conversation",
+    "chat.previewBackdrop": "Close preview from backdrop",
+    "chat.previewClose": "Close image preview",
+    "chat.refresh": "Refresh",
+    "chat.requestFailed": "Hermes request failed",
+    "chat.requestStillRunning": "Hermes is still running. Refresh the session later.",
+    "chat.runFailed": "Hermes run failed: {message}",
+    "chat.session": "Hermes session",
+    "chat.sessionCreateFailed": "Session could not be created",
+    "chat.send": "Send",
+    "chat.start": "Start a conversation",
+    "chat.stop": "Stop",
+    "chat.stopFailed": "Hermes stop failed",
+    "chat.typing": "Hermes is typing",
+    "chat.replying": "Hermes is responding",
+    "chat.workspaceLoadFailed": "Workspace data could not be loaded",
+    "chat.you": "You",
+    "common.loading": "Loading",
+    "file.download": "Download file {name}",
+    "tool.browser": "browser",
+    "tool.command": "command",
+    "tool.file": "file",
+    "tool.imageGenerate": "image generation",
+    "tool.skillView": "skill view",
+    "tool.shell": "shell",
+    "tool.terminal": "terminal",
+    "tool.unknown": "tool",
+    "execution.approved": "approved",
+    "execution.call": "call",
+    "execution.completed": "completed",
+    "execution.failed": "failed",
+    "execution.progress": "processing",
+    "execution.started": "start",
+    "execution.waiting": "waiting for approval",
+    "i18n.chinese": "中文",
+    "i18n.english": "English",
+    "i18n.language": "Language",
+    "layout.closeMenu": "Close menu",
+    "layout.collapseSidebar": "Collapse sidebar",
+    "layout.expandSidebar": "Expand sidebar",
+    "layout.management": "Management",
+    "layout.openMenu": "Open menu",
+    "layout.personalization": "Personalization",
+    "layout.primary": "Primary",
+    "layout.signOut": "Sign out",
+  },
+} satisfies Record<Language, Record<string, string>>;
+
+export type TranslationKey = keyof (typeof translations)["en"];
+
+const I18nContext = createContext<I18nContextValue | null>(null);
+
+export function I18nProvider({ children }: { children: ReactNode }) {
+  const [language, setLanguageState] = useState<Language>(() => preferredLanguage());
+
+  const value = useMemo<I18nContextValue>(
+    () => ({
+      language,
+      setLanguage(nextLanguage) {
+        localStorage.setItem(storageKey, nextLanguage);
+        setLanguageState(nextLanguage);
+      },
+      t(key, values) {
+        const template = translations[language][key] ?? translations.en[key] ?? key;
+        return interpolate(template, values);
+      },
+    }),
+    [language],
+  );
+
+  return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>;
+}
+
+export function useI18n() {
+  const context = useContext(I18nContext);
+  if (!context) {
+    throw new Error("useI18n must be used inside I18nProvider");
+  }
+  return context;
+}
+
+function preferredLanguage(): Language {
+  const stored = localStorage.getItem(storageKey);
+  if (stored === "zh" || stored === "en") {
+    return stored;
+  }
+
+  // 首次进入时尊重浏览器语言；用户一旦切换就以本地设置为准。
+  return navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
+}
+
+function interpolate(template: string, values?: TranslationValues) {
+  if (!values) {
+    return template;
+  }
+
+  return template.replace(/\{(\w+)\}/g, (match, key) =>
+    values[key] === undefined ? match : String(values[key]),
+  );
+}

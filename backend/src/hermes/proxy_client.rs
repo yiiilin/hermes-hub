@@ -9,7 +9,7 @@ use axum::{
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
 };
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -190,11 +190,28 @@ async fn response_from_reqwest(upstream: reqwest::Response) -> Result<Response, 
     let status = StatusCode::from_u16(upstream.status().as_u16())
         .map_err(|error| HermesProxyError::Failed(error.to_string()))?;
     let headers = upstream.headers().clone();
-    let body = Body::from_stream(
-        upstream
-            .bytes_stream()
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error)),
-    );
+    let is_event_stream = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
+    let upstream_stream = upstream.bytes_stream();
+    let body = if is_event_stream {
+        // Hermes 生图时偶发在已输出 run.completed 后提前结束 chunked body。
+        // 对 SSE 来说，保留已收到事件并正常结束比把底层读取错误传给浏览器更可靠。
+        Body::from_stream(upstream_stream.filter_map(|item| async move {
+            match item {
+                Ok(bytes) => Some(Ok::<_, std::io::Error>(bytes)),
+                Err(error) => {
+                    tracing::warn!(error = %error, "hermes event stream ended with upstream read error");
+                    None
+                }
+            }
+        }))
+    } else {
+        Body::from_stream(
+            upstream_stream.map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error)),
+        )
+    };
     let mut response = Response::builder()
         .status(status)
         .body(body)

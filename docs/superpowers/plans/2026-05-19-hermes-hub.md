@@ -513,3 +513,60 @@ Expected: pass.
 Run: `cargo test --workspace && cd frontend && npm test -- --run && npm run build && npm run test:e2e && cd .. && git diff --check`
 
 Expected: pass. Then commit all Task 12 changes.
+
+### Task 13: Replace prompt-based delivery with a native Hermes-Hub platform adapter
+
+**Files:**
+- Modify: `backend/migrations/0001_init.sql`
+- Modify: `backend/src/channel/service.rs`
+- Modify: `backend/src/channel/routes.rs`
+- Modify: `backend/src/http/channel_protocol.rs`
+- Modify: `backend/src/http/attachments.rs`
+- Modify: `backend/src/hermes/docker_provisioner.rs`
+- Modify: `backend/tests/hermes_proxy_test.rs`
+- Modify: `backend/tests/docker_provisioner_test.rs`
+- Modify: `backend/tests/schema_test.rs`
+- Modify: `frontend/src/api/client.ts`
+- Modify: `frontend/src/routes/channel-session.tsx`
+- Modify: `frontend/src/app.test.tsx`
+- Modify: `frontend/e2e/workspace.spec.ts`
+
+- [x] **Step 1: Add failing backend tests for adapter queue protocol**
+
+Add coverage for Hub-owned `channel_runs`, public enqueue, internal adapter long-poll/ack/status, internal input attachment download, and assistant message idempotency through `client_message_key`.
+
+Run: `cargo test -p hermes-hub-backend --test hermes_proxy_test --test schema_test`
+
+Expected: fail until the queue/status protocol exists.
+
+- [x] **Step 2: Implement Hub queue, status, and internal protocol**
+
+Persist each user turn as a Hub run, expose adapter long-poll and status endpoints authenticated by instance token, bind internal downloads to instance-owned sessions, and keep assistant delivery idempotent.
+
+Run: `cargo test -p hermes-hub-backend --test hermes_proxy_test --test schema_test`
+
+Expected: pass.
+
+- [x] **Step 3: Generate and enable the Hermes `hermes_hub` adapter plugin**
+
+Write `plugins/platforms/hermes_hub` into every managed Hermes config directory, enable it in `config.yaml`, and bump the Docker managed spec label so existing containers are recreated.
+
+Run: `cargo test -p hermes-hub-backend --test docker_provisioner_test`
+
+Expected: pass.
+
+- [x] **Step 4: Move the frontend send path to Hub adapter runs**
+
+Replace direct `/api/hermes/v1/runs` submission with `POST /api/channels/{channel_id}/sessions/{session_id}/runs`, poll Hub messages/run status for live updates, and stop appending duplicate final assistant messages in the browser.
+
+Run: `cd frontend && npm test -- --run && npm run build`
+
+Expected: pass.
+
+- [x] **Step 5: Verify full adapter delivery path**
+
+Run the backend suite, frontend suite, compose config check, and diff hygiene.
+
+Run: `cargo test --workspace && cd frontend && npm test -- --run && npm run build && cd .. && docker compose -f infra/docker/docker-compose.yml config && git diff --check`
+
+Expected: pass.

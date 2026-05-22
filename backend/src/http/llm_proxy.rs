@@ -12,7 +12,10 @@ use std::time::Instant;
 use crate::{
     http::ApiError,
     llm_proxy::{LlmProviderError, LlmProviderRequest},
-    model_config::{ModelRegistryError, CHAT_COMPLETIONS_API_TYPE, RESPONSES_API_TYPE},
+    model_config::{
+        ModelRegistryError, CHAT_COMPLETIONS_API_TYPE, IMAGES_GENERATIONS_API_TYPE,
+        IMAGE_MODEL_CONFIG_KIND, LLM_MODEL_CONFIG_KIND, RESPONSES_API_TYPE,
+    },
     session::store::LlmUsageEvent,
     AppState,
 };
@@ -22,6 +25,10 @@ pub fn router() -> Router<AppState> {
         .route("/internal/llm/v1/models", get(models))
         .route("/internal/llm/v1/chat/completions", post(chat_completions))
         .route("/internal/llm/v1/responses", post(responses))
+        .route(
+            "/internal/llm/v1/images/generations",
+            post(images_generations),
+        )
 }
 
 async fn models(
@@ -47,6 +54,7 @@ async fn chat_completions(
         state,
         headers,
         "/chat/completions",
+        LLM_MODEL_CONFIG_KIND,
         CHAT_COMPLETIONS_API_TYPE,
         body,
     )
@@ -58,13 +66,38 @@ async fn responses(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
-    proxy_model_request(state, headers, "/responses", RESPONSES_API_TYPE, body).await
+    proxy_model_request(
+        state,
+        headers,
+        "/responses",
+        LLM_MODEL_CONFIG_KIND,
+        RESPONSES_API_TYPE,
+        body,
+    )
+    .await
+}
+
+async fn images_generations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, ApiError> {
+    proxy_model_request(
+        state,
+        headers,
+        "/images/generations",
+        IMAGE_MODEL_CONFIG_KIND,
+        IMAGES_GENERATIONS_API_TYPE,
+        body,
+    )
+    .await
 }
 
 async fn proxy_model_request(
     state: AppState,
     headers: HeaderMap,
     path: &str,
+    config_kind: &str,
     api_type: &str,
     body: Body,
 ) -> Result<Response, ApiError> {
@@ -81,7 +114,7 @@ async fn proxy_model_request(
         .map_err(|_| ApiError::BadRequest("request body must be json"))?;
     let prepared = state
         .model_registry
-        .prepare_request_body(value, api_type)
+        .prepare_request_body_for_kind(value, config_kind, api_type)
         .await
         .map_err(map_model_error)?;
     let config = prepared.config.clone();

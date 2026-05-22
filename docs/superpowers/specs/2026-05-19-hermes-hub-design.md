@@ -166,7 +166,7 @@ Secrets are stored encrypted in PostgreSQL with an application-level master key 
 - `POST /internal/channel/v1/sessions/:session_id/attachments`
 - `POST /internal/channel/v1/sessions/:session_id/messages`
 
-The internal channel protocol is authenticated with the Hermes instance token. It lets Hermes-side platform adapters upload generated files/images and deliver assistant messages back to Hub without Hub reading Hermes container mount paths.
+The internal channel protocol is authenticated with the Hermes instance token. Hermes-side adapters upload generated files/images first, then deliver assistant messages whose markdown content references the returned Hub `download_url` values. Message attachments must reference Hub attachment ids from the same session, and Hub rebuilds attachment metadata from persisted records instead of trusting request JSON. Hub never reads Hermes container mount paths during normal message delivery.
 
 ### Hermes Proxy
 - `/api/hermes/{path...}`

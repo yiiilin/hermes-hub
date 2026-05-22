@@ -12,6 +12,12 @@ fn schema_migrations_include_initial_tables() {
     assert!(sql.contains("create table if not exists channel_sessions"));
     assert!(sql.contains("create table if not exists channel_session_messages"));
     assert!(sql.contains("create table if not exists channel_attachments"));
+    assert!(sql.contains("create table if not exists channel_runs"));
+    assert!(sql.contains("status text not null default 'queued'"));
+    assert!(sql.contains("channel_runs_ready_idx"));
+    assert!(sql.contains("channel_runs_user_message_idx"));
+    assert!(sql.contains("client_message_key text"));
+    assert!(sql.contains("channel_session_messages_client_key_idx"));
 }
 
 fn secret_cipher_round_trips_plaintext() {

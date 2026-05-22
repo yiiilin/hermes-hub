@@ -10,6 +10,7 @@ use hermes_hub_backend::{
     docker_config_from_app,
     hermes::{
         docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
+        event_streams::HermesEventStreamRegistry,
         proxy_client::{HermesProxyResponse, InMemoryHermesProxyClient},
     },
     llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
@@ -36,6 +37,7 @@ fn test_state(provider: InMemoryLlmProviderClient, proxy: InMemoryHermesProxyCli
         store: SessionStore::default(),
         channel_store: ChannelStore::default(),
         hermes_proxy: proxy.shared(),
+        hermes_event_streams: HermesEventStreamRegistry::default(),
         model_registry: ModelRegistry::default_for_tests(),
         llm_provider: provider.shared(),
         object_storage: InMemoryObjectStorage::default().shared(),

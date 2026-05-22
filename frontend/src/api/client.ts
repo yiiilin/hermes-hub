@@ -24,15 +24,33 @@ export type ChannelSession = {
   channel_id: string;
   kind: "chat" | "agent";
   title?: string | null;
+  created_at?: number;
+  updated_at?: number;
 };
 
 export type ChannelMessage = {
   id: string;
   session_id: string;
   role: "user" | "assistant";
+  client_message_key?: string | null;
   content: string;
   attachments: HermesAttachment[];
   created_at: number;
+};
+
+export type ChannelRun = {
+  id: string;
+  run_id: string;
+  session_id: string;
+  user_message_id?: string | null;
+  status: string;
+  input: string;
+  input_attachments: HermesAttachment[];
+  output_message_id?: string | null;
+  error?: string | null;
+  created_at?: number;
+  updated_at?: number;
+  completed_at?: number | null;
 };
 
 export type HermesInstance = {
@@ -87,6 +105,31 @@ export type HermesAttachment = {
   data_url?: string;
 };
 
+export type HermesActiveRun = {
+  run_id: string;
+  status: string;
+  output?: string | null;
+  error?: string | null;
+  output_message_id?: string | null;
+  created_at?: number;
+  updated_at?: number;
+};
+
+export type HermesVerboseEvent = {
+  kind:
+    | "text"
+    | "approval.request"
+    | "approval.responded"
+    | "tool.started"
+    | "tool.completed"
+    | "tool.progress"
+    | "tool.call";
+  tool?: string;
+  detail?: string;
+  choice?: string;
+  failed?: boolean;
+};
+
 type HermesRunStarted = {
   run_id?: string;
   status?: string;
@@ -94,15 +137,53 @@ type HermesRunStarted = {
 
 type HermesRunEvent = {
   event?: string;
+  type?: string;
   delta?: string;
   output?: string;
-  error?: string;
+  error?: string | boolean | { message?: string };
+  message?: string;
+  status?: string;
+  tool?: string;
+  name?: string;
+  choice?: string;
+  resolved?: number;
+  preview?: string;
+  command?: string;
+  description?: string;
+  text?: string;
+  duration?: number;
+  item?: {
+    type?: string;
+    name?: string;
+    status?: string;
+    arguments?: string;
+    input?: string;
+    output?: string;
+    content?: string;
+  };
 };
 
 export type HermesStreamHandlers = {
+  onRunStarted?: (runId: string) => void;
   onDelta?: (delta: string) => void;
   onOutput?: (output: string) => void;
+  onVerbose?: (message: HermesVerboseEvent | string) => void;
 };
+
+type HermesStreamProgress = {
+  receivedBytes: number;
+  deltaText: string;
+  completedOutput: string;
+  pendingEventName: string;
+  pendingDataLines: string[];
+};
+
+class HermesRunFailedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HermesRunFailedError";
+  }
+}
 
 export type CreateInviteInput = {
   expires_at: number;
@@ -143,12 +224,23 @@ export type ApiClient = {
     kind: "chat" | "agent",
     title?: string,
   ) => Promise<ChannelSession>;
+  deleteSession: (channelId: string, sessionId: string) => Promise<void>;
   listSessionMessages: (channelId: string, sessionId: string) => Promise<ChannelMessage[]>;
   appendSessionMessage: (
     channelId: string,
     sessionId: string,
     input: {
       role: "user" | "assistant";
+      content: string;
+      attachments?: HermesAttachment[];
+      clientMessageKey?: string;
+    },
+  ) => Promise<ChannelMessage>;
+  updateSessionMessage: (
+    channelId: string,
+    sessionId: string,
+    messageId: string,
+    input: {
       content: string;
       attachments?: HermesAttachment[];
     },
@@ -158,6 +250,15 @@ export type ApiClient = {
     sessionId: string,
     files: File[],
   ) => Promise<HermesAttachment[]>;
+  createChannelRun: (
+    channelId: string,
+    sessionId: string,
+    input: {
+      content: string;
+      attachments?: HermesAttachment[];
+      clientMessageKey?: string;
+    },
+  ) => Promise<{ message: ChannelMessage; run: ChannelRun }>;
   generateSessionTitle: (
     channelId: string,
     sessionId: string,
@@ -177,10 +278,14 @@ export type ApiClient = {
     sessionId?: string,
     handlers?: HermesStreamHandlers,
   ) => Promise<string>;
+  activeHermesRun: (channelId: string, sessionId: string) => Promise<HermesActiveRun | null>;
+  stopHermesRun: (channelId: string, sessionId: string) => Promise<HermesActiveRun | null>;
+  clearHermesRun: (channelId: string, sessionId: string) => Promise<void>;
+  resumeHermesRun: (runId: string, handlers?: HermesStreamHandlers) => Promise<string>;
 };
 
 type RequestOptions = {
-  method?: "GET" | "POST" | "PUT";
+  method?: "GET" | "POST" | "PUT" | "DELETE";
   body?: unknown;
   allowUnauthorized?: boolean;
 };
@@ -368,6 +473,11 @@ export function createApiClient(): ApiClient {
       );
       return payload.session;
     },
+    async deleteSession(channelId, sessionId) {
+      await request<void>(`/api/channels/${channelId}/sessions/${sessionId}`, {
+        method: "DELETE",
+      });
+    },
     async listSessionMessages(channelId, sessionId) {
       const payload = await request<{ messages: ChannelMessage[] }>(
         `/api/channels/${channelId}/sessions/${sessionId}/messages`,
@@ -381,6 +491,20 @@ export function createApiClient(): ApiClient {
           method: "POST",
           body: {
             role: input.role,
+            content: input.content,
+            attachments: stripAttachmentPreviews(input.attachments ?? []),
+            client_message_key: input.clientMessageKey,
+          },
+        },
+      );
+      return payload.message;
+    },
+    async updateSessionMessage(channelId, sessionId, messageId, input) {
+      const payload = await request<{ message: ChannelMessage }>(
+        `/api/channels/${channelId}/sessions/${sessionId}/messages/${messageId}`,
+        {
+          method: "PUT",
+          body: {
             content: input.content,
             attachments: stripAttachmentPreviews(input.attachments ?? []),
           },
@@ -413,6 +537,19 @@ export function createApiClient(): ApiClient {
 
       const payload = (await response.json()) as { attachments: HermesAttachment[] };
       return payload.attachments;
+    },
+    async createChannelRun(channelId, sessionId, input) {
+      return request<{ message: ChannelMessage; run: ChannelRun }>(
+        `/api/channels/${channelId}/sessions/${sessionId}/runs`,
+        {
+          method: "POST",
+          body: {
+            content: input.content,
+            attachments: stripAttachmentPreviews(input.attachments ?? []),
+            client_message_key: input.clientMessageKey,
+          },
+        },
+      );
     },
     async generateSessionTitle(channelId, sessionId, prompt) {
       const payload = await request<{ session: ChannelSession }>(
@@ -495,12 +632,34 @@ export function createApiClient(): ApiClient {
         if (!started.run_id) {
           throw new Error("Hermes run did not return a run_id");
         }
+        handlers?.onRunStarted?.(started.run_id);
         return readHermesRunEvents(started.run_id, handlers);
       }
 
       const text = await response.text();
       handlers?.onOutput?.(text);
       return text;
+    },
+    async activeHermesRun(channelId, sessionId) {
+      const payload = await request<{ active_run: HermesActiveRun | null }>(
+        `/api/channels/${channelId}/sessions/${sessionId}/active-run`,
+      );
+      return payload.active_run;
+    },
+    async stopHermesRun(channelId, sessionId) {
+      const payload = await request<{ active_run: HermesActiveRun | null }>(
+        `/api/channels/${channelId}/sessions/${sessionId}/active-run/stop`,
+        { method: "POST" },
+      );
+      return payload.active_run;
+    },
+    async clearHermesRun(channelId, sessionId) {
+      await request<void>(`/api/channels/${channelId}/sessions/${sessionId}/active-run`, {
+        method: "DELETE",
+      });
+    },
+    async resumeHermesRun(runId, handlers) {
+      return readHermesRunEvents(runId, handlers);
     },
   };
 }
@@ -554,10 +713,50 @@ async function readHermesRunEvents(
   runId: string,
   handlers?: HermesStreamHandlers,
 ): Promise<string> {
+  const progress: HermesStreamProgress = {
+    receivedBytes: 0,
+    deltaText: "",
+    completedOutput: "",
+    pendingEventName: "",
+    pendingDataLines: [],
+  };
+  let lastError: unknown = null;
+
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    try {
+      return await readHermesRunEventsOnce(runId, handlers, progress);
+    } catch (cause) {
+      if (!isReconnectableHermesStreamError(cause)) {
+        throw cause;
+      }
+
+      lastError = cause;
+      await waitForReconnectDelay(attempt);
+    }
+  }
+
+  if (progress.completedOutput || progress.deltaText.trim()) {
+    handlers?.onOutput?.(progress.completedOutput || progress.deltaText);
+    return progress.completedOutput || progress.deltaText;
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Hermes stream interrupted");
+}
+
+async function readHermesRunEventsOnce(
+  runId: string,
+  handlers: HermesStreamHandlers | undefined,
+  progress: HermesStreamProgress,
+): Promise<string> {
+  const headers: Record<string, string> = { Accept: "text/event-stream" };
+  if (progress.receivedBytes > 0) {
+    headers["X-Hermes-Hub-Received-Bytes"] = String(progress.receivedBytes);
+  }
+
   const response = await fetch(`/api/hermes/v1/runs/${encodeURIComponent(runId)}/events`, {
     method: "GET",
     credentials: "include",
-    headers: { Accept: "text/event-stream" },
+    headers,
   });
 
   if (!response.ok) {
@@ -565,21 +764,32 @@ async function readHermesRunEvents(
   }
 
   if (response.body) {
-    return readHermesRunEventsFromBody(response.body, handlers);
+    return readHermesRunEventsFromBody(response.body, handlers, progress);
   }
 
   const eventStream = await response.text();
-  const events = parseHermesRunEventLines(eventStream.split(/\r?\n/), handlers);
+  progress.receivedBytes += new TextEncoder().encode(eventStream).byteLength;
+  const events = parseHermesRunEventLines(eventStream.split(/\r?\n/), handlers, progress);
+  events.push(...flushHermesRunEventParser(handlers, progress));
   const result = reduceHermesRunEvents(events);
+  progress.deltaText += result.deltaText;
   if (result.completedOutput) {
+    progress.completedOutput = result.completedOutput;
     handlers?.onOutput?.(result.completedOutput);
   }
-  return result.completedOutput || result.deltaText || eventStream;
+  return progress.completedOutput || progress.deltaText || eventStream;
 }
 
 async function readHermesRunEventsFromBody(
   body: ReadableStream<Uint8Array>,
   handlers?: HermesStreamHandlers,
+  progress: HermesStreamProgress = {
+    receivedBytes: 0,
+    deltaText: "",
+    completedOutput: "",
+    pendingEventName: "",
+    pendingDataLines: [],
+  },
 ): Promise<string> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -587,35 +797,67 @@ async function readHermesRunEventsFromBody(
   let deltaText = "";
   let completedOutput = "";
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
+  try {
+    while (true) {
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      try {
+        chunk = await reader.read();
+      } catch (cause) {
+        if (completedOutput || progress.completedOutput) {
+          const recovered = completedOutput || progress.completedOutput;
+          handlers?.onOutput?.(recovered);
+          return recovered;
+        }
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split(/\r?\n/);
-    buffer = lines.pop() ?? "";
-    const result = reduceHermesRunEvents(parseHermesRunEventLines(lines, handlers));
-    deltaText += result.deltaText;
-    if (result.completedOutput) {
-      completedOutput = result.completedOutput;
+        // 前端到 Hub 的 SSE 可能因为切页、移动端后台、网络切换而中断；
+        // 这里抛出可重连错误，外层会用已收到字节数恢复同一个 Hermes run。
+        throw new Error(cause instanceof Error ? cause.message : "Hermes stream interrupted");
+      }
+
+      if (chunk.done) {
+        break;
+      }
+
+      progress.receivedBytes += chunk.value.byteLength;
+      buffer += decoder.decode(chunk.value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? "";
+      const result = reduceHermesRunEvents(parseHermesRunEventLines(lines, handlers, progress));
+      deltaText += result.deltaText;
+      progress.deltaText += result.deltaText;
+      if (result.completedOutput) {
+        completedOutput = result.completedOutput;
+        progress.completedOutput = result.completedOutput;
+      }
     }
+  } finally {
+    reader.releaseLock();
   }
 
   buffer += decoder.decode();
   if (buffer) {
-    const result = reduceHermesRunEvents(parseHermesRunEventLines(buffer.split(/\r?\n/), handlers));
+    const result = reduceHermesRunEvents(
+      parseHermesRunEventLines(buffer.split(/\r?\n/), handlers, progress),
+    );
     deltaText += result.deltaText;
+    progress.deltaText += result.deltaText;
     if (result.completedOutput) {
       completedOutput = result.completedOutput;
+      progress.completedOutput = result.completedOutput;
     }
+  }
+  const flushed = reduceHermesRunEvents(flushHermesRunEventParser(handlers, progress));
+  deltaText += flushed.deltaText;
+  progress.deltaText += flushed.deltaText;
+  if (flushed.completedOutput) {
+    completedOutput = flushed.completedOutput;
+    progress.completedOutput = flushed.completedOutput;
   }
 
   if (completedOutput) {
     handlers?.onOutput?.(completedOutput);
   }
-  return completedOutput || deltaText;
+  return progress.completedOutput || progress.deltaText || deltaText;
 }
 
 function reduceHermesRunEvents(events: HermesRunEvent[]) {
@@ -630,32 +872,302 @@ function reduceHermesRunEvents(events: HermesRunEvent[]) {
       completedOutput = event.output;
     }
     if (event.event === "run.failed") {
-      throw new Error(event.error || "Hermes run failed");
+      throw new HermesRunFailedError(errorMessageFromEvent(event.error) || "Hermes run failed");
     }
   }
 
   return { deltaText, completedOutput };
 }
 
+function isReconnectableHermesStreamError(cause: unknown) {
+  if (cause instanceof HermesRunFailedError) {
+    return false;
+  }
+
+  const message = cause instanceof Error ? cause.message : String(cause);
+  return (
+    /load failed|network|interrupted|terminated|aborted|body stream/i.test(message) ||
+    /Hermes run events failed: (408|429|500|502|503|504)/.test(message)
+  );
+}
+
+function waitForReconnectDelay(attempt: number) {
+  const delayMs = Math.min(1500, 150 * 2 ** attempt);
+  return new Promise((resolve) => globalThis.setTimeout(resolve, delayMs));
+}
+
 function parseHermesRunEventLines(
   lines: string[],
   handlers?: HermesStreamHandlers,
+  progress: HermesStreamProgress = {
+    receivedBytes: 0,
+    deltaText: "",
+    completedOutput: "",
+    pendingEventName: "",
+    pendingDataLines: [],
+  },
 ): HermesRunEvent[] {
-  return lines
-    .filter((line) => line.startsWith("data: "))
-    .map((line) => line.slice("data: ".length).trim())
-    .filter(Boolean)
-    .flatMap((line) => {
-      try {
-        const event = JSON.parse(line) as HermesRunEvent;
-        if (event.event === "message.delta" && event.delta) {
-          handlers?.onDelta?.(event.delta);
-        }
-        return [event];
-      } catch {
-        return [];
+  const events: HermesRunEvent[] = [];
+
+  for (const line of lines) {
+    if (line.startsWith("event:")) {
+      const previous = parseHermesRunEvent(progress.pendingEventName, progress.pendingDataLines);
+      if (previous) {
+        notifyHermesEventHandlers(previous, handlers);
+        events.push(previous);
+        progress.pendingDataLines = [];
       }
-    });
+      progress.pendingEventName = line.slice("event:".length).trim();
+      continue;
+    }
+    if (line.startsWith("data:")) {
+      if (!progress.pendingEventName && progress.pendingDataLines.length > 0) {
+        const previous = parseHermesRunEvent(progress.pendingEventName, progress.pendingDataLines);
+        if (previous) {
+          notifyHermesEventHandlers(previous, handlers);
+          events.push(previous);
+        }
+        progress.pendingDataLines = [];
+      }
+      progress.pendingDataLines.push(line.slice("data:".length).trim());
+      continue;
+    }
+    if (line.trim() === "") {
+      const event = parseHermesRunEvent(progress.pendingEventName, progress.pendingDataLines);
+      progress.pendingEventName = "";
+      progress.pendingDataLines = [];
+      if (event) {
+        notifyHermesEventHandlers(event, handlers);
+        events.push(event);
+      }
+    }
+  }
+
+  return events;
+}
+
+function flushHermesRunEventParser(
+  handlers: HermesStreamHandlers | undefined,
+  progress: HermesStreamProgress,
+) {
+  const event = parseHermesRunEvent(progress.pendingEventName, progress.pendingDataLines);
+  progress.pendingEventName = "";
+  progress.pendingDataLines = [];
+  if (!event) {
+    return [];
+  }
+
+  notifyHermesEventHandlers(event, handlers);
+  return [event];
+}
+
+function parseHermesRunEvent(eventName: string, dataLines: string[]): HermesRunEvent | null {
+  if (dataLines.length === 0) {
+    return null;
+  }
+
+  const data = dataLines.join("\n").trim();
+  if (!data || data === "[DONE]") {
+    return null;
+  }
+
+  try {
+    const event = JSON.parse(data) as HermesRunEvent;
+    return {
+      ...event,
+      event: event.event ?? eventName,
+    };
+  } catch {
+    return eventName ? { event: eventName, message: data } : null;
+  }
+}
+
+function notifyHermesEventHandlers(event: HermesRunEvent, handlers?: HermesStreamHandlers) {
+  if (event.event === "message.delta" && event.delta) {
+    handlers?.onDelta?.(event.delta);
+  }
+
+  const verbose = verboseMessageFromHermesEvent(event);
+  if (verbose) {
+    handlers?.onVerbose?.(verbose);
+  }
+}
+
+function verboseMessageFromHermesEvent(event: HermesRunEvent): HermesVerboseEvent | null {
+  if (event.message?.trim()) {
+    return { kind: "text", detail: normalizeVerboseText(event.message) ?? event.message };
+  }
+  const item = event.item;
+
+  if (event.event === "approval.request") {
+    return {
+      kind: "approval.request",
+      detail:
+        firstVerboseDetail(
+          event.command,
+          event.preview,
+          event.description,
+          event.output,
+          item?.arguments,
+          item?.input,
+          item?.output,
+          item?.content,
+        ) ?? undefined,
+    };
+  }
+
+  if (event.event === "approval.responded") {
+    return {
+      kind: "approval.responded",
+      choice: event.choice ?? "session",
+    };
+  }
+
+  if (event.event === "reasoning.available") {
+    return {
+      kind: "text",
+      detail: firstVerboseDetail(event.text, event.preview, event.message) ?? undefined,
+    };
+  }
+
+  if (event.event === "tool.started") {
+    return verboseToolEvent(
+      "tool.started",
+      event,
+      firstVerboseDetail(
+        event.preview,
+        event.command,
+        event.description,
+        item?.arguments,
+        item?.input,
+        item?.output,
+        item?.content,
+      ),
+    );
+  }
+
+  if (event.event === "tool.completed") {
+    return verboseToolEvent(
+      "tool.completed",
+      event,
+      firstVerboseDetail(
+        errorMessageFromEvent(event.error),
+        event.output,
+        item?.output,
+        item?.content,
+        event.preview,
+        event.command,
+        event.description,
+        item?.arguments,
+        item?.input,
+        durationDetail(event.duration),
+      ),
+      Boolean(event.error),
+    );
+  }
+
+  if (event.event === "hermes.tool.progress") {
+    const detail = firstVerboseDetail(
+      event.preview,
+      event.command,
+      event.description,
+      event.output,
+      item?.output,
+      item?.content,
+    );
+    const status = event.status ?? "";
+    return verboseToolEvent(
+      status === "completed" || status === "done" ? "tool.completed" : "tool.progress",
+      event,
+      detail,
+    );
+  }
+
+  if (
+    event.item &&
+    (event.event === "response.output_item.added" || event.event === "response.output_item.done") &&
+    (event.item.type === "function_call" || event.item.type === "function_call_output")
+  ) {
+    const item = event.item;
+    return {
+      kind: event.event === "response.output_item.done" ? "tool.completed" : "tool.call",
+      tool: item.name ?? undefined,
+      detail:
+        firstVerboseDetail(
+          item.arguments,
+          item.input,
+          item.output,
+          item.content,
+          event.preview,
+          event.command,
+          event.description,
+          event.output,
+        ) ?? undefined,
+    };
+  }
+
+  if (event.event?.includes("tool")) {
+    return verboseToolEvent(
+      event.event.includes("completed") || event.event.includes("done")
+        ? "tool.completed"
+        : "tool.started",
+      event,
+      firstVerboseDetail(
+        event.preview,
+        event.command,
+        event.description,
+        event.output,
+        item?.output,
+        item?.content,
+        item?.arguments,
+        item?.input,
+      ),
+    );
+  }
+
+  return null;
+}
+
+function verboseToolEvent(
+  kind: HermesVerboseEvent["kind"],
+  event: HermesRunEvent,
+  detail?: string | null,
+  failed = false,
+): HermesVerboseEvent {
+  return {
+    kind,
+    tool: event.tool ?? event.name ?? event.item?.name ?? undefined,
+    detail: detail ?? undefined,
+    failed,
+  };
+}
+
+function firstVerboseDetail(...values: Array<string | null | undefined>) {
+  for (const value of values) {
+    const normalized = normalizeVerboseText(value);
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return null;
+}
+
+function normalizeVerboseText(value: string | null | undefined) {
+  return value?.replace(/\s+/g, " ").trim() || null;
+}
+
+function errorMessageFromEvent(error: HermesRunEvent["error"]) {
+  if (typeof error === "string") {
+    return normalizeVerboseText(error);
+  }
+  if (typeof error === "object" && error?.message) {
+    return normalizeVerboseText(error.message);
+  }
+  return null;
+}
+
+function durationDetail(duration: number | undefined) {
+  return typeof duration === "number" ? `${duration.toFixed(3)}s` : null;
 }
 
 type MockApiClientOptions = {
@@ -664,6 +1176,13 @@ type MockApiClientOptions = {
   requiredModelsReady?: boolean;
   missingRequiredModelConfigKinds?: ModelConfigKind[];
   initialInstance?: HermesInstance | null;
+  initialMessagesBySessionId?: Record<string, ChannelMessage[]>;
+  createChannelRun?: ApiClient["createChannelRun"];
+  sendHermesPrompt?: ApiClient["sendHermesPrompt"];
+  activeRunsBySessionId?: Record<string, HermesActiveRun>;
+  resumeHermesRun?: ApiClient["resumeHermesRun"];
+  stopHermesRun?: ApiClient["stopHermesRun"];
+  deleteSession?: ApiClient["deleteSession"];
 };
 
 export function createMockApiClient(options: MockApiClientOptions = {}): ApiClient {
@@ -681,10 +1200,21 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       description: "Hermes Hub default channel",
     },
   ];
-  let sessions: ChannelSession[] = [{ id: "session-1", channel_id: "channel-1", kind: "agent", title: "Session" }];
+  let sessions: ChannelSession[] = [
+    {
+      id: "session-1",
+      channel_id: "channel-1",
+      kind: "agent",
+      title: "Session",
+      created_at: Date.now(),
+      updated_at: Date.now(),
+    },
+  ];
   let messagesBySessionId: Record<string, ChannelMessage[]> = {
     "session-1": [],
+    ...(options.initialMessagesBySessionId ?? {}),
   };
+  let activeRunsBySessionId = { ...(options.activeRunsBySessionId ?? {}) };
   let invites: Invite[] = [];
   let instance: HermesInstance | null = "initialInstance" in options ? options.initialInstance! : {
     id: "instance-1",
@@ -826,25 +1356,75 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       return sessions.filter((session) => session.channel_id === channelId);
     },
     async createSession(channelId, kind, title) {
-      const session = { id: `session-${sessions.length + 1}`, channel_id: channelId, kind, title };
+      const now = Date.now();
+      const session = {
+        id: `session-${sessions.length + 1}`,
+        channel_id: channelId,
+        kind,
+        title,
+        created_at: now,
+        updated_at: now,
+      };
       sessions = [session, ...sessions];
       messagesBySessionId[session.id] = [];
       return session;
+    },
+    async deleteSession(channelId, sessionId) {
+      if (options.deleteSession) {
+        await options.deleteSession(channelId, sessionId);
+      }
+      sessions = sessions.filter(
+        (session) => !(session.channel_id === channelId && session.id === sessionId),
+      );
+      delete messagesBySessionId[sessionId];
+      delete activeRunsBySessionId[sessionId];
     },
     async listSessionMessages(_channelId, sessionId) {
       return messagesBySessionId[sessionId] ?? [];
     },
     async appendSessionMessage(_channelId, sessionId, input) {
+      const existing = input.clientMessageKey
+        ? (messagesBySessionId[sessionId] ?? []).find(
+            (message) => message.client_message_key === input.clientMessageKey,
+          )
+        : undefined;
+      if (existing) {
+        return existing;
+      }
+
       const message: ChannelMessage = {
         id: `message-${(messagesBySessionId[sessionId] ?? []).length + 1}`,
         session_id: sessionId,
         role: input.role,
+        client_message_key: input.clientMessageKey,
         content: input.content,
         attachments: input.attachments ?? [],
         created_at: Date.now(),
       };
       messagesBySessionId[sessionId] = [...(messagesBySessionId[sessionId] ?? []), message];
+      sessions = sessions.map((session) =>
+        session.id === sessionId ? { ...session, updated_at: Date.now() } : session,
+      );
       return message;
+    },
+    async updateSessionMessage(_channelId, sessionId, messageId, input) {
+      const messages = messagesBySessionId[sessionId] ?? [];
+      const existing = messages.find((message) => message.id === messageId);
+      if (!existing) {
+        throw new Error("message not found");
+      }
+      const nextMessage = {
+        ...existing,
+        content: input.content,
+        attachments: input.attachments ?? [],
+      };
+      messagesBySessionId[sessionId] = messages.map((message) =>
+        message.id === messageId ? nextMessage : message,
+      );
+      sessions = sessions.map((session) =>
+        session.id === sessionId ? { ...session, updated_at: Date.now() } : session,
+      );
+      return nextMessage;
     },
     async uploadSessionAttachments(_channelId, sessionId, files) {
       return files.map((file, index) => ({
@@ -855,6 +1435,49 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
         size: file.size,
         download_url: `/api/attachments/attachment-${sessionId}-${index + 1}/download`,
       }));
+    },
+    async createChannelRun(_channelId, sessionId, input) {
+      if (options.createChannelRun) {
+        return options.createChannelRun(_channelId, sessionId, input);
+      }
+
+      const message = await this.appendSessionMessage("channel-1", sessionId, {
+        role: "user",
+        content: input.content,
+        attachments: input.attachments ?? [],
+        clientMessageKey: input.clientMessageKey,
+      });
+      const run: ChannelRun = {
+        id: `run-${Date.now()}`,
+        run_id: `hub-run-${Date.now()}`,
+        session_id: sessionId,
+        user_message_id: message.id,
+        status: "queued",
+        input: input.content,
+        input_attachments: input.attachments ?? [],
+        created_at: Date.now(),
+        updated_at: Date.now(),
+      };
+      activeRunsBySessionId[sessionId] = {
+        run_id: run.run_id,
+        status: run.status,
+        created_at: run.created_at,
+        updated_at: run.updated_at,
+      };
+
+      await Promise.resolve();
+      const assistant: ChannelMessage = {
+        id: `message-${(messagesBySessionId[sessionId] ?? []).length + 1}`,
+        session_id: sessionId,
+        role: "assistant",
+        client_message_key: `hermes-run:${run.run_id}`,
+        content: input.content,
+        attachments: [],
+        created_at: Date.now(),
+      };
+      messagesBySessionId[sessionId] = [...(messagesBySessionId[sessionId] ?? []), assistant];
+      delete activeRunsBySessionId[sessionId];
+      return { message, run };
     },
     async generateSessionTitle(channelId, sessionId, prompt) {
       const session = sessions.find((item) => item.id === sessionId && item.channel_id === channelId);
@@ -920,10 +1543,35 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       };
     },
     async sendHermesPrompt(prompt, _attachments, _sessionId, handlers) {
+      if (options.sendHermesPrompt) {
+        return options.sendHermesPrompt(prompt, _attachments, _sessionId, handlers);
+      }
+
       // 让 mock 行为接近真实 fetch 流：delta 会在调用栈释放后到达。
       await Promise.resolve();
       handlers?.onDelta?.(prompt);
       return prompt;
+    },
+    async activeHermesRun(_channelId, sessionId) {
+      return activeRunsBySessionId[sessionId] ?? null;
+    },
+    async stopHermesRun(channelId, sessionId) {
+      if (options.stopHermesRun) {
+        return options.stopHermesRun(channelId, sessionId);
+      }
+      delete activeRunsBySessionId[sessionId];
+      return null;
+    },
+    async clearHermesRun(_channelId, sessionId) {
+      delete activeRunsBySessionId[sessionId];
+    },
+    async resumeHermesRun(runId, handlers) {
+      if (options.resumeHermesRun) {
+        return options.resumeHermesRun(runId, handlers);
+      }
+      await Promise.resolve();
+      handlers?.onDelta?.("");
+      return "";
     },
   };
 }

@@ -16,10 +16,14 @@ pub mod domain {
     pub mod user;
 }
 
-use axum::{routing::get, Json, Router};
+use axum::{
+    routing::{any, get},
+    Json, Router,
+};
 use channel::service::ChannelStore;
 use hermes::{
     docker_provisioner::{DockerProvisioner, DockerProvisionerConfig, NoopDockerRuntime},
+    event_streams::HermesEventStreamRegistry,
     proxy_client::{DynHermesProxyClient, InMemoryHermesProxyClient, ReqwestHermesProxyClient},
 };
 use llm_proxy::{DynLlmProviderClient, InMemoryLlmProviderClient, ReqwestLlmProviderClient};
@@ -43,6 +47,7 @@ pub struct AppState {
     pub store: SessionStore,
     pub channel_store: ChannelStore,
     pub hermes_proxy: DynHermesProxyClient,
+    pub hermes_event_streams: HermesEventStreamRegistry,
     pub model_registry: ModelRegistry,
     pub llm_provider: DynLlmProviderClient,
     pub docker_provisioner: DockerProvisioner,
@@ -79,6 +84,7 @@ pub fn build_router(config: AppConfig) -> Router {
         store: SessionStore::default(),
         channel_store: ChannelStore::default(),
         hermes_proxy: InMemoryHermesProxyClient::default().shared(),
+        hermes_event_streams: HermesEventStreamRegistry::default(),
         llm_provider: InMemoryLlmProviderClient::default().shared(),
         docker_provisioner,
         object_storage,
@@ -102,6 +108,7 @@ pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppIn
             store: SessionStore::default(),
             channel_store: ChannelStore::default(),
             hermes_proxy: ReqwestHermesProxyClient::default().shared(),
+            hermes_event_streams: HermesEventStreamRegistry::default(),
             llm_provider: ReqwestLlmProviderClient::default().shared(),
             docker_provisioner,
             object_storage,
@@ -126,6 +133,7 @@ pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppIn
         store: SessionStore::postgres(pool.clone(), cipher),
         channel_store: ChannelStore::postgres(pool),
         hermes_proxy: ReqwestHermesProxyClient::default().shared(),
+        hermes_event_streams: HermesEventStreamRegistry::default(),
         model_registry,
         llm_provider: ReqwestLlmProviderClient::default().shared(),
         docker_provisioner,
@@ -144,12 +152,19 @@ pub fn build_router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .merge(http::router())
+        .route("/api", any(api_not_found))
+        .route("/api/{*path}", any(api_not_found))
         .fallback_service(static_assets)
         .with_state(state)
 }
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+async fn api_not_found() -> http::ApiError {
+    // API 未匹配时不能继续落到 SPA 静态文件 fallback，否则 POST 会变成含糊的 405。
+    http::ApiError::NotFound("api route not found")
 }
 
 pub fn docker_config_from_app(

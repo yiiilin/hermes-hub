@@ -118,7 +118,15 @@ impl S3ObjectStorage {
             .with_access_key_id(access_key)
             .with_secret_access_key(secret_key)
             .build()
-            .map_err(|_| ObjectStorageError::OperationFailed)?;
+            .map_err(|error| {
+                tracing::warn!(
+                    endpoint = %endpoint,
+                    bucket = %config.bucket,
+                    error = %error,
+                    "failed to initialize S3 object storage"
+                );
+                ObjectStorageError::OperationFailed
+            })?;
 
         Ok(Self {
             bucket: config.bucket.clone(),
@@ -137,7 +145,15 @@ impl HubObjectStorage for S3ObjectStorage {
         self.store
             .put(&ObjectPath::from(key), bytes.into())
             .await
-            .map_err(|_| ObjectStorageError::OperationFailed)?;
+            .map_err(|error| {
+                tracing::warn!(
+                    bucket = %self.bucket,
+                    key = %key,
+                    error = %error,
+                    "object storage put failed"
+                );
+                ObjectStorageError::OperationFailed
+            })?;
         Ok(())
     }
 
@@ -149,19 +165,41 @@ impl HubObjectStorage for S3ObjectStorage {
                 if matches!(error, object_store::Error::NotFound { .. }) {
                     ObjectStorageError::NotFound
                 } else {
+                    tracing::warn!(
+                        bucket = %self.bucket,
+                        key = %key,
+                        error = %error,
+                        "object storage get failed"
+                    );
                     ObjectStorageError::OperationFailed
                 }
             })?
             .bytes()
             .await
-            .map_err(|_| ObjectStorageError::OperationFailed)
+            .map_err(|error| {
+                tracing::warn!(
+                    bucket = %self.bucket,
+                    key = %key,
+                    error = %error,
+                    "object storage read failed"
+                );
+                ObjectStorageError::OperationFailed
+            })
     }
 
     async fn delete(&self, key: &str) -> Result<(), ObjectStorageError> {
         self.store
             .delete(&ObjectPath::from(key))
             .await
-            .map_err(|_| ObjectStorageError::OperationFailed)
+            .map_err(|error| {
+                tracing::warn!(
+                    bucket = %self.bucket,
+                    key = %key,
+                    error = %error,
+                    "object storage delete failed"
+                );
+                ObjectStorageError::OperationFailed
+            })
     }
 
     fn bucket(&self) -> &str {
@@ -173,6 +211,12 @@ pub fn object_storage_from_config(config: &ObjectStorageConfig) -> DynObjectStor
     if config.endpoint.is_some() && config.access_key.is_some() && config.secret_key.is_some() {
         if let Ok(storage) = S3ObjectStorage::from_config(config) {
             return storage.shared();
+        } else {
+            tracing::warn!(
+                endpoint = ?config.endpoint,
+                bucket = %config.bucket,
+                "failed to initialize configured S3 object storage; falling back to memory"
+            );
         }
     }
 

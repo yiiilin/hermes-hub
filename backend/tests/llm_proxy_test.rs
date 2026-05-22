@@ -12,6 +12,7 @@ use hermes_hub_backend::{
     docker_config_from_app,
     hermes::{
         docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
+        event_streams::HermesEventStreamRegistry,
         proxy_client::InMemoryHermesProxyClient,
     },
     llm_proxy::{
@@ -19,8 +20,8 @@ use hermes_hub_backend::{
         ReqwestLlmProviderClient,
     },
     model_config::{
-        ModelConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND,
-        RESPONSES_API_TYPE,
+        ModelConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE, IMAGES_GENERATIONS_API_TYPE,
+        IMAGE_MODEL_CONFIG_KIND, LLM_MODEL_CONFIG_KIND, RESPONSES_API_TYPE,
     },
     session::store::SessionStore,
     storage::InMemoryObjectStorage,
@@ -46,6 +47,7 @@ fn test_state_with_provider(provider: DynLlmProviderClient, registry: ModelRegis
         store: SessionStore::default(),
         channel_store: ChannelStore::default(),
         hermes_proxy: InMemoryHermesProxyClient::default().shared(),
+        hermes_event_streams: HermesEventStreamRegistry::default(),
         model_registry: registry,
         llm_provider: provider,
         object_storage: InMemoryObjectStorage::default().shared(),
@@ -156,11 +158,36 @@ async fn provider_handler(
     )
 }
 
+async fn slow_stream_provider_handler() -> impl IntoResponse {
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/event-stream")],
+        "data: slow-provider\n\n",
+    )
+}
+
 async fn spawn_provider_server(captured: CapturedProviderRequest) -> String {
     let app = Router::new()
         .route("/v1/chat/completions", post(provider_handler))
         .route("/v1/responses", post(provider_handler))
         .with_state(captured);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test provider can bind");
+    let addr = listener.local_addr().expect("test provider addr");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("test provider server runs");
+    });
+
+    format!("http://{addr}")
+}
+
+async fn spawn_slow_stream_provider_server() -> String {
+    let app = Router::new().route("/v1/chat/completions", post(slow_stream_provider_handler));
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("test provider can bind");
@@ -312,6 +339,60 @@ async fn llm_proxy_injects_reasoning_for_chat_and_responses_requests() {
 }
 
 #[tokio::test]
+async fn llm_proxy_uses_image_config_for_image_generation_requests() {
+    let provider = InMemoryLlmProviderClient::new(LlmProviderResponse {
+        status: StatusCode::OK,
+        content_type: Some("application/json".to_string()),
+        body: br#"{"data":[]}"#.to_vec(),
+    });
+    let registry = test_registry();
+    registry
+        .replace(ModelConfig {
+            config_kind: IMAGE_MODEL_CONFIG_KIND.to_string(),
+            provider_name: "openai-compatible-image".to_string(),
+            provider_base_url: "https://image-provider.example/v1".to_string(),
+            provider_api_key: "image-secret".to_string(),
+            default_model: "gpt-image-2-medium".to_string(),
+            allowed_models: vec!["gpt-image-2-medium".to_string()],
+            api_type: IMAGES_GENERATIONS_API_TYPE.to_string(),
+            reasoning_effort: None,
+            allow_streaming: false,
+            request_timeout_seconds: 180,
+        })
+        .await
+        .expect("image config can be replaced");
+    registry.add_instance_token("instance-token");
+    let app = test_app(provider.clone(), registry);
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/internal/llm/v1/images/generations",
+        json!({
+            "model": "gpt-image-2",
+            "prompt": "画一张架构图",
+            "size": "1024x1024",
+            "quality": "medium"
+        }),
+        Some("instance-token"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let forwarded = provider.last_request().expect("provider request");
+    assert_eq!(forwarded.path, "/images/generations");
+    assert_eq!(forwarded.authorization, "Bearer image-secret");
+    assert_eq!(forwarded.timeout_seconds, 180);
+    let forwarded_body: Value = serde_json::from_slice(&forwarded.body).expect("json forwarded");
+    // Hermes 的 OpenAI 图片插件可能写死一个模型名；Hub 以管理员配置的图片模型为准。
+    assert_eq!(forwarded_body["model"], "gpt-image-2-medium");
+    // 兼容网关经常不接受 OpenAI 图片专有参数，Hub 统一清洗后再转发。
+    assert!(forwarded_body.get("quality").is_none());
+    assert!(forwarded_body.get("reasoning").is_none());
+    assert!(forwarded_body.get("reasoning_effort").is_none());
+}
+
+#[tokio::test]
 async fn llm_proxy_uses_real_http_provider_and_records_usage() {
     let captured = CapturedProviderRequest::default();
     let provider_base_url = format!("{}/v1", spawn_provider_server(captured.clone()).await);
@@ -371,4 +452,42 @@ async fn llm_proxy_uses_real_http_provider_and_records_usage() {
         "gpt-4.1-mini"
     );
     assert_eq!(state.store.llm_usage_count().await.expect("usage count"), 1);
+}
+
+#[tokio::test]
+async fn llm_proxy_allows_longer_timeout_for_streaming_provider_requests() {
+    let provider_base_url = format!("{}/v1", spawn_slow_stream_provider_server().await);
+    let registry = ModelRegistry::new(ModelConfig {
+        config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
+        provider_name: "slow-provider".to_string(),
+        provider_base_url,
+        provider_api_key: "slow-provider-token".to_string(),
+        default_model: "gpt-4.1-mini".to_string(),
+        allowed_models: vec!["gpt-4.1-mini".to_string()],
+        api_type: CHAT_COMPLETIONS_API_TYPE.to_string(),
+        reasoning_effort: None,
+        allow_streaming: true,
+        request_timeout_seconds: 1,
+    });
+    registry
+        .add_instance_token_for_instance("instance-for-slow-stream", "instance-token")
+        .await
+        .expect("memory token can be registered");
+    let state = test_state_with_provider(ReqwestLlmProviderClient::default().shared(), registry);
+    let app = build_router_with_state(state);
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/internal/llm/v1/chat/completions",
+        json!({ "messages": [], "stream": true }),
+        Some("instance-token"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("streaming response body can be read");
+    assert_eq!(bytes, "data: slow-provider\n\n");
 }

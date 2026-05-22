@@ -8,6 +8,7 @@ import type {
   ReasoningEffort,
   User,
 } from "../api/client";
+import { useI18n } from "../i18n";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
 type AdminSection = "users" | "models" | "hermes";
@@ -19,11 +20,6 @@ type AdminRouteProps = {
 };
 
 const defaultInviteHours = 24;
-const modelLabels: Record<ModelConfigKind, string> = {
-  llm: "大模型",
-  image: "图片生成模型",
-  title: "标题生成模型",
-};
 const apiTypeLabels: Record<ModelApiType, string> = {
   chat_completions: "Chat Completions",
   responses: "Responses",
@@ -32,6 +28,7 @@ const apiTypeLabels: Record<ModelApiType, string> = {
 const reasoningEfforts: Array<ReasoningEffort | ""> = ["", "minimal", "low", "medium", "high"];
 
 export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps) {
+  const { language, t } = useI18n();
   const [users, setUsers] = useState<User[]>([]);
   const [invites, setInvites] = useState<Invite[]>([]);
   const [instances, setInstances] = useState<HermesInstance[]>([]);
@@ -57,6 +54,11 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
     () => new Map(instances.map((instance) => [instance.user_id, instance])),
     [instances],
   );
+  const modelLabels: Record<ModelConfigKind, string> = {
+    llm: t("admin.llm"),
+    image: t("admin.imageModel"),
+    title: t("admin.titleModel"),
+  };
 
   async function refresh() {
     setError(null);
@@ -74,7 +76,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
       setRequiredModelsReady(nextModelStatus.required_models_ready);
       setMissingRequiredModels(nextModelStatus.missing_required_model_config_kinds);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Admin data could not be loaded");
+      setError(cause instanceof Error ? cause.message : t("chat.workspaceLoadFailed"));
     }
   }
 
@@ -115,21 +117,21 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
     setTestingModel(config.config_kind);
     setModelTestMessages((messages) => ({
       ...messages,
-      [config.config_kind]: "Testing...",
+      [config.config_kind]: t("admin.modelTesting"),
     }));
     try {
       const result = await apiClient.testModelConfig(config);
       setModelTestMessages((messages) => ({
         ...messages,
-        [config.config_kind]: result.ok
-          ? result.message
-          : `HTTP ${result.status_code}: ${result.message}`,
+          [config.config_kind]: result.ok
+            ? result.message
+            : `HTTP ${result.status_code}: ${result.message}`,
       }));
     } catch (cause) {
       setModelTestMessages((messages) => ({
         ...messages,
         [config.config_kind]:
-          cause instanceof Error ? cause.message : "Model test failed",
+          cause instanceof Error ? cause.message : t("admin.modelTestFailed"),
       }));
     } finally {
       setTestingModel(null);
@@ -194,21 +196,21 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
 
   const missingRequiredModelNames =
     missingRequiredModels.length > 0
-      ? missingRequiredModels.map((kind) => modelLabels[kind]).join("、")
-      : "大模型、标题生成模型";
-  const modelGateMessage = `请先在模型配置管理中保存可用的${missingRequiredModelNames}。`;
+      ? missingRequiredModels.map((kind) => modelLabels[kind]).join(language === "zh" ? "、" : ", ")
+      : [modelLabels.llm, modelLabels.title].join(language === "zh" ? "、" : ", ");
+  const modelGateMessage = t("admin.modelGate", { models: missingRequiredModelNames });
 
   if (section === "models") {
     return (
       <section className="admin-page" id="admin-models">
         <form className="admin-page" onSubmit={(event) => void saveModels(event)}>
           <div className="panel-heading">
-            <h1>模型配置管理</h1>
+            <h1>{t("admin.modelConfig")}</h1>
             <div className="button-row">
               <button type="button" className="secondary" onClick={() => void refresh()}>
-                Refresh
+                {t("admin.refresh")}
               </button>
-              <button type="submit">Save</button>
+              <button type="submit">{t("admin.save")}</button>
             </div>
           </div>
           {error ? <p className="error">{error}</p> : null}
@@ -223,7 +225,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                     disabled={testingModel === config.config_kind}
                     onClick={() => void testModel(config)}
                   >
-                    Test
+                    {t("admin.test")}
                   </button>
                 </div>
                 {modelTestMessages[config.config_kind] ? (
@@ -239,7 +241,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                 ) : null}
                 <div className="form">
                   <label>
-                    Provider
+                    {t("admin.provider")}
                     <input
                       value={config.provider_name}
                       onChange={(event) =>
@@ -248,7 +250,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                     />
                   </label>
                   <label>
-                    Base URL
+                    {t("admin.baseUrl")}
                     <input
                       value={config.provider_base_url}
                       onChange={(event) =>
@@ -259,7 +261,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                     />
                   </label>
                   <label>
-                    API key
+                    {t("admin.apiKey")}
                     <input
                       type="password"
                       value={config.provider_api_key ?? ""}
@@ -269,7 +271,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                     />
                   </label>
                   <label>
-                    Model
+                    {t("admin.model")}
                     <input
                       value={config.default_model}
                       onChange={(event) =>
@@ -278,7 +280,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                     />
                   </label>
                   <label>
-                    API
+                    {t("admin.api")}
                     <select
                       value={config.api_type}
                       disabled={config.config_kind === "image"}
@@ -300,7 +302,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                   </label>
                   {config.config_kind !== "image" ? (
                     <label>
-                      思考等级
+                      {t("admin.reasoning")}
                       <select
                         value={config.reasoning_effort ?? ""}
                         onChange={(event) =>
@@ -314,14 +316,14 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                       >
                         {reasoningEfforts.map((effort) => (
                           <option key={effort || "none"} value={effort}>
-                            {effort || "不设置"}
+                            {effort || t("admin.noReasoning")}
                           </option>
                         ))}
                       </select>
                     </label>
                   ) : null}
                   <label>
-                    Timeout seconds
+                    {t("admin.timeout")}
                     <input
                       type="number"
                       min={1}
@@ -344,7 +346,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                           })
                         }
                       />
-                      Streaming
+                      {t("admin.streaming")}
                     </label>
                   ) : null}
                 </div>
@@ -360,9 +362,9 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
     return (
       <section className="admin-page" id="admin-hermes">
         <div className="panel-heading">
-          <h1>Hermes 管理</h1>
+          <h1>{t("admin.title")}</h1>
           <button type="button" className="secondary" onClick={() => void refresh()}>
-            Refresh
+            {t("admin.refresh")}
           </button>
         </div>
         {error ? <p className="error">{error}</p> : null}
@@ -371,11 +373,11 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
           <table>
             <thead>
               <tr>
-                <th>Owner</th>
-                <th>Kind</th>
-                <th>Status</th>
-                <th>Base URL</th>
-                <th>Action</th>
+                <th>{t("admin.owner")}</th>
+                <th>{t("admin.kind")}</th>
+                <th>{t("admin.status")}</th>
+                <th>{t("admin.baseUrl")}</th>
+                <th>{t("admin.action")}</th>
               </tr>
             </thead>
             <tbody>
@@ -395,7 +397,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                           disabled={!requiredModelsReady}
                           onClick={() => void createManagedHermes(owner.id)}
                         >
-                          Create
+                          {t("admin.create")}
                         </button>
                       ) : instance.kind === "managed_docker" ? (
                         <div className="button-row">
@@ -405,14 +407,14 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                             disabled={!requiredModelsReady}
                             onClick={() => void controlInstance("start", instance)}
                           >
-                            Start
+                            {t("admin.start")}
                           </button>
                           <button
                             type="button"
                             className="secondary"
                             onClick={() => void controlInstance("stop", instance)}
                           >
-                            Stop
+                            {t("admin.stop")}
                           </button>
                           <button
                             type="button"
@@ -420,7 +422,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                             disabled={!requiredModelsReady}
                             onClick={() => void controlInstance("rebuild", instance)}
                           >
-                            Rebuild
+                            {t("admin.rebuild")}
                           </button>
                         </div>
                       ) : (
@@ -429,7 +431,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                           className="secondary"
                           onClick={() => openExternalEditor(instance)}
                         >
-                          Edit
+                          {t("admin.edit")}
                         </button>
                       )}
                     </td>
@@ -442,17 +444,17 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
         {editingExternalUserId ? (
           <form className="panel form" onSubmit={(event) => void saveExternalHermesConfig(event)}>
             <div className="panel-heading">
-              <h2>Hermes 配置</h2>
+              <h2>{t("admin.hermesConfig")}</h2>
               <button
                 type="button"
                 className="secondary"
                 onClick={() => setEditingExternalUserId(null)}
               >
-                Cancel
+                {t("admin.cancel")}
               </button>
             </div>
             <label>
-              Name
+              {t("admin.name")}
               <input
                 value={externalDraft.name}
                 onChange={(event) =>
@@ -462,7 +464,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
               />
             </label>
             <label>
-              Base URL
+              {t("admin.baseUrl")}
               <input
                 value={externalDraft.base_url}
                 onChange={(event) =>
@@ -472,18 +474,18 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
               />
             </label>
             <label>
-              API token
+              {t("admin.apiKey")}
               <input
                 type="password"
                 value={externalDraft.api_token}
                 onChange={(event) =>
                   setExternalDraft((draft) => ({ ...draft, api_token: event.target.value }))
                 }
-                placeholder="留空表示沿用已有 token"
+                placeholder={t("admin.externalTokenHint")}
               />
             </label>
             <div className="button-row">
-              <button type="submit">Save config</button>
+              <button type="submit">{t("admin.saveConfig")}</button>
             </div>
           </form>
         ) : null}
@@ -494,22 +496,22 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
   return (
     <section className="admin-page" id="admin-users">
       <div className="panel-heading">
-        <h1>用户管理</h1>
+        <h1>{t("admin.userManagement")}</h1>
         <button type="button" className="secondary" onClick={() => void refresh()}>
-          Refresh
+          {t("admin.refresh")}
         </button>
       </div>
       {error ? <p className="error">{error}</p> : null}
       <div className="grid-section">
         <div className="panel">
-          <h2>Users</h2>
+          <h2>{t("admin.users")}</h2>
           <table>
             <thead>
               <tr>
-                <th>Email</th>
-                <th>Role</th>
-                <th>Status</th>
-                <th>Action</th>
+                <th>{t("admin.email")}</th>
+                <th>{t("admin.role")}</th>
+                <th>{t("admin.status")}</th>
+                <th>{t("admin.action")}</th>
               </tr>
             </thead>
             <tbody>
@@ -525,7 +527,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                       disabled={user.id === currentUser.id}
                       onClick={() => void toggleUser(user)}
                     >
-                      {user.status === "active" ? "Disable" : "Enable"}
+                      {user.status === "active" ? t("admin.disable") : t("admin.enable")}
                     </button>
                   </td>
                 </tr>
@@ -535,11 +537,11 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
         </div>
 
         <div className="panel">
-          <h2>Invites</h2>
+          <h2>{t("admin.invites")}</h2>
           {!requiredModelsReady ? <p className="notice">{modelGateMessage}</p> : null}
           <form className="inline-form" onSubmit={createInvite}>
             <label>
-              Hours
+              {t("admin.hours")}
               <input
                 type="number"
                 min={1}
@@ -549,7 +551,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
               />
             </label>
             <label>
-              Uses
+              {t("admin.uses")}
               <input
                 type="number"
                 min={1}
@@ -559,7 +561,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
               />
             </label>
             <button type="submit" disabled={!requiredModelsReady}>
-              Create invite
+              {t("admin.createInvite")}
             </button>
           </form>
           {lastInviteLink ? <p className="copy-line">{lastInviteLink}</p> : null}
@@ -568,8 +570,9 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
               <li key={invite.id}>
                 <strong>{invite.status}</strong>
                 <span>
-                  {invite.used_count}/{invite.max_uses} used · expires{" "}
-                  {new Date(invite.expires_at * 1000).toLocaleString()}
+                  {invite.used_count}/{invite.max_uses} {t("admin.used")} ·{" "}
+                  {t("admin.expiresAt")}{" "}
+                  {new Date(invite.expires_at * 1000).toLocaleString(language)}
                 </span>
                 {invite.status === "pending" ? (
                   <button
@@ -577,7 +580,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                     className="secondary"
                     onClick={() => void apiClient.revokeInvite(invite.id).then(refresh)}
                   >
-                    Revoke
+                    {t("admin.revoke")}
                   </button>
                 ) : null}
               </li>
