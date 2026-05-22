@@ -1369,6 +1369,31 @@ describe("App", () => {
     expect(screen.queryByText("secret-invite-token")).not.toBeInTheDocument();
   });
 
+  it("returns to sign in after invite registration creates the account", async () => {
+    window.history.pushState({}, "", "/?invite=secret-invite-token");
+    const client = createMockApiClient({ initialUser: null, bootstrapOpen: false });
+
+    render(<App apiClient={client} />);
+
+    expect(await screen.findByRole("button", { name: "Create account" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Email"), {
+      target: { value: "invited@example.com" },
+    });
+    fireEvent.change(screen.getByLabelText("Password"), {
+      target: { value: "invited-password-123" },
+    });
+    fireEvent.change(screen.getByLabelText("Confirm password"), {
+      target: { value: "invited-password-123" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create account" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Sign in" })).toBeInTheDocument();
+    });
+    expect(screen.queryByRole("button", { name: "New chat" })).not.toBeInTheDocument();
+    expect(window.location.search).toBe("");
+  });
+
   it("blocks invites and Hermes start controls until required models are ready", async () => {
     render(
       <App

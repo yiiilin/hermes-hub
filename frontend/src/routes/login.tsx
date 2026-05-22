@@ -16,8 +16,9 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
     const params = new URLSearchParams(window.location.search);
     return params.get("invite") ?? params.get("invite_token") ?? "";
   }, []);
-  const [mode, setMode] = useState<AuthMode>(inviteFromUrl ? "invite" : "login");
-  const [checkingBootstrap, setCheckingBootstrap] = useState(!inviteFromUrl);
+  const [inviteToken, setInviteToken] = useState(inviteFromUrl);
+  const [mode, setMode] = useState<AuthMode>(inviteToken ? "invite" : "login");
+  const [checkingBootstrap, setCheckingBootstrap] = useState(!inviteToken);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -28,7 +29,7 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
   useEffect(() => {
     let alive = true;
 
-    if (inviteFromUrl) {
+    if (inviteToken) {
       setCheckingBootstrap(false);
       return () => {
         alive = false;
@@ -56,7 +57,7 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
     return () => {
       alive = false;
     };
-  }, [apiClient, inviteFromUrl]);
+  }, [apiClient, inviteToken]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -72,8 +73,17 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
         mode === "bootstrap"
           ? await apiClient.bootstrapRegister(email, password)
           : mode === "invite"
-            ? await apiClient.registerWithInvite(inviteFromUrl, email, password)
+            ? await apiClient.registerWithInvite(inviteToken, email, password)
             : await apiClient.login(email, password);
+      if (mode === "invite") {
+        // 邀请注册只创建账号，不建立登录 cookie；成功后回到登录页让用户正式登录。
+        clearInviteTokenFromUrl();
+        setInviteToken("");
+        setMode("login");
+        setPassword("");
+        setConfirmPassword("");
+        return;
+      }
       onAuthenticated(user);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("auth.authFailed"));
@@ -139,7 +149,7 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
                   : t("auth.signIn")}
           </button>
         </form>
-        {!inviteFromUrl && !checkingBootstrap ? (
+        {!inviteToken && !checkingBootstrap ? (
           <button
             type="button"
             className="text-button"
@@ -156,4 +166,12 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
       </section>
     </main>
   );
+}
+
+function clearInviteTokenFromUrl() {
+  const url = new URL(window.location.href);
+  url.searchParams.delete("invite");
+  url.searchParams.delete("invite_token");
+  const nextPath = `${url.pathname}${url.search}${url.hash}`;
+  window.history.replaceState({}, "", nextPath);
 }
