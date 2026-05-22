@@ -667,10 +667,9 @@ fn normalize_model_config(mut config: ModelConfig) -> Result<ModelConfig, ModelR
 }
 
 fn sanitize_image_generation_request(object: &mut Map<String, Value>) {
-    // Hermes 的 OpenAI 图片插件会附带 quality 这一类 OpenAI 专有参数；
-    // 许多 OpenAI-compatible 网关会直接 502。Hub 以管理员的图片模型配置为准，
-    // 第一版只转发通用图片生成字段，保证兼容性优先。
-    for key in ["quality", "background", "output_format", "moderation"] {
+    // quality/background/output_format 是图片输出控制参数，管理员已允许透传给上游。
+    // moderation 更偏供应商审核策略，兼容网关支持不稳定，暂时继续清洗。
+    for key in ["moderation"] {
         object.remove(key);
     }
 }

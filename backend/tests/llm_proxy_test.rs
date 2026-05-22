@@ -373,7 +373,10 @@ async fn llm_proxy_uses_image_config_for_image_generation_requests() {
             "model": "gpt-image-2",
             "prompt": "画一张架构图",
             "size": "1024x1024",
-            "quality": "medium"
+            "quality": "medium",
+            "background": "opaque",
+            "output_format": "png",
+            "moderation": "low"
         }),
         Some("instance-token"),
     )
@@ -387,8 +390,12 @@ async fn llm_proxy_uses_image_config_for_image_generation_requests() {
     let forwarded_body: Value = serde_json::from_slice(&forwarded.body).expect("json forwarded");
     // Hermes 的 OpenAI 图片插件可能写死一个模型名；Hub 以管理员配置的图片模型为准。
     assert_eq!(forwarded_body["model"], "gpt-image-2-medium");
-    // 兼容网关经常不接受 OpenAI 图片专有参数，Hub 统一清洗后再转发。
-    assert!(forwarded_body.get("quality").is_none());
+    // 管理员明确允许的图片输出参数要透传，让 Hermes 可以控制输出质量和格式。
+    assert_eq!(forwarded_body["quality"], "medium");
+    assert_eq!(forwarded_body["background"], "opaque");
+    assert_eq!(forwarded_body["output_format"], "png");
+    // moderation 仍属于供应商策略参数，当前保持清洗，避免兼容网关误判。
+    assert!(forwarded_body.get("moderation").is_none());
     assert!(forwarded_body.get("reasoning").is_none());
     assert!(forwarded_body.get("reasoning_effort").is_none());
 }
