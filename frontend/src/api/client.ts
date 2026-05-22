@@ -95,6 +95,10 @@ export type ModelConfigTestResult = {
   duration_ms: number;
 };
 
+export type SystemSettings = {
+  max_sessions_per_user: number;
+};
+
 export type HermesAttachment = {
   id?: string;
   name: string;
@@ -284,6 +288,8 @@ export type ApiClient = {
   updateModelConfig: (config: ModelConfig) => Promise<void>;
   updateModelConfigs: (configs: ModelConfig[]) => Promise<void>;
   testModelConfig: (config: ModelConfig) => Promise<ModelConfigTestResult>;
+  systemSettings: () => Promise<SystemSettings>;
+  updateSystemSettings: (settings: SystemSettings) => Promise<void>;
   sendHermesPrompt: (
     prompt: string,
     attachments?: HermesAttachment[],
@@ -628,6 +634,18 @@ export function createApiClient(): ApiClient {
           body: normalizedModelConfig(config),
         },
       );
+    },
+    async systemSettings() {
+      const payload = await request<{ settings: SystemSettings }>(
+        "/api/admin/system-settings",
+      );
+      return payload.settings;
+    },
+    async updateSystemSettings(settings) {
+      await request<void>("/api/admin/system-settings", {
+        method: "PUT",
+        body: settings,
+      });
     },
     async sendHermesPrompt(prompt, attachments = [], sessionId, handlers) {
       const response = await fetch("/api/hermes/v1/runs", {
@@ -1237,6 +1255,7 @@ type MockApiClientOptions = {
   resumeHermesRun?: ApiClient["resumeHermesRun"];
   stopHermesRun?: ApiClient["stopHermesRun"];
   deleteSession?: ApiClient["deleteSession"];
+  createSession?: ApiClient["createSession"];
 };
 
 export function createMockApiClient(options: MockApiClientOptions = {}): ApiClient {
@@ -1311,6 +1330,9 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       allow_streaming: false,
     },
   ];
+  let systemSettings: SystemSettings = {
+    max_sessions_per_user: 20,
+  };
 
   function emitSessionEvent(sessionId: string, event: ChannelSessionEvent) {
     for (const listener of sessionEventListenersBySessionId[sessionId] ?? []) {
@@ -1420,6 +1442,10 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       return sessions.filter((session) => session.channel_id === channelId);
     },
     async createSession(channelId, kind, title) {
+      if (options.createSession) {
+        return options.createSession(channelId, kind, title);
+      }
+
       const now = Date.now();
       const session = {
         id: `session-${sessions.length + 1}`,
@@ -1611,6 +1637,12 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
         message: "model test succeeded",
         duration_ms: 12,
       };
+    },
+    async systemSettings() {
+      return systemSettings;
+    },
+    async updateSystemSettings(settings) {
+      systemSettings = settings;
     },
     async sendHermesPrompt(prompt, _attachments, _sessionId, handlers) {
       if (options.sendHermesPrompt) {

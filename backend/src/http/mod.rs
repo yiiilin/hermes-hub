@@ -36,6 +36,7 @@ pub enum ApiError {
     Unauthorized,
     Forbidden,
     Conflict(&'static str),
+    ConflictMessage(String),
     Gone(&'static str),
     NotFound(&'static str),
     BadGateway(&'static str),
@@ -46,30 +47,43 @@ pub enum ApiError {
 #[derive(Serialize)]
 struct ErrorBody {
     error: &'static str,
-    message: &'static str,
+    message: String,
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, error, message) = match self {
-            ApiError::BadRequest(message) => (StatusCode::BAD_REQUEST, "bad_request", message),
+            ApiError::BadRequest(message) => {
+                (StatusCode::BAD_REQUEST, "bad_request", message.to_string())
+            }
             ApiError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
-                "authentication required",
+                "authentication required".to_string(),
             ),
-            ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden", "admin access required"),
-            ApiError::Conflict(message) => (StatusCode::CONFLICT, "conflict", message),
-            ApiError::Gone(message) => (StatusCode::GONE, "gone", message),
-            ApiError::NotFound(message) => (StatusCode::NOT_FOUND, "not_found", message),
-            ApiError::BadGateway(message) => (StatusCode::BAD_GATEWAY, "bad_gateway", message),
-            ApiError::GatewayTimeout(message) => {
-                (StatusCode::GATEWAY_TIMEOUT, "gateway_timeout", message)
+            ApiError::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "admin access required".to_string(),
+            ),
+            ApiError::Conflict(message) => (StatusCode::CONFLICT, "conflict", message.to_string()),
+            ApiError::ConflictMessage(message) => (StatusCode::CONFLICT, "conflict", message),
+            ApiError::Gone(message) => (StatusCode::GONE, "gone", message.to_string()),
+            ApiError::NotFound(message) => {
+                (StatusCode::NOT_FOUND, "not_found", message.to_string())
             }
+            ApiError::BadGateway(message) => {
+                (StatusCode::BAD_GATEWAY, "bad_gateway", message.to_string())
+            }
+            ApiError::GatewayTimeout(message) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "gateway_timeout",
+                message.to_string(),
+            ),
             ApiError::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
-                "internal server error",
+                "internal server error".to_string(),
             ),
         };
 

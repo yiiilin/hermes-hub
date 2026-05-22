@@ -1,10 +1,10 @@
 import type { Dispatch, MouseEvent, ReactNode, SetStateAction } from "react";
 import type { User } from "../api/client";
-import { Bot, Cpu, Languages, LogOut, Menu, PanelLeftClose, PanelLeftOpen, Settings, Users, X } from "lucide-react";
+import { Bot, Cpu, Languages, LogOut, Menu, PanelLeftClose, PanelLeftOpen, Settings, SlidersHorizontal, Users, X } from "lucide-react";
 import { useI18n } from "../i18n";
 import { createContext, useContext, useEffect, useState } from "react";
 
-export type AppView = "chat" | "admin-users" | "admin-models" | "admin-hermes";
+export type AppView = "chat" | "admin-users" | "admin-models" | "admin-hermes" | "admin-settings";
 
 type ChatSidebarSetter = Dispatch<SetStateAction<ReactNode>>;
 
@@ -166,6 +166,15 @@ export function Layout({ children, user, activeView, onNavigate, onLogout }: Lay
                 >
                   <Cpu aria-hidden="true" size={18} />
                   <span>{t("admin.title")}</span>
+                </button>
+                <button
+                  type="button"
+                  className={activeView === "admin-settings" ? "nav-link active" : "nav-link"}
+                  onClick={() => navigate("admin-settings")}
+                  title={t("admin.systemSettings")}
+                >
+                  <SlidersHorizontal aria-hidden="true" size={18} />
+                  <span>{t("admin.systemSettings")}</span>
                 </button>
               </div>
             ) : null}

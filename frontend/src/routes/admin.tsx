@@ -6,12 +6,13 @@ import type {
   ModelConfig,
   ModelConfigKind,
   ReasoningEffort,
+  SystemSettings,
   User,
 } from "../api/client";
 import { useI18n } from "../i18n";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
-type AdminSection = "users" | "models" | "hermes";
+type AdminSection = "users" | "models" | "hermes" | "settings";
 
 type AdminRouteProps = {
   apiClient: ApiClient;
@@ -33,6 +34,10 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
   const [invites, setInvites] = useState<Invite[]>([]);
   const [instances, setInstances] = useState<HermesInstance[]>([]);
   const [modelConfigs, setModelConfigs] = useState<ModelConfig[]>([]);
+  const [systemSettings, setSystemSettings] = useState<SystemSettings>({
+    max_sessions_per_user: 20,
+  });
+  const [settingsSaved, setSettingsSaved] = useState(false);
   const [inviteHours, setInviteHours] = useState(defaultInviteHours);
   const [inviteMaxUses, setInviteMaxUses] = useState(1);
   const [lastInviteLink, setLastInviteLink] = useState<string | null>(null);
@@ -63,11 +68,12 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
   async function refresh() {
     setError(null);
     try {
-      const [nextUsers, nextInvites, nextInstances, nextModelStatus] = await Promise.all([
+      const [nextUsers, nextInvites, nextInstances, nextModelStatus, nextSettings] = await Promise.all([
         apiClient.listUsers(),
         apiClient.listInvites(),
         apiClient.listHermesInstances(),
         apiClient.modelConfigStatus(),
+        section === "settings" ? apiClient.systemSettings() : Promise.resolve(null),
       ]);
       setUsers(nextUsers);
       setInvites(nextInvites);
@@ -75,6 +81,9 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
       setModelConfigs(nextModelStatus.model_configs);
       setRequiredModelsReady(nextModelStatus.required_models_ready);
       setMissingRequiredModels(nextModelStatus.missing_required_model_config_kinds);
+      if (nextSettings) {
+        setSystemSettings(nextSettings);
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("chat.workspaceLoadFailed"));
     }
@@ -192,6 +201,19 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
     setEditingExternalUserId(null);
     setExternalDraft({ name: "", base_url: "", api_token: "" });
     await refresh();
+  }
+
+  async function saveSystemSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSettingsSaved(false);
+    setError(null);
+    try {
+      await apiClient.updateSystemSettings(systemSettings);
+      setSystemSettings(await apiClient.systemSettings());
+      setSettingsSaved(true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("admin.settingsSaveFailed"));
+    }
   }
 
   const missingRequiredModelNames =
@@ -489,6 +511,41 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
             </div>
           </form>
         ) : null}
+      </section>
+    );
+  }
+
+  if (section === "settings") {
+    return (
+      <section className="admin-page" id="admin-settings">
+        <form className="panel form" onSubmit={(event) => void saveSystemSettings(event)}>
+          <div className="panel-heading">
+            <h1>{t("admin.systemSettings")}</h1>
+            <button type="button" className="secondary" onClick={() => void refresh()}>
+              {t("admin.refresh")}
+            </button>
+          </div>
+          {error ? <p className="error">{error}</p> : null}
+          {settingsSaved ? <p className="copy-line">{t("admin.settingsSaved")}</p> : null}
+          <label>
+            {t("admin.maxSessionsPerUser")}
+            <input
+              type="number"
+              min={1}
+              max={500}
+              value={systemSettings.max_sessions_per_user}
+              onChange={(event) =>
+                setSystemSettings({
+                  max_sessions_per_user: Number(event.target.value),
+                })
+              }
+              required
+            />
+          </label>
+          <div className="button-row">
+            <button type="submit">{t("admin.saveSettings")}</button>
+          </div>
+        </form>
       </section>
     );
   }

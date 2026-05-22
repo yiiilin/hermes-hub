@@ -112,6 +112,17 @@ create table if not exists llm_usage_events (
     created_at timestamptz not null default now()
 );
 
+create table if not exists system_settings (
+    key text primary key,
+    value text not null,
+    updated_at timestamptz not null default now()
+);
+
+-- 系统设置必须有稳定默认值，老部署升级后不需要管理员手动补配置。
+insert into system_settings (key, value)
+values ('max_sessions_per_user', '20')
+on conflict (key) do nothing;
+
 create table if not exists channels (
     id uuid primary key,
     user_id uuid not null references users(id) on delete cascade,

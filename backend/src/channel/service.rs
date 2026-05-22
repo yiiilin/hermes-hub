@@ -262,6 +262,8 @@ pub enum ChannelStoreError {
     AttachmentNotFound,
     #[error("run not found")]
     RunNotFound,
+    #[error("session limit exceeded")]
+    SessionLimitExceeded { max_sessions_per_user: u32 },
     #[error("channel store lock failed")]
     LockFailed,
     #[error("database operation failed")]
@@ -575,6 +577,123 @@ impl ChannelStore {
 
                 row_to_session(&row)
             }),
+        }
+    }
+
+    pub async fn create_session_with_limit(
+        &self,
+        user_id: &str,
+        channel_id: &str,
+        kind: ChannelSessionKind,
+        title: Option<String>,
+        max_sessions_per_user: u32,
+    ) -> Result<ChannelSession, ChannelStoreError> {
+        self.get_channel(user_id, channel_id).await?;
+
+        match &self.backend {
+            ChannelStoreBackend::Memory(inner) => {
+                let now = unix_now();
+                let mut inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
+                let user_channel_ids = inner
+                    .channels_by_id
+                    .values()
+                    .filter(|channel| channel.user_id == user_id)
+                    .map(|channel| channel.id.clone())
+                    .collect::<HashSet<_>>();
+                let session_count = inner
+                    .sessions_by_id
+                    .values()
+                    .filter(|session| user_channel_ids.contains(&session.channel_id))
+                    .count();
+                if session_count >= max_sessions_per_user as usize {
+                    return Err(ChannelStoreError::SessionLimitExceeded {
+                        max_sessions_per_user,
+                    });
+                }
+
+                let session = ChannelSession {
+                    id: Uuid::new_v4().to_string(),
+                    channel_id: channel_id.to_string(),
+                    kind,
+                    hermes_session_id: None,
+                    hermes_response_id: None,
+                    hermes_run_id: None,
+                    title,
+                    created_at: now,
+                    updated_at: now,
+                };
+
+                inner
+                    .sessions_by_id
+                    .insert(session.id.clone(), session.clone());
+                Ok(session)
+            }
+            ChannelStoreBackend::Postgres(pool) => {
+                block_on_db(async {
+                    let mut tx = pool
+                        .begin()
+                        .await
+                        .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+                    // 锁定该用户的标准 channel，避免并发创建绕过用户级会话上限。
+                    sqlx::query("select id from channels where id = $1::uuid and user_id = $2::uuid for update")
+                    .bind(channel_id)
+                    .bind(user_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|_| ChannelStoreError::DatabaseFailed)?
+                    .ok_or(ChannelStoreError::ChannelNotFound)?;
+
+                    let session_count = sqlx::query(
+                        r#"
+                    select count(*)::bigint as count
+                    from channel_sessions
+                    join channels on channels.id = channel_sessions.channel_id
+                    where channels.user_id = $1::uuid
+                    "#,
+                    )
+                    .bind(user_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|_| ChannelStoreError::DatabaseFailed)?
+                    .try_get::<i64, _>("count")
+                    .map_err(|_| ChannelStoreError::DatabaseFailed)?
+                        as u32;
+
+                    if session_count >= max_sessions_per_user {
+                        return Err(ChannelStoreError::SessionLimitExceeded {
+                            max_sessions_per_user,
+                        });
+                    }
+
+                    let row = sqlx::query(
+                        r#"
+                    insert into channel_sessions (id, channel_id, kind, title)
+                    values ($1::uuid, $2::uuid, $3, $4)
+                    returning id::text as id,
+                              channel_id::text as channel_id,
+                              kind,
+                              hermes_session_id,
+                              hermes_response_id,
+                              hermes_run_id,
+                              title,
+                              extract(epoch from created_at)::bigint as created_at,
+                              extract(epoch from updated_at)::bigint as updated_at
+                    "#,
+                    )
+                    .bind(Uuid::new_v4().to_string())
+                    .bind(channel_id)
+                    .bind(kind.as_str())
+                    .bind(title)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+                    tx.commit()
+                        .await
+                        .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+
+                    row_to_session(&row)
+                })
+            }
         }
     }
 

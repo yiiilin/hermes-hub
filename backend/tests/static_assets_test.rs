@@ -78,3 +78,28 @@ async fn backend_serves_frontend_static_assets_and_spa_fallback() {
         "未知 API 路径必须返回 JSON 404，不能落到 SPA fallback 变成含糊的 405"
     );
 }
+
+#[tokio::test]
+async fn backend_serves_pwa_manifest_and_service_worker_as_static_assets() {
+    let mut config = AppConfig::for_tests();
+    let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("backend crate has a repository root");
+    config.static_dir = repository_root.join("frontend/public");
+    let app = build_router(config);
+
+    for uri in ["/manifest.webmanifest", "/service-worker.js"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request can be built"),
+            )
+            .await
+            .expect("pwa asset response");
+        assert_eq!(response.status(), StatusCode::OK, "{uri} must be served");
+    }
+}

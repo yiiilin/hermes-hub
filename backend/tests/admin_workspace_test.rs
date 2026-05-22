@@ -314,3 +314,68 @@ async fn admin_workspace_test() {
     .await;
     assert_eq!(update_managed_config.status(), StatusCode::CONFLICT);
 }
+
+#[tokio::test]
+async fn admin_can_configure_per_user_session_limit() {
+    let app = test_app();
+    let admin_cookie = bootstrap_admin(&app).await;
+
+    let settings = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/system-settings",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(settings).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["settings"]["max_sessions_per_user"], 20);
+
+    let update = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/system-settings",
+        json!({
+            "max_sessions_per_user": 2
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+
+    let channels = request_empty(&app, Method::GET, "/api/channels", Some(&admin_cookie)).await;
+    let (status, body) = response_json(channels).await;
+    assert_eq!(status, StatusCode::OK);
+    let channel_id = body["channels"][0]
+        .as_object()
+        .and_then(|channel| channel.get("id"))
+        .and_then(Value::as_str)
+        .expect("channel id");
+
+    for _ in 0..2 {
+        let created = request_json(
+            &app,
+            Method::POST,
+            &format!("/api/channels/{channel_id}/sessions"),
+            json!({ "kind": "agent" }),
+            Some(&admin_cookie),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+    }
+
+    let blocked = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions"),
+        json!({ "kind": "agent" }),
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(blocked).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body["message"],
+        "每个用户最多2个会话，你得先删除一个会话才能创建新会话"
+    );
+}

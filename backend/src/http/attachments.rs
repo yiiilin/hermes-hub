@@ -215,6 +215,9 @@ pub fn map_channel_error(error: ChannelStoreError) -> ApiError {
         | ChannelStoreError::InvalidAttachment
         | ChannelStoreError::InvalidRunStatus => ApiError::BadRequest("invalid channel request"),
         ChannelStoreError::RunNotFound => ApiError::NotFound("resource not found"),
+        ChannelStoreError::SessionLimitExceeded { .. } => {
+            ApiError::Conflict("session limit exceeded")
+        }
         ChannelStoreError::LockFailed | ChannelStoreError::DatabaseFailed => ApiError::Internal,
     }
 }

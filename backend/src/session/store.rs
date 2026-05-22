@@ -8,6 +8,7 @@ use crate::{
     security::crypto::{decrypt_secret, encrypt_secret, SecretCipher},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{Executor, PgPool, Postgres, Row};
 use std::{
@@ -19,6 +20,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const SESSION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+const DEFAULT_MAX_SESSIONS_PER_USER: u32 = 20;
+const MAX_CONFIGURABLE_SESSIONS_PER_USER: u32 = 500;
+const MAX_SESSIONS_PER_USER_KEY: &str = "max_sessions_per_user";
 
 #[derive(Clone)]
 pub struct SessionStore {
@@ -39,7 +43,6 @@ impl Default for SessionStore {
     }
 }
 
-#[derive(Default)]
 struct StoreInner {
     users_by_id: HashMap<String, User>,
     user_ids_by_email: HashMap<String, String>,
@@ -49,6 +52,36 @@ struct StoreInner {
     hermes_instances_by_user_id: HashMap<String, HermesInstance>,
     proxy_audit_logs: Vec<ProxyAuditEvent>,
     llm_usage_events: Vec<LlmUsageEvent>,
+    system_settings: SystemSettings,
+}
+
+impl Default for StoreInner {
+    fn default() -> Self {
+        Self {
+            users_by_id: HashMap::new(),
+            user_ids_by_email: HashMap::new(),
+            sessions_by_hash: HashMap::new(),
+            invites_by_id: HashMap::new(),
+            invite_ids_by_hash: HashMap::new(),
+            hermes_instances_by_user_id: HashMap::new(),
+            proxy_audit_logs: Vec::new(),
+            llm_usage_events: Vec::new(),
+            system_settings: SystemSettings::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SystemSettings {
+    pub max_sessions_per_user: u32,
+}
+
+impl Default for SystemSettings {
+    fn default() -> Self {
+        Self {
+            max_sessions_per_user: DEFAULT_MAX_SESSIONS_PER_USER,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -116,6 +149,8 @@ pub enum StoreError {
     DatabaseFailed,
     #[error("secret operation failed")]
     SecretFailed,
+    #[error("invalid system settings")]
+    InvalidSystemSettings,
 }
 
 impl SessionStore {
@@ -819,6 +854,61 @@ impl SessionStore {
         }
     }
 
+    pub async fn system_settings(&self) -> Result<SystemSettings, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                Ok(inner.system_settings.clone())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let value = sqlx::query("select value from system_settings where key = $1")
+                    .bind(MAX_SESSIONS_PER_USER_KEY)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?
+                    .and_then(|row| row.try_get::<String, _>("value").ok())
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap_or(DEFAULT_MAX_SESSIONS_PER_USER);
+
+                Ok(SystemSettings {
+                    max_sessions_per_user: value,
+                })
+            }),
+        }
+    }
+
+    pub async fn update_system_settings(
+        &self,
+        settings: SystemSettings,
+    ) -> Result<SystemSettings, StoreError> {
+        validate_system_settings(&settings)?;
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                inner.system_settings = settings.clone();
+                Ok(settings)
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                sqlx::query(
+                    r#"
+                    insert into system_settings (key, value, updated_at)
+                    values ($1, $2, now())
+                    on conflict (key) do update set
+                        value = excluded.value,
+                        updated_at = now()
+                    "#,
+                )
+                .bind(MAX_SESSIONS_PER_USER_KEY)
+                .bind(settings.max_sessions_per_user.to_string())
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                Ok(settings)
+            }),
+        }
+    }
+
     pub async fn proxy_audit_count(&self) -> Result<usize, StoreError> {
         match &self.backend {
             SessionStoreBackend::Memory(inner) => inner
@@ -893,6 +983,16 @@ impl SessionStore {
             }),
         }
     }
+}
+
+fn validate_system_settings(settings: &SystemSettings) -> Result<(), StoreError> {
+    if settings.max_sessions_per_user == 0
+        || settings.max_sessions_per_user > MAX_CONFIGURABLE_SESSIONS_PER_USER
+    {
+        return Err(StoreError::InvalidSystemSettings);
+    }
+
+    Ok(())
 }
 
 impl StoreInner {

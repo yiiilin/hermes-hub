@@ -285,7 +285,15 @@ export function ChannelSessionRoute({
 
   async function createSidebarSession() {
     onOpenChat?.();
-    await createSession();
+    try {
+      setError(null);
+      const session = await createSession();
+      if (!session) {
+        throw new Error(t("chat.sessionCreateFailed"));
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("chat.sessionCreateFailed"));
+    }
   }
 
   async function selectSession(session: ChannelSession) {

@@ -1067,3 +1067,38 @@ async fn postgres_channel_session_persists_hermes_anchors() {
         Some("hermes-response-1")
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_system_settings_persist_session_limit() {
+    let Some(pool) = postgres_pool().await else {
+        eprintln!(
+            "skipping postgres system settings test: HERMES_HUB_TEST_DATABASE_URL is not set"
+        );
+        return;
+    };
+    run_migrations(&pool).await.expect("migrations can run");
+
+    let cipher = SecretCipher::from_master_key(TEST_SECRET_KEY).expect("test cipher is valid");
+    let store = SessionStore::postgres(pool.clone(), cipher.clone());
+    assert_eq!(
+        store
+            .system_settings()
+            .await
+            .expect("settings can be read")
+            .max_sessions_per_user,
+        20
+    );
+
+    store
+        .update_system_settings(hermes_hub_backend::session::store::SystemSettings {
+            max_sessions_per_user: 7,
+        })
+        .await
+        .expect("settings can be updated");
+
+    let reloaded = SessionStore::postgres(pool, cipher)
+        .system_settings()
+        .await
+        .expect("settings can be reloaded");
+    assert_eq!(reloaded.max_sessions_per_user, 7);
+}

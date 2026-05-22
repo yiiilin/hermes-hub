@@ -27,6 +27,7 @@ use crate::{
         CHAT_COMPLETIONS_API_TYPE, IMAGE_MODEL_CONFIG_KIND, LLM_MODEL_CONFIG_KIND,
         RESPONSES_API_TYPE,
     },
+    session::store::SystemSettings,
     AppState,
 };
 
@@ -67,6 +68,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/admin/model-config/{config_kind}/test",
             post(test_model_config),
+        )
+        .route(
+            "/api/admin/system-settings",
+            get(get_system_settings).put(update_system_settings),
         )
 }
 
@@ -118,6 +123,16 @@ struct ModelConfigTestResponse {
     status_code: u16,
     message: String,
     duration_ms: u64,
+}
+
+#[derive(Serialize)]
+struct SystemSettingsResponse {
+    settings: SystemSettings,
+}
+
+#[derive(Deserialize)]
+struct UpdateSystemSettingsRequest {
+    max_sessions_per_user: u32,
 }
 
 #[derive(Deserialize)]
@@ -503,6 +518,43 @@ async fn test_model_config(
         message,
         duration_ms: started.elapsed().as_millis() as u64,
     }))
+}
+
+async fn get_system_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    let settings = state
+        .store
+        .system_settings()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    Ok(Json(SystemSettingsResponse { settings }))
+}
+
+async fn update_system_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<UpdateSystemSettingsRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    if payload.max_sessions_per_user == 0 {
+        return Err(ApiError::BadRequest(
+            "max sessions per user must be greater than zero",
+        ));
+    }
+
+    state
+        .store
+        .update_system_settings(SystemSettings {
+            max_sessions_per_user: payload.max_sessions_per_user,
+        })
+        .await
+        .map_err(|_| ApiError::BadRequest("invalid system settings"))?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn model_config_from_payload(

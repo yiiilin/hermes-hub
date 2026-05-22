@@ -386,6 +386,7 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "User management" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Model configuration" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Hermes management" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "System settings" })).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Message"), {
       target: { value: "hello" },
@@ -427,6 +428,13 @@ describe("App", () => {
     expect(apiKeyInputs[0]).toHaveValue("ready-provider-key");
     fireEvent.click(screen.getAllByRole("button", { name: "Test" })[0]);
     expect(await screen.findByText("model test succeeded")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "System settings" }));
+    expect(await screen.findByRole("heading", { name: "System settings" })).toBeInTheDocument();
+    const maxSessionsInput = screen.getByLabelText("Max sessions per user");
+    fireEvent.change(maxSessionsInput, { target: { value: "12" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    expect(await screen.findByText("Settings saved")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Hermes management" }));
     expect(await screen.findByRole("heading", { name: "Hermes management" })).toBeInTheDocument();
@@ -1306,6 +1314,25 @@ describe("App", () => {
     await waitFor(() => {
       expect(deleteSession).toHaveBeenCalledWith("channel-1", "session-1");
       expect(screen.queryByRole("button", { name: "Session" })).not.toBeInTheDocument();
+    });
+  });
+
+  it("shows the configured session limit message when a new session is blocked", async () => {
+    const client = createMockApiClient({
+      createSession: async () => {
+        throw new Error("每个用户最多2个会话，你得先删除一个会话才能创建新会话");
+      },
+    });
+
+    render(<App apiClient={client} />);
+
+    await screen.findByRole("button", { name: "Session" });
+    fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("每个用户最多2个会话，你得先删除一个会话才能创建新会话"),
+      ).toBeInTheDocument();
     });
   });
 

@@ -192,9 +192,20 @@ async fn create_session(
 ) -> Result<impl IntoResponse, ApiError> {
     let user = current_user(&state, &headers).await?;
     let kind = ChannelSessionKind::parse(&payload.kind).map_err(map_channel_error)?;
+    let settings = state
+        .store
+        .system_settings()
+        .await
+        .map_err(|_| ApiError::Internal)?;
     let session = state
         .channel_store
-        .create_session(&user.id, &channel_id, kind, None)
+        .create_session_with_limit(
+            &user.id,
+            &channel_id,
+            kind,
+            None,
+            settings.max_sessions_per_user,
+        )
         .await
         .map_err(map_channel_error)?;
 
@@ -863,6 +874,13 @@ fn map_channel_error(error: ChannelStoreError) -> ApiError {
         ChannelStoreError::InvalidRunStatus => ApiError::BadRequest("invalid run status"),
         ChannelStoreError::AttachmentNotFound => ApiError::NotFound("attachment not found"),
         ChannelStoreError::RunNotFound => ApiError::NotFound("run not found"),
+        ChannelStoreError::SessionLimitExceeded {
+            max_sessions_per_user,
+        } => ApiError::ConflictMessage(session_limit_exceeded_message(max_sessions_per_user)),
         ChannelStoreError::LockFailed | ChannelStoreError::DatabaseFailed => ApiError::Internal,
     }
+}
+
+fn session_limit_exceeded_message(max_sessions_per_user: u32) -> String {
+    format!("每个用户最多{max_sessions_per_user}个会话，你得先删除一个会话才能创建新会话")
 }
