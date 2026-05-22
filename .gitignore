@@ -5,5 +5,5 @@
 /frontend/playwright-report
 /frontend/test-results
 /frontend/tsconfig.tsbuildinfo
-/docs
+docs/
 /data

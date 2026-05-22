@@ -1,27 +1,30 @@
 # Hermes Hub
 
 [![Release](https://github.com/yiiilin/hermes-hub/actions/workflows/release.yml/badge.svg)](https://github.com/yiiilin/hermes-hub/actions/workflows/release.yml)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Hermes Hub is an invite-only web console for running isolated Hermes agent containers for multiple users.
+Hermes Hub is a self-hosted console for running Hermes agents in isolated per-user Docker containers.
 
-It provides authentication, admin-managed model settings, chat sessions, file attachments, and an internal OpenAI-compatible gateway so user containers never receive provider keys directly.
+It provides invite-only accounts, model administration, chat sessions, file attachments, image generation, and an internal OpenAI-compatible gateway so provider keys stay inside the Hub.
+
+[Docker Image](https://github.com/yiiilin/hermes-hub/pkgs/container/hermes-hub) | [Releases](https://github.com/yiiilin/hermes-hub/releases) | [Issues](https://github.com/yiiilin/hermes-hub/issues)
 
 ## Features
 
-- Invite-only accounts with first-admin bootstrap.
-- One managed Hermes container per user.
-- React workspace for chat sessions, attachments, tool progress, and image previews.
-- Rust/Axum API with PostgreSQL persistence and S3-compatible object storage.
-- Admin model configuration for chat, title, and image generation models.
+- Isolated Hermes container for every user.
+- Invite-only registration with first-admin bootstrap.
+- Chat workspace with sessions, attachments, tool progress, and image previews.
+- Admin-managed chat, title, and image model configuration.
 - Internal LLM and channel gateways for managed Hermes containers.
-- Release images published to GitHub Container Registry.
+- PostgreSQL persistence and S3-compatible object storage.
+- Tag-based releases with GHCR image publishing.
 
 ## Quick Start
 
-Prerequisites:
+Requirements:
 
 - Docker and Docker Compose
-- A model provider compatible with OpenAI-style APIs
+- An OpenAI-compatible model provider
 - A host where mounting `/var/run/docker.sock` is acceptable
 
 Create `.env` in the repository root:
@@ -43,34 +46,30 @@ HERMES_OBJECT_STORAGE_ACCESS_KEY=rustfsadmin
 HERMES_OBJECT_STORAGE_SECRET_KEY=change-me-rustfs-secret
 ```
 
-Start the stack:
+Start Hermes Hub:
 
 ```bash
 docker compose --project-directory . --env-file .env -f infra/docker/docker-compose.hub.yml pull
 docker compose --project-directory . --env-file .env -f infra/docker/docker-compose.hub.yml up -d --no-build
 ```
 
-Open `http://localhost:8080`, create the first admin account, configure models, then create invite links for users.
+Open `http://localhost:8080`, create the first admin account, configure models, and create invite links for users.
 
-## Development
+## Build From Source
 
-Development prerequisites: Rust 1.88 or newer, Node.js 24, npm, Docker, and Docker Compose.
+Requirements: Rust 1.88+, Node.js 24, npm, Docker, and Docker Compose.
 
 ```bash
-# Start local dependencies.
 make dev-db
-
-# Backend tests.
 cargo test --workspace
 
-# Frontend tests and build.
 cd frontend
 npm ci
 npm test
 npm run build
 ```
 
-Run the app locally:
+Run locally:
 
 ```bash
 HERMES_HUB_STATIC_DIR=frontend/dist \
@@ -78,29 +77,26 @@ HERMES_DATA_ROOT="$(pwd)/data/hub/users" \
 cargo run -p hermes-hub-backend
 ```
 
-## Docker Image
+## Docker
 
-The release image contains the Rust backend and the built React frontend:
+Release images are published to GitHub Container Registry:
 
 ```bash
 docker pull ghcr.io/yiiilin/hermes-hub:0.0.1
 ```
 
-The backend serves the frontend from `/app/public` and listens on port `8080`.
+The image contains the Rust backend and the built React frontend. The service listens on port `8080`.
 
-## Releases
+## Release
 
-Releases are tag-driven. Pushing a tag such as `v0.0.1` triggers `.github/workflows/release.yml`.
+Releases are tag-driven. Pushing a tag such as `v0.0.1` triggers the release workflow, builds the Docker image, pushes GHCR tags, and creates a GitHub Release with the commit list.
 
-The workflow:
+## Security
 
-- builds `infra/docker/backend.Dockerfile`
-- pushes image tags to `ghcr.io/yiiilin/hermes-hub`
-- creates or updates the GitHub Release
-- writes the published image tags and commit list into the release notes
+Hermes Hub mounts the host Docker socket to create per-user Hermes containers. Run it only on infrastructure where Docker daemon access is intended.
 
-## Security Notes
+Provider API keys are stored in Hub. Managed Hermes containers receive only internal gateway URLs and scoped instance tokens.
 
-Hermes Hub mounts the host Docker socket so it can create per-user Hermes containers. Treat the backend as a high-trust service and run it only on infrastructure where Docker daemon access is intended.
+## License
 
-Provider API keys stay in Hub. Managed Hermes containers receive only an internal Hub gateway URL and an instance token.
+Hermes Hub is licensed under the [MIT License](LICENSE).
