@@ -67,7 +67,7 @@ services:
   # 仅用于本地联调便利：当前服务使用源码挂载，不是生产镜像。
   backend:
     profiles: ["app-dev"]
-    image: rust:1.82
+    image: rust:1.88
     working_dir: /workspace
     command: ["bash", "-lc", "cargo run -p hermes-hub-backend"]
     environment:
