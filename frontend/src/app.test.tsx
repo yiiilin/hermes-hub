@@ -662,6 +662,60 @@ describe("App", () => {
     });
   });
 
+  it("keeps the loader on execution history that arrives before run state settles", async () => {
+    const eventListeners = new Set<(event: ChannelSessionEvent) => void>();
+    const run: ChannelRun = {
+      id: "run-storage-id",
+      run_id: "hub-run-early-execution",
+      session_id: "session-1",
+      user_message_id: "message-user",
+      status: "running",
+      input: "early execution",
+      input_attachments: [],
+      created_at: Date.now(),
+      updated_at: Date.now(),
+    };
+    const client = createMockApiClient({
+      async createChannelRun(_channelId, sessionId, input) {
+        const userMessage: ChannelMessage = {
+          id: "message-user",
+          session_id: sessionId,
+          role: "user",
+          client_message_key: input.clientMessageKey,
+          content: input.content,
+          attachments: input.attachments ?? [],
+          created_at: Date.now(),
+        };
+        const execution = executionMessage(
+          [{ kind: "tool.call", tool: "terminal", detail: "early tool" }],
+          "message-early-execution",
+        );
+        for (const listener of eventListeners) {
+          listener({ type: "message_created", message: execution });
+        }
+        return { message: userMessage, run };
+      },
+    });
+    client.subscribeSessionEvents = (_channelId, _sessionId, onEvent) => {
+      eventListeners.add(onEvent);
+      return () => eventListeners.delete(onEvent);
+    };
+
+    render(<App apiClient={client} />);
+
+    fireEvent.change(await screen.findByLabelText("Message"), {
+      target: { value: "early execution" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("call terminal：early tool")).toBeInTheDocument();
+    await waitFor(() => {
+      const pendingBubble = document.querySelector(".message-bubble.assistant.pending");
+      expect(pendingBubble?.textContent).toContain("call terminal：early tool");
+      expect(pendingBubble?.lastElementChild).toHaveClass("typing-indicator");
+    });
+  });
+
   it("keeps the first live Hermes execution entry when multiple entries stream in", async () => {
     const deferred = createDeferred<void>();
     const hubRun = createHubRunMock({

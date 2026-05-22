@@ -85,6 +85,8 @@ export function ChannelSessionRoute({
   const selectedSessionIdRef = useRef<string | null>(null);
   const activeRunRef = useRef<HermesActiveRun | null>(null);
   const messagesRef = useRef<ChannelMessage[]>([]);
+  const pendingAssistantMessageIdRef = useRef<string | null>(null);
+  const pendingAssistantSessionIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     selectedSessionIdRef.current = selectedSession?.id ?? null;
@@ -97,6 +99,22 @@ export function ChannelSessionRoute({
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  function markPendingAssistantMessage(sessionId: string, messageId: string) {
+    pendingAssistantMessageIdRef.current = messageId;
+    pendingAssistantSessionIdRef.current = sessionId;
+    if (selectedSessionIdRef.current === sessionId) {
+      setPendingAssistantMessageId(messageId);
+      setPendingAssistantSessionId(sessionId);
+    }
+  }
+
+  function clearPendingAssistantMessage() {
+    pendingAssistantMessageIdRef.current = null;
+    pendingAssistantSessionIdRef.current = null;
+    setPendingAssistantMessageId(null);
+    setPendingAssistantSessionId(null);
+  }
 
   async function refreshWorkspace() {
     setError(null);
@@ -157,8 +175,7 @@ export function ChannelSessionRoute({
         } else {
           setMessages([]);
           setActiveRun(null);
-          setPendingAssistantMessageId(null);
-          setPendingAssistantSessionId(null);
+          clearPendingAssistantMessage();
           resetVerboseEvents();
         }
       }
@@ -250,8 +267,7 @@ export function ChannelSessionRoute({
     setUnreadSessionIds((current) => withoutSession(current, session.id));
     setMessages([]);
     setActiveRun(null);
-    setPendingAssistantMessageId(null);
-    setPendingAssistantSessionId(null);
+    clearPendingAssistantMessage();
     resetVerboseEvents();
     clearExecutionHistory(session.id);
     stickToBottomRef.current = true;
@@ -269,8 +285,7 @@ export function ChannelSessionRoute({
     }
     selectedSessionIdRef.current = session.id;
     setSelectedSession(session);
-    setPendingAssistantMessageId(null);
-    setPendingAssistantSessionId(null);
+    clearPendingAssistantMessage();
     setActiveRun(null);
     resetVerboseEvents();
     setSeenSessionUpdates((current) => ({
@@ -306,8 +321,7 @@ export function ChannelSessionRoute({
     }
     if (!run) {
       setActiveRun(null);
-      setPendingAssistantMessageId(null);
-      setPendingAssistantSessionId(null);
+      clearPendingAssistantMessage();
       resetVerboseEvents();
       return;
     }
@@ -315,8 +329,7 @@ export function ChannelSessionRoute({
       // Hub 对话只能恢复 channel_runs 产生的 hub-run；原生 Hermes run 不能进入聊天状态机。
       await apiClient.clearHermesRun(channelId, session.id);
       setActiveRun(null);
-      setPendingAssistantMessageId(null);
-      setPendingAssistantSessionId(null);
+      clearPendingAssistantMessage();
       resetVerboseEvents();
       return;
     }
@@ -329,8 +342,7 @@ export function ChannelSessionRoute({
       delete pendingAssistantIdsByRunRef.current[run.run_id];
       if (selectedSessionIdRef.current === session.id) {
         setActiveRun(null);
-        setPendingAssistantMessageId(null);
-        setPendingAssistantSessionId(null);
+        clearPendingAssistantMessage();
         resetVerboseEvents();
       }
       clearExecutionHistory(session.id);
@@ -380,23 +392,26 @@ export function ChannelSessionRoute({
         const run = activeRunRef.current;
         const activeRunId = run?.run_id ?? runId;
         const runStillActive = Boolean(activeRunId && (!run || !isTerminalHermesRun(run)));
-        if (activeRunId && runStillActive) {
+        const hasPendingMessageInSession = Boolean(
+          pendingAssistantMessageIdRef.current &&
+            pendingAssistantSessionIdRef.current === message.session_id,
+        );
+        if ((activeRunId && runStillActive) || hasPendingMessageInSession) {
           if (isExecutionHistoryContent(message.content)) {
             // 执行日志本身就是当前可见的 loading 气泡，避免再保留一个空回复气泡。
-            pendingAssistantIdsByRunRef.current[activeRunId] = message.id;
-            if (selectedSessionIdRef.current === message.session_id) {
-              setPendingAssistantMessageId(message.id);
-              setPendingAssistantSessionId(message.session_id);
+            if (activeRunId) {
+              pendingAssistantIdsByRunRef.current[activeRunId] = message.id;
             }
+            markPendingAssistantMessage(message.session_id, message.id);
           } else if (
+            activeRunId &&
             message.client_message_key === hermesRunMessageKey(activeRunId) &&
             hasRenderableMessageBody(message)
           ) {
             // 正式回复开始流式出现后，把 loading 挂到真实回复气泡上，直到 run 结束。
             pendingAssistantIdsByRunRef.current[activeRunId] = message.id;
+            markPendingAssistantMessage(message.session_id, message.id);
             if (selectedSessionIdRef.current === message.session_id) {
-              setPendingAssistantMessageId(message.id);
-              setPendingAssistantSessionId(message.session_id);
               resetVerboseEvents();
             }
           }
@@ -414,8 +429,7 @@ export function ChannelSessionRoute({
         attachedRunIdsRef.current.delete(run.run_id);
         delete pendingAssistantIdsByRunRef.current[run.run_id];
         setActiveRun(null);
-        setPendingAssistantMessageId(null);
-        setPendingAssistantSessionId(null);
+        clearPendingAssistantMessage();
         resetVerboseEvents();
       } else {
         resumeAdapterRun(channelId, session.id, run);
@@ -429,8 +443,7 @@ export function ChannelSessionRoute({
         delete pendingAssistantIdsByRunRef.current[activeRunRef.current.run_id];
       }
       setActiveRun(null);
-      setPendingAssistantMessageId(null);
-      setPendingAssistantSessionId(null);
+      clearPendingAssistantMessage();
       resetVerboseEvents();
       return;
     }
@@ -446,10 +459,7 @@ export function ChannelSessionRoute({
     preferredMessageId?: string,
   ) {
     const assistantMessageId = preferredMessageId ?? `pending-${run.run_id}`;
-    if (selectedSessionIdRef.current === sessionId) {
-      setPendingAssistantMessageId(assistantMessageId);
-      setPendingAssistantSessionId(sessionId);
-    }
+    markPendingAssistantMessage(sessionId, assistantMessageId);
     updateMessagesForSession(sessionId, (current) =>
       current.some((message) => message.id === assistantMessageId)
         ? current
@@ -552,10 +562,7 @@ export function ChannelSessionRoute({
       const nextAssistantMessageId = createClientMessageId();
       assistantMessageId = nextAssistantMessageId;
       // 真实 Hermes 响应到达前先落一个临时气泡，用它展示输入/回复状态。
-      if (selectedSessionIdRef.current === session.id) {
-        setPendingAssistantMessageId(nextAssistantMessageId);
-        setPendingAssistantSessionId(session.id);
-      }
+      markPendingAssistantMessage(session.id, nextAssistantMessageId);
       updateMessagesForSession(session.id, (current) => [
         ...current,
         {
@@ -611,8 +618,7 @@ export function ChannelSessionRoute({
       } else {
         if (!sessionForRequest || selectedSessionIdRef.current === sessionForRequest.id) {
           setError(message);
-          setPendingAssistantMessageId(null);
-          setPendingAssistantSessionId(null);
+          clearPendingAssistantMessage();
         }
       }
     } finally {
@@ -638,8 +644,7 @@ export function ChannelSessionRoute({
       completePendingRunMessages(current, assistantMessageId, executionMessage, assistantMessage),
     );
     if (selectedSessionIdRef.current === sessionId) {
-      setPendingAssistantMessageId(null);
-      setPendingAssistantSessionId(null);
+      clearPendingAssistantMessage();
       setActiveRun(null);
       resetVerboseEvents();
     }
@@ -803,8 +808,7 @@ export function ChannelSessionRoute({
         });
       }
       if (selectedSessionIdRef.current === sessionId) {
-        setPendingAssistantMessageId(null);
-        setPendingAssistantSessionId(null);
+        clearPendingAssistantMessage();
         setActiveRun(null);
         resetVerboseEvents();
       }
@@ -844,8 +848,7 @@ export function ChannelSessionRoute({
         if (nextSelected) {
           hydrateExecutionHistory(nextSelected.id, nextMessages);
         }
-        setPendingAssistantMessageId(null);
-        setPendingAssistantSessionId(null);
+        clearPendingAssistantMessage();
         setActiveRun(null);
         resetVerboseEvents();
       }
