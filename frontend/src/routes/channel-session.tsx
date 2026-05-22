@@ -75,6 +75,7 @@ export function ChannelSessionRoute({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
   const attachedRunIdsRef = useRef<Set<string>>(new Set());
@@ -114,6 +115,14 @@ export function ChannelSessionRoute({
     pendingAssistantSessionIdRef.current = null;
     setPendingAssistantMessageId(null);
     setPendingAssistantSessionId(null);
+  }
+
+  function focusComposerInputSoon() {
+    const schedule = globalThis.requestAnimationFrame ?? ((callback: FrameRequestCallback) => {
+      globalThis.setTimeout(callback, 0);
+      return 0;
+    });
+    schedule(() => composerInputRef.current?.focus());
   }
 
   async function refreshWorkspace() {
@@ -555,6 +564,8 @@ export function ChannelSessionRoute({
     setAttachments([]);
     resetVerboseEvents();
     stickToBottomRef.current = true;
+    // 发送后立即把焦点还给输入框，Hermes 回复时用户也可以继续写下一条草稿。
+    focusComposerInputSoon();
     let sessionForRequest: ChannelSession | null = null;
     let assistantMessageId: string | null = null;
     let runIdForRequest: string | null = null;
@@ -974,6 +985,7 @@ export function ChannelSessionRoute({
             </div>
           ) : null}
           <textarea
+            ref={composerInputRef}
             aria-label={t("chat.messageLabel")}
             value={prompt}
             onChange={(event) => setPrompt(event.target.value)}
@@ -983,8 +995,8 @@ export function ChannelSessionRoute({
               if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) {
                 return;
               }
-              event.preventDefault();
               if (!busy && !runInProgress) {
+                event.preventDefault();
                 void submitPrompt();
               }
             }}

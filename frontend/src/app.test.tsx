@@ -536,6 +536,33 @@ describe("App", () => {
     });
   });
 
+  it("keeps the composer focused and editable while Hermes is responding", async () => {
+    const deferred = createDeferred<void>();
+    const hubRun = createHubRunMock({ answer: "done", answerDelay: deferred.promise });
+
+    render(<App apiClient={hubRun.client} />);
+
+    const composer = await screen.findByLabelText("Message");
+    fireEvent.change(composer, {
+      target: { value: "first prompt" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expectPendingLoader());
+    expect(composer).toHaveFocus();
+    fireEvent.change(composer, {
+      target: { value: "draft next prompt" },
+    });
+    expect(composer).toHaveValue("draft next prompt");
+    expect(fireEvent.keyDown(composer, { key: "Enter" })).toBe(true);
+
+    deferred.resolve();
+    await waitFor(() => {
+      expect(screen.getByText("done")).toBeInTheDocument();
+    });
+    expect(composer).toHaveValue("draft next prompt");
+  });
+
   it("keeps the pending loader on streamed assistant content until the run clears", async () => {
     const eventListeners = new Set<(event: ChannelSessionEvent) => void>();
     const run: ChannelRun = {
