@@ -222,7 +222,12 @@ async fn bind_external_hermes_instance(
     };
     state
         .store
-        .bind_hermes_instance(instance)
+        .bind_hermes_instance(instance.clone())
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    state
+        .channel_store
+        .bind_hub_channel_to_instance(&user_id, &instance.id)
         .await
         .map_err(|_| ApiError::Internal)?;
 
@@ -261,6 +266,11 @@ async fn update_external_hermes_instance_config(
     state
         .store
         .bind_hermes_instance(instance.clone())
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    state
+        .channel_store
+        .bind_hub_channel_to_instance(&user_id, &instance.id)
         .await
         .map_err(|_| ApiError::Internal)?;
 
@@ -330,12 +340,18 @@ async fn rebuild_managed_hermes_instance(
         .active_config()
         .await
         .map_err(|_| ApiError::Internal)?;
+    let image_config = state
+        .model_registry
+        .config_for_kind(IMAGE_MODEL_CONFIG_KIND)
+        .await
+        .map_err(|_| ApiError::Internal)?;
     let instance = state
         .docker_provisioner
         .rebuild_instance_with_default_model(
             &instance,
             &llm_api_key,
             &llm_config.default_model,
+            &image_config.default_model,
             &llm_config.api_type,
         )
         .await
@@ -343,6 +359,11 @@ async fn rebuild_managed_hermes_instance(
     state
         .store
         .bind_hermes_instance(instance.clone())
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    state
+        .channel_store
+        .bind_hub_channel_to_instance(&user_id, &instance.id)
         .await
         .map_err(|_| ApiError::Internal)?;
     Ok(Json(HermesInstanceResponse {

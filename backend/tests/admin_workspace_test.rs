@@ -218,6 +218,25 @@ async fn admin_workspace_test() {
     .await;
     assert_eq!(update_title_model.status(), StatusCode::NO_CONTENT);
 
+    let update_image_model = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/model-config",
+        json!({
+            "config_kind": "image",
+            "provider_name": "custom",
+            "provider_base_url": "https://models.example/v1",
+            "provider_api_key": "image-secret-v2",
+            "default_model": "gpt-image-1",
+            "allowed_models": ["gpt-image-1"],
+            "allow_streaming": false,
+            "request_timeout_seconds": 180
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update_image_model.status(), StatusCode::NO_CONTENT);
+
     let created_by_admin = request_empty(
         &app,
         Method::POST,
@@ -229,6 +248,12 @@ async fn admin_workspace_test() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["hermes_instance"]["kind"], "managed_docker");
     assert_eq!(body["hermes_instance"]["status"], "running");
+    let managed_config = std::fs::read_to_string(format!(
+        "/tmp/hermes-hub/users/{admin_id}/config/config.yaml"
+    ))
+    .expect("managed Hermes config is written");
+    assert!(managed_config.contains("model: \"gpt-image-1\""));
+    assert!(!managed_config.contains("gpt-image-2-medium"));
 
     let ensured = request_empty(
         &app,

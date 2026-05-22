@@ -75,6 +75,7 @@ fn test_state_with_proxy_and_channel_store(
         })
         .shared(),
         object_storage: InMemoryObjectStorage::default().shared(),
+        session_events: Default::default(),
     }
 }
 
@@ -675,6 +676,7 @@ async fn managed_proxy_requires_successful_docker_ensure() {
         })
         .shared(),
         object_storage: InMemoryObjectStorage::default().shared(),
+        session_events: Default::default(),
     };
     let app = build_router_with_state(state);
     let user = store
@@ -2097,6 +2099,113 @@ async fn hermes_instance_can_deliver_channel_message_to_hub() {
 }
 
 #[tokio::test]
+async fn channel_session_events_stream_snapshot_and_adapter_messages() {
+    let proxy = InMemoryHermesProxyClient::default();
+    let store = SessionStore::default();
+    let state = test_state(store.clone(), proxy);
+    let instance_token = "instance-session-events-token";
+    state
+        .model_registry
+        .add_instance_token_for_instance("instance-1", instance_token)
+        .await
+        .expect("instance token can be registered");
+    let app = build_router_with_state(state.clone());
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    store
+        .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
+        .expect("instance can be bound");
+
+    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
+    let (_, channel_body) = response_json(channel).await;
+    let channel_id = channel_body["channels"][0]["id"]
+        .as_str()
+        .expect("channel id");
+    let session = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions"),
+        json!({ "kind": "agent" }),
+        Some(&cookie),
+    )
+    .await;
+    let (_, session_body) = response_json(session).await;
+    let session_id = session_body["session"]["id"].as_str().expect("session id");
+
+    let stored = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        json!({
+            "role": "assistant",
+            "content": "stored answer",
+            "attachments": []
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(stored.status(), StatusCode::CREATED);
+
+    let stream_response = request_empty(
+        &app,
+        Method::GET,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/events"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(stream_response.status(), StatusCode::OK);
+    assert_eq!(
+        stream_response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let mut body = stream_response.into_body().into_data_stream();
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+        .await
+        .expect("snapshot event arrives")
+        .expect("snapshot chunk exists")
+        .expect("snapshot chunk is readable");
+    let snapshot_text = String::from_utf8_lossy(&snapshot);
+    assert!(snapshot_text.contains("messages_snapshot"));
+    assert!(snapshot_text.contains("stored answer"));
+
+    let delivered = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/messages"),
+        "application/json",
+        json!({
+            "role": "assistant",
+            "content": "live adapter answer",
+            "attachments": [],
+            "client_message_key": "adapter-live-message"
+        })
+        .to_string()
+        .into_bytes(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    assert_eq!(delivered.status(), StatusCode::CREATED);
+
+    let live = tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+        .await
+        .expect("live event arrives")
+        .expect("live chunk exists")
+        .expect("live chunk is readable");
+    let live_text = String::from_utf8_lossy(&live);
+    assert!(live_text.contains("message_created"));
+    assert!(live_text.contains("live adapter answer"));
+}
+
+#[tokio::test]
 async fn hermes_channel_protocol_uploads_output_file_before_delivering_message() {
     let proxy = InMemoryHermesProxyClient::default();
     let store = SessionStore::default();
@@ -2727,9 +2836,7 @@ async fn channel_run_enqueue_can_be_polled_and_completed_by_hermes_hub_adapter()
         Method::POST,
         &format!("/internal/channel/v1/inbox/{run_id}/ack"),
         "application/json",
-        json!({ "output_message_id": assistant_message_id })
-            .to_string()
-            .into_bytes(),
+        json!({}).to_string().into_bytes(),
         None,
         Some(instance_token),
     )
@@ -2979,6 +3086,149 @@ async fn terminal_adapter_run_remains_visible_until_browser_clears_it() {
     let (status, active_body) = response_json(active).await;
     assert_eq!(status, StatusCode::OK);
     assert!(active_body["active_run"].is_null());
+}
+
+#[tokio::test]
+async fn late_adapter_output_after_stop_does_not_create_message() {
+    let proxy = InMemoryHermesProxyClient::default();
+    let store = SessionStore::default();
+    let state = test_state(store.clone(), proxy);
+    let instance_token = "instance-late-output-token";
+    state
+        .model_registry
+        .add_instance_token_for_instance("instance-1", instance_token)
+        .await
+        .expect("instance token can be registered");
+    let app = build_router_with_state(state.clone());
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    store
+        .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
+        .expect("instance can be bound");
+
+    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
+    let (_, channel_body) = response_json(channel).await;
+    let channel_id = channel_body["channels"][0]["id"]
+        .as_str()
+        .expect("channel id");
+    let session = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions"),
+        json!({ "kind": "agent" }),
+        Some(&cookie),
+    )
+    .await;
+    let (_, session_body) = response_json(session).await;
+    let session_id = session_body["session"]["id"].as_str().expect("session id");
+
+    let created_run = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/runs"),
+        json!({
+            "content": "请生成一个会被停止的文件",
+            "client_message_key": "late-output-user-turn"
+        }),
+        Some(&cookie),
+    )
+    .await;
+    let (status, created_run_body) = response_json(created_run).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let run_id = created_run_body["run"]["run_id"].as_str().expect("run id");
+
+    let progress = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/messages"),
+        "application/json",
+        json!({
+            "role": "assistant",
+            "content": "执行中",
+            "attachments": [],
+            "run_id": run_id
+        })
+        .to_string()
+        .into_bytes(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    assert_eq!(progress.status(), StatusCode::CREATED);
+    let (_, progress_body) = response_json(progress).await;
+    let progress_message_id = progress_body["message"]["id"]
+        .as_str()
+        .expect("progress message id");
+
+    let stopped = request_empty(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/active-run/stop"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(stopped.status(), StatusCode::OK);
+
+    let late_edit = request_raw(
+        &app,
+        Method::PUT,
+        &format!("/internal/channel/v1/sessions/{session_id}/messages/{progress_message_id}"),
+        "application/json",
+        json!({
+            "content": "停止后的迟到编辑",
+            "attachments": [],
+            "run_id": run_id
+        })
+        .to_string()
+        .into_bytes(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    assert_eq!(late_edit.status(), StatusCode::CONFLICT);
+
+    let late_output = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/messages"),
+        "application/json",
+        json!({
+            "role": "assistant",
+            "content": "迟到的最终输出",
+            "attachments": [],
+            "client_message_key": format!("hermes-run:{run_id}")
+        })
+        .to_string()
+        .into_bytes(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    assert_eq!(late_output.status(), StatusCode::CONFLICT);
+
+    let messages = request_empty(
+        &app,
+        Method::GET,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        Some(&cookie),
+    )
+    .await;
+    let (_, messages_body) = response_json(messages).await;
+    assert_eq!(
+        messages_body["messages"]
+            .as_array()
+            .expect("messages")
+            .len(),
+        2,
+        "停止后的迟到 Hermes 输出不能再写入会话"
+    );
+    assert_eq!(messages_body["messages"][0]["role"], "user");
+    assert_eq!(messages_body["messages"][1]["content"], "执行中");
 }
 
 #[tokio::test]

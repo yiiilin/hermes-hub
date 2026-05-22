@@ -52,6 +52,7 @@ pub struct AppState {
     pub llm_provider: DynLlmProviderClient,
     pub docker_provisioner: DockerProvisioner,
     pub object_storage: DynObjectStorage,
+    pub session_events: channel::events::SessionEventHub,
 }
 
 #[derive(Debug, Error)]
@@ -88,6 +89,7 @@ pub fn build_router(config: AppConfig) -> Router {
         llm_provider: InMemoryLlmProviderClient::default().shared(),
         docker_provisioner,
         object_storage,
+        session_events: channel::events::SessionEventHub::default(),
     };
 
     build_router_with_state(state)
@@ -112,6 +114,7 @@ pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppIn
             llm_provider: ReqwestLlmProviderClient::default().shared(),
             docker_provisioner,
             object_storage,
+            session_events: channel::events::SessionEventHub::default(),
         };
         return Ok(build_router_with_state(state));
     };
@@ -138,6 +141,7 @@ pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppIn
         llm_provider: ReqwestLlmProviderClient::default().shared(),
         docker_provisioner,
         object_storage,
+        session_events: channel::events::SessionEventHub::default(),
     };
 
     Ok(build_router_with_state(state))
@@ -181,6 +185,9 @@ pub fn docker_config_from_app(
         published_base_url: config.hermes_docker.published_base_url.clone(),
         hub_llm_base_url: config.hermes_docker.hub_llm_base_url.clone(),
         default_model: model_config.default_model.clone(),
+        // 启动时还没有读取管理员的图片模型配置；实际创建/重建容器时会用数据库中的
+        // image 配置覆盖这里的默认值。
+        image_model: "gpt-image-1".to_string(),
         api_mode: model_config.api_type.clone(),
         memory_limit: config.hermes_docker.memory_limit.clone(),
         cpu_limit: config.hermes_docker.cpu_limit.clone(),

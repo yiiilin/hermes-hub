@@ -6,7 +6,7 @@ use axum::{
 };
 use hermes_hub_backend::{
     build_router_with_state,
-    channel::service::{ChannelSessionKind, ChannelStore},
+    channel::service::{ChannelRunStatus, ChannelSessionKind, ChannelStore},
     db::migrations::run_migrations,
     docker_config_from_app,
     hermes::{
@@ -92,6 +92,7 @@ async fn test_state(pool: PgPool, provider: InMemoryLlmProviderClient) -> AppSta
         model_registry,
         llm_provider: provider.shared(),
         object_storage: InMemoryObjectStorage::default().shared(),
+        session_events: Default::default(),
     }
 }
 
@@ -466,6 +467,246 @@ async fn postgres_state_survives_recreated_router_state() {
         "https://provider-persisted.example/v1"
     );
     assert_eq!(forwarded.authorization, "Bearer provider-persisted-key");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_adapter_can_poll_when_channel_predates_instance() {
+    let Some(pool) = postgres_pool().await else {
+        eprintln!(
+            "skipping postgres adapter binding test: HERMES_HUB_TEST_DATABASE_URL is not set"
+        );
+        return;
+    };
+    run_migrations(&pool).await.expect("migrations can run");
+
+    let provider = InMemoryLlmProviderClient::new(LlmProviderResponse {
+        status: StatusCode::OK,
+        content_type: Some("application/json".to_string()),
+        body: br#"{"id":"provider-response"}"#.to_vec(),
+    });
+    let state = test_state(pool, provider).await;
+    let app = test_app(state.clone());
+
+    let created = request_json(
+        &app,
+        Method::POST,
+        "/api/auth/bootstrap-register",
+        json!({
+            "email": "admin@example.com",
+            "password": "admin-password-123"
+        }),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let cookie = cookie_from(&created);
+
+    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie), None).await;
+    let (status, channel_body) = response_json(channel).await;
+    assert_eq!(status, StatusCode::OK);
+    let channel_id = channel_body["channels"][0]["id"]
+        .as_str()
+        .expect("channel id")
+        .to_string();
+
+    let session = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions"),
+        json!({ "kind": "agent" }),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    let (status, session_body) = response_json(session).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let session_id = session_body["session"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    // 生产里用户可能先进入会话页生成 channel，之后 ensure Hermes 才创建实例。
+    // ensure 成功后必须反向补齐 channel.hermes_instance_id，否则 adapter 按实例 token 拉不到队列。
+    let ensured = request_empty(
+        &app,
+        Method::POST,
+        "/api/workspace/ensure-hermes",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    let (status, ensured_body) = response_json(ensured).await;
+    assert_eq!(status, StatusCode::OK);
+    let instance_id = ensured_body["hermes_instance"]["id"]
+        .as_str()
+        .expect("instance id")
+        .to_string();
+    state
+        .model_registry
+        .add_instance_token_for_instance(&instance_id, "late-bound-instance-token")
+        .await
+        .expect("instance token can be stored");
+
+    let created_run = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/runs"),
+        json!({
+            "content": "late bound channel",
+            "attachments": [],
+            "client_message_key": "late-bound-turn"
+        }),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    let (status, created_run_body) = response_json(created_run).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let run_id = created_run_body["run"]["run_id"]
+        .as_str()
+        .expect("run id")
+        .to_string();
+
+    let inbox = request_empty(
+        &app,
+        Method::GET,
+        "/internal/channel/v1/inbox?timeout_seconds=0&limit=4",
+        None,
+        Some("late-bound-instance-token"),
+    )
+    .await;
+    let (status, inbox_body) = response_json(inbox).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inbox_body["items"].as_array().expect("items").len(), 1);
+    assert_eq!(inbox_body["items"][0]["id"], run_id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_adapter_releases_stale_running_runs() {
+    let Some(pool) = postgres_pool().await else {
+        eprintln!(
+            "skipping postgres stale run recovery test: HERMES_HUB_TEST_DATABASE_URL is not set"
+        );
+        return;
+    };
+    run_migrations(&pool).await.expect("migrations can run");
+
+    let provider = InMemoryLlmProviderClient::new(LlmProviderResponse {
+        status: StatusCode::OK,
+        content_type: Some("application/json".to_string()),
+        body: br#"{"id":"provider-response"}"#.to_vec(),
+    });
+    let state = test_state(pool.clone(), provider).await;
+    let app = test_app(state.clone());
+
+    let created = request_json(
+        &app,
+        Method::POST,
+        "/api/auth/bootstrap-register",
+        json!({
+            "email": "admin@example.com",
+            "password": "admin-password-123"
+        }),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let cookie = cookie_from(&created);
+
+    let ensured = request_empty(
+        &app,
+        Method::POST,
+        "/api/workspace/ensure-hermes",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    let (status, ensured_body) = response_json(ensured).await;
+    assert_eq!(status, StatusCode::OK);
+    let instance_id = ensured_body["hermes_instance"]["id"]
+        .as_str()
+        .expect("instance id")
+        .to_string();
+
+    let channel = state
+        .channel_store
+        .ensure_hub_channel(
+            ensured_body["hermes_instance"]["user_id"]
+                .as_str()
+                .expect("user id"),
+        )
+        .await
+        .expect("hub channel can be ensured");
+    let session = state
+        .channel_store
+        .create_session(
+            ensured_body["hermes_instance"]["user_id"]
+                .as_str()
+                .expect("user id"),
+            &channel.id,
+            ChannelSessionKind::Agent,
+            None,
+        )
+        .await
+        .expect("session can be created");
+    let user_message = state
+        .channel_store
+        .append_session_message(
+            ensured_body["hermes_instance"]["user_id"]
+                .as_str()
+                .expect("user id"),
+            &channel.id,
+            &session.id,
+            hermes_hub_backend::channel::service::ChannelMessageRole::User,
+            Some("stale-running-turn".to_string()),
+            "recover me".to_string(),
+            json!([]),
+        )
+        .await
+        .expect("message can be appended");
+    let run = state
+        .channel_store
+        .create_channel_run(
+            ensured_body["hermes_instance"]["user_id"]
+                .as_str()
+                .expect("user id"),
+            &channel.id,
+            &session.id,
+            &user_message.id,
+            "recover me".to_string(),
+            json!([]),
+        )
+        .await
+        .expect("run can be created");
+    state
+        .channel_store
+        .update_run_status_for_session(
+            &session.id,
+            &run.run_id,
+            ChannelRunStatus::Running,
+            None,
+            None,
+        )
+        .await
+        .expect("run can be marked running");
+    sqlx::query(
+        "update channel_runs set updated_at = now() - interval '11 minutes' where id = $1::uuid",
+    )
+    .bind(&run.id)
+    .execute(&pool)
+    .await
+    .expect("run timestamp can be aged");
+
+    let leased = state
+        .channel_store
+        .lease_runs_for_instance(Some(&instance_id), 4)
+        .await
+        .expect("stale running run can be leased");
+    assert_eq!(leased.len(), 1);
+    assert_eq!(leased[0].run_id, run.run_id);
+    assert_eq!(leased[0].status, ChannelRunStatus::Leased);
 }
 
 #[tokio::test(flavor = "multi_thread")]

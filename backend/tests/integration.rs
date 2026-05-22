@@ -41,6 +41,7 @@ fn test_state(provider: InMemoryLlmProviderClient, proxy: InMemoryHermesProxyCli
         model_registry: ModelRegistry::default_for_tests(),
         llm_provider: provider.shared(),
         object_storage: InMemoryObjectStorage::default().shared(),
+        session_events: Default::default(),
     }
 }
 

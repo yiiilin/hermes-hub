@@ -115,6 +115,18 @@ export type HermesActiveRun = {
   updated_at?: number;
 };
 
+export type ChannelSessionEvent =
+  | {
+      type: "messages_snapshot";
+      messages: ChannelMessage[];
+      active_run: HermesActiveRun | null;
+    }
+  | { type: "message_created"; message: ChannelMessage }
+  | { type: "message_updated"; message: ChannelMessage }
+  | { type: "run_updated"; run: ChannelRun }
+  | { type: "run_cleared"; session_id: string }
+  | { type: "session_deleted"; session_id: string };
+
 export type HermesVerboseEvent = {
   kind:
     | "text"
@@ -279,6 +291,12 @@ export type ApiClient = {
     handlers?: HermesStreamHandlers,
   ) => Promise<string>;
   activeHermesRun: (channelId: string, sessionId: string) => Promise<HermesActiveRun | null>;
+  subscribeSessionEvents: (
+    channelId: string,
+    sessionId: string,
+    onEvent: (event: ChannelSessionEvent) => void,
+    onError?: (error: Error) => void,
+  ) => () => void;
   stopHermesRun: (channelId: string, sessionId: string) => Promise<HermesActiveRun | null>;
   clearHermesRun: (channelId: string, sessionId: string) => Promise<void>;
   resumeHermesRun: (runId: string, handlers?: HermesStreamHandlers) => Promise<string>;
@@ -645,6 +663,41 @@ export function createApiClient(): ApiClient {
         `/api/channels/${channelId}/sessions/${sessionId}/active-run`,
       );
       return payload.active_run;
+    },
+    subscribeSessionEvents(channelId, sessionId, onEvent, onError) {
+      const source = new EventSource(
+        `/api/channels/${channelId}/sessions/${sessionId}/events`,
+        { withCredentials: true },
+      );
+      const eventNames = [
+        "messages_snapshot",
+        "message_created",
+        "message_updated",
+        "run_updated",
+        "run_cleared",
+        "session_deleted",
+      ];
+      const listeners = eventNames.map((eventName) => {
+        const listener = (event: MessageEvent) => {
+          try {
+            onEvent(JSON.parse(event.data) as ChannelSessionEvent);
+          } catch (cause) {
+            onError?.(cause instanceof Error ? cause : new Error("invalid session event"));
+          }
+        };
+        source.addEventListener(eventName, listener);
+        return [eventName, listener] as const;
+      });
+      source.onerror = () => {
+        // EventSource 会自动重连；这里仅上报给测试/诊断，不在 UI 上显示 load failed。
+        onError?.(new Error("session event stream disconnected"));
+      };
+      return () => {
+        for (const [eventName, listener] of listeners) {
+          source.removeEventListener(eventName, listener);
+        }
+        source.close();
+      };
     },
     async stopHermesRun(channelId, sessionId) {
       const payload = await request<{ active_run: HermesActiveRun | null }>(
@@ -1180,6 +1233,7 @@ type MockApiClientOptions = {
   createChannelRun?: ApiClient["createChannelRun"];
   sendHermesPrompt?: ApiClient["sendHermesPrompt"];
   activeRunsBySessionId?: Record<string, HermesActiveRun>;
+  subscribeSessionEvents?: ApiClient["subscribeSessionEvents"];
   resumeHermesRun?: ApiClient["resumeHermesRun"];
   stopHermesRun?: ApiClient["stopHermesRun"];
   deleteSession?: ApiClient["deleteSession"];
@@ -1215,6 +1269,10 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     ...(options.initialMessagesBySessionId ?? {}),
   };
   let activeRunsBySessionId = { ...(options.activeRunsBySessionId ?? {}) };
+  const sessionEventListenersBySessionId: Record<
+    string,
+    Set<(event: ChannelSessionEvent) => void>
+  > = {};
   let invites: Invite[] = [];
   let instance: HermesInstance | null = "initialInstance" in options ? options.initialInstance! : {
     id: "instance-1",
@@ -1253,6 +1311,12 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       allow_streaming: false,
     },
   ];
+
+  function emitSessionEvent(sessionId: string, event: ChannelSessionEvent) {
+    for (const listener of sessionEventListenersBySessionId[sessionId] ?? []) {
+      listener(event);
+    }
+  }
 
   return {
     async me() {
@@ -1378,6 +1442,7 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       );
       delete messagesBySessionId[sessionId];
       delete activeRunsBySessionId[sessionId];
+      emitSessionEvent(sessionId, { type: "session_deleted", session_id: sessionId });
     },
     async listSessionMessages(_channelId, sessionId) {
       return messagesBySessionId[sessionId] ?? [];
@@ -1405,6 +1470,7 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       sessions = sessions.map((session) =>
         session.id === sessionId ? { ...session, updated_at: Date.now() } : session,
       );
+      emitSessionEvent(sessionId, { type: "message_created", message });
       return message;
     },
     async updateSessionMessage(_channelId, sessionId, messageId, input) {
@@ -1424,6 +1490,7 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       sessions = sessions.map((session) =>
         session.id === sessionId ? { ...session, updated_at: Date.now() } : session,
       );
+      emitSessionEvent(sessionId, { type: "message_updated", message: nextMessage });
       return nextMessage;
     },
     async uploadSessionAttachments(_channelId, sessionId, files) {
@@ -1464,6 +1531,7 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
         created_at: run.created_at,
         updated_at: run.updated_at,
       };
+      emitSessionEvent(sessionId, { type: "run_updated", run });
 
       await Promise.resolve();
       const assistant: ChannelMessage = {
@@ -1476,7 +1544,9 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
         created_at: Date.now(),
       };
       messagesBySessionId[sessionId] = [...(messagesBySessionId[sessionId] ?? []), assistant];
+      emitSessionEvent(sessionId, { type: "message_created", message: assistant });
       delete activeRunsBySessionId[sessionId];
+      emitSessionEvent(sessionId, { type: "run_cleared", session_id: sessionId });
       return { message, run };
     },
     async generateSessionTitle(channelId, sessionId, prompt) {
@@ -1555,15 +1625,35 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     async activeHermesRun(_channelId, sessionId) {
       return activeRunsBySessionId[sessionId] ?? null;
     },
+    subscribeSessionEvents(channelId, sessionId, onEvent, onError) {
+      if (options.subscribeSessionEvents) {
+        return options.subscribeSessionEvents(channelId, sessionId, onEvent, onError);
+      }
+      sessionEventListenersBySessionId[sessionId] =
+        sessionEventListenersBySessionId[sessionId] ?? new Set();
+      sessionEventListenersBySessionId[sessionId].add(onEvent);
+      queueMicrotask(() => {
+        onEvent({
+          type: "messages_snapshot",
+          messages: messagesBySessionId[sessionId] ?? [],
+          active_run: activeRunsBySessionId[sessionId] ?? null,
+        });
+      });
+      return () => {
+        sessionEventListenersBySessionId[sessionId]?.delete(onEvent);
+      };
+    },
     async stopHermesRun(channelId, sessionId) {
       if (options.stopHermesRun) {
         return options.stopHermesRun(channelId, sessionId);
       }
       delete activeRunsBySessionId[sessionId];
+      emitSessionEvent(sessionId, { type: "run_cleared", session_id: sessionId });
       return null;
     },
     async clearHermesRun(_channelId, sessionId) {
       delete activeRunsBySessionId[sessionId];
+      emitSessionEvent(sessionId, { type: "run_cleared", session_id: sessionId });
     },
     async resumeHermesRun(runId, handlers) {
       if (options.resumeHermesRun) {

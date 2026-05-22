@@ -14,9 +14,12 @@ use std::{
 };
 
 use crate::{
-    channel::service::{
-        ChannelAttachment, ChannelAttachmentDirection, ChannelMessage, ChannelMessageRole,
-        ChannelRun, ChannelRunStatus,
+    channel::{
+        events::SessionEvent,
+        service::{
+            ChannelAttachment, ChannelAttachmentDirection, ChannelMessage, ChannelMessageRole,
+            ChannelRun, ChannelRunStatus,
+        },
     },
     http::{
         attachments::{map_channel_error, upload_session_attachments_for_context},
@@ -61,12 +64,14 @@ struct DeliverMessageRequest {
     content: String,
     attachments: Option<Value>,
     client_message_key: Option<String>,
+    run_id: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct UpdateMessageRequest {
     content: String,
     attachments: Option<Value>,
+    run_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -135,6 +140,14 @@ async fn deliver_message(
             "channel message role must be assistant",
         ));
     }
+    let client_message_key = payload.client_message_key;
+    reject_late_terminal_output(
+        &state,
+        &token_context,
+        payload.run_id.as_deref(),
+        client_message_key.as_deref(),
+    )
+    .await?;
     let message = state
         .channel_store
         .append_session_message(
@@ -142,14 +155,60 @@ async fn deliver_message(
             &session_context.channel_id,
             &session_id,
             role,
-            payload.client_message_key,
+            client_message_key,
             payload.content,
             payload.attachments.unwrap_or_else(|| json!([])),
         )
         .await
         .map_err(map_channel_error)?;
+    state.session_events.publish(SessionEvent::MessageCreated {
+        message: message.clone(),
+    });
 
     Ok((StatusCode::CREATED, Json(MessageResponse { message })))
+}
+
+async fn reject_late_terminal_output(
+    state: &AppState,
+    token_context: &InstanceTokenContext,
+    run_id: Option<&str>,
+    client_message_key: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(run_id) = run_id
+        .and_then(normalize_protocol_run_id)
+        .or_else(|| client_message_key.and_then(hermes_run_id_from_client_message_key))
+    else {
+        return Ok(());
+    };
+
+    match state
+        .channel_store
+        .get_run_for_instance(token_context.hermes_instance_id.as_deref(), run_id)
+        .await
+    {
+        Ok(run) if run.status.is_terminal() => {
+            // Stop/delete 后 Hermes 容器可能还会把旧任务的最终输出发回来；
+            // 这些输出不能重新污染已经终止的 Hub 会话。
+            Err(ApiError::Conflict(
+                "channel run is no longer accepting output",
+            ))
+        }
+        Ok(_) | Err(crate::channel::service::ChannelStoreError::RunNotFound) => Ok(()),
+        Err(error) => Err(map_channel_error(error)),
+    }
+}
+
+fn hermes_run_id_from_client_message_key(value: &str) -> Option<&str> {
+    value.strip_prefix("hermes-run:").and_then(|rest| {
+        let run_id = rest.split(':').next().unwrap_or(rest);
+        run_id.starts_with("hub-run-").then_some(run_id)
+    })
+}
+
+fn normalize_protocol_run_id(value: &str) -> Option<&str> {
+    let run_id = value.strip_prefix("hermes-run:").unwrap_or(value);
+    let run_id = run_id.split(':').next().unwrap_or(run_id);
+    run_id.starts_with("hub-run-").then_some(run_id)
 }
 
 async fn upload_output_attachments(
@@ -202,6 +261,7 @@ async fn update_message(
         &session_context.user_id,
         &session_context.hermes_instance_id,
     )?;
+    reject_late_terminal_output(&state, &token_context, payload.run_id.as_deref(), None).await?;
     let message = state
         .channel_store
         .update_session_message(
@@ -214,6 +274,9 @@ async fn update_message(
         )
         .await
         .map_err(map_channel_error)?;
+    state.session_events.publish(SessionEvent::MessageUpdated {
+        message: message.clone(),
+    });
 
     Ok(Json(MessageResponse { message }))
 }
@@ -294,6 +357,9 @@ async fn ack_inbox_item(
         )
         .await
         .map_err(map_channel_error)?;
+    state
+        .session_events
+        .publish(SessionEvent::RunUpdated { run: run.clone() });
 
     Ok(Json(RunResponse { run }))
 }
@@ -330,6 +396,9 @@ async fn update_run_status(
         )
         .await
         .map_err(map_channel_error)?;
+    state
+        .session_events
+        .publish(SessionEvent::RunUpdated { run: run.clone() });
 
     Ok(Json(RunResponse { run }))
 }

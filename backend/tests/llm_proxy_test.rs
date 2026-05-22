@@ -51,6 +51,7 @@ fn test_state_with_provider(provider: DynLlmProviderClient, registry: ModelRegis
         model_registry: registry,
         llm_provider: provider,
         object_storage: InMemoryObjectStorage::default().shared(),
+        session_events: Default::default(),
     }
 }
 

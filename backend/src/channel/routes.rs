@@ -2,18 +2,29 @@ use axum::{
     body::to_bytes,
     extract::{Multipart, Path, State},
     http::{HeaderMap, Method},
-    response::IntoResponse,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
     routing::{get, post, put},
     Json, Router,
 };
+use futures_util::{stream, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::time::Instant;
+use std::{
+    convert::Infallible,
+    time::{Duration, Instant},
+};
 
 use crate::{
-    channel::service::{
-        Channel, ChannelAttachment, ChannelAttachmentDirection, ChannelMessage, ChannelMessageRole,
-        ChannelRun, ChannelRunStatus, ChannelSession, ChannelSessionKind, ChannelStoreError,
+    channel::{
+        events::SessionEvent,
+        service::{
+            Channel, ChannelAttachment, ChannelAttachmentDirection, ChannelMessage,
+            ChannelMessageRole, ChannelRun, ChannelRunStatus, ChannelSession, ChannelSessionKind,
+            ChannelStoreError,
+        },
     },
     http::{
         attachments::upload_session_attachments, auth::current_user,
@@ -57,6 +68,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/channels/{channel_id}/sessions/{session_id}/messages",
             get(list_session_messages).post(append_session_message),
+        )
+        .route(
+            "/api/channels/{channel_id}/sessions/{session_id}/events",
+            get(session_events),
         )
         .route(
             "/api/channels/{channel_id}/sessions/{session_id}/messages/{message_id}",
@@ -238,6 +253,9 @@ async fn delete_session(
         .delete_session(&user.id, &channel_id, &session_id)
         .await
         .map_err(map_channel_error)?;
+    state.session_events.publish(SessionEvent::SessionDeleted {
+        session_id: session_id.clone(),
+    });
     delete_session_objects(&state, &deleted.attachments).await?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
@@ -293,6 +311,9 @@ async fn clear_active_run(
         .await
         .map_err(map_channel_error)?;
     clear_persisted_hermes_run(&state, &user.id, &channel_id, &session_id).await?;
+    state.session_events.publish(SessionEvent::RunCleared {
+        session_id: session_id.clone(),
+    });
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -334,6 +355,9 @@ async fn append_session_message(
         )
         .await
         .map_err(map_channel_error)?;
+    state.session_events.publish(SessionEvent::MessageCreated {
+        message: message.clone(),
+    });
 
     Ok((
         axum::http::StatusCode::CREATED,
@@ -365,6 +389,9 @@ async fn create_channel_run(
         )
         .await
         .map_err(map_channel_error)?;
+    state.session_events.publish(SessionEvent::MessageCreated {
+        message: message.clone(),
+    });
     let run = state
         .channel_store
         .create_channel_run(
@@ -377,6 +404,9 @@ async fn create_channel_run(
         )
         .await
         .map_err(map_channel_error)?;
+    state
+        .session_events
+        .publish(SessionEvent::RunUpdated { run: run.clone() });
 
     Ok((
         axum::http::StatusCode::CREATED,
@@ -405,8 +435,50 @@ async fn update_session_message(
         )
         .await
         .map_err(map_channel_error)?;
+    state.session_events.publish(SessionEvent::MessageUpdated {
+        message: message.clone(),
+    });
 
     Ok(Json(MessageResponse { message }))
+}
+
+async fn session_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((channel_id, session_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = current_user(&state, &headers).await?;
+    // 必须先订阅再读取 snapshot，避免“历史读取完成前后”之间的落库事件丢失。
+    // 这会把同一消息同时出现在 snapshot 和 live event 的最坏情况交给前端按 id 去重，
+    // 但不会漏掉 Hermes 已经持久化的输出。
+    let receiver = state.session_events.subscribe();
+    let messages = state
+        .channel_store
+        .list_session_messages(&user.id, &channel_id, &session_id)
+        .await
+        .map_err(map_channel_error)?;
+    let active_run = state
+        .channel_store
+        .get_active_run_for_session(&user.id, &channel_id, &session_id)
+        .await
+        .map_err(map_channel_error)?
+        .map(channel_run_to_active_run);
+
+    // 浏览器进入 room 时先拿到持久化历史和当前 run，再接收后续实时事件。
+    let snapshot = json!({
+        "type": "messages_snapshot",
+        "messages": messages,
+        "active_run": active_run,
+    });
+    let snapshot_stream =
+        stream::once(async move { sse_json_event("messages_snapshot", &snapshot) });
+    let live_stream = session_live_event_stream(receiver, session_id);
+
+    Ok(Sse::new(snapshot_stream.chain(live_stream)).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
 }
 
 async fn upload_attachments(
@@ -482,7 +554,13 @@ async fn stop_active_run_for_session(
         )
         .await
         .map_err(map_channel_error)?;
+    state.session_events.publish(SessionEvent::RunUpdated {
+        run: updated.clone(),
+    });
     clear_persisted_hermes_run(state, user_id, channel_id, session_id).await?;
+    state.session_events.publish(SessionEvent::RunCleared {
+        session_id: session_id.to_string(),
+    });
 
     Ok(Some(channel_run_to_active_run(updated)))
 }
@@ -511,6 +589,51 @@ fn channel_run_to_active_run(run: ChannelRun) -> crate::hermes::event_streams::H
         created_at: run.created_at,
         updated_at: run.updated_at,
     }
+}
+
+fn session_live_event_stream(
+    receiver: tokio::sync::broadcast::Receiver<SessionEvent>,
+    session_id: String,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    stream::unfold(receiver, move |mut receiver| {
+        let session_id = session_id.clone();
+        async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(event) if event.session_id() == session_id => {
+                        return Some((
+                            sse_json_event(session_event_name(&event), &event),
+                            receiver,
+                        ));
+                    }
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // 连接落后时主动结束本次 SSE；浏览器 EventSource 会重连并重新读取 snapshot。
+                        return None;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        }
+    })
+}
+
+fn session_event_name(event: &SessionEvent) -> &'static str {
+    match event {
+        SessionEvent::MessageCreated { .. } => "message_created",
+        SessionEvent::MessageUpdated { .. } => "message_updated",
+        SessionEvent::RunUpdated { .. } => "run_updated",
+        SessionEvent::RunCleared { .. } => "run_cleared",
+        SessionEvent::SessionDeleted { .. } => "session_deleted",
+    }
+}
+
+fn sse_json_event<T: Serialize>(name: &'static str, payload: &T) -> Result<Event, Infallible> {
+    let data = serde_json::to_string(payload).unwrap_or_else(|_| {
+        // 序列化失败只可能来自内部结构异常；保持 SSE 连接可读，方便前端重连恢复。
+        json!({"type": "serialization_failed"}).to_string()
+    });
+    Ok(Event::default().event(name).data(data))
 }
 
 async fn delete_session_objects(

@@ -8,6 +8,7 @@ import {
   type ApiClient,
   type ChannelMessage,
   type ChannelRun,
+  type ChannelSessionEvent,
   type HermesActiveRun,
   type HermesVerboseEvent,
 } from "./api/client";
@@ -61,13 +62,22 @@ describe("App", () => {
     let createCalled = false;
     const runId = "hub-run-test";
     let executionMessagesPushed = false;
+    const eventListeners = new Set<(event: ChannelSessionEvent) => void>();
+
+    function emitSessionEvent(event: ChannelSessionEvent) {
+      for (const listener of eventListeners) {
+        listener(event);
+      }
+    }
 
     function pushExecutionMessages(sessionId: string) {
       if (!options.executionEvents?.length || executionMessagesPushed) {
         return;
       }
       executionMessagesPushed = true;
-      messages.push(executionMessage(options.executionEvents, `message-execution-${sessionId}`));
+      const message = executionMessage(options.executionEvents, `message-execution-${sessionId}`);
+      messages.push(message);
+      emitSessionEvent({ type: "message_created", message });
     }
 
     const client = createMockApiClient({
@@ -97,18 +107,21 @@ describe("App", () => {
             updated_at: Date.now(),
           };
           messages.push(userMessage);
+          emitSessionEvent({ type: "message_created", message: userMessage });
           run = { ...run, status: "running", updated_at: Date.now() };
+          emitSessionEvent({ type: "run_updated", run });
           // Hub adapter 会在最终回答前持续落库执行步骤，测试 mock 也要模拟这个实时行为。
           queueMicrotask(() => pushExecutionMessages(sessionId));
           if (options.error) {
             run = { ...run, status: "failed", error: options.error, updated_at: Date.now() };
+            emitSessionEvent({ type: "run_updated", run });
             return { message: userMessage, run };
           }
           void (async () => {
             await (options.answerDelay ?? Promise.resolve());
             pushExecutionMessages(sessionId);
             const answer = options.answer ?? input.content;
-            messages.push({
+            const assistantMessage: ChannelMessage = {
               id: "message-assistant",
               session_id: sessionId,
               role: "assistant",
@@ -116,14 +129,45 @@ describe("App", () => {
               content: answer,
               attachments: [],
               created_at: Date.now(),
-            });
+            };
+            messages.push(assistantMessage);
+            emitSessionEvent({ type: "message_created", message: assistantMessage });
+            if (run) {
+              emitSessionEvent({
+                type: "run_updated",
+                run: { ...run, status: "completed", output_message_id: assistantMessage.id },
+              });
+            }
             run = null;
+            emitSessionEvent({ type: "run_cleared", session_id: sessionId });
           })();
           return { message: userMessage, run };
         },
         activeRunsBySessionId: {},
       });
     client.activeHermesRun = async () => run;
+    client.subscribeSessionEvents = (_channelId, sessionId, onEvent) => {
+      eventListeners.add(onEvent);
+      queueMicrotask(() => {
+        onEvent({
+          type: "messages_snapshot",
+          messages,
+          active_run: run
+            ? {
+                run_id: run.run_id,
+                status: run.status,
+                error: run.error,
+                output_message_id: run.output_message_id,
+                created_at: run.created_at,
+                updated_at: run.updated_at,
+              }
+            : null,
+        });
+      });
+      return () => {
+        eventListeners.delete(onEvent);
+      };
+    };
     client.clearHermesRun = async () => {
       run = null;
     };
@@ -144,6 +188,7 @@ describe("App", () => {
   }
 
   it("restores a failed Hub adapter run from active-run instead of dropping it", async () => {
+    const eventListeners = new Set<(event: ChannelSessionEvent) => void>();
     let activeRun: HermesActiveRun | null = {
       run_id: "hub-run-failed-restored",
       status: "running",
@@ -159,6 +204,17 @@ describe("App", () => {
       },
     });
     client.activeHermesRun = async () => activeRun;
+    client.subscribeSessionEvents = (_channelId, _sessionId, onEvent) => {
+      eventListeners.add(onEvent);
+      queueMicrotask(() => {
+        onEvent({
+          type: "messages_snapshot",
+          messages: [],
+          active_run: activeRun,
+        });
+      });
+      return () => eventListeners.delete(onEvent);
+    };
     client.clearHermesRun = clearHermesRun;
 
     render(<App apiClient={client} />);
@@ -170,6 +226,22 @@ describe("App", () => {
       error: "tool failed",
       updated_at: Date.now(),
     } as HermesActiveRun;
+    for (const listener of eventListeners) {
+      listener({
+        type: "run_updated",
+        run: {
+          id: "run-storage-id",
+          run_id: activeRun.run_id,
+          session_id: "session-1",
+          status: "failed",
+          input: "failed input",
+          input_attachments: [],
+          error: "tool failed",
+          created_at: activeRun.created_at,
+          updated_at: activeRun.updated_at,
+        },
+      });
+    }
 
     await waitFor(() => {
       expect(screen.getByText("Hermes run failed: tool failed")).toBeInTheDocument();
@@ -311,6 +383,7 @@ describe("App", () => {
   });
 
   it("renders markdown content and file chips inside message bubbles", async () => {
+    const absolutePptUrl = `${window.location.origin}/api/attachments/attachment-ppt/download`;
     render(
       <App
         apiClient={createMockApiClient({
@@ -321,7 +394,7 @@ describe("App", () => {
                 session_id: "session-1",
                 role: "assistant",
                 content:
-                  "## 结果\n\n**加粗文本** 和 `code`\n\n文件：[练习.pptx](/api/attachments/attachment-ppt/download)\n\n![cat](/api/attachments/cat/download)\n\n[open](/download)",
+                  `## 结果\n\n**加粗文本** 和 \`code\`\n\n文件：[练习.pptx](${absolutePptUrl})\n\n![cat](/api/attachments/cat/download)\n\n[open](/download)`,
                 attachments: [
                   {
                     id: "attachment-ppt",
@@ -370,6 +443,28 @@ describe("App", () => {
     await waitFor(() => {
       expect(screen.queryByText("Hermes is typing")).not.toBeInTheDocument();
       expect(screen.getByText("pong")).toBeInTheDocument();
+    });
+  });
+
+  it("removes the local pending bubble when the final Hub message arrives", async () => {
+    const deferred = createDeferred<void>();
+    const hubRun = createHubRunMock({
+      answer: "final answer",
+      answerDelay: deferred.promise,
+    });
+
+    render(<App apiClient={hubRun.client} />);
+
+    fireEvent.change(await screen.findByLabelText("Message"), {
+      target: { value: "finish cleanly" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(await screen.findByText("Hermes is typing")).toBeInTheDocument();
+
+    deferred.resolve();
+    expect(await screen.findByText("final answer")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(document.querySelector(".message-bubble.empty-body")).not.toBeInTheDocument();
     });
   });
 
@@ -510,6 +605,34 @@ describe("App", () => {
     expect(screen.getAllByText("最终结果")).toHaveLength(1);
   });
 
+  it("keeps legitimate repeated execution steps in the same run", async () => {
+    const repeatedEvents = [
+      { kind: "tool.call", tool: "terminal", detail: "echo 1" },
+      { kind: "tool.call", tool: "terminal", detail: "echo 1" },
+    ];
+
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialMessagesBySessionId: {
+            "session-1": [
+              {
+                id: "message-repeated-execution",
+                session_id: "session-1",
+                role: "assistant",
+                content: `<!-- hermes-hub:execution:v1 -->\n${JSON.stringify(repeatedEvents)}`,
+                attachments: [],
+                created_at: 1,
+              },
+            ],
+          },
+        })}
+      />,
+    );
+
+    expect(await screen.findAllByText("call terminal：echo 1")).toHaveLength(2);
+  });
+
   it("does not treat old assistant messages as the current Hub run response", async () => {
     const deferred = createDeferred<void>();
     const hubRun = createHubRunMock({
@@ -551,6 +674,7 @@ describe("App", () => {
     const persistGate = new Promise<void>((resolve) => {
       releasePersist = resolve;
     });
+    const eventListeners = new Set<(event: ChannelSessionEvent) => void>();
     const client = createMockApiClient({
       async createChannelRun(_channelId, sessionId, input) {
         const message: ChannelMessage = {
@@ -568,6 +692,18 @@ describe("App", () => {
           created_at: 1,
           updated_at: 1,
         };
+        queueMicrotask(() => {
+          const events: HermesVerboseEvent[] = [
+            {
+              kind: "tool.call",
+              tool: "skill_view",
+              detail: "inspect image skill",
+            },
+          ];
+          for (const listener of eventListeners) {
+            listener({ type: "message_created", message: executionMessage(events) });
+          }
+        });
         return {
           message,
           run: {
@@ -585,6 +721,17 @@ describe("App", () => {
       },
     });
     client.activeHermesRun = async () => activeRun;
+    client.subscribeSessionEvents = (_channelId, sessionId, onEvent) => {
+      eventListeners.add(onEvent);
+      queueMicrotask(async () => {
+        onEvent({
+          type: "messages_snapshot",
+          messages: await client.listSessionMessages("channel-1", sessionId),
+          active_run: activeRun,
+        });
+      });
+      return () => eventListeners.delete(onEvent);
+    };
     client.clearHermesRun = async () => {
       activeRun = null;
     };
@@ -650,7 +797,9 @@ describe("App", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
-    expect(await screen.findByText("call skill view：inspect image skill")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByText("call skill view：inspect image skill")).toBeInTheDocument();
+    });
     fireEvent.click(screen.getByRole("button", { name: "New chat" }));
     await waitFor(() => {
       expect(screen.queryByText("call skill view：inspect image skill")).not.toBeInTheDocument();
@@ -661,6 +810,19 @@ describe("App", () => {
 
     releasePersist?.();
     activeRun = null;
+    const finalMessage: ChannelMessage = {
+      id: "message-final",
+      session_id: "session-1",
+      role: "assistant",
+      client_message_key: "hermes-run:hub-run-restored",
+      content: "done",
+      attachments: [],
+      created_at: 3,
+    };
+    for (const listener of eventListeners) {
+      listener({ type: "message_created", message: finalMessage });
+      listener({ type: "run_cleared", session_id: "session-1" });
+    }
     await waitFor(() => {
       expect(screen.getAllByText("call skill view：inspect image skill")).toHaveLength(1);
       expect(screen.getAllByText("done")).toHaveLength(1);
@@ -694,6 +856,29 @@ describe("App", () => {
     await waitFor(() => {
       expect(stopHermesRun).toHaveBeenCalledWith("channel-1", "session-1");
       expect(screen.queryByText("Hermes is typing")).not.toBeInTheDocument();
+    });
+  });
+
+  it("does not create an empty final reply for a completed run without output id", async () => {
+    render(
+      <App
+        apiClient={createMockApiClient({
+          activeRunsBySessionId: {
+            "session-1": {
+              run_id: "hub-run-empty-output",
+              status: "completed",
+              created_at: 1,
+              updated_at: 2,
+            },
+          },
+        })}
+      />,
+    );
+
+    await screen.findByRole("button", { name: "New chat" });
+    await waitFor(() => {
+      expect(screen.queryByText("Hermes returned an empty response.")).not.toBeInTheDocument();
+      expect(document.querySelector(".message-bubble.empty-body")).not.toBeInTheDocument();
     });
   });
 

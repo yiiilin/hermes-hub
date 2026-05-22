@@ -10,6 +10,7 @@ use serde::Serialize;
 use crate::{
     hermes::instance::{HermesInstance, HermesInstanceKind},
     http::{auth::current_user, ApiError},
+    model_config::IMAGE_MODEL_CONFIG_KIND,
     AppState,
 };
 
@@ -86,6 +87,11 @@ pub async fn ensure_managed_hermes_for_user(
             .active_config()
             .await
             .map_err(|_| ApiError::Internal)?;
+        let image_config = state
+            .model_registry
+            .config_for_kind(IMAGE_MODEL_CONFIG_KIND)
+            .await
+            .map_err(|_| ApiError::Internal)?;
         // 数据库里的容器状态可能滞后于 Docker daemon；ensure 操作会幂等检查并启动容器。
         let llm_api_key = match instance.api_token_secret_ref.as_deref() {
             Some(existing_token) => {
@@ -108,6 +114,7 @@ pub async fn ensure_managed_hermes_for_user(
                 &instance,
                 &llm_api_key,
                 &llm_config.default_model,
+                &image_config.default_model,
                 &llm_config.api_type,
             )
             .await
@@ -115,6 +122,11 @@ pub async fn ensure_managed_hermes_for_user(
         state
             .store
             .bind_hermes_instance(ensured.clone())
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        state
+            .channel_store
+            .bind_hub_channel_to_instance(user_id, &ensured.id)
             .await
             .map_err(|_| ApiError::Internal)?;
 
@@ -127,10 +139,20 @@ pub async fn ensure_managed_hermes_for_user(
         .active_config()
         .await
         .map_err(|_| ApiError::Internal)?;
+    let image_config = state
+        .model_registry
+        .config_for_kind(IMAGE_MODEL_CONFIG_KIND)
+        .await
+        .map_err(|_| ApiError::Internal)?;
     let instance = state.docker_provisioner.prepare_instance(user_id);
     state
         .store
         .bind_hermes_instance(instance.clone())
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    state
+        .channel_store
+        .bind_hub_channel_to_instance(user_id, &instance.id)
         .await
         .map_err(|_| ApiError::Internal)?;
     let llm_api_key = state
@@ -144,6 +166,7 @@ pub async fn ensure_managed_hermes_for_user(
             &instance,
             &llm_api_key,
             &llm_config.default_model,
+            &image_config.default_model,
             &llm_config.api_type,
         )
         .await
@@ -151,6 +174,11 @@ pub async fn ensure_managed_hermes_for_user(
     state
         .store
         .bind_hermes_instance(instance.clone())
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    state
+        .channel_store
+        .bind_hub_channel_to_instance(user_id, &instance.id)
         .await
         .map_err(|_| ApiError::Internal)?;
 

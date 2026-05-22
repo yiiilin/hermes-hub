@@ -21,7 +21,7 @@ use super::{
 
 /// Hub 托管 Hermes 容器规格版本。只要 env、挂载、工作目录或安全策略有变化，
 /// 就提升这个值，确保已存在的旧容器会被重建并拿到新行为。
-const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-21-hermes-hub-platform-2";
+const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-22-hermes-hub-image-model";
 const MANAGED_CONTAINER_SPEC_LABEL: &str = "hermes_hub_spec_version";
 const HUB_INBOX_PATH: &str = "/internal/channel/v1/inbox";
 const HUB_INBOX_TIMEOUT_SECONDS: u16 = 25;
@@ -171,6 +171,9 @@ class HermesHubAdapter(BasePlatformAdapter):
             "content": content,
             "attachments": (metadata or {}).get("attachments") or [],
         }
+        run_id = self._run_id(metadata)
+        if run_id:
+            payload["run_id"] = run_id
         client_message_key = self._client_message_key(metadata)
         if client_message_key:
             payload["client_message_key"] = client_message_key
@@ -204,6 +207,9 @@ class HermesHubAdapter(BasePlatformAdapter):
             "content": content,
             "attachments": (metadata or {}).get("attachments") or [],
         }
+        run_id = self._run_id(metadata)
+        if run_id:
+            payload["run_id"] = run_id
         try:
             response = await self._request_json(
                 "PUT", f"/sessions/{session_id}/messages/{message_id}", json=payload
@@ -362,6 +368,10 @@ class HermesHubAdapter(BasePlatformAdapter):
                 content = f"{content}\n\n[{display_name}]({download_url})".strip()
             next_metadata = dict(metadata or {})
             next_metadata["attachments"] = [attachment]
+            run_id = self._run_id(metadata)
+            attachment_id = attachment.get("id")
+            if run_id and attachment_id:
+                next_metadata["client_message_key"] = f"hermes-run:{run_id}:attachment:{attachment_id}"
             return await self.send(chat_id, content, metadata=next_metadata)
         except Exception as error:
             logger.warning("Hermes Hub attachment send failed: %s", error)
@@ -554,6 +564,7 @@ pub struct DockerProvisionerConfig {
     pub published_base_url: String,
     pub hub_llm_base_url: String,
     pub default_model: String,
+    pub image_model: String,
     pub api_mode: String,
     pub memory_limit: Option<String>,
     pub cpu_limit: Option<String>,
@@ -765,7 +776,7 @@ impl DockerProvisioner {
                 format!("HERMES_HUB_INBOX_TIMEOUT_SECONDS={HUB_INBOX_TIMEOUT_SECONDS}"),
                 format!("HERMES_HUB_INBOX_LIMIT={HUB_INBOX_LIMIT}"),
                 format!("OPENAI_MODEL={}", self.config.default_model),
-                "OPENAI_IMAGE_MODEL=gpt-image-2-medium".to_string(),
+                format!("OPENAI_IMAGE_MODEL={}", self.config.image_model),
                 "HERMES_TOOL_PROGRESS_MODE=verbose".to_string(),
                 // Hub 托管 Hermes 已经运行在用户独立容器里，命令安全边界由容器承担；
                 // 默认自动批准可以避免长任务卡在无人值守的 approval prompt。
@@ -864,10 +875,12 @@ impl DockerProvisioner {
         instance: &HermesInstance,
         llm_api_key: &str,
         default_model: &str,
+        image_model: &str,
         api_mode: &str,
     ) -> Result<HermesInstance, ProvisionerError> {
         let mut provisioner = self.clone();
         provisioner.config.default_model = default_model.to_string();
+        provisioner.config.image_model = image_model.to_string();
         provisioner.config.api_mode = api_mode.to_string();
         provisioner.ensure_container(instance, llm_api_key).await
     }
@@ -877,10 +890,12 @@ impl DockerProvisioner {
         instance: &HermesInstance,
         llm_api_key: &str,
         default_model: &str,
+        image_model: &str,
         api_mode: &str,
     ) -> Result<HermesInstance, ProvisionerError> {
         let mut provisioner = self.clone();
         provisioner.config.default_model = default_model.to_string();
+        provisioner.config.image_model = image_model.to_string();
         provisioner.config.api_mode = api_mode.to_string();
         provisioner.rebuild_instance(instance, llm_api_key).await
     }
@@ -1104,6 +1119,7 @@ impl DockerProvisioner {
             .ok_or(ProvisionerError::InvalidManagedInstance)?;
         let config_path = PathBuf::from(config_path);
         let model = yaml_string(&self.config.default_model)?;
+        let image_model = yaml_string(&self.config.image_model)?;
         let base_url = yaml_string(&self.config.hub_llm_base_url)?;
         let channel_base_url = yaml_string(&hub_channel_base_url(&self.config.hub_llm_base_url))?;
         let api_key = yaml_string(instance.llm_api_key.as_deref().unwrap_or(""))?;
@@ -1122,9 +1138,9 @@ impl DockerProvisioner {
              \x20\x20api_mode: {api_mode}\n\
              image_gen:\n\
              \x20\x20provider: \"openai\"\n\
-             \x20\x20model: \"gpt-image-2-medium\"\n\
+             \x20\x20model: {image_model}\n\
              \x20\x20openai:\n\
-             \x20\x20\x20\x20model: \"gpt-image-2-medium\"\n\
+             \x20\x20\x20\x20model: {image_model}\n\
              display:\n\
              \x20\x20tool_progress: \"verbose\"\n\
              \x20\x20tool_progress_command: true\n\

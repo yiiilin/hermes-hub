@@ -103,6 +103,7 @@ fn test_config() -> DockerProvisionerConfig {
         published_base_url: "http://127.0.0.1".to_string(),
         hub_llm_base_url: "http://hermes-hub:8080/internal/llm/v1".to_string(),
         default_model: "gpt-4.1-mini".to_string(),
+        image_model: "gpt-image-2-medium".to_string(),
         api_mode: "chat_completions".to_string(),
         memory_limit: Some("1g".to_string()),
         cpu_limit: Some("1.0".to_string()),
@@ -202,6 +203,33 @@ async fn docker_provisioner_writes_codex_responses_api_mode_for_responses_models
         std::fs::read_to_string("/tmp/hermes-hub-test/users/user-responses/config/config.yaml")
             .expect("managed Hermes config is written");
     assert!(managed_config.contains("api_mode: \"codex_responses\""));
+}
+
+#[tokio::test]
+async fn docker_provisioner_writes_configured_image_model_to_env_and_config() {
+    let runtime = FakeDockerRuntime::default();
+    let mut config = test_config();
+    config.image_model = "gpt-image-1".to_string();
+    let provisioner = DockerProvisioner::new_with_runtime(config, Arc::new(runtime.clone()));
+
+    let instance = provisioner
+        .ensure_instance("user-image-model", "instance-token")
+        .await
+        .expect("instance can be created");
+    let spec = provisioner
+        .container_spec_for(&instance)
+        .expect("container spec can be rendered");
+
+    assert!(spec
+        .env
+        .iter()
+        .any(|entry| entry == "OPENAI_IMAGE_MODEL=gpt-image-1"));
+    let managed_config =
+        std::fs::read_to_string("/tmp/hermes-hub-test/users/user-image-model/config/config.yaml")
+            .expect("managed Hermes config is written");
+    assert!(managed_config.contains("image_gen:"));
+    assert!(managed_config.contains("model: \"gpt-image-1\""));
+    assert!(!managed_config.contains("gpt-image-2-medium"));
 }
 
 #[tokio::test]
@@ -462,7 +490,7 @@ async fn docker_provisioner_test() {
         .iter()
         .any(|entry| entry == "HERMES_ACCEPT_HOOKS=1"));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version" && value == "2026-05-21-hermes-hub-platform-2"
+        key == "hermes_hub_spec_version" && value == "2026-05-22-hermes-hub-image-model"
     }));
     assert!(spec
         .mounts
@@ -549,9 +577,10 @@ async fn docker_provisioner_test() {
     assert!(plugin_adapter.contains("return f\"hub-run-{value}\""));
     assert!(plugin_adapter.contains("\"output_message_id\": output_message_id"));
     assert!(plugin_adapter.contains("payload[\"client_message_key\"] = client_message_key"));
+    assert!(plugin_adapter.contains("payload[\"run_id\"] = run_id"));
+    assert!(plugin_adapter.contains("hermes-run:{run_id}:attachment:{attachment_id}"));
     assert!(plugin_adapter.contains("def _client_message_key("));
     assert!(plugin_adapter.contains("return f\"hermes-run:{run_id}\""));
-    assert!(!plugin_adapter.contains("payload[\"run_id\"] = run_id"));
     assert!(plugin_adapter.contains("f\"/inbox/{run_id}/ack\""));
     assert!(plugin_adapter.contains("media_types.append(content_type)"));
     assert!(plugin_adapter.contains("startswith(\"image/\")"));
@@ -598,7 +627,7 @@ async fn docker_provisioner_test() {
     assert!(
         create_call.windows(2).any(|args| {
             args[0] == "--label"
-                && args[1] == "hermes_hub_spec_version=2026-05-21-hermes-hub-platform-2"
+                && args[1] == "hermes_hub_spec_version=2026-05-22-hermes-hub-image-model"
         }),
         "managed Hermes containers must carry the current spec label"
     );

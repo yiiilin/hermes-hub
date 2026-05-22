@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::db::runtime::block_on_db;
 
 pub const HUB_CHANNEL_NAME: &str = "hermes-hub";
+const RUNNING_RUN_RECOVERY_AFTER: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -414,6 +415,47 @@ impl ChannelStore {
                     values ($1::uuid, $2::uuid, $3::uuid, $4, $5)
                     on conflict (user_id, name) do update set
                         hermes_instance_id = coalesce(excluded.hermes_instance_id, channels.hermes_instance_id),
+                        updated_at = now()
+                    returning id::text as id,
+                              user_id::text as user_id,
+                              name,
+                              description,
+                              extract(epoch from created_at)::bigint as created_at,
+                              extract(epoch from updated_at)::bigint as updated_at
+                    "#,
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(user_id)
+                .bind(instance_id)
+                .bind(HUB_CHANNEL_NAME)
+                .bind(Some("Hermes Hub default channel".to_string()))
+                .fetch_one(pool)
+                .await
+                .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+
+                row_to_channel(&row)
+            }),
+        }
+    }
+
+    /// Hermes 实例创建或改绑后，补齐该用户标准 Hub channel 的实例归属。
+    ///
+    /// 用户可能先打开聊天页创建 channel，再由邀请注册、管理员或 workspace ensure
+    /// 创建 Hermes 实例；adapter 按实例过滤队列，所以这里必须让旧 channel 重新绑定。
+    pub async fn bind_hub_channel_to_instance(
+        &self,
+        user_id: &str,
+        instance_id: &str,
+    ) -> Result<Channel, ChannelStoreError> {
+        match &self.backend {
+            ChannelStoreBackend::Memory(_) => self.ensure_hub_channel(user_id).await,
+            ChannelStoreBackend::Postgres(pool) => block_on_db(async {
+                let row = sqlx::query(
+                    r#"
+                    insert into channels (id, user_id, hermes_instance_id, name, description)
+                    values ($1::uuid, $2::uuid, $3::uuid, $4, $5)
+                    on conflict (user_id, name) do update set
+                        hermes_instance_id = excluded.hermes_instance_id,
                         updated_at = now()
                     returning id::text as id,
                               user_id::text as user_id,
@@ -843,6 +885,30 @@ impl ChannelStore {
         }
     }
 
+    pub async fn find_session_message_by_client_key(
+        &self,
+        session_id: &str,
+        client_message_key: &str,
+    ) -> Result<Option<ChannelMessage>, ChannelStoreError> {
+        let client_message_key = normalize_client_message_key(Some(client_message_key.to_string()));
+        match &self.backend {
+            ChannelStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
+                Ok(find_memory_message_by_client_key(
+                    &inner,
+                    session_id,
+                    client_message_key.as_deref(),
+                ))
+            }
+            ChannelStoreBackend::Postgres(pool) => {
+                let Some(client_message_key) = client_message_key else {
+                    return Ok(None);
+                };
+                find_postgres_message_by_client_key(pool, session_id, &client_message_key).await
+            }
+        }
+    }
+
     pub async fn append_session_message(
         &self,
         user_id: &str,
@@ -1058,6 +1124,7 @@ impl ChannelStore {
         match &self.backend {
             ChannelStoreBackend::Memory(inner) => {
                 let mut inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
+                let now = unix_now();
                 let mut runs = inner
                     .runs_by_id
                     .values()
@@ -1065,7 +1132,9 @@ impl ChannelStore {
                         matches!(
                             run.status,
                             ChannelRunStatus::Queued | ChannelRunStatus::Leased
-                        )
+                        ) || (run.status == ChannelRunStatus::Running
+                            && now.saturating_sub(run.updated_at)
+                                >= RUNNING_RUN_RECOVERY_AFTER.as_secs())
                     })
                     .filter(|run| run_belongs_to_instance(&inner, run, instance_id))
                     .cloned()
@@ -1073,7 +1142,6 @@ impl ChannelStore {
                 runs.sort_by(|left, right| left.created_at.cmp(&right.created_at));
                 runs.truncate(limit);
 
-                let now = unix_now();
                 for run in &mut runs {
                     if let Some(stored) = inner.runs_by_id.get_mut(&run.id) {
                         if stored.attempt_count >= 5 {
@@ -1109,6 +1177,11 @@ impl ChannelStore {
                                 and channel_runs.lease_expires_at <= now()
                                 and channel_runs.attempt_count < 5
                             )
+                            or (
+                                channel_runs.status = 'running'
+                                and channel_runs.updated_at <= now() - $3::interval
+                                and channel_runs.attempt_count < 5
+                            )
                         )
                           and ($1::uuid is null or channels.hermes_instance_id = $1::uuid)
                         order by channel_runs.created_at asc
@@ -1138,6 +1211,7 @@ impl ChannelStore {
                 )
                 .bind(instance_id)
                 .bind(limit as i64)
+                .bind(format!("{} seconds", RUNNING_RUN_RECOVERY_AFTER.as_secs()))
                 .fetch_all(pool)
                 .await
                 .map_err(|_| ChannelStoreError::DatabaseFailed)?;
@@ -1267,6 +1341,12 @@ impl ChannelStore {
                     .find(|run| run.session_id == session_id && run_matches(run, run_id))
                     .ok_or(ChannelStoreError::RunNotFound)?;
                 if run.status.is_terminal() {
+                    if run.output_message_id.is_none() {
+                        if let Some(output_message_id) = output_message_id {
+                            run.output_message_id = Some(output_message_id.to_string());
+                            run.updated_at = unix_now();
+                        }
+                    }
                     return Ok(run.clone());
                 }
                 if !run_status_transition_allowed(&run.status, &status) {
@@ -1312,6 +1392,16 @@ impl ChannelStore {
                         where id in (select id from current_run)
                           and status in ('queued', 'leased', 'running')
                         returning *
+                    ),
+                    terminal_output_patch as (
+                        update channel_runs
+                        set output_message_id = $3::uuid,
+                            updated_at = now()
+                        where id in (select id from current_run)
+                          and status in ('completed', 'failed', 'cancelled', 'expired')
+                          and output_message_id is null
+                          and $3::uuid is not null
+                        returning *
                     )
                     select id::text as id,
                            session_id::text as session_id,
@@ -1339,9 +1429,24 @@ impl ChannelStore {
                            extract(epoch from created_at)::bigint as created_at,
                            extract(epoch from updated_at)::bigint as updated_at,
                            extract(epoch from completed_at)::bigint as completed_at
+                    from terminal_output_patch
+                    union all
+                    select id::text as id,
+                           session_id::text as session_id,
+                           user_message_id::text as user_message_id,
+                           status,
+                           input,
+                           input_attachments,
+                           output_message_id::text as output_message_id,
+                           error,
+                           attempt_count,
+                           extract(epoch from created_at)::bigint as created_at,
+                           extract(epoch from updated_at)::bigint as updated_at,
+                           extract(epoch from completed_at)::bigint as completed_at
                     from current_run
                     where status in ('completed', 'failed', 'cancelled', 'expired')
                       and not exists (select 1 from updated_run)
+                      and not exists (select 1 from terminal_output_patch)
                     limit 1
                     "#,
                 )
@@ -1416,12 +1521,22 @@ impl ChannelStore {
             }
         };
 
+        let resolved_output_message_id = match output_message_id {
+            Some(value) => Some(value.to_string()),
+            None => {
+                let key = format!("hermes-run:{normalized_run_id}");
+                self.find_session_message_by_client_key(&session_id, &key)
+                    .await?
+                    .map(|message| message.id)
+            }
+        };
+
         self.update_run_status_for_session(
             &session_id,
             &normalized_run_id,
             ChannelRunStatus::Completed,
             None,
-            output_message_id,
+            resolved_output_message_id.as_deref(),
         )
         .await
     }

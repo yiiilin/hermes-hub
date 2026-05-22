@@ -2,6 +2,8 @@ import type {
   ApiClient,
   Channel,
   ChannelMessage,
+  ChannelRun,
+  ChannelSessionEvent,
   ChannelSession,
   HermesActiveRun,
   HermesAttachment,
@@ -81,10 +83,20 @@ export function ChannelSessionRoute({
   const executionMessageIdsRef = useRef<Record<string, string>>({});
   const executionPersistQueueRef = useRef<Record<string, Promise<ChannelMessage | null>>>({});
   const selectedSessionIdRef = useRef<string | null>(null);
+  const activeRunRef = useRef<HermesActiveRun | null>(null);
+  const messagesRef = useRef<ChannelMessage[]>([]);
 
   useEffect(() => {
     selectedSessionIdRef.current = selectedSession?.id ?? null;
   }, [selectedSession?.id]);
+
+  useEffect(() => {
+    activeRunRef.current = activeRun;
+  }, [activeRun]);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   async function refreshWorkspace() {
     setError(null);
@@ -158,6 +170,25 @@ export function ChannelSessionRoute({
   useEffect(() => {
     void refreshWorkspace();
   }, []);
+
+  useEffect(() => {
+    if (!active || !channel || !selectedSession) {
+      return;
+    }
+
+    const session = selectedSession;
+    // 浏览器只订阅当前激活会话的 room；断线后 EventSource 自动重连，重连首包会重新同步历史。
+    return apiClient.subscribeSessionEvents(
+      channel.id,
+      session.id,
+      (event) => {
+        void handleSessionEvent(channel.id, session, event);
+      },
+      () => {
+        // EventSource 会自动重连。这里不设置页面错误，避免切后台/刷新造成 load failed 假错误。
+      },
+    );
+  }, [active, apiClient, channel?.id, selectedSession?.id]);
 
   useEffect(() => {
     const node = messageListRef.current;
@@ -266,8 +297,10 @@ export function ChannelSessionRoute({
     channelId: string,
     session: ChannelSession,
     currentMessages: ChannelMessage[],
+    knownRun?: HermesActiveRun | null,
   ) {
-    const run = await apiClient.activeHermesRun(channelId, session.id);
+    const run =
+      knownRun === undefined ? await apiClient.activeHermesRun(channelId, session.id) : knownRun;
     if (selectedSessionIdRef.current !== session.id) {
       return;
     }
@@ -306,35 +339,81 @@ export function ChannelSessionRoute({
   }
 
   function resumeAdapterRun(channelId: string, sessionId: string, run: HermesActiveRun) {
+    void channelId;
     const attachedPendingId = pendingAssistantIdsByRunRef.current[run.run_id];
-    if (attachedRunIdsRef.current.has(run.run_id)) {
-      ensurePendingAssistantPlaceholder(sessionId, run, attachedPendingId);
-      return;
-    }
-
     const assistantMessageId = ensurePendingAssistantPlaceholder(sessionId, run, attachedPendingId);
     attachedRunIdsRef.current.add(run.run_id);
     pendingAssistantIdsByRunRef.current[run.run_id] = assistantMessageId;
+  }
 
-    void waitForAdapterResponse(channelId, sessionId, run.run_id, assistantMessageId)
-      .then(async () => {
-        await apiClient.clearHermesRun(channelId, sessionId);
-        if (selectedSessionIdRef.current === sessionId) {
-          setActiveRun(null);
+  async function handleSessionEvent(
+    channelId: string,
+    session: ChannelSession,
+    event: ChannelSessionEvent,
+  ) {
+    if (selectedSessionIdRef.current !== session.id) {
+      return;
+    }
+
+    if (event.type === "messages_snapshot") {
+      const nextMessages = sortMessagesForDisplay(event.messages);
+      setMessages(nextMessages);
+      hydrateExecutionHistory(session.id, nextMessages);
+      await restoreActiveRun(channelId, session, nextMessages, event.active_run);
+      return;
+    }
+
+    if (event.type === "message_created" || event.type === "message_updated") {
+      const message = event.message;
+      const runId = runIdFromHermesMessageKey(message.client_message_key);
+      const pendingId = runId ? pendingAssistantIdsByRunRef.current[runId] : undefined;
+      updateMessagesForSession(session.id, (current) => {
+        const withoutPending =
+          message.role === "assistant"
+            ? removePendingAssistantForMessage(current, message, pendingId)
+            : current;
+        return mergeMessagesById(withoutPending, [message]);
+      });
+      if (message.role === "assistant") {
+        const run = activeRunRef.current;
+        if (run && message.client_message_key === hermesRunMessageKey(run.run_id)) {
+          attachedRunIdsRef.current.delete(run.run_id);
+          delete pendingAssistantIdsByRunRef.current[run.run_id];
           setPendingAssistantMessageId(null);
           setPendingAssistantSessionId(null);
           resetVerboseEvents();
         }
-      })
-      .catch(async (cause) => {
-        const message = hermesRunErrorMessage(cause, t("chat.requestFailed"));
-        await appendHermesErrorMessage(channelId, sessionId, assistantMessageId, message);
-        await apiClient.clearHermesRun(channelId, sessionId);
-      })
-      .finally(() => {
-        attachedRunIdsRef.current.delete(run.run_id);
-        delete pendingAssistantIdsByRunRef.current[run.run_id];
-      });
+      }
+      return;
+    }
+
+    if (event.type === "run_updated") {
+      const run = activeRunFromChannelRun(event.run);
+      setActiveRun(run);
+      if (isTerminalHermesRun(run)) {
+        await persistTerminalRun(channelId, session.id, run, messagesRef.current);
+        await apiClient.clearHermesRun(channelId, session.id);
+        setActiveRun(null);
+        setPendingAssistantMessageId(null);
+        setPendingAssistantSessionId(null);
+        resetVerboseEvents();
+      } else {
+        resumeAdapterRun(channelId, session.id, run);
+      }
+      return;
+    }
+
+    if (event.type === "run_cleared") {
+      setActiveRun(null);
+      setPendingAssistantMessageId(null);
+      setPendingAssistantSessionId(null);
+      resetVerboseEvents();
+      return;
+    }
+
+    if (event.type === "session_deleted") {
+      await refreshWorkspace();
+    }
   }
 
   function ensurePendingAssistantPlaceholder(
@@ -387,10 +466,15 @@ export function ChannelSessionRoute({
       return;
     }
 
-    const content =
-      run.status === "failed"
-        ? t("chat.runFailed", { message: run.error || t("chat.requestFailed") })
-        : run.output || t("chat.emptyResponse");
+    if (run.status !== "failed" && !run.output) {
+      // completed 事件可能先于最终 message_created 到达；没有 output_message_id 时等待
+      // 后续消息或重连 snapshot，不能主动制造一个空回答气泡。
+      return;
+    }
+
+    const content = run.status === "failed"
+      ? t("chat.runFailed", { message: run.error || t("chat.requestFailed") })
+      : run.output || t("chat.emptyResponse");
     if (currentMessages.some((message) => message.role === "assistant" && message.content === content)) {
       return;
     }
@@ -482,20 +566,6 @@ export function ChannelSessionRoute({
         mergeMessagesById(current, [userMessage]),
       );
 
-      await waitForAdapterResponse(
-        channel.id,
-        session.id,
-        run.run_id,
-        nextAssistantMessageId,
-      );
-      if (selectedSessionIdRef.current === session.id) {
-        setPendingAssistantMessageId(null);
-        setPendingAssistantSessionId(null);
-        setActiveRun(null);
-        resetVerboseEvents();
-      }
-      await apiClient.clearHermesRun(channel.id, session.id);
-      clearExecutionHistory(session.id);
       if (text && !session.title) {
         const titled = await apiClient.generateSessionTitle(channel.id, session.id, text);
         if (selectedSessionIdRef.current === session.id) {
@@ -508,9 +578,6 @@ export function ChannelSessionRoute({
         setSessions((current) =>
           current.map((item) => (item.id === titled.id ? titled : item)),
         );
-      }
-      if (selectedSessionIdRef.current === session.id) {
-        await refreshWorkspace();
       }
     } catch (cause) {
       const message = hermesRunErrorMessage(cause, t("chat.requestFailed"));
@@ -525,70 +592,9 @@ export function ChannelSessionRoute({
         }
       }
     } finally {
-      if (runIdForRequest) {
-        attachedRunIdsRef.current.delete(runIdForRequest);
-        delete pendingAssistantIdsByRunRef.current[runIdForRequest];
-      }
+      void runIdForRequest;
       setBusy(false);
     }
-  }
-
-  async function waitForAdapterResponse(
-    channelId: string,
-    sessionId: string,
-    runId: string,
-    pendingMessageId: string,
-  ) {
-    let lastError: string | null = null;
-    for (let attempt = 0; attempt < 240; attempt += 1) {
-      await waitForAdapterPollDelay(attempt);
-      const [nextMessages, run] = await Promise.all([
-        apiClient.listSessionMessages(channelId, sessionId),
-        apiClient.activeHermesRun(channelId, sessionId),
-      ]);
-      const assistantMessage = [...nextMessages]
-        .reverse()
-        .find((message) => message.client_message_key === hermesRunMessageKey(runId));
-      const outputMessage = run?.output_message_id
-        ? nextMessages.find((message) => message.id === run.output_message_id)
-        : undefined;
-      const assistantContent = assistantMessage?.content ?? "";
-
-      updateMessagesForSession(sessionId, (current) => {
-        const withoutPending = current.filter((message) => message.id !== pendingMessageId);
-        return mergeMessagesById(withoutPending, nextMessages);
-      });
-      if (run && selectedSessionIdRef.current === sessionId) {
-        setActiveRun(run);
-      }
-      if (assistantMessage) {
-        return assistantContent;
-      }
-      if (!run) {
-        // active-run 的一次空响应可能来自刷新/切页时的短暂竞态；没有最终消息前不能清理本地状态。
-        continue;
-      }
-      if (isTerminalHermesRun(run)) {
-        if (run.status === "failed") {
-          lastError = run.error || t("chat.requestFailed");
-        }
-        if (outputMessage) {
-          return outputMessage.content;
-        }
-        if (run.status === "completed") {
-          return run.output ?? "";
-        }
-        if (run.status === "cancelled") {
-          return "";
-        }
-        break;
-      }
-    }
-
-    if (lastError) {
-      throw new Error(lastError);
-    }
-    throw new Error(t("chat.requestStillRunning"));
   }
 
   async function appendHermesErrorMessage(
@@ -778,6 +784,8 @@ export function ChannelSessionRoute({
         setActiveRun(null);
         resetVerboseEvents();
       }
+      attachedRunIdsRef.current.delete(activeRun.run_id);
+      delete pendingAssistantIdsByRunRef.current[activeRun.run_id];
       clearExecutionHistory(sessionId);
       setBusy(false);
     } catch (cause) {
@@ -850,7 +858,12 @@ export function ChannelSessionRoute({
     return null;
   }
 
-  const renderedMessages = sortMessagesForDisplay(messages);
+  // 会话切换和 SSE snapshot 都是异步状态更新；渲染层再按当前会话兜底过滤，
+  // 避免旧会话消息在新会话页面短暂或异常残留。
+  const selectedSessionId = selectedSession?.id ?? null;
+  const renderedMessages = sortMessagesForDisplay(
+    messages.filter((message) => !selectedSessionId || message.session_id === selectedSessionId),
+  );
   const runInProgress = Boolean(activeRun && !isTerminalHermesRun(activeRun));
   const liveExecutionVisible = Boolean(
     pendingAssistantSessionId === selectedSession?.id && verboseEvents.length > 0,
@@ -870,10 +883,10 @@ export function ChannelSessionRoute({
         </header>
 
         <div
-          className={messages.length === 0 ? "message-list empty" : "message-list"}
+          className={renderedMessages.length === 0 ? "message-list empty" : "message-list"}
           ref={messageListRef}
         >
-          {messages.length === 0 ? (
+          {renderedMessages.length === 0 ? (
             <div className="empty-chat">
               <Bot aria-hidden="true" size={30} />
               <strong>{t("chat.empty")}</strong>
@@ -1008,18 +1021,37 @@ function sameExecutionEntry(
 function mergeExecutionEvents(
   ...eventGroups: Array<ExecutionHistoryEntry[] | undefined>
 ): ExecutionHistoryEntry[] {
-  const merged: ExecutionHistoryEntry[] = [];
+  let merged: ExecutionHistoryEntry[] = [];
 
   for (const group of eventGroups) {
-    for (const event of group ?? []) {
-      if (merged.some((existing) => sameExecutionEntry(existing, event))) {
-        continue;
-      }
-      merged.push(event);
+    const events = group ?? [];
+    if (events.length === 0) {
+      continue;
     }
+
+    // 同一组里的重复步骤可能是真实连续执行；只去掉不同来源之间的边界重叠，
+    // 例如 SSE 实时消息和重连 snapshot 同时包含同一段执行历史。
+    const overlap = overlappingExecutionPrefixLength(merged, events);
+    merged = [...merged, ...events.slice(overlap)];
   }
 
   return compactRepeatedExecutionEvents(merged);
+}
+
+function overlappingExecutionPrefixLength(
+  previous: ExecutionHistoryEntry[],
+  next: ExecutionHistoryEntry[],
+) {
+  let overlap = Math.min(previous.length, next.length);
+  while (overlap > 0) {
+    const previousTail = previous.slice(previous.length - overlap);
+    const nextHead = next.slice(0, overlap);
+    if (sameExecutionSequence(previousTail, nextHead)) {
+      return overlap;
+    }
+    overlap -= 1;
+  }
+  return 0;
 }
 
 function compactRepeatedExecutionEvents(events: ExecutionHistoryEntry[]) {
@@ -1286,6 +1318,39 @@ function isHubRunId(runId: string) {
   return runId.startsWith("hub-run-");
 }
 
+function activeRunFromChannelRun(run: ChannelRun): HermesActiveRun {
+  return {
+    run_id: run.run_id,
+    status: run.status,
+    error: run.error,
+    output_message_id: run.output_message_id,
+    created_at: run.created_at,
+    updated_at: run.updated_at,
+  };
+}
+
+function removePendingAssistantForMessage(
+  messages: ChannelMessage[],
+  message: ChannelMessage,
+  pendingMessageId?: string,
+) {
+  if (message.role !== "assistant") {
+    return messages;
+  }
+  return messages.filter(
+    (current) =>
+      !(
+        current.role === "assistant" &&
+        current.session_id === message.session_id &&
+        !current.content.trim() &&
+        (current.attachments ?? []).length === 0 &&
+        (current.id.startsWith("pending-") ||
+          current.id === pendingMessageId ||
+          !current.client_message_key)
+      ),
+  );
+}
+
 function hermesRunErrorMessage(cause: unknown, fallback = "Hermes request failed") {
   if (cause instanceof Error && cause.message.trim()) {
     return cause.message;
@@ -1298,9 +1363,13 @@ function hermesRunMessageKey(runId: string) {
   return `hermes-run:${runId}`;
 }
 
-function waitForAdapterPollDelay(attempt: number) {
-  const delay = attempt < 5 ? 400 : 1000;
-  return new Promise((resolve) => globalThis.setTimeout(resolve, delay));
+function runIdFromHermesMessageKey(value: string | null | undefined) {
+  const raw = value?.trim();
+  if (!raw?.startsWith("hermes-run:")) {
+    return null;
+  }
+  const runId = raw.slice("hermes-run:".length).split(":")[0];
+  return runId.startsWith("hub-run-") ? runId : null;
 }
 
 function withoutSession(source: Set<string>, sessionId: string) {
@@ -1965,19 +2034,43 @@ function InlineAttachment({
 
 function attachmentForUrl(attachments: HermesAttachment[], url: string) {
   const normalizedUrl = normalizeAttachmentUrl(url);
+  const normalizedId = attachmentIdFromUrl(normalizedUrl);
   return attachments.find((attachment) => {
     const downloadUrl = normalizeAttachmentUrl(attachment.download_url);
     const dataUrl = normalizeAttachmentUrl(attachment.data_url);
-    return Boolean(normalizedUrl && (normalizedUrl === downloadUrl || normalizedUrl === dataUrl));
+    const attachmentId = attachment.id ?? attachmentIdFromUrl(downloadUrl);
+    return Boolean(
+      normalizedUrl &&
+        (normalizedUrl === downloadUrl ||
+          normalizedUrl === dataUrl ||
+          (normalizedId && attachmentId === normalizedId)),
+    );
   });
 }
 
 function normalizeAttachmentUrl(url: string | undefined) {
-  return url?.trim().replace(/[),.;，。；、]+$/u, "") ?? "";
+  const trimmed = url?.trim().replace(/[),.;，。；、]+$/u, "") ?? "";
+  if (!trimmed) {
+    return "";
+  }
+  try {
+    const parsed = new URL(trimmed, window.location.origin);
+    if (parsed.origin === window.location.origin) {
+      return `${parsed.pathname}${parsed.search}`;
+    }
+  } catch {
+    return trimmed;
+  }
+  return trimmed;
+}
+
+function attachmentIdFromUrl(url: string) {
+  return /\/api\/attachments\/([^/]+)\/download/.exec(url)?.[1] ?? null;
 }
 
 function isPlainAttachmentUrl(token: string) {
-  return Boolean(safeMarkdownUrl(normalizeAttachmentUrl(token), false));
+  // 只有真实附件下载地址才进入附件渲染分支；普通文本不能被相对 URL 解析误判。
+  return Boolean(attachmentIdFromUrl(normalizeAttachmentUrl(token)));
 }
 
 function safeMarkdownUrl(url: string, imageOnly: boolean) {
