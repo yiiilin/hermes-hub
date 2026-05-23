@@ -97,6 +97,29 @@ export type ModelConfigTestResult = {
 
 export type SystemSettings = {
   max_sessions_per_user: number;
+  oidc: OidcSettings;
+};
+
+export type OidcSettings = {
+  enabled: boolean;
+  display_name: string;
+  client_id: string;
+  client_secret: string;
+  issuer_url: string;
+  authorization_url: string;
+  token_url: string;
+  userinfo_url: string;
+  logout_url: string;
+  scopes: string;
+  username_claim: string;
+  email_claim: string;
+  allow_password_login: boolean;
+  auto_create_users: boolean;
+};
+
+export type OidcPublicConfig = {
+  enabled: boolean;
+  display_name: string;
 };
 
 export type HermesAttachment = {
@@ -209,6 +232,7 @@ export type CreateInviteInput = {
 export type ApiClient = {
   me: () => Promise<User | null>;
   bootstrapStatus: () => Promise<{ bootstrap_open: boolean }>;
+  oidcConfig: () => Promise<OidcPublicConfig>;
   login: (email: string, password: string) => Promise<User>;
   bootstrapRegister: (email: string, password: string) => Promise<User>;
   registerWithInvite: (
@@ -386,6 +410,25 @@ function normalizedModelConfig(config: ModelConfig): ModelConfig {
   };
 }
 
+export function defaultOidcSettings(): OidcSettings {
+  return {
+    enabled: false,
+    display_name: "OpenID Connect",
+    client_id: "",
+    client_secret: "",
+    issuer_url: "",
+    authorization_url: "",
+    token_url: "",
+    userinfo_url: "",
+    logout_url: "",
+    scopes: "openid profile email",
+    username_claim: "preferred_username",
+    email_claim: "email",
+    allow_password_login: true,
+    auto_create_users: true,
+  };
+}
+
 export function createApiClient(): ApiClient {
   return {
     async me() {
@@ -396,6 +439,10 @@ export function createApiClient(): ApiClient {
     },
     async bootstrapStatus() {
       return request<{ bootstrap_open: boolean }>("/api/auth/bootstrap-status");
+    },
+    async oidcConfig() {
+      const payload = await request<{ oidc: OidcPublicConfig }>("/api/auth/oidc/config");
+      return payload.oidc;
     },
     async login(email, password) {
       const payload = await request<{ user: User }>("/api/auth/login", {
@@ -1267,6 +1314,7 @@ function durationDetail(duration: number | undefined) {
 
 type MockApiClientOptions = {
   initialUser?: User | null;
+  oidcPublicConfig?: OidcPublicConfig;
   bootstrapOpen?: boolean;
   requiredModelsReady?: boolean;
   missingRequiredModelConfigKinds?: ModelConfigKind[];
@@ -1356,6 +1404,7 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
   ];
   let systemSettings: SystemSettings = {
     max_sessions_per_user: 20,
+    oidc: defaultOidcSettings(),
   };
 
   function emitSessionEvent(sessionId: string, event: ChannelSessionEvent) {
@@ -1370,6 +1419,12 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     },
     async bootstrapStatus() {
       return { bootstrap_open: !hasAnyUser };
+    },
+    async oidcConfig() {
+      return options.oidcPublicConfig ?? {
+        enabled: systemSettings.oidc.enabled,
+        display_name: systemSettings.oidc.display_name,
+      };
     },
     async login(email) {
       hasAnyUser = true;

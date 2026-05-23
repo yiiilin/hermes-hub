@@ -330,18 +330,62 @@ async fn admin_can_configure_per_user_session_limit() {
     let (status, body) = response_json(settings).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["settings"]["max_sessions_per_user"], 20);
+    assert_eq!(body["settings"]["oidc"]["enabled"], false);
+    assert_eq!(body["settings"]["oidc"]["display_name"], "OpenID Connect");
 
     let update = request_json(
         &app,
         Method::PUT,
         "/api/admin/system-settings",
         json!({
-            "max_sessions_per_user": 2
+            "max_sessions_per_user": 2,
+            "oidc": {
+                "enabled": true,
+                "display_name": "Acme SSO",
+                "client_id": "hermes-hub",
+                "client_secret": "oidc-secret",
+                "issuer_url": "https://idp.example.com",
+                "authorization_url": "https://idp.example.com/oauth2/v1/authorize",
+                "token_url": "https://idp.example.com/oauth2/v1/token",
+                "userinfo_url": "https://idp.example.com/oauth2/v1/userinfo",
+                "logout_url": "https://idp.example.com/logout",
+                "scopes": "openid profile email",
+                "username_claim": "preferred_username",
+                "email_claim": "email",
+                "allow_password_login": true,
+                "auto_create_users": true
+            }
         }),
         Some(&admin_cookie),
     )
     .await;
     assert_eq!(update.status(), StatusCode::NO_CONTENT);
+
+    let settings = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/system-settings",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(settings).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["settings"]["max_sessions_per_user"], 2);
+    assert_eq!(body["settings"]["oidc"]["enabled"], true);
+    assert_eq!(body["settings"]["oidc"]["display_name"], "Acme SSO");
+    assert_eq!(body["settings"]["oidc"]["client_id"], "hermes-hub");
+    assert_eq!(body["settings"]["oidc"]["client_secret"], "oidc-secret");
+    assert_eq!(
+        body["settings"]["oidc"]["authorization_url"],
+        "https://idp.example.com/oauth2/v1/authorize"
+    );
+
+    let public_oidc = request_empty(&app, Method::GET, "/api/auth/oidc/config", None).await;
+    let (status, body) = response_json(public_oidc).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["oidc"]["enabled"], true);
+    assert_eq!(body["oidc"]["display_name"], "Acme SSO");
+    assert!(body["oidc"].get("client_secret").is_none());
 
     let channels = request_empty(&app, Method::GET, "/api/channels", Some(&admin_cookie)).await;
     let (status, body) = response_json(channels).await;

@@ -9,6 +9,7 @@ import type {
   SystemSettings,
   User,
 } from "../api/client";
+import { defaultOidcSettings } from "../api/client";
 import { useI18n } from "../i18n";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
@@ -36,6 +37,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
   const [modelConfigs, setModelConfigs] = useState<ModelConfig[]>([]);
   const [systemSettings, setSystemSettings] = useState<SystemSettings>({
     max_sessions_per_user: 20,
+    oidc: defaultOidcSettings(),
   });
   const [settingsSaved, setSettingsSaved] = useState(false);
   const [inviteHours, setInviteHours] = useState(defaultInviteHours);
@@ -536,12 +538,194 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
               value={systemSettings.max_sessions_per_user}
               onChange={(event) =>
                 setSystemSettings({
+                  ...systemSettings,
                   max_sessions_per_user: Number(event.target.value),
                 })
               }
               required
             />
           </label>
+          <fieldset className="form-section">
+            <legend>{t("admin.oidcSettings")}</legend>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={systemSettings.oidc.enabled}
+                onChange={(event) =>
+                  setSystemSettings({
+                    ...systemSettings,
+                    oidc: { ...systemSettings.oidc, enabled: event.target.checked },
+                  })
+                }
+              />
+              {t("admin.oidcEnabled")}
+            </label>
+            <label>
+              {t("admin.oidcDisplayName")}
+              <input
+                value={systemSettings.oidc.display_name}
+                onChange={(event) =>
+                  setSystemSettings({
+                    ...systemSettings,
+                    oidc: { ...systemSettings.oidc, display_name: event.target.value },
+                  })
+                }
+              />
+            </label>
+            <label>
+              {t("admin.oidcClientId")}
+              <input
+                value={systemSettings.oidc.client_id}
+                onChange={(event) =>
+                  setSystemSettings({
+                    ...systemSettings,
+                    oidc: { ...systemSettings.oidc, client_id: event.target.value },
+                  })
+                }
+              />
+            </label>
+            <label>
+              {t("admin.oidcClientSecret")}
+              <input
+                type="password"
+                value={systemSettings.oidc.client_secret}
+                onChange={(event) =>
+                  setSystemSettings({
+                    ...systemSettings,
+                    oidc: { ...systemSettings.oidc, client_secret: event.target.value },
+                  })
+                }
+              />
+            </label>
+            <label>
+              {t("admin.oidcIssuerUrl")}
+              <input
+                value={systemSettings.oidc.issuer_url}
+                onChange={(event) =>
+                  setSystemSettings({
+                    ...systemSettings,
+                    oidc: { ...systemSettings.oidc, issuer_url: event.target.value },
+                  })
+                }
+              />
+            </label>
+            <label>
+              {t("admin.oidcAuthorizationUrl")}
+              <input
+                value={systemSettings.oidc.authorization_url}
+                onChange={(event) =>
+                  setSystemSettings({
+                    ...systemSettings,
+                    oidc: { ...systemSettings.oidc, authorization_url: event.target.value },
+                  })
+                }
+              />
+            </label>
+            <label>
+              {t("admin.oidcTokenUrl")}
+              <input
+                value={systemSettings.oidc.token_url}
+                onChange={(event) =>
+                  setSystemSettings({
+                    ...systemSettings,
+                    oidc: { ...systemSettings.oidc, token_url: event.target.value },
+                  })
+                }
+              />
+            </label>
+            <label>
+              {t("admin.oidcUserinfoUrl")}
+              <input
+                value={systemSettings.oidc.userinfo_url}
+                onChange={(event) =>
+                  setSystemSettings({
+                    ...systemSettings,
+                    oidc: { ...systemSettings.oidc, userinfo_url: event.target.value },
+                  })
+                }
+              />
+            </label>
+            <label>
+              {t("admin.oidcLogoutUrl")}
+              <input
+                value={systemSettings.oidc.logout_url}
+                onChange={(event) =>
+                  setSystemSettings({
+                    ...systemSettings,
+                    oidc: { ...systemSettings.oidc, logout_url: event.target.value },
+                  })
+                }
+              />
+            </label>
+            <label>
+              {t("admin.oidcScopes")}
+              <input
+                value={systemSettings.oidc.scopes}
+                onChange={(event) =>
+                  setSystemSettings({
+                    ...systemSettings,
+                    oidc: { ...systemSettings.oidc, scopes: event.target.value },
+                  })
+                }
+              />
+            </label>
+            <label>
+              {t("admin.oidcUsernameClaim")}
+              <input
+                value={systemSettings.oidc.username_claim}
+                onChange={(event) =>
+                  setSystemSettings({
+                    ...systemSettings,
+                    oidc: { ...systemSettings.oidc, username_claim: event.target.value },
+                  })
+                }
+              />
+            </label>
+            <label>
+              {t("admin.oidcEmailClaim")}
+              <input
+                value={systemSettings.oidc.email_claim}
+                onChange={(event) =>
+                  setSystemSettings({
+                    ...systemSettings,
+                    oidc: { ...systemSettings.oidc, email_claim: event.target.value },
+                  })
+                }
+              />
+            </label>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={systemSettings.oidc.allow_password_login}
+                onChange={(event) =>
+                  setSystemSettings({
+                    ...systemSettings,
+                    oidc: {
+                      ...systemSettings.oidc,
+                      allow_password_login: event.target.checked,
+                    },
+                  })
+                }
+              />
+              {t("admin.oidcAllowPasswordLogin")}
+            </label>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={systemSettings.oidc.auto_create_users}
+                onChange={(event) =>
+                  setSystemSettings({
+                    ...systemSettings,
+                    oidc: {
+                      ...systemSettings.oidc,
+                      auto_create_users: event.target.checked,
+                    },
+                  })
+                }
+              />
+              {t("admin.oidcAutoCreateUsers")}
+            </label>
+          </fieldset>
           <div className="button-row">
             <button type="submit">{t("admin.saveSettings")}</button>
           </div>

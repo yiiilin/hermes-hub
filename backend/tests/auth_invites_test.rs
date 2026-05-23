@@ -1,12 +1,14 @@
 use axum::{
     body::{to_bytes, Body},
-    http::{header, Method, Request, StatusCode},
+    http::{header, HeaderMap, Method, Request, StatusCode},
     response::Response,
-    Router,
+    routing::{get, post},
+    Json, Router,
 };
 use hermes_hub_backend::{build_router, AppConfig};
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::net::TcpListener;
 use tower::ServiceExt;
 
 fn test_app() -> Router {
@@ -56,6 +58,24 @@ async fn request_empty(
 
     if let Some(cookie) = cookie {
         builder = builder.header(header::COOKIE, cookie);
+    }
+
+    app.clone()
+        .oneshot(builder.body(Body::empty()).expect("request can be built"))
+        .await
+        .expect("router responds")
+}
+
+async fn request_empty_with_headers(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> Response<Body> {
+    let mut builder = Request::builder().method(method).uri(uri);
+
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
     }
 
     app.clone()
@@ -124,6 +144,172 @@ async fn login(app: &Router, email: &str, password: &str) -> String {
     cookie_from(&response)
 }
 
+#[tokio::test]
+async fn oidc_start_redirects_with_configured_authorization_parameters() {
+    let app = test_app();
+    bootstrap_admin(&app).await;
+    let admin_cookie = login(&app, "admin@example.com", "admin-password-123").await;
+
+    let update = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/system-settings",
+        json!({
+            "max_sessions_per_user": 20,
+            "oidc": {
+                "enabled": true,
+                "display_name": "Acme SSO",
+                "client_id": "hermes-hub",
+                "client_secret": "oidc-secret",
+                "authorization_url": "https://idp.example.com/oauth2/v1/authorize",
+                "token_url": "https://idp.example.com/oauth2/v1/token",
+                "userinfo_url": "https://idp.example.com/oauth2/v1/userinfo",
+                "scopes": "openid profile email",
+                "email_claim": "email",
+                "username_claim": "preferred_username",
+                "allow_password_login": true,
+                "auto_create_users": true
+            }
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+
+    let response = request_empty(&app, Method::GET, "/api/auth/oidc/start", None).await;
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .expect("redirect location")
+        .to_str()
+        .expect("location is valid")
+        .to_string();
+    assert!(location.starts_with("https://idp.example.com/oauth2/v1/authorize?"));
+    assert!(location.contains("client_id=hermes-hub"));
+    assert!(location.contains("response_type=code"));
+    assert!(location.contains("scope=openid%20profile%20email"));
+    assert!(location.contains("redirect_uri=http%3A%2F%2Flocalhost%2Fapi%2Fauth%2Foidc%2Fcallback"));
+    assert!(location.contains("state="));
+    assert!(location.contains("nonce="));
+}
+
+#[tokio::test]
+async fn oidc_start_uses_forwarded_origin_for_redirect_uri() {
+    let app = test_app();
+    bootstrap_admin(&app).await;
+    let admin_cookie = login(&app, "admin@example.com", "admin-password-123").await;
+
+    let update = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/system-settings",
+        json!({
+            "max_sessions_per_user": 20,
+            "oidc": {
+                "enabled": true,
+                "display_name": "Acme SSO",
+                "client_id": "hermes-hub",
+                "client_secret": "oidc-secret",
+                "authorization_url": "https://idp.example.com/oauth2/v1/authorize",
+                "token_url": "https://idp.example.com/oauth2/v1/token",
+                "userinfo_url": "https://idp.example.com/oauth2/v1/userinfo",
+                "scopes": "openid profile email",
+                "email_claim": "email",
+                "username_claim": "preferred_username",
+                "allow_password_login": true,
+                "auto_create_users": true
+            }
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+
+    let response = request_empty_with_headers(
+        &app,
+        Method::GET,
+        "/api/auth/oidc/start",
+        &[("host", "hub.example.com"), ("x-forwarded-proto", "https")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .expect("redirect location")
+        .to_str()
+        .expect("location is valid");
+
+    assert!(location
+        .contains("redirect_uri=https%3A%2F%2Fhub.example.com%2Fapi%2Fauth%2Foidc%2Fcallback"));
+}
+
+#[tokio::test]
+async fn oidc_callback_exchanges_code_creates_user_and_sets_session_cookie() {
+    let provider_base_url = spawn_oidc_provider_server().await;
+    let app = test_app();
+    bootstrap_admin(&app).await;
+    let admin_cookie = login(&app, "admin@example.com", "admin-password-123").await;
+
+    let update = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/system-settings",
+        json!({
+            "max_sessions_per_user": 20,
+            "oidc": {
+                "enabled": true,
+                "display_name": "Acme SSO",
+                "client_id": "hermes-hub",
+                "client_secret": "oidc-secret",
+                "authorization_url": format!("{provider_base_url}/authorize"),
+                "token_url": format!("{provider_base_url}/token"),
+                "userinfo_url": format!("{provider_base_url}/userinfo"),
+                "scopes": "openid profile email",
+                "email_claim": "email",
+                "username_claim": "preferred_username",
+                "allow_password_login": true,
+                "auto_create_users": true
+            }
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+
+    let start = request_empty(&app, Method::GET, "/api/auth/oidc/start", None).await;
+    assert_eq!(start.status(), StatusCode::FOUND);
+    let state_cookie = cookie_from(&start);
+    let state = state_cookie
+        .split_once('=')
+        .map(|(_, value)| value)
+        .expect("state cookie has a value");
+
+    let callback = request_empty(
+        &app,
+        Method::GET,
+        &format!("/api/auth/oidc/callback?code=auth-code&state={state}"),
+        Some(&state_cookie),
+    )
+    .await;
+    assert_eq!(callback.status(), StatusCode::FOUND);
+    assert_eq!(
+        callback
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/")
+    );
+    let session_cookie = cookie_from(&callback);
+
+    let me = request_empty(&app, Method::GET, "/api/auth/me", Some(&session_cookie)).await;
+    let (status, body) = response_json(me).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["user"]["email"], "oidc-user@example.com");
+    assert_eq!(body["user"]["role"], "user");
+}
+
 async fn create_invite(app: &Router, admin_cookie: &str, expires_at: u64, max_uses: u32) -> Value {
     let response = request_json(
         app,
@@ -140,6 +326,44 @@ async fn create_invite(app: &Router, admin_cookie: &str, expires_at: u64, max_us
 
     assert_eq!(status, StatusCode::CREATED);
     value
+}
+
+async fn spawn_oidc_provider_server() -> String {
+    let app = Router::new()
+        .route("/token", post(oidc_token_handler))
+        .route("/userinfo", get(oidc_userinfo_handler));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test OIDC provider can bind");
+    let addr = listener.local_addr().expect("test OIDC provider addr");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("test OIDC provider server runs");
+    });
+
+    format!("http://{addr}")
+}
+
+async fn oidc_token_handler() -> Json<Value> {
+    Json(json!({
+        "access_token": "access-token",
+        "token_type": "Bearer"
+    }))
+}
+
+async fn oidc_userinfo_handler(headers: HeaderMap) -> Json<Value> {
+    assert_eq!(
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer access-token")
+    );
+    Json(json!({
+        "email": "oidc-user@example.com",
+        "preferred_username": "oidc-user"
+    }))
 }
 
 async fn configure_required_model_configs(app: &Router, admin_cookie: &str) {

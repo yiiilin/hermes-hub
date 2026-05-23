@@ -181,15 +181,23 @@ pub async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<User
     Ok(user)
 }
 
-fn session_cookie(cookie_name: &str, session_token: &str) -> String {
+pub fn session_cookie(cookie_name: &str, session_token: &str) -> String {
     format!("{cookie_name}={session_token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800")
 }
 
 fn clear_session_cookie(cookie_name: &str) -> String {
+    clear_cookie(cookie_name)
+}
+
+pub fn clear_cookie(cookie_name: &str) -> String {
     format!("{cookie_name}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
 }
 
 fn session_token_from_headers(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
+    cookie_value_from_headers(headers, cookie_name)
+}
+
+pub fn cookie_value_from_headers(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
     let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
 
     cookie_header

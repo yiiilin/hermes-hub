@@ -43,9 +43,10 @@ describe("App", () => {
   }
 
   function expectPendingLoader() {
-    expect(document.querySelector(".typing-indicator .typing-dots")).toBeInTheDocument();
-    expect(screen.queryByText("Hermes is typing")).not.toBeInTheDocument();
-    expect(screen.queryByText("Hermes is responding")).not.toBeInTheDocument();
+    const indicator = document.querySelector(".message-bubble.assistant.pending .typing-indicator");
+    expect(indicator?.querySelector(".typing-dots")).toBeInTheDocument();
+    expect(indicator).not.toHaveTextContent("Hermes is typing");
+    expect(indicator).not.toHaveTextContent("Hermes is responding");
   }
 
   function expectNoPendingLoader() {
@@ -434,6 +435,25 @@ describe("App", () => {
     expect(await screen.findByRole("heading", { name: "System settings" })).toBeInTheDocument();
     const maxSessionsInput = screen.getByLabelText("Max sessions per user");
     fireEvent.change(maxSessionsInput, { target: { value: "12" } });
+    fireEvent.click(screen.getByLabelText("Enable OIDC"));
+    fireEvent.change(screen.getByLabelText("OIDC display name"), {
+      target: { value: "Acme SSO" },
+    });
+    fireEvent.change(screen.getByLabelText("OIDC client ID"), {
+      target: { value: "hermes-hub" },
+    });
+    fireEvent.change(screen.getByLabelText("OIDC client secret"), {
+      target: { value: "oidc-secret" },
+    });
+    fireEvent.change(screen.getByLabelText("OIDC authorization URL"), {
+      target: { value: "https://idp.example.com/oauth2/v1/authorize" },
+    });
+    fireEvent.change(screen.getByLabelText("OIDC token URL"), {
+      target: { value: "https://idp.example.com/oauth2/v1/token" },
+    });
+    fireEvent.change(screen.getByLabelText("OIDC userinfo URL"), {
+      target: { value: "https://idp.example.com/oauth2/v1/userinfo" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
     expect(await screen.findByText("Settings saved")).toBeInTheDocument();
 
@@ -797,7 +817,7 @@ describe("App", () => {
     });
   });
 
-  it("keeps live tool calls complete but truncates long tool results", async () => {
+  it("truncates long execution parameters and shows the header typing state", async () => {
     const deferred = createDeferred<void>();
     const longToolCall = "write report " + "x".repeat(60);
     const longToolResult = "result " + "y".repeat(60);
@@ -817,16 +837,40 @@ describe("App", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
-    expect(await screen.findByText(`call terminal：${longToolCall}`)).toBeInTheDocument();
+    const expectedCall = `call terminal：${Array.from(longToolCall).slice(0, 50).join("")}…`;
+    expect(await screen.findByText(expectedCall)).toBeInTheDocument();
+    expect(screen.queryByText(`call terminal：${longToolCall}`)).not.toBeInTheDocument();
     const expectedResult = `completed terminal：${Array.from(longToolResult).slice(0, 50).join("")}…`;
     expect(screen.getByText(expectedResult)).toBeInTheDocument();
     expect(screen.queryByText(`completed terminal：${longToolResult}`)).not.toBeInTheDocument();
+    expect(screen.getByText("Hermes is typing")).toBeInTheDocument();
     const pendingBubble = document.querySelector(".message-bubble.assistant.pending");
     expect(pendingBubble?.lastElementChild).toHaveClass("typing-indicator");
 
     deferred.resolve();
     await waitFor(() => {
       expect(screen.getByText("done")).toBeInTheDocument();
+    });
+  });
+
+  it("shows the header typing state while restoring an active run", async () => {
+    const client = createMockApiClient({
+      activeRunsBySessionId: {
+        "session-1": {
+          run_id: "hub-run-restored",
+          status: "running",
+          created_at: Date.now(),
+          updated_at: Date.now(),
+        },
+      },
+    });
+
+    render(<App apiClient={client} />);
+
+    expect(await screen.findByText("Hermes is typing")).toBeInTheDocument();
+    await waitFor(() => {
+      const pendingBubble = document.querySelector(".message-bubble.assistant.pending");
+      expect(pendingBubble?.lastElementChild).toHaveClass("typing-indicator");
     });
   });
 
@@ -1385,6 +1429,21 @@ describe("App", () => {
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "New chat" })).toBeInTheDocument();
     });
+  });
+
+  it("shows OIDC sign-in when it is enabled", async () => {
+    const client = createMockApiClient({
+      initialUser: null,
+      oidcPublicConfig: {
+        enabled: true,
+        display_name: "Acme SSO",
+      },
+    });
+
+    render(<App apiClient={client} />);
+
+    const oidcButton = await screen.findByRole("link", { name: "Sign in with Acme SSO" });
+    expect(oidcButton).toHaveAttribute("href", "/api/auth/oidc/start");
   });
 
   it("shows the first-user registration form without the app sidebar", async () => {

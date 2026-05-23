@@ -1,4 +1,4 @@
-import type { ApiClient, User } from "../api/client";
+import type { ApiClient, OidcPublicConfig, User } from "../api/client";
 import { useI18n } from "../i18n";
 import { Bot } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useState } from "react";
@@ -22,6 +22,7 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
+  const [oidc, setOidc] = useState<OidcPublicConfig | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const isRegistering = mode !== "login";
@@ -36,9 +37,11 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
       };
     }
 
-    void apiClient
-      .bootstrapStatus()
-      .then((status) => {
+    void Promise.all([apiClient.bootstrapStatus(), apiClient.oidcConfig()])
+      .then(([status, oidcConfig]) => {
+        if (alive) {
+          setOidc(oidcConfig);
+        }
         if (alive && status.bootstrap_open) {
           setMode("bootstrap");
         }
@@ -149,6 +152,11 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
                   : t("auth.signIn")}
           </button>
         </form>
+        {!isRegistering && oidc?.enabled ? (
+          <a className="oidc-button" href="/api/auth/oidc/start">
+            {t("auth.signInWith", { provider: oidc.display_name })}
+          </a>
+        ) : null}
         {!inviteToken && !checkingBootstrap ? (
           <button
             type="button"

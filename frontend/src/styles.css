@@ -322,6 +322,19 @@ nav,
   margin: -8px 0 4px;
 }
 
+.oidc-button {
+  align-items: center;
+  background: #132026;
+  border: 1px solid #132026;
+  border-radius: 6px;
+  color: #ffffff;
+  display: inline-flex;
+  justify-content: center;
+  min-height: 40px;
+  padding: 8px 10px;
+  text-decoration: none;
+}
+
 .grid-section {
   display: grid;
   gap: 20px;
@@ -384,6 +397,32 @@ label {
   display: grid;
   font-size: 14px;
   gap: 6px;
+}
+
+.form-section {
+  border: 1px solid #dfe5e8;
+  border-radius: 8px;
+  display: grid;
+  gap: 12px;
+  margin: 4px 0 0;
+  padding: 14px;
+}
+
+.form-section legend {
+  color: #41545b;
+  font-weight: 700;
+  padding: 0 6px;
+}
+
+.checkbox-row {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.checkbox-row input {
+  min-height: 0;
+  width: auto;
 }
 
 input,
@@ -780,6 +819,22 @@ td {
   color: #102027;
   font-size: 19px;
   line-height: 1.25;
+}
+
+.chat-title-row {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  min-width: 0;
+}
+
+.header-typing {
+  align-items: center;
+  color: #55707a;
+  display: inline-flex;
+  font-size: 13px;
+  gap: 7px;
 }
 
 .message-list {

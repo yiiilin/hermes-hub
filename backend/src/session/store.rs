@@ -23,6 +23,7 @@ const SESSION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_MAX_SESSIONS_PER_USER: u32 = 20;
 const MAX_CONFIGURABLE_SESSIONS_PER_USER: u32 = 500;
 const MAX_SESSIONS_PER_USER_KEY: &str = "max_sessions_per_user";
+const OIDC_SETTINGS_KEY: &str = "oidc";
 
 #[derive(Clone)]
 pub struct SessionStore {
@@ -71,15 +72,60 @@ impl Default for StoreInner {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 pub struct SystemSettings {
     pub max_sessions_per_user: u32,
+    #[serde(default)]
+    pub oidc: OidcSettings,
+}
+
+/// 管理员可配置的 OIDC 参数。字段名尽量贴近 Outline 的环境变量语义，
+/// 但放在系统设置中，便于运行时调整。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct OidcSettings {
+    pub enabled: bool,
+    pub display_name: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub issuer_url: String,
+    pub authorization_url: String,
+    pub token_url: String,
+    pub userinfo_url: String,
+    pub logout_url: String,
+    pub scopes: String,
+    pub username_claim: String,
+    pub email_claim: String,
+    pub allow_password_login: bool,
+    pub auto_create_users: bool,
 }
 
 impl Default for SystemSettings {
     fn default() -> Self {
         Self {
             max_sessions_per_user: DEFAULT_MAX_SESSIONS_PER_USER,
+            oidc: OidcSettings::default(),
+        }
+    }
+}
+
+impl Default for OidcSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            display_name: "OpenID Connect".to_string(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            issuer_url: String::new(),
+            authorization_url: String::new(),
+            token_url: String::new(),
+            userinfo_url: String::new(),
+            logout_url: String::new(),
+            scopes: "openid profile email".to_string(),
+            username_claim: "preferred_username".to_string(),
+            email_claim: "email".to_string(),
+            allow_password_login: true,
+            auto_create_users: true,
         }
     }
 }
@@ -333,6 +379,50 @@ impl SessionStore {
 
                 Ok(user)
             }),
+        }
+    }
+
+    pub async fn user_by_email(&self, email: &str) -> Result<Option<User>, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let email = normalize_email(email);
+                Ok(inner
+                    .user_ids_by_email
+                    .get(&email)
+                    .and_then(|user_id| inner.users_by_id.get(user_id))
+                    .cloned())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => postgres_user_by_email(pool, email).await,
+        }
+    }
+
+    pub async fn get_or_create_oidc_user(
+        &self,
+        email: &str,
+        auto_create: bool,
+    ) -> Result<User, StoreError> {
+        if let Some(user) = self.user_by_email(email).await? {
+            if user.status == UserStatus::Active {
+                return Ok(user);
+            }
+            return Err(StoreError::InvalidCredentials);
+        }
+
+        if !auto_create {
+            return Err(StoreError::InvalidCredentials);
+        }
+
+        // OIDC 用户不使用密码登录；这里生成不可猜测占位密码哈希，保持现有 users 表结构。
+        let placeholder_password = format!("oidc:{}", Uuid::new_v4());
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                inner.create_user(email, &placeholder_password, UserRole::User)
+            }
+            SessionStoreBackend::Postgres { pool, .. } => {
+                postgres_create_user(pool, email, &placeholder_password, UserRole::User).await
+            }
         }
     }
 
@@ -860,7 +950,7 @@ impl SessionStore {
                 let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
                 Ok(inner.system_settings.clone())
             }
-            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+            SessionStoreBackend::Postgres { pool, cipher } => block_on_db(async {
                 let value = sqlx::query("select value from system_settings where key = $1")
                     .bind(MAX_SESSIONS_PER_USER_KEY)
                     .fetch_optional(pool)
@@ -870,8 +960,23 @@ impl SessionStore {
                     .and_then(|value| value.parse::<u32>().ok())
                     .unwrap_or(DEFAULT_MAX_SESSIONS_PER_USER);
 
+                let oidc = sqlx::query("select value from system_settings where key = $1")
+                    .bind(OIDC_SETTINGS_KEY)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?
+                    .and_then(|row| row.try_get::<String, _>("value").ok())
+                    .map(|value| {
+                        serde_json::from_str::<OidcSettings>(&value)
+                            .map_err(|_| StoreError::DatabaseFailed)
+                            .and_then(|settings| decrypt_oidc_settings(settings, cipher))
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+
                 Ok(SystemSettings {
                     max_sessions_per_user: value,
+                    oidc,
                 })
             }),
         }
@@ -888,7 +993,8 @@ impl SessionStore {
                 inner.system_settings = settings.clone();
                 Ok(settings)
             }
-            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+            SessionStoreBackend::Postgres { pool, cipher } => block_on_db(async {
+                let stored_oidc = encrypted_oidc_settings(&settings.oidc, cipher);
                 sqlx::query(
                     r#"
                     insert into system_settings (key, value, updated_at)
@@ -900,6 +1006,21 @@ impl SessionStore {
                 )
                 .bind(MAX_SESSIONS_PER_USER_KEY)
                 .bind(settings.max_sessions_per_user.to_string())
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                sqlx::query(
+                    r#"
+                    insert into system_settings (key, value, updated_at)
+                    values ($1, $2, now())
+                    on conflict (key) do update set
+                        value = excluded.value,
+                        updated_at = now()
+                    "#,
+                )
+                .bind(OIDC_SETTINGS_KEY)
+                .bind(serde_json::to_string(&stored_oidc).map_err(|_| StoreError::DatabaseFailed)?)
                 .execute(pool)
                 .await
                 .map_err(|_| StoreError::DatabaseFailed)?;
@@ -991,8 +1112,47 @@ fn validate_system_settings(settings: &SystemSettings) -> Result<(), StoreError>
     {
         return Err(StoreError::InvalidSystemSettings);
     }
+    if settings.oidc.enabled {
+        let oidc = &settings.oidc;
+        if oidc.client_id.trim().is_empty()
+            || oidc.client_secret.trim().is_empty()
+            || oidc.authorization_url.trim().is_empty()
+            || oidc.token_url.trim().is_empty()
+            || oidc.userinfo_url.trim().is_empty()
+            || oidc.email_claim.trim().is_empty()
+        {
+            return Err(StoreError::InvalidSystemSettings);
+        }
+    }
 
     Ok(())
+}
+
+fn encrypted_oidc_settings(settings: &OidcSettings, cipher: &SecretCipher) -> OidcSettings {
+    let mut stored = settings.clone();
+    if !stored.client_secret.is_empty() {
+        stored.client_secret = encrypt_secret(cipher, &stored.client_secret);
+    }
+    stored
+}
+
+fn decrypt_oidc_settings(
+    mut settings: OidcSettings,
+    cipher: &SecretCipher,
+) -> Result<OidcSettings, StoreError> {
+    if looks_like_encrypted_secret(&settings.client_secret) {
+        settings.client_secret = decrypt_secret(cipher, &settings.client_secret)
+            .map_err(|_| StoreError::SecretFailed)?;
+    }
+    Ok(settings)
+}
+
+fn looks_like_encrypted_secret(value: &str) -> bool {
+    let mut parts = value.split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some("v1"), Some(_), Some(_), None)
+    )
 }
 
 impl StoreInner {
@@ -1233,6 +1393,15 @@ where
     .map_err(|_| StoreError::DatabaseFailed)?;
 
     Ok(user)
+}
+
+async fn postgres_create_user(
+    pool: &PgPool,
+    email: &str,
+    password: &str,
+    role: UserRole,
+) -> Result<User, StoreError> {
+    postgres_create_user_with_executor(pool, email, password, role).await
 }
 
 async fn postgres_user_id_by_email_with_executor<'e, E>(

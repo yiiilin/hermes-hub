@@ -933,8 +933,18 @@ export function ChannelSessionRoute({
     <section className="chat-workspace">
       <main className="chat-panel" aria-labelledby="chat-title">
         <header className="chat-header">
-          <div>
+          <div className="chat-title-row">
             <h2 id="chat-title">{selectedSession?.title ?? t("chat.newConversation")}</h2>
+            {runInProgress ? (
+              <span className="header-typing" aria-live="polite">
+                <span className="typing-dots" aria-hidden="true">
+                  <i />
+                  <i />
+                  <i />
+                </span>
+                {t("chat.typing")}
+              </span>
+            ) : null}
           </div>
           <button type="button" className="secondary" onClick={() => void refreshWorkspace()}>
             <RefreshCw aria-hidden="true" size={16} />
@@ -1170,6 +1180,16 @@ function compactExecutionDisplayLine(message: string) {
 }
 
 function compactToolResultDetail(message: string) {
+  const normalized = message.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return "";
+  }
+
+  const chars = Array.from(normalized);
+  return chars.length > 50 ? `${chars.slice(0, 50).join("")}…` : normalized;
+}
+
+function compactToolParameterDetail(message: string) {
   const normalized = message.replace(/\s+/g, " ").trim();
   if (!normalized) {
     return "";
@@ -1657,7 +1677,7 @@ function formatExecutionEntry(event: ExecutionHistoryEntry, t: Translate) {
     );
   }
   if (event.kind === "tool.call") {
-    return joinExecutionParts(`${t("execution.call")} ${tool}`, detail);
+    return joinExecutionParts(`${t("execution.call")} ${tool}`, compactToolParameterDetail(detail));
   }
   if (event.kind === "tool.completed") {
     const action = event.failed ? t("execution.failed") : t("execution.completed");

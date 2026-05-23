@@ -130,10 +130,7 @@ struct SystemSettingsResponse {
     settings: SystemSettings,
 }
 
-#[derive(Deserialize)]
-struct UpdateSystemSettingsRequest {
-    max_sessions_per_user: u32,
-}
+type UpdateSystemSettingsRequest = SystemSettings;
 
 #[derive(Deserialize)]
 struct BindExternalHermesRequest {
@@ -548,9 +545,7 @@ async fn update_system_settings(
 
     state
         .store
-        .update_system_settings(SystemSettings {
-            max_sessions_per_user: payload.max_sessions_per_user,
-        })
+        .update_system_settings(payload)
         .await
         .map_err(|_| ApiError::BadRequest("invalid system settings"))?;
 

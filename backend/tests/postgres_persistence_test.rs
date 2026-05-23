@@ -17,12 +17,12 @@ use hermes_hub_backend::{
     llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
     model_config::{ModelConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND},
     security::crypto::SecretCipher,
-    session::store::SessionStore,
+    session::store::{OidcSettings, SessionStore, SystemSettings},
     storage::InMemoryObjectStorage,
     AppConfig, AppState,
 };
 use serde_json::{json, Value};
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -1090,15 +1090,41 @@ async fn postgres_system_settings_persist_session_limit() {
     );
 
     store
-        .update_system_settings(hermes_hub_backend::session::store::SystemSettings {
+        .update_system_settings(SystemSettings {
             max_sessions_per_user: 7,
+            oidc: OidcSettings {
+                enabled: true,
+                display_name: "Acme SSO".to_string(),
+                client_id: "hermes-hub".to_string(),
+                client_secret: "oidc-secret".to_string(),
+                issuer_url: "https://idp.example.com".to_string(),
+                authorization_url: "https://idp.example.com/oauth2/v1/authorize".to_string(),
+                token_url: "https://idp.example.com/oauth2/v1/token".to_string(),
+                userinfo_url: "https://idp.example.com/oauth2/v1/userinfo".to_string(),
+                logout_url: "https://idp.example.com/logout".to_string(),
+                scopes: "openid profile email".to_string(),
+                username_claim: "preferred_username".to_string(),
+                email_claim: "email".to_string(),
+                allow_password_login: true,
+                auto_create_users: true,
+            },
         })
         .await
         .expect("settings can be updated");
+
+    let stored_oidc: String = sqlx::query("select value from system_settings where key = 'oidc'")
+        .fetch_one(&pool)
+        .await
+        .expect("stored oidc settings can be read")
+        .try_get("value")
+        .expect("stored oidc settings include value");
+    assert!(!stored_oidc.contains("oidc-secret"));
+    assert!(stored_oidc.contains(r#""client_secret":"v1."#));
 
     let reloaded = SessionStore::postgres(pool, cipher)
         .system_settings()
         .await
         .expect("settings can be reloaded");
     assert_eq!(reloaded.max_sessions_per_user, 7);
+    assert_eq!(reloaded.oidc.client_secret, "oidc-secret");
 }
