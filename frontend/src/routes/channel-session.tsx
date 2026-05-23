@@ -1,14 +1,12 @@
 import type {
   ApiClient,
-  Channel,
   ChannelMessage,
   ChannelRun,
   ChannelSessionEvent,
-  ChannelSession,
   HermesActiveRun,
   HermesAttachment,
-  HermesInstance,
   HermesVerboseEvent,
+  SessionSummary,
 } from "../api/client";
 import { ApiRequestError } from "../api/client";
 import { useChatSidebar, useSidebarCollapsed } from "../components/layout";
@@ -59,12 +57,10 @@ export function ChannelSessionRoute({
   const { t } = useI18n();
   const setChatSidebar = useChatSidebar();
   const sidebarCollapsed = useSidebarCollapsed();
-  const [channel, setChannel] = useState<Channel | null>(null);
-  const [sessions, setSessions] = useState<ChannelSession[]>([]);
-  const [selectedSession, setSelectedSession] = useState<ChannelSession | null>(null);
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [selectedSession, setSelectedSession] = useState<SessionSummary | null>(null);
   const [seenSessionUpdates, setSeenSessionUpdates] = useState<Record<string, number>>({});
   const [unreadSessionIds, setUnreadSessionIds] = useState<Set<string>>(() => new Set());
-  const [instance, setInstance] = useState<HermesInstance | null>(null);
   const [messages, setMessages] = useState<ChannelMessage[]>([]);
   const [prompt, setPrompt] = useState("");
   const [attachments, setAttachments] = useState<HermesAttachment[]>([]);
@@ -79,10 +75,8 @@ export function ChannelSessionRoute({
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
-  const attachedRunIdsRef = useRef<Set<string>>(new Set());
   const pendingAssistantIdsByRunRef = useRef<Record<string, string>>({});
   const verboseEventsRef = useRef<Record<string, ExecutionHistoryEntry[]>>({});
-  const executionMessageIdsRef = useRef<Record<string, string>>({});
   const executionPersistQueueRef = useRef<Record<string, Promise<ChannelMessage | null>>>({});
   const selectedSessionIdRef = useRef<string | null>(null);
   const activeRunRef = useRef<HermesActiveRun | null>(null);
@@ -126,68 +120,53 @@ export function ChannelSessionRoute({
     schedule(() => composerInputRef.current?.focus());
   }
 
-  async function refreshWorkspace() {
+  async function refreshSessions() {
     setError(null);
     try {
-      const [channels, nextInstance] = await Promise.all([
-        apiClient.listChannels(),
-        apiClient.workspaceStatus(),
-      ]);
-      const hubChannel = channels.find((item) => item.name === "hermes-hub") ?? channels[0];
-      setChannel(hubChannel ?? null);
-      setInstance(nextInstance);
-
-      if (hubChannel) {
-        const nextSessions = await apiClient.listSessions(hubChannel.id);
-        const selectedSessionId = selectedSession?.id;
-        const nextSessionIds = new Set(nextSessions.map((session) => session.id));
-        setSessions(nextSessions);
-        setUnreadSessionIds((current) => {
-          const next = new Set(current);
-          for (const session of nextSessions) {
-            const lastSeen = seenSessionUpdates[session.id];
-            if (
-              lastSeen !== undefined &&
-              sessionUpdatedAt(session) > lastSeen &&
-              session.id !== selectedSessionId
-            ) {
-              next.add(session.id);
-            }
+      const nextSessions = await apiClient.listSessionsPublic();
+      const selectedSessionId = selectedSession?.id;
+      const nextSessionIds = new Set(nextSessions.map((session) => session.id));
+      setSessions(nextSessions);
+      setUnreadSessionIds((current) => {
+        const next = new Set(current);
+        for (const session of nextSessions) {
+          const lastSeen = seenSessionUpdates[session.id];
+          if (
+            lastSeen !== undefined &&
+            sessionUpdatedAt(session) > lastSeen &&
+            session.id !== selectedSessionId
+          ) {
+            next.add(session.id);
           }
-          for (const sessionId of next) {
-            if (!nextSessionIds.has(sessionId) || sessionId === selectedSessionId) {
-              next.delete(sessionId);
-            }
-          }
-          return next;
-        });
-
-        setSeenSessionUpdates((current) => {
-          const next = { ...current };
-          for (const session of nextSessions) {
-            if (next[session.id] === undefined || session.id === selectedSessionId) {
-              next[session.id] = sessionUpdatedAt(session);
-            }
-          }
-          return next;
-        });
-
-        const nextSelected = selectedSessionId
-          ? nextSessions.find((session) => session.id === selectedSessionId) ?? null
-          : nextSessions[0] ?? null;
-        selectedSessionIdRef.current = nextSelected?.id ?? null;
-        setSelectedSession(nextSelected);
-        if (nextSelected) {
-          const nextMessages = await apiClient.listSessionMessages(hubChannel.id, nextSelected.id);
-          setMessages(nextMessages);
-          hydrateExecutionHistory(nextSelected.id, nextMessages);
-          await restoreActiveRun(hubChannel.id, nextSelected, nextMessages);
-        } else {
-          setMessages([]);
-          setActiveRun(null);
-          clearPendingAssistantMessage();
-          resetVerboseEvents();
         }
+        for (const sessionId of next) {
+          if (!nextSessionIds.has(sessionId) || sessionId === selectedSessionId) {
+            next.delete(sessionId);
+          }
+        }
+        return next;
+      });
+
+      setSeenSessionUpdates((current) => {
+        const next = { ...current };
+        for (const session of nextSessions) {
+          if (next[session.id] === undefined || session.id === selectedSessionId) {
+            next[session.id] = sessionUpdatedAt(session);
+          }
+        }
+        return next;
+      });
+
+      const nextSelected = selectedSessionId
+        ? nextSessions.find((session) => session.id === selectedSessionId) ?? null
+        : nextSessions[0] ?? null;
+      selectedSessionIdRef.current = nextSelected?.id ?? null;
+      setSelectedSession(nextSelected);
+      if (!nextSelected) {
+        setMessages([]);
+        setActiveRun(null);
+        clearPendingAssistantMessage();
+        resetVerboseEvents();
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("chat.workspaceLoadFailed"));
@@ -195,27 +174,26 @@ export function ChannelSessionRoute({
   }
 
   useEffect(() => {
-    void refreshWorkspace();
+    void refreshSessions();
   }, []);
 
   useEffect(() => {
-    if (!active || !channel || !selectedSession) {
+    if (!active || !selectedSession) {
       return;
     }
 
     const session = selectedSession;
     // 浏览器只订阅当前激活会话的 room；断线后 EventSource 自动重连，重连首包会重新同步历史。
-    return apiClient.subscribeSessionEvents(
-      channel.id,
+    return apiClient.subscribeSessionEventsPublic(
       session.id,
       (event) => {
-        void handleSessionEvent(channel.id, session, event);
+        void handleSessionEvent(session, event);
       },
       () => {
         // EventSource 会自动重连。这里不设置页面错误，避免切后台/刷新造成 load failed 假错误。
       },
     );
-  }, [active, apiClient, channel?.id, selectedSession?.id]);
+  }, [active, apiClient, selectedSession?.id]);
 
   useEffect(() => {
     const node = messageListRef.current;
@@ -260,13 +238,10 @@ export function ChannelSessionRoute({
     );
 
     return () => setChatSidebar?.(null);
-  }, [channel, sessions, selectedSession, setChatSidebar, sidebarCollapsed, t, unreadSessionIds]);
+  }, [sessions, selectedSession, setChatSidebar, sidebarCollapsed, t, unreadSessionIds]);
 
   async function createSession() {
-    if (!channel) {
-      return null;
-    }
-    const session = await apiClient.createSession(channel.id, "agent");
+    const session = await apiClient.createSessionPublic("agent");
     setSessions((current) => [session, ...current]);
     selectedSessionIdRef.current = session.id;
     setSelectedSession(session);
@@ -297,10 +272,16 @@ export function ChannelSessionRoute({
     }
   }
 
-  async function selectSession(session: ChannelSession) {
-    if (!channel) {
+  async function selectSession(session: SessionSummary) {
+    if (selectedSessionIdRef.current === session.id) {
+      setSeenSessionUpdates((current) => ({
+        ...current,
+        [session.id]: sessionUpdatedAt(session),
+      }));
+      setUnreadSessionIds((current) => withoutSession(current, session.id));
       return;
     }
+
     selectedSessionIdRef.current = session.id;
     setSelectedSession(session);
     clearPendingAssistantMessage();
@@ -312,28 +293,20 @@ export function ChannelSessionRoute({
     }));
     setUnreadSessionIds((current) => withoutSession(current, session.id));
     stickToBottomRef.current = true;
-    const nextMessages = await apiClient.listSessionMessages(channel.id, session.id);
-    if (selectedSessionIdRef.current !== session.id) {
-      return;
-    }
-    setMessages(nextMessages);
-    hydrateExecutionHistory(session.id, nextMessages);
-    await restoreActiveRun(channel.id, session, nextMessages);
+    setMessages([]);
   }
 
-  async function selectSidebarSession(session: ChannelSession) {
+  async function selectSidebarSession(session: SessionSummary) {
     onOpenChat?.();
     await selectSession(session);
   }
 
   async function restoreActiveRun(
-    channelId: string,
-    session: ChannelSession,
+    session: SessionSummary,
     currentMessages: ChannelMessage[],
     knownRun?: HermesActiveRun | null,
   ) {
-    const run =
-      knownRun === undefined ? await apiClient.activeHermesRun(channelId, session.id) : knownRun;
+    const run = knownRun ?? null;
     if (selectedSessionIdRef.current !== session.id) {
       return;
     }
@@ -344,8 +317,7 @@ export function ChannelSessionRoute({
       return;
     }
     if (!isHubRunId(run.run_id)) {
-      // Hub 对话只能恢复 channel_runs 产生的 hub-run；原生 Hermes run 不能进入聊天状态机。
-      await apiClient.clearHermesRun(channelId, session.id);
+      // 只接受 Hub 规范的 run id；其他来源的状态不进入聊天态。
       setActiveRun(null);
       clearPendingAssistantMessage();
       resetVerboseEvents();
@@ -354,33 +326,23 @@ export function ChannelSessionRoute({
 
     setActiveRun(run);
     if (isTerminalHermesRun(run)) {
-      await persistTerminalRun(channelId, session.id, run, currentMessages);
-      await apiClient.clearHermesRun(channelId, session.id);
-      attachedRunIdsRef.current.delete(run.run_id);
-      delete pendingAssistantIdsByRunRef.current[run.run_id];
-      if (selectedSessionIdRef.current === session.id) {
-        setActiveRun(null);
-        clearPendingAssistantMessage();
-        resetVerboseEvents();
-      }
-      clearExecutionHistory(session.id);
+      await persistTerminalRun(session.id, run, currentMessages);
+      clearPendingAssistantMessage();
+      resetVerboseEvents();
       return;
     }
 
-    resumeAdapterRun(channelId, session.id, run);
+    resumeAdapterRun(session.id, run);
   }
 
-  function resumeAdapterRun(channelId: string, sessionId: string, run: HermesActiveRun) {
-    void channelId;
+  function resumeAdapterRun(sessionId: string, run: HermesActiveRun) {
     const attachedPendingId = pendingAssistantIdsByRunRef.current[run.run_id];
     const assistantMessageId = ensurePendingAssistantPlaceholder(sessionId, run, attachedPendingId);
-    attachedRunIdsRef.current.add(run.run_id);
     pendingAssistantIdsByRunRef.current[run.run_id] = assistantMessageId;
   }
 
   async function handleSessionEvent(
-    channelId: string,
-    session: ChannelSession,
+    session: SessionSummary,
     event: ChannelSessionEvent,
   ) {
     if (selectedSessionIdRef.current !== session.id) {
@@ -390,8 +352,8 @@ export function ChannelSessionRoute({
     if (event.type === "messages_snapshot") {
       const nextMessages = sortMessagesForDisplay(event.messages);
       setMessages(nextMessages);
-      hydrateExecutionHistory(session.id, nextMessages);
-      await restoreActiveRun(channelId, session, nextMessages, event.active_run);
+      hydrateExecutionHistory(session.id, nextMessages, event.active_run);
+      await restoreActiveRun(session, nextMessages, event.active_run);
       return;
     }
 
@@ -442,32 +404,28 @@ export function ChannelSessionRoute({
       const run = activeRunFromChannelRun(event.run);
       setActiveRun(run);
       if (isTerminalHermesRun(run)) {
-        await persistTerminalRun(channelId, session.id, run, messagesRef.current);
-        await apiClient.clearHermesRun(channelId, session.id);
-        attachedRunIdsRef.current.delete(run.run_id);
+        await persistTerminalRun(session.id, run, messagesRef.current);
         delete pendingAssistantIdsByRunRef.current[run.run_id];
-        setActiveRun(null);
         clearPendingAssistantMessage();
-        resetVerboseEvents();
+        clearExecutionHistory(session.id);
       } else {
-        resumeAdapterRun(channelId, session.id, run);
+        resumeAdapterRun(session.id, run);
       }
       return;
     }
 
     if (event.type === "run_cleared") {
       if (activeRunRef.current) {
-        attachedRunIdsRef.current.delete(activeRunRef.current.run_id);
         delete pendingAssistantIdsByRunRef.current[activeRunRef.current.run_id];
       }
       setActiveRun(null);
       clearPendingAssistantMessage();
-      resetVerboseEvents();
+      clearExecutionHistory(session.id);
       return;
     }
 
     if (event.type === "session_deleted") {
-      await refreshWorkspace();
+      await refreshSessions();
     }
   }
 
@@ -497,7 +455,6 @@ export function ChannelSessionRoute({
   }
 
   async function persistTerminalRun(
-    channelId: string,
     sessionId: string,
     run: HermesActiveRun,
     currentMessages: ChannelMessage[],
@@ -506,19 +463,6 @@ export function ChannelSessionRoute({
       const outputMessage = currentMessages.find((message) => message.id === run.output_message_id);
       if (outputMessage) {
         updateMessagesForSession(sessionId, (current) => upsertMessage(current, outputMessage));
-        return;
-      }
-
-      // 最终 message_created 可能比 completed run_updated 更早、更晚，甚至被本次 SSE 连接错过。
-      // completed 事件已经给出了 output_message_id 时，主动拉一次历史，才能拿到附件等完整字段。
-      const latestMessages = await apiClient.listSessionMessages(channelId, sessionId);
-      const latestOutputMessage = latestMessages.find(
-        (message) => message.id === run.output_message_id,
-      );
-      if (latestOutputMessage) {
-        updateMessagesForSession(sessionId, (current) =>
-          mergeMessagesById(current, [latestOutputMessage]),
-        );
         return;
       }
     }
@@ -544,14 +488,20 @@ export function ChannelSessionRoute({
       return;
     }
 
-    await persistExecutionHistoryMessage(channelId, sessionId);
-    const assistantMessage = await apiClient.appendSessionMessage(channelId, sessionId, {
+    const executionMessage = await persistExecutionHistoryMessage(sessionId, run.run_id);
+    const assistantMessage = await apiClient.appendSessionMessagePublic(sessionId, {
       role: "assistant",
       content,
       attachments: [],
-      clientMessageKey: hermesRunMessageKey(run.run_id),
     });
-    updateMessagesForSession(sessionId, (current) => upsertMessage(current, assistantMessage));
+    updateMessagesForSession(sessionId, (current) =>
+      completePendingRunMessages(
+        current,
+        pendingAssistantMessageIdRef.current ?? "",
+        executionMessage,
+        assistantMessage,
+      ),
+    );
   }
 
   async function sendPrompt(event: FormEvent<HTMLFormElement>) {
@@ -560,7 +510,7 @@ export function ChannelSessionRoute({
   }
 
   async function submitPrompt() {
-    if (!channel || (!prompt.trim() && attachments.length === 0)) {
+    if (!selectedSession && (!prompt.trim() && attachments.length === 0)) {
       return;
     }
 
@@ -575,9 +525,8 @@ export function ChannelSessionRoute({
     stickToBottomRef.current = true;
     // 发送后立即把焦点还给输入框，Hermes 回复时用户也可以继续写下一条草稿。
     focusComposerInputSoon();
-    let sessionForRequest: ChannelSession | null = null;
+    let sessionForRequest: SessionSummary | null = null;
     let assistantMessageId: string | null = null;
-    let runIdForRequest: string | null = null;
     const userMessageKey = createClientMessageId();
 
     try {
@@ -587,10 +536,6 @@ export function ChannelSessionRoute({
       }
       sessionForRequest = session;
       clearExecutionHistory(session.id);
-
-      if (!instance || instance.status !== "running") {
-        setInstance(await apiClient.ensureHermes());
-      }
 
       const nextAssistantMessageId = createClientMessageId();
       assistantMessageId = nextAssistantMessageId;
@@ -607,47 +552,20 @@ export function ChannelSessionRoute({
           created_at: Date.now(),
         },
       ]);
-      const { message: userMessage, run } = await apiClient.createChannelRun(channel.id, session.id, {
+      const userMessage = await apiClient.appendSessionMessagePublic(session.id, {
+        role: "user",
         content: text,
         attachments: nextAttachments,
         clientMessageKey: userMessageKey,
       });
-      if (!isHubRunId(run.run_id)) {
-        throw new Error("invalid Hub run id");
-      }
-      runIdForRequest = run.run_id;
-      pendingAssistantIdsByRunRef.current[run.run_id] = nextAssistantMessageId;
-      attachedRunIdsRef.current.add(run.run_id);
-      if (selectedSessionIdRef.current === session.id) {
-        setActiveRun({
-          run_id: run.run_id,
-          status: run.status,
-          created_at: run.created_at ?? Date.now(),
-          updated_at: run.updated_at ?? Date.now(),
-        });
-      }
       updateMessagesForSession(session.id, (current) =>
         mergeMessagesById(current, [userMessage]),
       );
 
-      if (text && !session.title) {
-        const titled = await apiClient.generateSessionTitle(channel.id, session.id, text);
-        if (selectedSessionIdRef.current === session.id) {
-          setSelectedSession(titled);
-        }
-        setSeenSessionUpdates((current) => ({
-          ...current,
-          [titled.id]: sessionUpdatedAt(titled),
-        }));
-        setSessions((current) =>
-          current.map((item) => (item.id === titled.id ? titled : item)),
-        );
-      }
     } catch (cause) {
       const message = hermesRunErrorMessage(cause, t("chat.requestFailed"), t);
       if (sessionForRequest && assistantMessageId) {
-        await appendHermesErrorMessage(channel.id, sessionForRequest.id, assistantMessageId, message);
-        await apiClient.clearHermesRun(channel.id, sessionForRequest.id);
+        await appendHermesErrorMessage(sessionForRequest.id, assistantMessageId, message);
       } else {
         if (!sessionForRequest || selectedSessionIdRef.current === sessionForRequest.id) {
           setError(message);
@@ -655,20 +573,21 @@ export function ChannelSessionRoute({
         }
       }
     } finally {
-      void runIdForRequest;
       setBusy(false);
     }
   }
 
   async function appendHermesErrorMessage(
-    channelId: string,
     sessionId: string,
     assistantMessageId: string,
     message: string,
   ) {
     const content = t("chat.runFailed", { message });
-    const executionMessage = await persistExecutionHistoryMessage(channelId, sessionId);
-    const assistantMessage = await apiClient.appendSessionMessage(channelId, sessionId, {
+    const executionMessage = await persistExecutionHistoryMessage(
+      sessionId,
+      activeRunRef.current?.run_id,
+    );
+    const assistantMessage = await apiClient.appendSessionMessagePublic(sessionId, {
       role: "assistant",
       content,
       attachments: [],
@@ -679,7 +598,7 @@ export function ChannelSessionRoute({
     if (selectedSessionIdRef.current === sessionId) {
       clearPendingAssistantMessage();
       setActiveRun(null);
-      resetVerboseEvents();
+      clearExecutionHistory(sessionId);
     }
     clearExecutionHistory(sessionId);
   }
@@ -694,7 +613,6 @@ export function ChannelSessionRoute({
   }
 
   async function appendVerboseEvent(
-    channelId: string,
     sessionId: string,
     message: HermesVerboseEvent | string,
   ) {
@@ -703,7 +621,7 @@ export function ChannelSessionRoute({
       return;
     }
 
-    const current = executionEventsForSession(sessionId, messages);
+    const current = currentExecutionEventsForSession(sessionId);
     if (sameExecutionEntry(current.at(-1), event)) {
       return;
     }
@@ -716,31 +634,30 @@ export function ChannelSessionRoute({
     if (selectedSessionIdRef.current === sessionId) {
       setVerboseEvents(next);
     }
-    await persistExecutionHistoryMessage(channelId, sessionId);
+    await persistExecutionHistoryMessage(sessionId, activeRunRef.current?.run_id);
   }
 
   function resetVerboseEvents() {
     setVerboseEvents([]);
   }
 
-  function executionEventsForSession(sessionId: string, sessionMessages: ChannelMessage[]) {
-    const persistedEvents = sessionMessages
-      .filter((message) => message.session_id === sessionId)
-      .flatMap((message) => executionHistoryEvents(message.content) ?? []);
-    return mergeExecutionEvents(persistedEvents, verboseEventsRef.current[sessionId] ?? []);
+  function currentExecutionEventsForSession(sessionId: string) {
+    return verboseEventsRef.current[sessionId] ?? [];
   }
 
-  function hydrateExecutionHistory(sessionId: string, sessionMessages: ChannelMessage[]) {
-    const executionMessage = [...sessionMessages]
-      .reverse()
-      .find((message) => executionHistoryEvents(message.content));
-    const currentEvents = compactRepeatedExecutionEvents(verboseEventsRef.current[sessionId] ?? []);
+  function hydrateExecutionHistory(
+    sessionId: string,
+    sessionMessages: ChannelMessage[],
+    run: HermesActiveRun | null,
+  ) {
+    const executionMessage = activeExecutionMessageForRun(sessionMessages, run);
+    const currentEvents = verboseEventsRef.current[sessionId] ?? [];
     if (currentEvents.length > 0) {
       verboseEventsRef.current[sessionId] = currentEvents;
     }
     if (!executionMessage) {
-      // 切换会话时如果当前会话还有未完成的执行过程，先保留内存中的事件，
-      // 等待异步落库完成后再由持久化内容接管，避免还没写入时被误删。
+      // 切换会话时如果当前 run 还有未完成的执行过程，先保留内存中的事件，
+      // 等待异步落库完成后再由当前 run 的持久化内容接管，避免还没写入时被误删。
       if (currentEvents.length > 0) {
         if (selectedSessionIdRef.current === sessionId) {
           setVerboseEvents(currentEvents);
@@ -748,15 +665,11 @@ export function ChannelSessionRoute({
         return;
       }
       delete verboseEventsRef.current[sessionId];
-      delete executionMessageIdsRef.current[sessionId];
       return;
     }
 
-    const persistedEvents = compactRepeatedExecutionEvents(
-      executionHistoryEvents(executionMessage.content) ?? [],
-    );
-    executionMessageIdsRef.current[sessionId] = executionMessage.id;
-    // 执行步骤可能同时来自已落库消息和当前 SSE 流；按顺序去重合并，避免切会话或刷新时丢第一条。
+    const persistedEvents = executionHistoryEvents(executionMessage.content) ?? [];
+    // 当前 run 的执行步骤可能同时来自已落库消息和当前 SSE 流；按顺序去重合并，避免切会话或刷新时丢第一条。
     const mergedEvents = mergeExecutionEvents(persistedEvents, currentEvents);
     verboseEventsRef.current[sessionId] = mergedEvents;
     if (selectedSessionIdRef.current === sessionId) {
@@ -766,66 +679,71 @@ export function ChannelSessionRoute({
 
   function clearExecutionHistory(sessionId: string) {
     delete verboseEventsRef.current[sessionId];
-    delete executionMessageIdsRef.current[sessionId];
     delete executionPersistQueueRef.current[sessionId];
     if (selectedSessionIdRef.current === sessionId) {
       setVerboseEvents([]);
     }
   }
 
-  async function persistExecutionHistoryMessage(channelId: string, sessionId: string) {
-    const events = executionEventsForSession(sessionId, messages);
+  async function persistExecutionHistoryMessage(sessionId: string, runId?: string | null) {
+    const events = currentExecutionEventsForSession(sessionId);
     const previous = executionPersistQueueRef.current[sessionId] ?? Promise.resolve(null);
     const next = previous
       .catch(() => null)
-      .then(() => persistExecutionHistoryMessageNow(channelId, sessionId, events));
+      .then(() => persistExecutionHistoryMessageNow(sessionId, events, runId));
     executionPersistQueueRef.current[sessionId] = next;
     return next;
   }
 
   async function persistExecutionHistoryMessageNow(
-    channelId: string,
     sessionId: string,
     events: ExecutionHistoryEntry[],
+    runId?: string | null,
   ) {
     if (events.length === 0) {
       return null;
     }
 
     const content = executionHistoryContent(events);
-    const messageId = executionMessageIdsRef.current[sessionId];
-    const message = messageId
-      ? await apiClient.updateSessionMessage(channelId, sessionId, messageId, {
+    const clientMessageKey = runId && isHubRunId(runId) ? hermesExecutionMessageKey(runId) : undefined;
+    const existingMessage = clientMessageKey
+      ? messagesRef.current.find(
+          (message) =>
+            message.session_id === sessionId && message.client_message_key === clientMessageKey,
+        )
+      : null;
+    const message = existingMessage
+      ? await apiClient.updateSessionMessagePublic(sessionId, existingMessage.id, {
           content,
           attachments: [],
         })
-      : await apiClient.appendSessionMessage(channelId, sessionId, {
+      : await apiClient.appendSessionMessagePublic(sessionId, {
           role: "assistant",
           content,
           attachments: [],
+          clientMessageKey,
         });
 
-    executionMessageIdsRef.current[sessionId] = message.id;
     updateMessagesForSession(sessionId, (current) => upsertExecutionMessage(current, message));
     return message;
   }
 
   async function stopCurrentRun() {
-    if (!channel || !selectedSession || !activeRun) {
+    if (!selectedSession || !activeRun) {
       return;
     }
 
-      setError(null);
+    setError(null);
     try {
       const sessionId = selectedSession.id;
-      await apiClient.stopHermesRun(channel.id, sessionId);
+      await apiClient.stopSessionRunPublic(sessionId);
       const pendingId = pendingAssistantMessageId;
       const pendingMessage = pendingId
         ? messages.find((message) => message.id === pendingId)
         : undefined;
       if (pendingId && pendingMessage?.content.trim()) {
-        const executionMessage = await persistExecutionHistoryMessage(channel.id, sessionId);
-        const assistantMessage = await apiClient.appendSessionMessage(channel.id, sessionId, {
+        const executionMessage = await persistExecutionHistoryMessage(sessionId, activeRun.run_id);
+        const assistantMessage = await apiClient.appendSessionMessagePublic(sessionId, {
           role: "assistant",
           content: pendingMessage.content,
           attachments: [],
@@ -834,7 +752,7 @@ export function ChannelSessionRoute({
           completePendingRunMessages(current, pendingId, executionMessage, assistantMessage),
         );
       } else if (pendingId) {
-        const executionMessage = await persistExecutionHistoryMessage(channel.id, sessionId);
+        const executionMessage = await persistExecutionHistoryMessage(sessionId, activeRun.run_id);
         updateMessagesForSession(sessionId, (current) => {
           const withoutPending = current.filter((message) => message.id !== pendingId);
           return executionMessage ? upsertMessage(withoutPending, executionMessage) : withoutPending;
@@ -843,9 +761,8 @@ export function ChannelSessionRoute({
       if (selectedSessionIdRef.current === sessionId) {
         clearPendingAssistantMessage();
         setActiveRun(null);
-        resetVerboseEvents();
+        clearExecutionHistory(sessionId);
       }
-      attachedRunIdsRef.current.delete(activeRun.run_id);
       delete pendingAssistantIdsByRunRef.current[activeRun.run_id];
       clearExecutionHistory(sessionId);
       setBusy(false);
@@ -854,14 +771,10 @@ export function ChannelSessionRoute({
     }
   }
 
-  async function deleteSidebarSession(session: ChannelSession) {
-    if (!channel) {
-      return;
-    }
-
+  async function deleteSidebarSession(session: SessionSummary) {
     setError(null);
     try {
-      await apiClient.deleteSession(channel.id, session.id);
+      await apiClient.deleteSessionPublic(session.id);
       const nextSessions = sessions.filter((item) => item.id !== session.id);
       setSessions(nextSessions);
       setSeenSessionUpdates((current) => {
@@ -874,13 +787,7 @@ export function ChannelSessionRoute({
         const nextSelected = nextSessions[0] ?? null;
         selectedSessionIdRef.current = nextSelected?.id ?? null;
         setSelectedSession(nextSelected);
-        const nextMessages = nextSelected
-          ? await apiClient.listSessionMessages(channel.id, nextSelected.id)
-          : [];
-        setMessages(nextMessages);
-        if (nextSelected) {
-          hydrateExecutionHistory(nextSelected.id, nextMessages);
-        }
+        setMessages([]);
         clearPendingAssistantMessage();
         setActiveRun(null);
         resetVerboseEvents();
@@ -895,16 +802,13 @@ export function ChannelSessionRoute({
     if (!files?.length) {
       return;
     }
-    if (!channel) {
-      return;
-    }
     setError(null);
     try {
       const session = selectedSession ?? (await createSession());
       if (!session) {
         throw new Error(t("chat.sessionCreateFailed"));
       }
-      const selected = await apiClient.uploadSessionAttachments(channel.id, session.id, Array.from(files));
+      const selected = await apiClient.uploadSessionAttachmentsPublic(session.id, Array.from(files));
       setAttachments((current) => [...current, ...selected]);
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
@@ -928,6 +832,7 @@ export function ChannelSessionRoute({
   const liveExecutionVisible = Boolean(
     pendingAssistantSessionId === selectedSession?.id && verboseEvents.length > 0,
   );
+  const activeExecutionMessage = activeExecutionMessageForRun(renderedMessages, activeRun);
 
   return (
     <section className="chat-workspace">
@@ -946,7 +851,7 @@ export function ChannelSessionRoute({
               </span>
             ) : null}
           </div>
-          <button type="button" className="secondary" onClick={() => void refreshWorkspace()}>
+          <button type="button" className="secondary" onClick={() => void refreshSessions()}>
             <RefreshCw aria-hidden="true" size={16} />
             {t("chat.refresh")}
           </button>
@@ -966,7 +871,7 @@ export function ChannelSessionRoute({
               const isPendingMessage = message.id === pendingAssistantMessageId;
               if (
                 liveExecutionVisible &&
-                isExecutionHistoryContent(message.content) &&
+                activeExecutionMessage?.id === message.id &&
                 !isPendingMessage
               ) {
                 return null;
@@ -1067,6 +972,7 @@ export function ChannelSessionRoute({
 }
 
 const EXECUTION_HISTORY_MARKER = "<!-- hermes-hub:execution:v1 -->";
+const LEGACY_HERMES_EXECUTION_LINE = /^\S+\s+([A-Za-z0-9_.-]+)\((.*)\)$/u;
 
 function normalizeExecutionEntry(message: HermesVerboseEvent | string): ExecutionHistoryEntry | null {
   if (typeof message === "string") {
@@ -1114,7 +1020,7 @@ function mergeExecutionEvents(
     merged = [...merged, ...events.slice(overlap)];
   }
 
-  return compactRepeatedExecutionEvents(merged);
+  return merged;
 }
 
 function overlappingExecutionPrefixLength(
@@ -1131,33 +1037,6 @@ function overlappingExecutionPrefixLength(
     overlap -= 1;
   }
   return 0;
-}
-
-function compactRepeatedExecutionEvents(events: ExecutionHistoryEntry[]) {
-  let next = [...events];
-  let changed = true;
-
-  while (changed) {
-    changed = false;
-
-    for (let start = 0; start < next.length && !changed; start += 1) {
-      const maxSize = Math.floor((next.length - start) / 2);
-      for (let size = maxSize; size >= 3; size -= 1) {
-        const left = next.slice(start, start + size);
-        const right = next.slice(start + size, start + size * 2);
-        if (sameExecutionSequence(left, right)) {
-          next = [
-            ...next.slice(0, start + size),
-            ...next.slice(start + size * 2),
-          ];
-          changed = true;
-          break;
-        }
-      }
-    }
-  }
-
-  return next;
 }
 
 function sameExecutionSequence(left: ExecutionHistoryEntry[], right: ExecutionHistoryEntry[]) {
@@ -1200,7 +1079,7 @@ function compactToolParameterDetail(message: string) {
 }
 
 function executionHistoryContent(events: ExecutionHistoryEntry[]) {
-  return `${EXECUTION_HISTORY_MARKER}\n${JSON.stringify(compactRepeatedExecutionEvents(events))}`;
+  return `${EXECUTION_HISTORY_MARKER}\n${JSON.stringify(events)}`;
 }
 
 function completePendingRunMessages(
@@ -1227,9 +1106,7 @@ function mergeMessagesById(messages: ChannelMessage[], nextMessages: ChannelMess
 }
 
 function upsertExecutionMessage(messages: ChannelMessage[], nextMessage: ChannelMessage) {
-  const withoutExisting = messages.filter(
-    (message) => message.id !== nextMessage.id && !isExecutionHistoryContent(message.content),
-  );
+  const withoutExisting = messages.filter((message) => message.id !== nextMessage.id);
   const pendingIndex = withoutExisting.findIndex((message) => message.id.startsWith("pending-"));
   if (pendingIndex === -1) {
     return [...withoutExisting, nextMessage];
@@ -1281,13 +1158,13 @@ function ChatSidebar({
   onSelect,
   onDelete,
 }: {
-  sessions: ChannelSession[];
-  selectedSession: ChannelSession | null;
+  sessions: SessionSummary[];
+  selectedSession: SessionSummary | null;
   collapsed: boolean;
   unreadSessionIds: Set<string>;
   onCreate: () => void;
-  onSelect: (session: ChannelSession) => void;
-  onDelete: (session: ChannelSession) => void;
+  onSelect: (session: SessionSummary) => void;
+  onDelete: (session: SessionSummary) => void;
 }) {
   const { t } = useI18n();
   const listRef = useRef<HTMLUListElement | null>(null);
@@ -1405,8 +1282,37 @@ function ChatSidebar({
   );
 }
 
-function sessionUpdatedAt(session: ChannelSession) {
+function sessionUpdatedAt(session: SessionSummary) {
   return session.updated_at ?? session.created_at ?? 0;
+}
+
+function activeExecutionMessageForRun(
+  messages: ChannelMessage[],
+  run: HermesActiveRun | null,
+) {
+  if (!run || isTerminalHermesRun(run)) {
+    return null;
+  }
+
+  const executionKey = hermesExecutionMessageKey(run.run_id);
+  const keyedMessage = messages.find(
+    (message) =>
+      message.client_message_key === executionKey && isExecutionHistoryContent(message.content),
+  );
+  if (keyedMessage) {
+    return keyedMessage;
+  }
+
+  const runCreatedAt = run.created_at ?? 0;
+  return (
+    [...messages]
+      .reverse()
+      .find(
+        (message) =>
+          isExecutionHistoryContent(message.content) &&
+          (message.created_at ?? 0) >= runCreatedAt,
+      ) ?? null
+  );
 }
 
 function isTerminalHermesRun(run: HermesActiveRun) {
@@ -1495,6 +1401,10 @@ function userFacingErrorMessage(cause: unknown, fallback: string, t: Translate) 
 
 function hermesRunMessageKey(runId: string) {
   return `hermes-run:${runId}`;
+}
+
+function hermesExecutionMessageKey(runId: string) {
+  return `hermes-execution:${runId}`;
 }
 
 function runIdFromHermesMessageKey(value: string | null | undefined) {
@@ -1610,30 +1520,16 @@ function sortMessagesForDisplay(messages: ChannelMessage[]) {
 }
 
 function mergeExecutionHistoryMessages(messages: ChannelMessage[]) {
-  const executionMessages = messages.filter((message) => isExecutionHistoryContent(message.content));
-  if (executionMessages.length <= 1) {
-    return messages;
-  }
-
-  const executionIds = new Set(executionMessages.map((message) => message.id));
-  const mergedEvents = mergeExecutionEvents(
-    ...executionMessages.map((message) => executionHistoryEvents(message.content) ?? []),
-  );
-  const canonical = executionMessages.reduce((latest, message) =>
-    (message.created_at ?? 0) >= (latest.created_at ?? 0) ? message : latest,
-  );
-
-  return [
-    ...messages.filter((message) => !executionIds.has(message.id)),
-    {
-      ...canonical,
-      content: executionHistoryContent(mergedEvents),
-    },
-  ];
+  // 执行块按消息逐条保留，不再把不同轮次的执行过程折叠成一条。
+  return messages;
 }
 
 function isExecutionHistoryContent(content: string) {
-  return content.startsWith(`${EXECUTION_HISTORY_MARKER}\n`) || content.startsWith("执行步骤\n");
+  return (
+    content.startsWith(`${EXECUTION_HISTORY_MARKER}\n`) ||
+    content.startsWith("执行步骤\n") ||
+    Boolean(parseLegacyHermesExecutionEvents(content))
+  );
 }
 
 function dedupeRepeatedAssistantMessages(messages: ChannelMessage[]) {
@@ -2286,23 +2182,58 @@ function executionHistoryEvents(content: string): ExecutionHistoryEntry[] | null
       const events = parsed
         .map((event) => normalizeStoredExecutionEntry(event))
         .filter((event): event is ExecutionHistoryEntry => Boolean(event));
-      const compacted = compactRepeatedExecutionEvents(events);
-      return compacted.length > 0 ? compacted : null;
+      return events.length > 0 ? events : null;
     } catch {
       return null;
     }
   }
 
   if (!content.startsWith("执行步骤\n")) {
-    return null;
+    const legacyEvents = parseLegacyHermesExecutionEvents(content);
+    return legacyEvents;
   }
   const events = content
     .split(/\r?\n/)
     .slice(1)
     .map((line) => normalizeExecutionEntry(line.trim().replace(/^- /, "")))
     .filter((event): event is ExecutionHistoryEntry => Boolean(event));
-  const compacted = compactRepeatedExecutionEvents(events);
-  return compacted.length > 0 ? compacted : null;
+  return events.length > 0 ? events : null;
+}
+
+function parseLegacyHermesExecutionEvents(content: string): ExecutionHistoryEntry[] | null {
+  const lines = content.split(/\r?\n/);
+  const events: ExecutionHistoryEntry[] = [];
+
+  for (let index = 0; index < lines.length; ) {
+    const current = lines[index]?.trim() ?? "";
+    if (!current) {
+      index += 1;
+      continue;
+    }
+
+    const match = current.match(LEGACY_HERMES_EXECUTION_LINE);
+    if (!match) {
+      index += 1;
+      continue;
+    }
+
+    const tool = normalizeExecutionText(match[1]);
+    const nextLine = lines[index + 1]?.trim() ?? "";
+    const nextLooksLikeTool = LEGACY_HERMES_EXECUTION_LINE.test(nextLine);
+    const detail = !nextLooksLikeTool && nextLine ? nextLine : match[2];
+    const event = normalizeExecutionEntry({
+      kind: "tool.call",
+      tool,
+      detail,
+    });
+    if (event) {
+      events.push(event);
+    }
+
+    index += !nextLooksLikeTool && nextLine ? 2 : 1;
+  }
+
+  return events.length > 0 ? events : null;
 }
 
 function normalizeStoredExecutionEntry(value: unknown): ExecutionHistoryEntry | null {

@@ -42,6 +42,21 @@ describe("App", () => {
     };
   }
 
+  function legacyExecutionMessage(
+    content: string,
+    id = "message-legacy-execution",
+    createdAt = Date.now(),
+  ): ChannelMessage {
+    return {
+      id,
+      session_id: "session-1",
+      role: "assistant",
+      content,
+      attachments: [],
+      created_at: createdAt,
+    };
+  }
+
   function expectPendingLoader() {
     const indicator = document.querySelector(".message-bubble.assistant.pending .typing-indicator");
     expect(indicator?.querySelector(".typing-dots")).toBeInTheDocument();
@@ -207,9 +222,6 @@ describe("App", () => {
       created_at: Date.now(),
       updated_at: Date.now(),
     };
-    const clearHermesRun = vi.fn(async () => {
-      activeRun = null;
-    });
     const client = createMockApiClient({
       activeRunsBySessionId: {
         "session-1": activeRun,
@@ -227,7 +239,6 @@ describe("App", () => {
       });
       return () => eventListeners.delete(onEvent);
     };
-    client.clearHermesRun = clearHermesRun;
 
     render(<App apiClient={client} />);
 
@@ -258,7 +269,7 @@ describe("App", () => {
     await waitFor(() => {
       expect(screen.getByText("Hermes run failed: tool failed")).toBeInTheDocument();
     });
-    expect(clearHermesRun).toHaveBeenCalledWith("channel-1", "session-1");
+    expectNoPendingLoader();
   });
 
   it("uses a completed Hub adapter run output message without adding an empty reply", async () => {
@@ -270,7 +281,6 @@ describe("App", () => {
       attachments: [],
       created_at: Date.now(),
     };
-    const clearHermesRun = vi.fn(async () => undefined);
     const client = createMockApiClient({
       initialMessagesBySessionId: {
         "session-1": [finalMessage],
@@ -285,21 +295,15 @@ describe("App", () => {
         },
       },
     });
-    client.clearHermesRun = clearHermesRun;
 
     render(<App apiClient={client} />);
 
     expect(await screen.findByText("最终答案")).toBeInTheDocument();
-    await waitFor(() => {
-      expect(clearHermesRun).toHaveBeenCalledWith("channel-1", "session-1");
-    });
     expect(screen.getAllByText("最终答案")).toHaveLength(1);
-    await expect(client.listSessionMessages("channel-1", "session-1")).resolves.toHaveLength(1);
   });
 
   it("loads a completed run output message with attachments when the live message event was missed", async () => {
     const eventListeners = new Set<(event: ChannelSessionEvent) => void>();
-    let includeFinalMessage = false;
     let activeRun: HermesActiveRun | null = {
       run_id: "hub-run-output-attachment",
       status: "running",
@@ -324,17 +328,12 @@ describe("App", () => {
       ],
       created_at: 2,
     };
-    const clearHermesRun = vi.fn(async () => {
-      activeRun = null;
-    });
     const client = createMockApiClient({
       activeRunsBySessionId: {
         "session-1": activeRun,
       },
     });
     client.activeHermesRun = async () => activeRun;
-    client.listSessionMessages = async (_channelId, sessionId) =>
-      includeFinalMessage && sessionId === "session-1" ? [finalMessage] : [];
     client.subscribeSessionEvents = (_channelId, _sessionId, onEvent) => {
       eventListeners.add(onEvent);
       queueMicrotask(() => {
@@ -346,12 +345,16 @@ describe("App", () => {
       });
       return () => eventListeners.delete(onEvent);
     };
-    client.clearHermesRun = clearHermesRun;
 
     render(<App apiClient={client} />);
 
     await waitFor(() => expectPendingLoader());
-    includeFinalMessage = true;
+    activeRun = {
+      ...activeRun,
+      status: "completed",
+      output_message_id: finalMessage.id,
+      updated_at: 2,
+    };
     for (const listener of eventListeners) {
       listener({
         type: "run_updated",
@@ -367,6 +370,11 @@ describe("App", () => {
           updated_at: 2,
         },
       });
+      listener({
+        type: "messages_snapshot",
+        messages: [finalMessage],
+        active_run: activeRun,
+      });
     }
 
     expect(await screen.findByText("文件已生成")).toBeInTheDocument();
@@ -374,7 +382,6 @@ describe("App", () => {
       "href",
       "/api/attachments/attachment-output/download",
     );
-    expect(clearHermesRun).toHaveBeenCalledWith("channel-1", "session-1");
   });
 
   it("renders the authenticated admin workspace and can send a Hermes prompt", async () => {
@@ -668,6 +675,18 @@ describe("App", () => {
           attachments: input.attachments ?? [],
           created_at: Date.now(),
         };
+        queueMicrotask(() => {
+          for (const listener of eventListeners) {
+            listener({
+              type: "run_updated",
+              run: {
+                ...run,
+                status: "running",
+                updated_at: Date.now(),
+              },
+            });
+          }
+        });
         return { message: userMessage, run };
       },
     });
@@ -815,6 +834,73 @@ describe("App", () => {
     await waitFor(() => {
       expect(screen.getByText("done")).toBeInTheDocument();
     });
+  });
+
+  it("renders legacy Hermes tool logs as execution history", async () => {
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialMessagesBySessionId: {
+            "session-1": [
+              legacyExecutionMessage(
+                `📚 skill_view(['name'])\n{"name":"comfyui"}\n🎨 image_generate(['aspect_ratio', 'prompt'])\n{"aspect_ratio":"portrait","prompt":"cat"}`,
+              ),
+            ],
+          },
+        })}
+      />,
+    );
+
+    expect(await screen.findByText("Execution steps")).toBeInTheDocument();
+    expect(screen.getByText('call skill view：{"name":"comfyui"}')).toBeInTheDocument();
+    expect(
+      screen.getByText('call image generation：{"aspect_ratio":"portrait","prompt":"cat"}'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("📚 skill_view(['name'])")).not.toBeInTheDocument();
+  });
+
+  it("keeps earlier execution blocks visible while a later run is pending", async () => {
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialMessagesBySessionId: {
+            "session-1": [
+              legacyExecutionMessage(
+                `💻 terminal(['command'])\n{"command":"first tool"}`,
+                "message-execution-first",
+                1,
+              ),
+              {
+                id: "message-final-first",
+                session_id: "session-1",
+                role: "assistant",
+                content: "第一次最终结果",
+                attachments: [],
+                created_at: 2,
+              },
+              legacyExecutionMessage(
+                `💻 terminal(['command'])\n{"command":"second tool"}`,
+                "message-execution-second",
+                3,
+              ),
+            ],
+          },
+          activeRunsBySessionId: {
+            "session-1": {
+              run_id: "hub-run-second",
+              status: "running",
+              created_at: 3,
+              updated_at: 3,
+            },
+          },
+        })}
+      />,
+    );
+
+    expect(await screen.findByText('call terminal：{"command":"first tool"}')).toBeInTheDocument();
+    expect(screen.getByText("第一次最终结果")).toBeInTheDocument();
+    expect(screen.getByText('call terminal：{"command":"second tool"}')).toBeInTheDocument();
+    expect(screen.getAllByText("Execution steps")).toHaveLength(2);
   });
 
   it("truncates long execution parameters and shows the header typing state", async () => {
@@ -984,7 +1070,7 @@ describe("App", () => {
     });
   });
 
-  it("deduplicates replayed execution history and repeated final answers from persisted messages", async () => {
+  it("keeps every persisted execution entry and deduplicates repeated final answers", async () => {
     const executionEvents = [
       { kind: "tool.call", tool: "terminal", detail: "echo 1" },
       { kind: "tool.completed", tool: "terminal", detail: "done" },
@@ -1029,8 +1115,7 @@ describe("App", () => {
       />,
     );
 
-    expect(await screen.findByText("call terminal：echo 1")).toBeInTheDocument();
-    expect(screen.getAllByText("call terminal：echo 1")).toHaveLength(1);
+    expect(await screen.findAllByText("call terminal：echo 1")).toHaveLength(2);
     expect(screen.getByText("completed image generation：image done")).toBeInTheDocument();
     expect(screen.getAllByText("最终结果")).toHaveLength(1);
   });
@@ -1313,7 +1398,6 @@ describe("App", () => {
   });
 
   it("ignores stale native Hermes runs when restoring chat state", async () => {
-    const clearHermesRun = vi.fn(async () => undefined);
     const client = createMockApiClient({
       activeRunsBySessionId: {
         "session-1": {
@@ -1324,14 +1408,11 @@ describe("App", () => {
         },
       },
     });
-    client.clearHermesRun = clearHermesRun;
 
     render(<App apiClient={client} />);
 
-    await waitFor(() => {
-      expect(clearHermesRun).toHaveBeenCalledWith("channel-1", "session-1");
-    });
-    expectNoPendingLoader();
+    await screen.findByRole("button", { name: "New chat" });
+    await waitFor(() => expectNoPendingLoader());
   });
 
   it("shows explicit Hermes run errors as assistant messages", async () => {

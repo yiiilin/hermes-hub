@@ -490,7 +490,7 @@ async fn docker_provisioner_test() {
         .iter()
         .any(|entry| entry == "HERMES_ACCEPT_HOOKS=1"));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version" && value == "2026-05-22-hermes-hub-attachment-filenames"
+        key == "hermes_hub_spec_version" && value == "2026-05-23-hermes-hub-session-search-main"
     }));
     assert!(spec
         .mounts
@@ -543,6 +543,11 @@ async fn docker_provisioner_test() {
     assert!(managed_config.contains("display:"));
     assert!(managed_config.contains("tool_progress: \"verbose\""));
     assert!(managed_config.contains("tool_progress_command: true"));
+    assert!(managed_config.contains("auxiliary:"));
+    assert!(managed_config.contains("session_search:"));
+    assert!(managed_config.contains("provider: \"main\""));
+    assert!(managed_config.contains("timeout: 60"));
+    assert!(managed_config.contains("max_concurrency: 1"));
     assert!(managed_config.contains("approvals:"));
     assert!(managed_config.contains("mode: \"off\""));
     assert!(managed_config.contains("cron_mode: \"approve\""));
@@ -631,7 +636,7 @@ async fn docker_provisioner_test() {
     assert!(
         create_call.windows(2).any(|args| {
             args[0] == "--label"
-                && args[1] == "hermes_hub_spec_version=2026-05-22-hermes-hub-attachment-filenames"
+                && args[1] == "hermes_hub_spec_version=2026-05-23-hermes-hub-session-search-main"
         }),
         "managed Hermes containers must carry the current spec label"
     );

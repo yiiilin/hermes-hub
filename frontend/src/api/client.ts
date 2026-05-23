@@ -28,6 +28,13 @@ export type ChannelSession = {
   updated_at?: number;
 };
 
+export type SessionSummary = {
+  id: string;
+  title?: string | null;
+  created_at?: number;
+  updated_at?: number;
+};
+
 export type ChannelMessage = {
   id: string;
   session_id: string;
@@ -330,6 +337,39 @@ export type ApiClient = {
   stopHermesRun: (channelId: string, sessionId: string) => Promise<HermesActiveRun | null>;
   clearHermesRun: (channelId: string, sessionId: string) => Promise<void>;
   resumeHermesRun: (runId: string, handlers?: HermesStreamHandlers) => Promise<string>;
+  listSessionsPublic: () => Promise<SessionSummary[]>;
+  createSessionPublic: (
+    kind?: "chat" | "agent",
+    title?: string,
+  ) => Promise<SessionSummary>;
+  deleteSessionPublic: (sessionId: string) => Promise<void>;
+  appendSessionMessagePublic: (
+    sessionId: string,
+    input: {
+      role: "user" | "assistant";
+      content: string;
+      attachments?: HermesAttachment[];
+      clientMessageKey?: string;
+    },
+  ) => Promise<ChannelMessage>;
+  updateSessionMessagePublic: (
+    sessionId: string,
+    messageId: string,
+    input: {
+      content: string;
+      attachments?: HermesAttachment[];
+    },
+  ) => Promise<ChannelMessage>;
+  uploadSessionAttachmentsPublic: (
+    sessionId: string,
+    files: File[],
+  ) => Promise<HermesAttachment[]>;
+  subscribeSessionEventsPublic: (
+    sessionId: string,
+    onEvent: (event: ChannelSessionEvent) => void,
+    onError?: (error: Error) => void,
+  ) => () => void;
+  stopSessionRunPublic: (sessionId: string) => Promise<void>;
 };
 
 type RequestOptions = {
@@ -802,6 +842,111 @@ export function createApiClient(): ApiClient {
     },
     async resumeHermesRun(runId, handlers) {
       return readHermesRunEvents(runId, handlers);
+    },
+    async listSessionsPublic() {
+      const payload = await request<{ sessions: SessionSummary[] }>("/api/sessions");
+      return payload.sessions;
+    },
+    async createSessionPublic(kind = "agent", title) {
+      const payload = await request<{ session: SessionSummary }>("/api/sessions", {
+        method: "POST",
+        body: { kind, title },
+      });
+      return payload.session;
+    },
+    async deleteSessionPublic(sessionId) {
+      await request<void>(`/api/sessions/${sessionId}`, {
+        method: "DELETE",
+      });
+    },
+    async appendSessionMessagePublic(sessionId, input) {
+      const payload = await request<{ message: ChannelMessage }>(
+        `/api/sessions/${sessionId}/messages`,
+        {
+          method: "POST",
+          body: {
+            role: input.role,
+            content: input.content,
+            attachments: stripAttachmentPreviews(input.attachments ?? []),
+            client_message_key: input.clientMessageKey,
+          },
+        },
+      );
+      return payload.message;
+    },
+    async updateSessionMessagePublic(sessionId, messageId, input) {
+      const payload = await request<{ message: ChannelMessage }>(
+        `/api/sessions/${sessionId}/messages/${messageId}`,
+        {
+          method: "PUT",
+          body: {
+            content: input.content,
+            attachments: stripAttachmentPreviews(input.attachments ?? []),
+          },
+        },
+      );
+      return payload.message;
+    },
+    async uploadSessionAttachmentsPublic(sessionId, files) {
+      const form = new FormData();
+      for (const file of files) {
+        form.append("file", file, file.name);
+      }
+
+      const response = await fetch(`/api/sessions/${sessionId}/attachments`, {
+        method: "POST",
+        credentials: "include",
+        body: form,
+      });
+
+      if (!response.ok) {
+        const message = await response
+          .json()
+          .then((value) => value.message ?? value.error ?? response.statusText)
+          .catch(() => response.statusText);
+        throw new Error(String(message));
+      }
+
+      const payload = (await response.json()) as { attachments: HermesAttachment[] };
+      return payload.attachments;
+    },
+    subscribeSessionEventsPublic(sessionId, onEvent, onError) {
+      const source = new EventSource(`/api/sessions/${sessionId}/events`, {
+        withCredentials: true,
+      });
+      const eventNames = [
+        "messages_snapshot",
+        "message_created",
+        "message_updated",
+        "run_updated",
+        "run_cleared",
+        "session_deleted",
+      ];
+      const listeners = eventNames.map((eventName) => {
+        const listener = (event: MessageEvent) => {
+          try {
+            onEvent(JSON.parse(event.data) as ChannelSessionEvent);
+          } catch (cause) {
+            onError?.(cause instanceof Error ? cause : new Error("invalid session event"));
+          }
+        };
+        source.addEventListener(eventName, listener);
+        return [eventName, listener] as const;
+      });
+      source.onerror = () => {
+        onError?.(new Error("session event stream disconnected"));
+      };
+      return () => {
+        for (const [eventName, listener] of listeners) {
+          source.removeEventListener(eventName, listener);
+        }
+        source.close();
+      };
+    },
+    async stopSessionRunPublic(sessionId) {
+      await request<void>(`/api/sessions/${sessionId}/stop`, {
+        method: "POST",
+      });
     },
   };
 }
@@ -1773,6 +1918,54 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       await Promise.resolve();
       handlers?.onDelta?.("");
       return "";
+    },
+    async listSessionsPublic() {
+      return sessions
+        .slice()
+        .sort((left, right) => (right.updated_at ?? 0) - (left.updated_at ?? 0))
+        .map(({ id, title, created_at, updated_at }) => ({
+          id,
+          title,
+          created_at,
+          updated_at,
+        }));
+    },
+    async createSessionPublic(kind = "agent", title) {
+      const session = options.createSession
+        ? await options.createSession("channel-1", kind, title)
+        : await this.createSession("channel-1", kind, title);
+      return {
+        id: session.id,
+        title: session.title,
+        created_at: session.created_at,
+        updated_at: session.updated_at,
+      };
+    },
+    async deleteSessionPublic(sessionId) {
+      await this.deleteSession("channel-1", sessionId);
+    },
+    async appendSessionMessagePublic(sessionId, input) {
+      if (input.role === "user") {
+        const { message } = await this.createChannelRun("channel-1", sessionId, {
+          content: input.content,
+          attachments: input.attachments ?? [],
+          clientMessageKey: input.clientMessageKey,
+        });
+        return message;
+      }
+      return this.appendSessionMessage("channel-1", sessionId, input);
+    },
+    async updateSessionMessagePublic(sessionId, messageId, input) {
+      return this.updateSessionMessage("channel-1", sessionId, messageId, input);
+    },
+    async uploadSessionAttachmentsPublic(sessionId, files) {
+      return this.uploadSessionAttachments("channel-1", sessionId, files);
+    },
+    subscribeSessionEventsPublic(sessionId, onEvent, onError) {
+      return this.subscribeSessionEvents("channel-1", sessionId, onEvent, onError);
+    },
+    async stopSessionRunPublic(sessionId) {
+      await this.stopHermesRun("channel-1", sessionId);
     },
   };
 }

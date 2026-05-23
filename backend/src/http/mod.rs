@@ -6,6 +6,7 @@ pub mod hermes_proxy;
 pub mod invites;
 pub mod llm_proxy;
 pub mod oidc;
+pub mod sessions;
 pub mod workspace;
 
 use axum::{
@@ -26,6 +27,7 @@ pub fn router() -> Router<AppState> {
         .merge(invites::router())
         .merge(attachments::router())
         .merge(channel_protocol::router())
+        .merge(sessions::router())
         .merge(llm_proxy::router())
         .merge(workspace::router())
         .merge(crate::channel::routes::router())
