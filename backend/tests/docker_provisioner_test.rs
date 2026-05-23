@@ -561,7 +561,7 @@ async fn docker_provisioner_test() {
     assert!(plugin_adapter.contains("text=content"));
     assert!(plugin_adapter.contains("HERMES_HUB_HOME_CHANNEL"));
     assert!(plugin_adapter.contains("self.build_source("));
-    assert!(plugin_adapter.contains("thread_id=run_id"));
+    assert!(plugin_adapter.contains("thread_id=session_id"));
     assert!(plugin_adapter.contains("raw_message[\"run_id\"] = run_id"));
     assert!(plugin_adapter.contains("await self.handle_message(event)"));
     assert!(plugin_adapter.contains("async def on_processing_complete("));

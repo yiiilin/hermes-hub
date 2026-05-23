@@ -313,7 +313,9 @@ class HermesHubAdapter(BasePlatformAdapter):
             chat_type=item.get("chat_type") or "dm",
             user_id=str(item.get("user_id") or self.user_id or "hub-user"),
             user_name=item.get("user_name") or "Hub user",
-            thread_id=run_id,
+            # thread_id 必须稳定跟随 session_id，而不是每一轮的 run_id；
+            # 这样 Hermes 才会把同一会话的历史连续接起来。
+            thread_id=session_id,
             message_id=inbox_id or None,
         )
         raw_message = dict(item)
