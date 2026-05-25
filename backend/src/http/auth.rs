@@ -73,6 +73,12 @@ async fn bootstrap_register(
         .create_bootstrap_admin(&payload.email, &payload.password)
         .await
         .map_err(map_register_error)?;
+    match workspace::ensure_managed_hermes_for_user(&state, &user.id).await {
+        Ok(_) => {}
+        // 首个管理员通常需要先进入系统配置模型；模型未就绪时不能反过来阻断初始化。
+        Err(ApiError::Conflict(_)) => {}
+        Err(error) => return Err(error),
+    }
 
     Ok((
         StatusCode::CREATED,

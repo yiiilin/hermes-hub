@@ -16,7 +16,7 @@ use crate::{
     AppState,
 };
 
-use super::{auth, ApiError};
+use super::{auth, workspace, ApiError};
 
 const OIDC_STATE_COOKIE: &str = "hermes_hub_oidc_state";
 const OIDC_NONCE_COOKIE: &str = "hermes_hub_oidc_nonce";
@@ -160,14 +160,28 @@ async fn oidc_callback(
     let email = claim_string(&userinfo, &oidc.email_claim)
         .ok_or(ApiError::Unauthorized)?
         .to_lowercase();
-    let user = state
+    if oidc.auto_create_users
+        && state
+            .store
+            .user_by_email(&email)
+            .await
+            .map_err(|_| ApiError::Internal)?
+            .is_none()
+    {
+        // 新 OIDC 用户创建后必须马上有托管 Hermes；先校验模型配置，避免创建无法使用的账号。
+        workspace::ensure_required_model_configs(&state).await?;
+    }
+    let oidc_user = state
         .store
         .get_or_create_oidc_user(&email, oidc.auto_create_users)
         .await
         .map_err(map_oidc_user_error)?;
+    if oidc_user.created {
+        workspace::ensure_managed_hermes_for_user(&state, &oidc_user.user.id).await?;
+    }
     let session_token = state
         .store
-        .create_session(&user.id)
+        .create_session(&oidc_user.user.id)
         .await
         .map_err(|_| ApiError::Internal)?;
 

@@ -100,6 +100,14 @@ pub struct OidcSettings {
     pub auto_create_users: bool,
 }
 
+/// OIDC 登录会复用已有用户，也可能按配置自动创建新用户。
+/// HTTP 层需要知道是否新建，才能只在创建用户后补建 Hermes 运行时。
+#[derive(Clone, Debug)]
+pub struct OidcUserResult {
+    pub user: User,
+    pub created: bool,
+}
+
 impl Default for SystemSettings {
     fn default() -> Self {
         Self {
@@ -401,10 +409,13 @@ impl SessionStore {
         &self,
         email: &str,
         auto_create: bool,
-    ) -> Result<User, StoreError> {
+    ) -> Result<OidcUserResult, StoreError> {
         if let Some(user) = self.user_by_email(email).await? {
             if user.status == UserStatus::Active {
-                return Ok(user);
+                return Ok(OidcUserResult {
+                    user,
+                    created: false,
+                });
             }
             return Err(StoreError::InvalidCredentials);
         }
@@ -418,10 +429,19 @@ impl SessionStore {
         match &self.backend {
             SessionStoreBackend::Memory(inner) => {
                 let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
-                inner.create_user(email, &placeholder_password, UserRole::User)
+                let user = inner.create_user(email, &placeholder_password, UserRole::User)?;
+                Ok(OidcUserResult {
+                    user,
+                    created: true,
+                })
             }
             SessionStoreBackend::Postgres { pool, .. } => {
-                postgres_create_user(pool, email, &placeholder_password, UserRole::User).await
+                let user = postgres_create_user(pool, email, &placeholder_password, UserRole::User)
+                    .await?;
+                Ok(OidcUserResult {
+                    user,
+                    created: true,
+                })
             }
         }
     }

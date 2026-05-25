@@ -277,6 +277,7 @@ async fn oidc_callback_exchanges_code_creates_user_and_sets_session_cookie() {
     )
     .await;
     assert_eq!(update.status(), StatusCode::NO_CONTENT);
+    configure_required_model_configs(&app, &admin_cookie).await;
 
     let start = request_empty(&app, Method::GET, "/api/auth/oidc/start", None).await;
     assert_eq!(start.status(), StatusCode::FOUND);
@@ -308,6 +309,23 @@ async fn oidc_callback_exchanges_code_creates_user_and_sets_session_cookie() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["user"]["email"], "oidc-user@example.com");
     assert_eq!(body["user"]["role"], "user");
+    let oidc_user_id = body["user"]["id"]
+        .as_str()
+        .expect("OIDC user id exists")
+        .to_string();
+
+    let instances = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/hermes-instances",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(instances).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["hermes_instances"][0]["user_id"], oidc_user_id);
+    assert_eq!(body["hermes_instances"][0]["kind"], "managed_docker");
+    assert_eq!(body["hermes_instances"][0]["status"], "running");
 }
 
 async fn create_invite(app: &Router, admin_cookie: &str, expires_at: u64, max_uses: u32) -> Value {
