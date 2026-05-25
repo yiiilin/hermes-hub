@@ -6,7 +6,9 @@ use axum::{
 };
 use hermes_hub_backend::{build_router, AppConfig};
 use serde_json::{json, Value};
+use std::io::{Cursor, Write};
 use tower::ServiceExt;
+use zip::{write::SimpleFileOptions, ZipWriter};
 
 fn test_app() -> Router {
     build_router(AppConfig::for_tests())
@@ -56,6 +58,33 @@ async fn request_empty(
         .expect("router responds")
 }
 
+async fn request_raw(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    content_type: &str,
+    body: Vec<u8>,
+    cookie: Option<&str>,
+) -> Response<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, content_type);
+
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+
+    app.clone()
+        .oneshot(
+            builder
+                .body(Body::from(body))
+                .expect("request can be built"),
+        )
+        .await
+        .expect("router responds")
+}
+
 async fn response_json(response: Response<Body>) -> (StatusCode, Value) {
     let status = response.status();
     let bytes = to_bytes(response.into_body(), usize::MAX)
@@ -81,6 +110,64 @@ fn cookie_from(response: &Response<Body>) -> String {
         .next()
         .expect("cookie has name and value")
         .to_string()
+}
+
+fn multipart_text(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"{name}\"\r\n\r\n\
+             {value}\r\n"
+        )
+        .as_bytes(),
+    );
+}
+
+fn multipart_file(
+    body: &mut Vec<u8>,
+    boundary: &str,
+    name: &str,
+    filename: &str,
+    content_type: &str,
+    bytes: &[u8],
+) {
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n\
+             Content-Type: {content_type}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(b"\r\n");
+}
+
+fn finish_multipart(body: &mut Vec<u8>, boundary: &str) {
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+}
+
+fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let cursor = Cursor::new(Vec::new());
+    let mut writer = ZipWriter::new(cursor);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (path, bytes) in entries {
+        writer.start_file(path, options).expect("zip file entry");
+        writer.write_all(bytes).expect("zip entry bytes");
+    }
+    writer
+        .finish()
+        .expect("zip archive can be finished")
+        .into_inner()
+}
+
+fn tree_child<'a>(node: &'a Value, name: &str) -> &'a Value {
+    node["children"]
+        .as_array()
+        .expect("tree node has children")
+        .iter()
+        .find(|child| child["name"] == name)
+        .unwrap_or_else(|| panic!("missing tree child {name}"))
 }
 
 async fn bootstrap_admin(app: &Router) -> String {
@@ -498,4 +585,325 @@ async fn admin_can_manage_hub_skills() {
     )
     .await;
     assert_eq!(read_deleted.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn admin_can_view_managed_skills_as_a_file_tree() {
+    let app = test_app();
+    let admin_cookie = bootstrap_admin(&app).await;
+
+    for (path, content) in [
+        ("writing/SKILL.md", "# Writing\n"),
+        ("writing/references/style.md", "Be precise.\n"),
+        ("image/SKILL.md", "# Image\n"),
+    ] {
+        let save = request_json(
+            &app,
+            Method::PUT,
+            &format!("/api/admin/managed-skills/{path}"),
+            json!({ "content": content }),
+            Some(&admin_cookie),
+        )
+        .await;
+        assert_eq!(save.status(), StatusCode::OK);
+    }
+
+    let tree = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/managed-skills/tree",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(tree).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["tree"]["kind"], "dir");
+    assert_eq!(body["tree"]["path"], "");
+
+    let image = tree_child(&body["tree"], "image");
+    assert_eq!(image["kind"], "dir");
+    assert_eq!(tree_child(image, "SKILL.md")["kind"], "file");
+
+    let writing = tree_child(&body["tree"], "writing");
+    assert_eq!(writing["kind"], "dir");
+    assert_eq!(tree_child(writing, "SKILL.md")["size"], 10);
+    let references = tree_child(writing, "references");
+    assert_eq!(
+        tree_child(references, "style.md")["path"],
+        "writing/references/style.md"
+    );
+}
+
+#[tokio::test]
+async fn admin_can_create_empty_managed_skill_directories() {
+    let app = test_app();
+    let admin_cookie = bootstrap_admin(&app).await;
+
+    let create = request_empty(
+        &app,
+        Method::POST,
+        "/api/admin/managed-skills/directories/research/references",
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let list = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/managed-skills",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(list).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["skills"].as_array().expect("skills").is_empty());
+
+    let tree = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/managed-skills/tree",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(tree).await;
+    assert_eq!(status, StatusCode::OK);
+    let research = tree_child(&body["tree"], "research");
+    assert_eq!(research["kind"], "dir");
+    assert_eq!(tree_child(research, "references")["kind"], "dir");
+
+    let hidden = request_empty(
+        &app,
+        Method::POST,
+        "/api/admin/managed-skills/directories/.curator_state",
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(hidden.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn admin_can_delete_managed_skill_directories_recursively() {
+    let app = test_app();
+    let admin_cookie = bootstrap_admin(&app).await;
+
+    for path in [
+        "writing/SKILL.md",
+        "writing/references/style.md",
+        "image/SKILL.md",
+    ] {
+        let save = request_json(
+            &app,
+            Method::PUT,
+            &format!("/api/admin/managed-skills/{path}"),
+            json!({ "content": path }),
+            Some(&admin_cookie),
+        )
+        .await;
+        assert_eq!(save.status(), StatusCode::OK);
+    }
+
+    let delete = request_empty(
+        &app,
+        Method::DELETE,
+        "/api/admin/managed-skills/writing",
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+
+    let list = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/managed-skills",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(list).await;
+    assert_eq!(status, StatusCode::OK);
+    let paths = body["skills"]
+        .as_array()
+        .expect("skills array")
+        .iter()
+        .map(|skill| skill["path"].as_str().expect("skill path"))
+        .collect::<Vec<_>>();
+    assert_eq!(paths, vec!["image/SKILL.md"]);
+
+    let delete_missing = request_empty(
+        &app,
+        Method::DELETE,
+        "/api/admin/managed-skills/writing",
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(delete_missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn admin_can_upload_managed_skill_files_and_folders() {
+    let app = test_app();
+    let admin_cookie = bootstrap_admin(&app).await;
+    let boundary = "managed-skills-upload-boundary";
+    let mut upload_body = Vec::new();
+    multipart_text(&mut upload_body, boundary, "target_path", "packs");
+    multipart_file(
+        &mut upload_body,
+        boundary,
+        "files",
+        "research/SKILL.md",
+        "text/markdown",
+        b"# Research\n",
+    );
+    multipart_file(
+        &mut upload_body,
+        boundary,
+        "files",
+        "research/references/paper.md",
+        "text/markdown",
+        b"Read primary sources.\n",
+    );
+    finish_multipart(&mut upload_body, boundary);
+
+    let upload = request_raw(
+        &app,
+        Method::POST,
+        "/api/admin/managed-skills/upload",
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload_body,
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(upload).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["skills"].as_array().expect("uploaded skills").len(), 2);
+
+    let read = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/managed-skills/packs/research/references/paper.md",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(read).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["skill"]["content"], "Read primary sources.\n");
+}
+
+#[tokio::test]
+async fn admin_can_upload_managed_skill_zip_archives() {
+    let app = test_app();
+    let admin_cookie = bootstrap_admin(&app).await;
+    let boundary = "managed-skills-zip-boundary";
+    let archive = zip_bytes(&[
+        ("assistant/SKILL.md", b"# Assistant\n" as &[u8]),
+        ("assistant/references/tone.md", b"Be direct.\n" as &[u8]),
+    ]);
+    let mut upload_body = Vec::new();
+    multipart_text(&mut upload_body, boundary, "target_path", "bundles");
+    multipart_file(
+        &mut upload_body,
+        boundary,
+        "file",
+        "skills.zip",
+        "application/zip",
+        &archive,
+    );
+    finish_multipart(&mut upload_body, boundary);
+
+    let upload = request_raw(
+        &app,
+        Method::POST,
+        "/api/admin/managed-skills/upload",
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload_body,
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(upload).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["skills"].as_array().expect("uploaded skills").len(), 2);
+
+    let read = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/managed-skills/bundles/assistant/SKILL.md",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(read).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["skill"]["content"], "# Assistant\n");
+}
+
+#[tokio::test]
+async fn managed_skill_upload_rejects_unsafe_paths() {
+    let app = test_app();
+    let admin_cookie = bootstrap_admin(&app).await;
+
+    let boundary = "managed-skills-unsafe-folder-boundary";
+    let mut unsafe_folder_body = Vec::new();
+    multipart_file(
+        &mut unsafe_folder_body,
+        boundary,
+        "files",
+        "../SKILL.md",
+        "text/markdown",
+        b"escaped",
+    );
+    finish_multipart(&mut unsafe_folder_body, boundary);
+    let unsafe_folder = request_raw(
+        &app,
+        Method::POST,
+        "/api/admin/managed-skills/upload",
+        &format!("multipart/form-data; boundary={boundary}"),
+        unsafe_folder_body,
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(unsafe_folder.status(), StatusCode::BAD_REQUEST);
+
+    let boundary = "managed-skills-hidden-upload-boundary";
+    let mut hidden_body = Vec::new();
+    multipart_file(
+        &mut hidden_body,
+        boundary,
+        "files",
+        ".curator_state/state.json",
+        "application/json",
+        b"{}",
+    );
+    finish_multipart(&mut hidden_body, boundary);
+    let hidden = request_raw(
+        &app,
+        Method::POST,
+        "/api/admin/managed-skills/upload",
+        &format!("multipart/form-data; boundary={boundary}"),
+        hidden_body,
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(hidden.status(), StatusCode::BAD_REQUEST);
+
+    let boundary = "managed-skills-unsafe-zip-boundary";
+    let archive = zip_bytes(&[("../escape.md", b"escaped" as &[u8])]);
+    let mut unsafe_zip_body = Vec::new();
+    multipart_file(
+        &mut unsafe_zip_body,
+        boundary,
+        "file",
+        "skills.zip",
+        "application/zip",
+        &archive,
+    );
+    finish_multipart(&mut unsafe_zip_body, boundary);
+    let unsafe_zip = request_raw(
+        &app,
+        Method::POST,
+        "/api/admin/managed-skills/upload",
+        &format!("multipart/form-data; boundary={boundary}"),
+        unsafe_zip_body,
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(unsafe_zip.status(), StatusCode::BAD_REQUEST);
 }

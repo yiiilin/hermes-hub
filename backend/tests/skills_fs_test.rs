@@ -30,6 +30,9 @@ async fn test_operator() -> Operator {
     op.create_dir("managed-skills/current/empty-dir/")
         .await
         .expect("empty directory marker fixture can be written");
+    op.write("managed-skills/current/hub-empty/.hub-directory", "")
+        .await
+        .expect("hub empty directory marker fixture can be written");
     op
 }
 
@@ -104,6 +107,10 @@ async fn readonly_skills_fs_lists_and_reads_from_prefix() {
     ));
     assert!(matches!(
         fs.lookup(root_id, &b"hidden-only".as_slice().into()).await,
+        Err(nfsstat3::NFS3ERR_NOENT)
+    ));
+    assert!(matches!(
+        fs.lookup(root_id, &b"hub-empty".as_slice().into()).await,
         Err(nfsstat3::NFS3ERR_NOENT)
     ));
 

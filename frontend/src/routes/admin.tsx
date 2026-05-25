@@ -3,6 +3,7 @@ import type {
   HermesInstance,
   Invite,
   ManagedSkill,
+  ManagedSkillTreeNode,
   ModelApiType,
   ModelConfig,
   ModelConfigKind,
@@ -12,7 +13,8 @@ import type {
 } from "../api/client";
 import { defaultOidcSettings } from "../api/client";
 import { useI18n } from "../i18n";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { FileArchive, FilePlus2, FolderPlus, Upload } from "lucide-react";
 
 type AdminSection = "users" | "models" | "hermes" | "skills" | "settings";
 
@@ -21,6 +23,11 @@ type AdminRouteProps = {
   currentUser: User;
   section: AdminSection;
 };
+
+type SelectedSkillNode = {
+  path: string;
+  kind: "dir" | "file";
+} | null;
 
 const defaultInviteHours = 24;
 const apiTypeLabels: Record<ModelApiType, string> = {
@@ -40,6 +47,46 @@ function formatBytes(size: number): string {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function parentPath(path: string): string {
+  return path.split("/").slice(0, -1).join("/");
+}
+
+function defaultFilePathForDirectory(path: string): string {
+  return path ? `${path}/SKILL.md` : "writing/SKILL.md";
+}
+
+function defaultChildDirectoryPath(path: string): string {
+  return path ? `${path}/new-folder` : "new-folder";
+}
+
+function uploadedFileName(file: File): string {
+  return (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
+}
+
+function findManagedSkillTreeNode(
+  node: ManagedSkillTreeNode,
+  path: string,
+): ManagedSkillTreeNode | null {
+  if (node.path === path) {
+    return node;
+  }
+  for (const child of node.children) {
+    const found = findManagedSkillTreeNode(child, path);
+    if (found) {
+      return found;
+    }
+  }
+  return null;
+}
+
+function collectManagedSkillDirectories(node: ManagedSkillTreeNode): string[] {
+  const directories = node.kind === "dir" && node.path ? [node.path] : [];
+  for (const child of node.children) {
+    directories.push(...collectManagedSkillDirectories(child));
+  }
+  return directories;
+}
+
 export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps) {
   const { language, t } = useI18n();
   const [users, setUsers] = useState<User[]>([]);
@@ -47,11 +94,16 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
   const [instances, setInstances] = useState<HermesInstance[]>([]);
   const [modelConfigs, setModelConfigs] = useState<ModelConfig[]>([]);
   const [managedSkills, setManagedSkills] = useState<ManagedSkill[]>([]);
-  const [selectedSkillPath, setSelectedSkillPath] = useState<string | null>(null);
-  const [skillPathInput, setSkillPathInput] = useState("writing/SKILL.md");
+  const [managedSkillTree, setManagedSkillTree] = useState<ManagedSkillTreeNode | null>(null);
+  const [selectedSkillNode, setSelectedSkillNode] = useState<SelectedSkillNode>(null);
+  const [skillPathInput, setSkillPathInput] = useState("");
   const [skillContent, setSkillContent] = useState("");
   const [skillSaved, setSkillSaved] = useState(false);
   const [skillLoading, setSkillLoading] = useState(false);
+  const [skillEditorMode, setSkillEditorMode] = useState<"file" | "directory">("file");
+  const fileUploadInputRef = useRef<HTMLInputElement | null>(null);
+  const folderUploadInputRef = useRef<HTMLInputElement | null>(null);
+  const zipUploadInputRef = useRef<HTMLInputElement | null>(null);
   const [systemSettings, setSystemSettings] = useState<SystemSettings>({
     max_sessions_per_user: 20,
     oidc: defaultOidcSettings(),
@@ -102,7 +154,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
         setSystemSettings(nextSettings);
       }
       if (section === "skills") {
-        setManagedSkills(await apiClient.listManagedSkills());
+        await refreshManagedSkills();
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("chat.workspaceLoadFailed"));
@@ -112,6 +164,15 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
   useEffect(() => {
     void refresh();
   }, []);
+
+  async function refreshManagedSkills() {
+    const [nextSkills, nextTree] = await Promise.all([
+      apiClient.listManagedSkills(),
+      apiClient.listManagedSkillTree(),
+    ]);
+    setManagedSkills(nextSkills);
+    setManagedSkillTree(nextTree);
+  }
 
   async function createInvite(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -222,9 +283,10 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
     setError(null);
     try {
       const skill = await apiClient.readManagedSkill(path);
-      setSelectedSkillPath(skill.path);
+      setSelectedSkillNode({ path: skill.path, kind: "file" });
       setSkillPathInput(skill.path);
       setSkillContent(skill.content);
+      setSkillEditorMode("file");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("admin.skillLoadFailed"));
     } finally {
@@ -232,10 +294,41 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
     }
   }
 
-  function newManagedSkill() {
-    setSelectedSkillPath(null);
-    setSkillPathInput("writing/SKILL.md");
+  function selectManagedSkillDirectory(path: string) {
+    setSkillSaved(false);
+    setError(null);
+    setSelectedSkillNode({ path, kind: "dir" });
+    setSkillPathInput(path);
     setSkillContent("");
+    setSkillEditorMode("directory");
+  }
+
+  function newManagedSkill() {
+    const directory =
+      selectedSkillNode?.kind === "dir"
+        ? selectedSkillNode.path
+        : selectedSkillNode?.path
+          ? parentPath(selectedSkillNode.path)
+          : "";
+    setSelectedSkillNode(null);
+    setSkillPathInput(defaultFilePathForDirectory(directory));
+    setSkillContent("");
+    setSkillEditorMode("file");
+    setSkillSaved(false);
+    setError(null);
+  }
+
+  function newManagedSkillDirectory() {
+    const directory =
+      selectedSkillNode?.kind === "dir"
+        ? selectedSkillNode.path
+        : selectedSkillNode?.path
+          ? parentPath(selectedSkillNode.path)
+          : "";
+    setSelectedSkillNode(null);
+    setSkillPathInput(defaultChildDirectoryPath(directory));
+    setSkillContent("");
+    setSkillEditorMode("directory");
     setSkillSaved(false);
     setError(null);
   }
@@ -251,12 +344,51 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
         setError(t("admin.skillPathRequired"));
         return;
       }
+      if (skillEditorMode === "directory") {
+        if (selectedSkillNode?.kind === "dir" && selectedSkillNode.path !== path) {
+          const fromPrefix = `${selectedSkillNode.path}/`;
+          const selectedTreeNode = managedSkillTree
+            ? findManagedSkillTreeNode(managedSkillTree, selectedSkillNode.path)
+            : null;
+          const directoriesToMove = selectedTreeNode
+            ? collectManagedSkillDirectories(selectedTreeNode)
+            : [selectedSkillNode.path];
+          const filesToMove = managedSkills.filter(
+            (skill) => skill.path === selectedSkillNode.path || skill.path.startsWith(fromPrefix),
+          );
+          for (const skill of filesToMove) {
+            const suffix = skill.path.slice(selectedSkillNode.path.length).replace(/^\//, "");
+            const target = suffix ? `${path}/${suffix}` : path;
+            const content = await apiClient.readManagedSkill(skill.path);
+            await apiClient.saveManagedSkill(target, content.content);
+          }
+          for (const directory of directoriesToMove) {
+            const suffix = directory.slice(selectedSkillNode.path.length).replace(/^\//, "");
+            await apiClient.createManagedSkillDirectory(suffix ? `${path}/${suffix}` : path);
+          }
+          await apiClient.deleteManagedSkill(selectedSkillNode.path);
+          setSelectedSkillNode({ path, kind: "dir" });
+          setSkillContent("");
+          setSkillSaved(true);
+          await refreshManagedSkills();
+          return;
+        }
+        await apiClient.createManagedSkillDirectory(path);
+        setSelectedSkillNode({ path, kind: "dir" });
+        setSkillContent("");
+        setSkillSaved(true);
+        await refreshManagedSkills();
+        return;
+      }
       const saved = await apiClient.saveManagedSkill(path, skillContent);
-      setSelectedSkillPath(saved.path);
+      if (selectedSkillNode?.kind === "file" && selectedSkillNode.path !== saved.path) {
+        await apiClient.deleteManagedSkill(selectedSkillNode.path);
+      }
+      setSelectedSkillNode({ path: saved.path, kind: "file" });
       setSkillPathInput(saved.path);
       setSkillContent(saved.content);
       setSkillSaved(true);
-      setManagedSkills(await apiClient.listManagedSkills());
+      await refreshManagedSkills();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("admin.skillSaveFailed"));
     } finally {
@@ -265,7 +397,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
   }
 
   async function deleteManagedSkill() {
-    const path = selectedSkillPath ?? skillPathInput.trim();
+    const path = selectedSkillNode?.path ?? skillPathInput.trim();
     if (!path) {
       return;
     }
@@ -274,12 +406,34 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
     setError(null);
     try {
       await apiClient.deleteManagedSkill(path);
-      setSelectedSkillPath(null);
-      setSkillPathInput("writing/SKILL.md");
+      setSelectedSkillNode(null);
+      setSkillPathInput("");
       setSkillContent("");
-      setManagedSkills(await apiClient.listManagedSkills());
+      setSkillEditorMode("file");
+      await refreshManagedSkills();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("admin.skillDeleteFailed"));
+    } finally {
+      setSkillLoading(false);
+    }
+  }
+
+  async function uploadManagedSkillFiles(event: ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    if (files.length === 0) {
+      return;
+    }
+    const targetPath = selectedSkillNode?.kind === "dir" ? selectedSkillNode.path : undefined;
+    setSkillSaved(false);
+    setSkillLoading(true);
+    setError(null);
+    try {
+      await apiClient.uploadManagedSkills(files, targetPath);
+      setSkillSaved(true);
+      await refreshManagedSkills();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("admin.skillUploadFailed"));
     } finally {
       setSkillLoading(false);
     }
@@ -290,6 +444,36 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
       ? missingRequiredModels.map((kind) => modelLabels[kind]).join(language === "zh" ? "、" : ", ")
       : [modelLabels.llm, modelLabels.title].join(language === "zh" ? "、" : ", ");
   const modelGateMessage = t("admin.modelGate", { models: missingRequiredModelNames });
+
+  function renderManagedSkillNode(node: ManagedSkillTreeNode): ReactNode {
+    if (node.path === "") {
+      return node.children.map(renderManagedSkillNode);
+    }
+    const selected = selectedSkillNode?.path === node.path && selectedSkillNode.kind === node.kind;
+    return (
+      <li
+        key={`${node.kind}:${node.path}`}
+        className={selected ? "selected" : undefined}
+      >
+        <button
+          type="button"
+          className={`skill-tree-button ${node.kind === "dir" ? "directory" : "file"}`}
+          aria-label={`${node.kind === "dir" ? t("admin.skillDirectory") : t("admin.skillFile")} ${node.path}`}
+          onClick={() =>
+            node.kind === "dir"
+              ? selectManagedSkillDirectory(node.path)
+              : void openManagedSkill(node.path)
+          }
+        >
+          <strong>{node.path}</strong>
+          <span>{node.kind === "dir" ? t("admin.skillDirectory") : formatBytes(node.size)}</span>
+        </button>
+        {node.kind === "dir" && node.children.length > 0 ? (
+          <ul className="skill-tree">{node.children.map(renderManagedSkillNode)}</ul>
+        ) : null}
+      </li>
+    );
+  }
 
   if (section === "models") {
     return (
@@ -757,7 +941,12 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
               {t("admin.refresh")}
             </button>
             <button type="button" className="secondary" onClick={newManagedSkill}>
+              <FilePlus2 aria-hidden="true" size={16} />
               {t("admin.skillNew")}
+            </button>
+            <button type="button" className="secondary" onClick={newManagedSkillDirectory}>
+              <FolderPlus aria-hidden="true" size={16} />
+              {t("admin.skillNewFolder")}
             </button>
           </div>
         </div>
@@ -765,25 +954,65 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
         {skillSaved ? <p className="copy-line">{t("admin.skillSaved")}</p> : null}
         <div className="skills-layout">
           <div className="panel skills-list-panel">
-            {managedSkills.length === 0 ? (
+            <div className="skill-upload-toolbar">
+              <input
+                ref={fileUploadInputRef}
+                type="file"
+                multiple
+                hidden
+                onChange={(event) => void uploadManagedSkillFiles(event)}
+              />
+              <input
+                ref={folderUploadInputRef}
+                type="file"
+                multiple
+                hidden
+                data-testid="managed-skills-folder-input"
+                // Chromium/WebKit 提供目录上传，React 类型暂未包含这个非标准属性。
+                {...({ webkitdirectory: "", directory: "" } as Record<string, string>)}
+                onChange={(event) => void uploadManagedSkillFiles(event)}
+              />
+              <input
+                ref={zipUploadInputRef}
+                type="file"
+                accept=".zip,application/zip"
+                hidden
+                data-testid="managed-skills-zip-input"
+                onChange={(event) => void uploadManagedSkillFiles(event)}
+              />
+              <button
+                type="button"
+                className="secondary"
+                disabled={skillLoading}
+                onClick={() => fileUploadInputRef.current?.click()}
+              >
+                <Upload aria-hidden="true" size={16} />
+                {t("admin.skillUploadFiles")}
+              </button>
+              <button
+                type="button"
+                className="secondary"
+                disabled={skillLoading}
+                onClick={() => folderUploadInputRef.current?.click()}
+              >
+                <FolderPlus aria-hidden="true" size={16} />
+                {t("admin.skillUploadFolder")}
+              </button>
+              <button
+                type="button"
+                className="secondary"
+                disabled={skillLoading}
+                onClick={() => zipUploadInputRef.current?.click()}
+              >
+                <FileArchive aria-hidden="true" size={16} />
+                {t("admin.skillUploadZip")}
+              </button>
+            </div>
+            {!managedSkillTree || managedSkillTree.children.length === 0 ? (
               <p className="notice">{t("admin.skillEmpty")}</p>
             ) : (
-              <ul className="list compact-list skill-list">
-                {managedSkills.map((skill) => (
-                  <li
-                    key={skill.path}
-                    className={selectedSkillPath === skill.path ? "selected" : undefined}
-                  >
-                    <button
-                      type="button"
-                      className="list-button"
-                      onClick={() => void openManagedSkill(skill.path)}
-                    >
-                      <strong>{skill.path}</strong>
-                      <span>{formatBytes(skill.size)}</span>
-                    </button>
-                  </li>
-                ))}
+              <ul className="list compact-list skill-list skill-tree">
+                {managedSkillTree.children.map(renderManagedSkillNode)}
               </ul>
             )}
           </div>
@@ -799,25 +1028,29 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                 required
               />
             </label>
-            <label>
-              {t("admin.skillContent")}
-              <textarea
-                value={skillContent}
-                onChange={(event) => {
-                  setSkillContent(event.target.value);
-                  setSkillSaved(false);
-                }}
-                spellCheck={false}
-              />
-            </label>
+            {skillEditorMode === "file" ? (
+              <label>
+                {t("admin.skillContent")}
+                <textarea
+                  value={skillContent}
+                  onChange={(event) => {
+                    setSkillContent(event.target.value);
+                    setSkillSaved(false);
+                  }}
+                  spellCheck={false}
+                />
+              </label>
+            ) : (
+              <p className="notice">{t("admin.skillDirectorySelected")}</p>
+            )}
             <div className="button-row">
               <button type="submit" disabled={skillLoading || skillPathInput.trim() === ""}>
-                {t("admin.save")}
+                {skillEditorMode === "directory" ? t("admin.skillCreateFolder") : t("admin.save")}
               </button>
               <button
                 type="button"
                 className="secondary"
-                disabled={skillLoading || !selectedSkillPath}
+                disabled={skillLoading || !selectedSkillNode}
                 onClick={() => void deleteManagedSkill()}
               >
                 {t("admin.delete")}

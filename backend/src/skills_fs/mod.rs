@@ -23,7 +23,7 @@ const ROOT_ID: fileid3 = 1;
 const FS_ID: u64 = 0x4848_534b_494c_4c53;
 const DIR_MODE: u32 = 0o555;
 const FILE_MODE: u32 = 0o444;
-const HIDDEN_SEGMENTS: [&str; 2] = [".curator_state", ".bundled_manifest"];
+const HIDDEN_SEGMENTS: [&str; 3] = [".curator_state", ".bundled_manifest", ".hub-directory"];
 
 #[derive(Debug, Error)]
 pub enum SkillsFsError {

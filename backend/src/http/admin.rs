@@ -1,14 +1,21 @@
 use axum::{
     body::to_bytes,
-    extract::{Path, State},
+    extract::{Multipart, Path, State},
     http::{HeaderMap, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::time::Instant;
+use std::{
+    collections::BTreeMap,
+    io::{Cursor, Read},
+    path::{Component, Path as StdPath},
+    time::Instant,
+};
+use zip::ZipArchive;
 
 use crate::{
     domain::user::{PublicUser, UserListItem},
@@ -32,6 +39,9 @@ use crate::{
     storage::ObjectStorageError,
     AppState,
 };
+
+const MAX_MANAGED_SKILL_UPLOAD_FILES: usize = 1000;
+const MANAGED_SKILL_DIRECTORY_MARKER: &str = ".hub-directory";
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -68,6 +78,18 @@ pub fn router() -> Router<AppState> {
             get(get_system_settings).put(update_system_settings),
         )
         .route("/api/admin/managed-skills", get(list_managed_skills))
+        .route(
+            "/api/admin/managed-skills/tree",
+            get(get_managed_skills_tree),
+        )
+        .route(
+            "/api/admin/managed-skills/upload",
+            post(upload_managed_skills),
+        )
+        .route(
+            "/api/admin/managed-skills/directories/{*path}",
+            post(create_managed_skill_directory),
+        )
         .route(
             "/api/admin/managed-skills/{*path}",
             get(get_managed_skill)
@@ -144,6 +166,20 @@ struct ManagedSkillsResponse {
     skills: Vec<ManagedSkillSummary>,
 }
 
+#[derive(Clone, Serialize)]
+struct ManagedSkillTreeNode {
+    name: String,
+    path: String,
+    kind: &'static str,
+    size: u64,
+    children: Vec<ManagedSkillTreeNode>,
+}
+
+#[derive(Serialize)]
+struct ManagedSkillTreeResponse {
+    tree: ManagedSkillTreeNode,
+}
+
 #[derive(Serialize)]
 struct ManagedSkillContent {
     path: String,
@@ -158,6 +194,26 @@ struct ManagedSkillResponse {
 #[derive(Deserialize)]
 struct SaveManagedSkillRequest {
     content: String,
+}
+
+#[derive(Serialize)]
+struct ManagedSkillUploadResponse {
+    skills: Vec<ManagedSkillSummary>,
+}
+
+struct ManagedSkillUploadPart {
+    file_name: String,
+    content_type: Option<String>,
+    bytes: Bytes,
+}
+
+#[derive(Default)]
+struct ManagedSkillTreeBuilder {
+    name: String,
+    path: String,
+    is_dir: bool,
+    size: u64,
+    children: BTreeMap<String, ManagedSkillTreeBuilder>,
 }
 
 async fn list_users(
@@ -485,24 +541,38 @@ async fn list_managed_skills(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
+    let skills = list_managed_skill_summaries(&state).await?;
+
+    Ok(Json(ManagedSkillsResponse { skills }))
+}
+
+async fn get_managed_skills_tree(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
     let prefix = managed_skills_prefix(&state)?;
     let list_prefix = managed_skills_list_prefix(&prefix);
-    let mut skills = state
+    let mut root = ManagedSkillTreeBuilder::root();
+
+    for object in state
         .object_storage
         .list_prefix(&list_prefix)
         .await
         .map_err(map_object_storage_error)?
-        .into_iter()
-        .filter_map(|object| {
-            managed_skill_relative_path(&prefix, &object.key).map(|path| ManagedSkillSummary {
-                path,
-                size: object.size,
-            })
-        })
-        .collect::<Vec<_>>();
-    skills.sort_by(|left, right| left.path.cmp(&right.path));
+    {
+        if let Some(path) = managed_skill_directory_marker_path(&prefix, &object.key) {
+            root.insert_dir(&path)?;
+            continue;
+        }
+        if let Some(path) = managed_skill_relative_path(&prefix, &object.key) {
+            root.insert_file(&path, object.size)?;
+        }
+    }
 
-    Ok(Json(ManagedSkillsResponse { skills }))
+    Ok(Json(ManagedSkillTreeResponse {
+        tree: root.into_node(),
+    }))
 }
 
 async fn get_managed_skill(
@@ -556,14 +626,88 @@ async fn delete_managed_skill(
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
     let path = normalize_managed_skill_path(&path)?;
-    let key = managed_skill_object_key(&managed_skills_prefix(&state)?, &path);
+    let prefix = managed_skills_prefix(&state)?;
+    let key = managed_skill_object_key(&prefix, &path);
+    let list_prefix = managed_skill_object_key(&prefix, &format!("{path}/"));
+    let mut keys = state
+        .object_storage
+        .list_prefix(&list_prefix)
+        .await
+        .map_err(map_object_storage_error)?
+        .into_iter()
+        .map(|object| object.key)
+        .collect::<Vec<_>>();
+
+    match state.object_storage.get(&key).await {
+        Ok(_) => keys.push(key),
+        Err(ObjectStorageError::NotFound) => {}
+        Err(error) => return Err(map_object_storage_error(error)),
+    }
+
+    keys.sort();
+    keys.dedup();
+    if keys.is_empty() {
+        return Err(ApiError::NotFound("managed skill not found"));
+    }
+
+    for key in keys {
+        state
+            .object_storage
+            .delete(&key)
+            .await
+            .map_err(map_object_storage_error)?;
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn upload_managed_skills(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    let uploads = parse_managed_skill_upload(&state, multipart).await?;
+    if uploads.is_empty() {
+        return Err(ApiError::BadRequest("managed skill upload is empty"));
+    }
+    let prefix = managed_skills_prefix(&state)?;
+    let mut skills = Vec::with_capacity(uploads.len());
+
+    for (path, bytes) in uploads {
+        let key = managed_skill_object_key(&prefix, &path);
+        let size = bytes.len() as u64;
+        state
+            .object_storage
+            .put(&key, bytes)
+            .await
+            .map_err(map_object_storage_error)?;
+        skills.push(ManagedSkillSummary { path, size });
+    }
+    skills.sort_by(|left, right| left.path.cmp(&right.path));
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ManagedSkillUploadResponse { skills }),
+    ))
+}
+
+async fn create_managed_skill_directory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    let path = normalize_managed_skill_path(&path)?;
+    let marker_path = format!("{path}/{MANAGED_SKILL_DIRECTORY_MARKER}");
+    let key = managed_skill_object_key(&managed_skills_prefix(&state)?, &marker_path);
     state
         .object_storage
-        .delete(&key)
+        .put(&key, Bytes::new())
         .await
         .map_err(map_object_storage_error)?;
 
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::CREATED)
 }
 
 async fn model_config_from_payload(
@@ -619,6 +763,28 @@ fn managed_skills_list_prefix(prefix: &str) -> String {
     }
 }
 
+async fn list_managed_skill_summaries(
+    state: &AppState,
+) -> Result<Vec<ManagedSkillSummary>, ApiError> {
+    let prefix = managed_skills_prefix(state)?;
+    let list_prefix = managed_skills_list_prefix(&prefix);
+    let mut skills = state
+        .object_storage
+        .list_prefix(&list_prefix)
+        .await
+        .map_err(map_object_storage_error)?
+        .into_iter()
+        .filter_map(|object| {
+            managed_skill_relative_path(&prefix, &object.key).map(|path| ManagedSkillSummary {
+                path,
+                size: object.size,
+            })
+        })
+        .collect::<Vec<_>>();
+    skills.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(skills)
+}
+
 fn managed_skill_object_key(prefix: &str, path: &str) -> String {
     if prefix.is_empty() {
         path.to_string()
@@ -637,7 +803,209 @@ fn managed_skill_relative_path(prefix: &str, key: &str) -> Option<String> {
     } else {
         key.strip_prefix(&format!("{prefix}/"))?
     };
+    if relative
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name == MANAGED_SKILL_DIRECTORY_MARKER)
+    {
+        return None;
+    }
     normalize_managed_skill_path(relative).ok()
+}
+
+fn managed_skill_directory_marker_path(prefix: &str, key: &str) -> Option<String> {
+    let key = key.trim_start_matches('/');
+    let relative = if prefix.is_empty() {
+        key
+    } else {
+        key.strip_prefix(&format!("{prefix}/"))?
+    };
+    let directory = relative.strip_suffix(&format!("/{MANAGED_SKILL_DIRECTORY_MARKER}"))?;
+    normalize_managed_skill_path(directory).ok()
+}
+
+async fn parse_managed_skill_upload(
+    state: &AppState,
+    mut multipart: Multipart,
+) -> Result<Vec<(String, Bytes)>, ApiError> {
+    let mut target_path = String::new();
+    let mut parts = Vec::new();
+    let mut total_bytes = 0usize;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| ApiError::BadRequest("multipart body is invalid"))?
+    {
+        let field_name = field.name().map(ToOwned::to_owned).unwrap_or_default();
+        if field_name == "target_path" {
+            let value = field
+                .text()
+                .await
+                .map_err(|_| ApiError::BadRequest("multipart body is invalid"))?;
+            target_path = normalize_managed_skill_optional_path(&value)?;
+            continue;
+        }
+
+        let Some(file_name) = field.file_name().map(ToOwned::to_owned) else {
+            continue;
+        };
+        let content_type = field.content_type().map(ToOwned::to_owned);
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|_| ApiError::BadRequest("managed skill upload body is invalid"))?;
+        total_bytes = total_bytes
+            .checked_add(bytes.len())
+            .ok_or(ApiError::BadRequest("managed skill upload is too large"))?;
+        if total_bytes > state.config.object_storage.max_upload_bytes {
+            return Err(ApiError::BadRequest("managed skill upload is too large"));
+        }
+        parts.push(ManagedSkillUploadPart {
+            file_name,
+            content_type,
+            bytes,
+        });
+        if parts.len() > MAX_MANAGED_SKILL_UPLOAD_FILES {
+            return Err(ApiError::BadRequest(
+                "managed skill upload has too many files",
+            ));
+        }
+    }
+
+    let mut uploads = Vec::new();
+    for part in parts {
+        let is_zip = managed_skill_upload_is_zip(&part);
+        if is_zip {
+            let files = extract_managed_skill_zip(&target_path, &part.bytes, state)?;
+            uploads.extend(files);
+        } else {
+            let path = normalize_managed_skill_upload_path(&target_path, &part.file_name)?;
+            uploads.push((path, part.bytes));
+        }
+        if uploads.len() > MAX_MANAGED_SKILL_UPLOAD_FILES {
+            return Err(ApiError::BadRequest(
+                "managed skill upload has too many files",
+            ));
+        }
+    }
+
+    uploads.sort_by(|left, right| left.0.cmp(&right.0));
+    uploads.dedup_by(|left, right| left.0 == right.0);
+    Ok(uploads)
+}
+
+fn managed_skill_upload_is_zip(part: &ManagedSkillUploadPart) -> bool {
+    part.file_name
+        .rsplit('.')
+        .next()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+        || part.content_type.as_deref().is_some_and(|content_type| {
+            matches!(
+                content_type,
+                "application/zip" | "application/x-zip-compressed"
+            )
+        })
+}
+
+fn extract_managed_skill_zip(
+    target_path: &str,
+    bytes: &Bytes,
+    state: &AppState,
+) -> Result<Vec<(String, Bytes)>, ApiError> {
+    let cursor = Cursor::new(bytes.as_ref());
+    let mut archive = ZipArchive::new(cursor)
+        .map_err(|_| ApiError::BadRequest("managed skill zip archive is invalid"))?;
+    let mut files = Vec::new();
+    let mut total_bytes = 0usize;
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|_| ApiError::BadRequest("managed skill zip archive is invalid"))?;
+        if entry.is_dir() {
+            continue;
+        }
+        if zip_entry_is_symlink(entry.unix_mode()) {
+            return Err(ApiError::BadRequest(
+                "managed skill zip archive contains unsupported entries",
+            ));
+        }
+        let entry_path = entry
+            .enclosed_name()
+            .ok_or(ApiError::BadRequest("invalid managed skill path"))?;
+        let entry_path = path_buf_to_managed_skill_path(&entry_path)?;
+        let path = normalize_managed_skill_upload_path(target_path, &entry_path)?;
+        let entry_size = usize::try_from(entry.size())
+            .map_err(|_| ApiError::BadRequest("managed skill upload is too large"))?;
+        total_bytes = total_bytes
+            .checked_add(entry_size)
+            .ok_or(ApiError::BadRequest("managed skill upload is too large"))?;
+        if total_bytes > state.config.object_storage.max_upload_bytes {
+            return Err(ApiError::BadRequest("managed skill upload is too large"));
+        }
+
+        let mut data = Vec::with_capacity(entry_size);
+        entry
+            .read_to_end(&mut data)
+            .map_err(|_| ApiError::BadRequest("managed skill zip archive is invalid"))?;
+        files.push((path, Bytes::from(data)));
+        if files.len() > MAX_MANAGED_SKILL_UPLOAD_FILES {
+            return Err(ApiError::BadRequest(
+                "managed skill upload has too many files",
+            ));
+        }
+    }
+
+    Ok(files)
+}
+
+fn zip_entry_is_symlink(unix_mode: Option<u32>) -> bool {
+    unix_mode.is_some_and(|mode| mode & 0o170000 == 0o120000)
+}
+
+fn path_buf_to_managed_skill_path(path: &StdPath) -> Result<String, ApiError> {
+    let mut segments = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(segment) => {
+                let segment = segment
+                    .to_str()
+                    .ok_or(ApiError::BadRequest("invalid managed skill path"))?;
+                segments.push(segment.to_string());
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(ApiError::BadRequest("invalid managed skill path"));
+            }
+        }
+    }
+    if segments.is_empty() {
+        return Err(ApiError::BadRequest("invalid managed skill path"));
+    }
+    Ok(segments.join("/"))
+}
+
+fn normalize_managed_skill_optional_path(path: &str) -> Result<String, ApiError> {
+    let path = path.trim().trim_matches('/');
+    if path.is_empty() {
+        return Ok(String::new());
+    }
+    normalize_managed_skill_path(path)
+}
+
+fn normalize_managed_skill_upload_path(target_path: &str, path: &str) -> Result<String, ApiError> {
+    let path = path.trim().replace('\\', "/");
+    let path = path.trim_matches('/');
+    if path.is_empty() {
+        return Err(ApiError::BadRequest("invalid managed skill path"));
+    }
+    let combined = if target_path.is_empty() {
+        path.to_string()
+    } else {
+        format!("{target_path}/{path}")
+    };
+    normalize_managed_skill_path(&combined)
 }
 
 fn normalize_managed_skill_path(path: &str) -> Result<String, ApiError> {
@@ -653,10 +1021,106 @@ fn normalize_managed_skill_path(path: &str) -> Result<String, ApiError> {
     Ok(normalized)
 }
 
+impl ManagedSkillTreeBuilder {
+    fn root() -> Self {
+        Self {
+            name: String::new(),
+            path: String::new(),
+            is_dir: true,
+            size: 0,
+            children: BTreeMap::new(),
+        }
+    }
+
+    fn insert_file(&mut self, path: &str, size: u64) -> Result<(), ApiError> {
+        let path = normalize_managed_skill_path(path)?;
+        let mut current = self;
+        let mut current_path = String::new();
+        let mut segments = path.split('/').peekable();
+
+        while let Some(segment) = segments.next() {
+            let is_file = segments.peek().is_none();
+            current_path = if current_path.is_empty() {
+                segment.to_string()
+            } else {
+                format!("{current_path}/{segment}")
+            };
+            current = current
+                .children
+                .entry(segment.to_string())
+                .or_insert_with(|| ManagedSkillTreeBuilder {
+                    name: segment.to_string(),
+                    path: current_path.clone(),
+                    is_dir: !is_file,
+                    size: 0,
+                    children: BTreeMap::new(),
+                });
+            if is_file {
+                current.is_dir = false;
+                current.size = size;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn insert_dir(&mut self, path: &str) -> Result<(), ApiError> {
+        let path = normalize_managed_skill_path(path)?;
+        let mut current = self;
+        let mut current_path = String::new();
+
+        for segment in path.split('/') {
+            current_path = if current_path.is_empty() {
+                segment.to_string()
+            } else {
+                format!("{current_path}/{segment}")
+            };
+            current = current
+                .children
+                .entry(segment.to_string())
+                .or_insert_with(|| ManagedSkillTreeBuilder {
+                    name: segment.to_string(),
+                    path: current_path.clone(),
+                    is_dir: true,
+                    size: 0,
+                    children: BTreeMap::new(),
+                });
+            current.is_dir = true;
+        }
+
+        Ok(())
+    }
+
+    fn into_node(self) -> ManagedSkillTreeNode {
+        let mut children = self
+            .children
+            .into_values()
+            .map(ManagedSkillTreeBuilder::into_node)
+            .collect::<Vec<_>>();
+        // 文件夹排在文件前面，同类按路径稳定排序，前端刷新时树不会跳动。
+        children.sort_by(|left, right| match (left.kind, right.kind) {
+            ("dir", "file") => std::cmp::Ordering::Less,
+            ("file", "dir") => std::cmp::Ordering::Greater,
+            _ => left.name.cmp(&right.name),
+        });
+        ManagedSkillTreeNode {
+            name: self.name,
+            path: self.path,
+            kind: if self.is_dir { "dir" } else { "file" },
+            size: self.size,
+            children,
+        }
+    }
+}
+
 fn has_hidden_managed_skill_segment(path: &str) -> bool {
     // 这些路径属于 Hermes curator 的内部状态，统一管理的 Skill 不能覆盖或暴露它们。
-    path.split('/')
-        .any(|segment| matches!(segment, ".curator_state" | ".bundled_manifest"))
+    path.split('/').any(|segment| {
+        matches!(
+            segment,
+            ".curator_state" | ".bundled_manifest" | MANAGED_SKILL_DIRECTORY_MARKER
+        )
+    })
 }
 
 fn map_object_storage_error(error: ObjectStorageError) -> ApiError {

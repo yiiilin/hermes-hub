@@ -112,6 +112,14 @@ export type ManagedSkill = {
   size: number;
 };
 
+export type ManagedSkillTreeNode = {
+  name: string;
+  path: string;
+  kind: "dir" | "file";
+  size: number;
+  children: ManagedSkillTreeNode[];
+};
+
 export type ManagedSkillContent = {
   path: string;
   content: string;
@@ -273,9 +281,12 @@ export type ApiClient = {
   systemSettings: () => Promise<SystemSettings>;
   updateSystemSettings: (settings: SystemSettings) => Promise<void>;
   listManagedSkills: () => Promise<ManagedSkill[]>;
+  listManagedSkillTree: () => Promise<ManagedSkillTreeNode>;
   readManagedSkill: (path: string) => Promise<ManagedSkillContent>;
   saveManagedSkill: (path: string, content: string) => Promise<ManagedSkillContent>;
   deleteManagedSkill: (path: string) => Promise<void>;
+  createManagedSkillDirectory: (path: string) => Promise<void>;
+  uploadManagedSkills: (files: File[], targetPath?: string) => Promise<ManagedSkill[]>;
   activeHermesRun: (channelId: string, sessionId: string) => Promise<HermesActiveRun | null>;
   subscribeSessionEvents: (
     channelId: string,
@@ -382,6 +393,29 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   return response.json() as Promise<T>;
 }
 
+async function requestForm<T>(path: string, form: FormData): Promise<T> {
+  const response = await fetch(path, {
+    method: "POST",
+    credentials: "include",
+    body: form,
+  });
+
+  if (!response.ok) {
+    const payload: ApiErrorPayload = await response
+      .json()
+      .then((value): ApiErrorPayload =>
+        value && typeof value === "object"
+          ? (value as ApiErrorPayload)
+          : { message: response.statusText },
+      )
+      .catch((): ApiErrorPayload => ({ message: response.statusText }));
+    const message = payload.message ?? payload.error ?? response.statusText;
+    throw new ApiRequestError(String(message), payload);
+  }
+
+  return response.json() as Promise<T>;
+}
+
 async function updateModelConfigRequest(config: ModelConfig): Promise<void> {
   await request<void>("/api/admin/model-config", {
     method: "PUT",
@@ -406,6 +440,19 @@ function managedSkillUrl(path: string): string {
     // 点号段可能被浏览器在发出请求前规范化，显式编码后交给后端统一校验。
     .map((segment) => segment.replace(/\./g, "%2E"))
     .join("/")}`;
+}
+
+function managedSkillDirectoryUrl(path: string): string {
+  return `/api/admin/managed-skills/directories/${path
+    .split("/")
+    .filter(Boolean)
+    .map(encodeURIComponent)
+    .map((segment) => segment.replace(/\./g, "%2E"))
+    .join("/")}`;
+}
+
+function managedSkillFileName(file: File): string {
+  return (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
 }
 
 export function defaultOidcSettings(): OidcSettings {
@@ -713,6 +760,12 @@ export function createApiClient(): ApiClient {
       const payload = await request<{ skills: ManagedSkill[] }>("/api/admin/managed-skills");
       return payload.skills;
     },
+    async listManagedSkillTree() {
+      const payload = await request<{ tree: ManagedSkillTreeNode }>(
+        "/api/admin/managed-skills/tree",
+      );
+      return payload.tree;
+    },
     async readManagedSkill(path) {
       const payload = await request<{ skill: ManagedSkillContent }>(managedSkillUrl(path));
       return payload.skill;
@@ -726,6 +779,23 @@ export function createApiClient(): ApiClient {
     },
     async deleteManagedSkill(path) {
       await request<void>(managedSkillUrl(path), { method: "DELETE" });
+    },
+    async createManagedSkillDirectory(path) {
+      await request<void>(managedSkillDirectoryUrl(path), { method: "POST" });
+    },
+    async uploadManagedSkills(files, targetPath) {
+      const form = new FormData();
+      if (targetPath?.trim()) {
+        form.append("target_path", targetPath.trim());
+      }
+      for (const file of files) {
+        form.append("files", file, managedSkillFileName(file));
+      }
+      const payload = await requestForm<{ skills: ManagedSkill[] }>(
+        "/api/admin/managed-skills/upload",
+        form,
+      );
+      return payload.skills;
     },
     async activeHermesRun(channelId, sessionId) {
       const payload = await request<{ active_run: HermesActiveRun | null }>(
@@ -907,8 +977,11 @@ type MockApiClientOptions = {
   deleteSession?: ApiClient["deleteSession"];
   createSession?: ApiClient["createSession"];
   initialManagedSkills?: Record<string, string>;
+  initialManagedSkillDirectories?: string[];
   saveManagedSkill?: ApiClient["saveManagedSkill"];
   deleteManagedSkill?: ApiClient["deleteManagedSkill"];
+  createManagedSkillDirectory?: ApiClient["createManagedSkillDirectory"];
+  uploadManagedSkills?: ApiClient["uploadManagedSkills"];
 };
 
 export function createMockApiClient(options: MockApiClientOptions = {}): ApiClient {
@@ -990,11 +1063,73 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     "writing/SKILL.md": "# Writing\n\nUse concise prose.\n",
     ...(options.initialManagedSkills ?? {}),
   };
+  let managedSkillDirectories = new Set(options.initialManagedSkillDirectories ?? []);
 
   function emitSessionEvent(sessionId: string, event: ChannelSessionEvent) {
     for (const listener of sessionEventListenersBySessionId[sessionId] ?? []) {
       listener(event);
     }
+  }
+
+  function managedSkillTreeFromState(): ManagedSkillTreeNode {
+    const root: ManagedSkillTreeNode = {
+      name: "",
+      path: "",
+      kind: "dir",
+      size: 0,
+      children: [],
+    };
+
+    function ensureDir(path: string) {
+      let node = root;
+      let currentPath = "";
+      for (const segment of path.split("/").filter(Boolean)) {
+        currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+        let child = node.children.find((item) => item.name === segment && item.kind === "dir");
+        if (!child) {
+          child = {
+            name: segment,
+            path: currentPath,
+            kind: "dir",
+            size: 0,
+            children: [],
+          };
+          node.children.push(child);
+        }
+        node = child;
+      }
+      return node;
+    }
+
+    for (const directory of managedSkillDirectories) {
+      ensureDir(directory);
+    }
+    for (const [path, content] of Object.entries(managedSkills)) {
+      const segments = path.split("/");
+      const fileName = segments.pop()!;
+      const parent = ensureDir(segments.join("/"));
+      parent.children.push({
+        name: fileName,
+        path,
+        kind: "file",
+        size: new Blob([content]).size,
+        children: [],
+      });
+    }
+
+    function sortNode(node: ManagedSkillTreeNode) {
+      node.children.sort((left, right) => {
+        if (left.kind !== right.kind) {
+          return left.kind === "dir" ? -1 : 1;
+        }
+        return left.name.localeCompare(right.name);
+      });
+      for (const child of node.children) {
+        sortNode(child);
+      }
+    }
+    sortNode(root);
+    return root;
   }
 
   return {
@@ -1305,6 +1440,9 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
         .map(([path, content]) => ({ path, size: new Blob([content]).size }))
         .sort((left, right) => left.path.localeCompare(right.path));
     },
+    async listManagedSkillTree() {
+      return managedSkillTreeFromState();
+    },
     async readManagedSkill(path) {
       if (!(path in managedSkills)) {
         throw new Error("managed skill not found");
@@ -1324,7 +1462,38 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       if (options.deleteManagedSkill) {
         await options.deleteManagedSkill(path);
       }
-      delete managedSkills[path];
+      for (const skillPath of Object.keys(managedSkills)) {
+        if (skillPath === path || skillPath.startsWith(`${path}/`)) {
+          delete managedSkills[skillPath];
+        }
+      }
+      managedSkillDirectories = new Set(
+        Array.from(managedSkillDirectories).filter(
+          (directory) => directory !== path && !directory.startsWith(`${path}/`),
+        ),
+      );
+    },
+    async createManagedSkillDirectory(path) {
+      if (options.createManagedSkillDirectory) {
+        await options.createManagedSkillDirectory(path);
+      }
+      managedSkillDirectories.add(path);
+    },
+    async uploadManagedSkills(files, targetPath) {
+      if (options.uploadManagedSkills) {
+        const uploaded = await options.uploadManagedSkills(files, targetPath);
+        for (const skill of uploaded) {
+          managedSkills[skill.path] = "";
+        }
+        return uploaded;
+      }
+      const uploaded = files.map((file) => {
+        const filePath = managedSkillFileName(file);
+        const path = targetPath?.trim() ? `${targetPath.trim()}/${filePath}` : filePath;
+        managedSkills[path] = "";
+        return { path, size: file.size };
+      });
+      return uploaded.sort((left, right) => left.path.localeCompare(right.path));
     },
     async activeHermesRun(_channelId, sessionId) {
       return activeRunsBySessionId[sessionId] ?? null;

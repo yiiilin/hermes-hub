@@ -1722,15 +1722,19 @@ describe("App", () => {
     // 用可观测的 mock API 验证页面不会只更新本地状态。
     const saveManagedSkill = vi.fn(async (path: string, content: string) => ({ path, content }));
     const deleteManagedSkill = vi.fn(async () => undefined);
+    const createManagedSkillDirectory = vi.fn(async () => undefined);
 
     render(
       <App
         apiClient={createMockApiClient({
           initialManagedSkills: {
             "image/SKILL.md": "# Image\n\nUse sharp visual prompts.\n",
+            "writing/references/style.md": "Use direct language.\n",
           },
+          initialManagedSkillDirectories: ["research", "writing/drafts/empty-child"],
           saveManagedSkill,
           deleteManagedSkill,
+          createManagedSkillDirectory,
         })}
       />,
     );
@@ -1740,8 +1744,9 @@ describe("App", () => {
     fireEvent.click(skillNav);
 
     expect(await screen.findByRole("heading", { name: "统一 Skill 管理" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /image\/SKILL\.md/ })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /writing\/SKILL\.md/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "文件夹 writing" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "文件夹 research" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /writing\/references\/style\.md/ })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /image\/SKILL\.md/ }));
     expect(await screen.findByLabelText("Skill 路径")).toHaveValue("image/SKILL.md");
@@ -1771,13 +1776,79 @@ describe("App", () => {
       expect(deleteManagedSkill).toHaveBeenCalledWith("image/SKILL.md");
       expect(screen.queryByRole("button", { name: /image\/SKILL\.md/ })).not.toBeInTheDocument();
     });
-    expect(screen.getByLabelText("Skill 路径")).toHaveValue("writing/SKILL.md");
+    expect(screen.getByLabelText("Skill 路径")).toHaveValue("");
     expect(screen.getByLabelText("Skill 内容")).toHaveValue("");
     expect(screen.getByRole("button", { name: "删除" })).toBeDisabled();
 
+    fireEvent.click(screen.getByRole("button", { name: "文件夹 writing" }));
+    fireEvent.click(screen.getByRole("button", { name: "新建文件夹" }));
+    expect(screen.getByLabelText("Skill 路径")).toHaveValue("writing/new-folder");
+    fireEvent.change(screen.getByLabelText("Skill 路径"), {
+      target: { value: "writing/drafts" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "创建文件夹" }));
+    await waitFor(() => {
+      expect(createManagedSkillDirectory).toHaveBeenCalledWith("writing/drafts");
+      expect(screen.getByRole("button", { name: "文件夹 writing/drafts" })).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByLabelText("Skill 路径"), {
+      target: { value: "writing/archive" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "创建文件夹" }));
+    await waitFor(() => {
+      expect(createManagedSkillDirectory).toHaveBeenCalledWith("writing/archive");
+      expect(createManagedSkillDirectory).toHaveBeenCalledWith("writing/archive/empty-child");
+      expect(deleteManagedSkill).toHaveBeenCalledWith("writing/drafts");
+      expect(screen.getByRole("button", { name: "文件夹 writing/archive" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "文件夹 writing/archive/empty-child" })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "文件夹 writing/archive" }));
     fireEvent.click(screen.getByRole("button", { name: "新建 Skill" }));
-    expect(screen.getByLabelText("Skill 路径")).toHaveValue("writing/SKILL.md");
+    expect(screen.getByLabelText("Skill 路径")).toHaveValue("writing/archive/SKILL.md");
     expect(screen.getByLabelText("Skill 内容")).toHaveValue("");
+  });
+
+  it("uploads managed skill folders and zip archives from the admin tree", async () => {
+    localStorage.setItem("hermes-hub-language", "zh");
+    const uploadManagedSkills = vi.fn(async (files: File[], targetPath?: string) =>
+      files.map((file) => ({
+        path: `${targetPath ? `${targetPath}/` : ""}${(file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name}`,
+        size: file.size,
+      })),
+    );
+
+    render(
+      <App
+        apiClient={createMockApiClient({
+          uploadManagedSkills,
+        })}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "统一 Skill 管理" }));
+    fireEvent.click(await screen.findByRole("button", { name: "文件夹 writing" }));
+
+    const folderFile = new File(["# Research\n"], "SKILL.md", { type: "text/markdown" });
+    Object.defineProperty(folderFile, "webkitRelativePath", {
+      value: "research/SKILL.md",
+    });
+    fireEvent.change(screen.getByTestId("managed-skills-folder-input"), {
+      target: { files: [folderFile] },
+    });
+    await waitFor(() => {
+      expect(uploadManagedSkills).toHaveBeenCalledWith([folderFile], "writing");
+      expect(screen.getByRole("button", { name: /writing\/research\/SKILL\.md/ })).toBeInTheDocument();
+    });
+
+    const zipFile = new File(["zip"], "skills.zip", { type: "application/zip" });
+    fireEvent.change(screen.getByTestId("managed-skills-zip-input"), {
+      target: { files: [zipFile] },
+    });
+    await waitFor(() => {
+      expect(uploadManagedSkills).toHaveBeenLastCalledWith([zipFile], "writing");
+    });
   });
 
   it("keeps returned model API keys in the real API client while password inputs hide them", async () => {
@@ -1924,6 +1995,46 @@ describe("App", () => {
         attachments: [],
       }),
     ).resolves.toEqual(expect.objectContaining({ content: "updated answer" }));
+    fetchMock.mockRestore();
+  });
+
+  it("uses FormData for managed skill uploads in the real API client", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (path, init) => {
+      expect(path).toBe("/api/admin/managed-skills/upload");
+      expect(init?.method).toBe("POST");
+      expect(init?.credentials).toBe("include");
+      expect(init?.body).toBeInstanceOf(FormData);
+      const form = init?.body as FormData;
+      expect(form.get("target_path")).toBe("writing");
+      const files = form.getAll("files");
+      expect(files).toHaveLength(2);
+      expect(files[0]).toBeInstanceOf(File);
+      expect((files[0] as File).name).toBe("research/SKILL.md");
+      expect((files[1] as File).name).toBe("skills.zip");
+      return {
+        ok: true,
+        status: 201,
+        json: async () => ({
+          skills: [
+            { path: "writing/research/SKILL.md", size: 5 },
+            { path: "writing/assistant/SKILL.md", size: 5 },
+          ],
+        }),
+      } as Response;
+    });
+
+    const folderFile = new File(["hello"], "SKILL.md", { type: "text/markdown" });
+    Object.defineProperty(folderFile, "webkitRelativePath", {
+      value: "research/SKILL.md",
+    });
+    const zipFile = new File(["hello"], "skills.zip", { type: "application/zip" });
+
+    await expect(
+      createApiClient().uploadManagedSkills([folderFile, zipFile], "writing"),
+    ).resolves.toEqual([
+      { path: "writing/research/SKILL.md", size: 5 },
+      { path: "writing/assistant/SKILL.md", size: 5 },
+    ]);
     fetchMock.mockRestore();
   });
 
