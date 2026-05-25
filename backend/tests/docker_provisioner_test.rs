@@ -470,7 +470,7 @@ async fn docker_provisioner_test() {
         .iter()
         .any(|entry| entry == "HERMES_ACCEPT_HOOKS=1"));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version" && value == "2026-05-23-hermes-hub-session-search-main"
+        key == "hermes_hub_spec_version" && value == "2026-05-25-hermes-hub-adapter-only-no-ports"
     }));
     assert!(spec
         .mounts
@@ -616,7 +616,7 @@ async fn docker_provisioner_test() {
     assert!(
         create_call.windows(2).any(|args| {
             args[0] == "--label"
-                && args[1] == "hermes_hub_spec_version=2026-05-23-hermes-hub-session-search-main"
+                && args[1] == "hermes_hub_spec_version=2026-05-25-hermes-hub-adapter-only-no-ports"
         }),
         "managed Hermes containers must carry the current spec label"
     );
