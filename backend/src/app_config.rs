@@ -2,7 +2,6 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use crate::hermes::docker_provisioner::HermesContainerConnectMode;
 use crate::model_config::{
     normalize_reasoning_effort, ModelConfig, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND,
 };
@@ -28,9 +27,6 @@ pub struct HermesDockerConfig {
     pub data_root: PathBuf,
     pub network: String,
     pub internal_port: u16,
-    pub connect_mode: HermesContainerConnectMode,
-    pub published_host_ip: String,
-    pub published_base_url: String,
     pub hub_llm_base_url: String,
     pub memory_limit: Option<String>,
     pub cpu_limit: Option<String>,
@@ -194,14 +190,6 @@ fn hermes_docker_config_from_env() -> HermesDockerConfig {
         network: std::env::var("HERMES_CONTAINER_NETWORK")
             .unwrap_or_else(|_| "hermes-hub-net".to_string()),
         internal_port: env_u16("HERMES_CONTAINER_INTERNAL_PORT", 8000),
-        connect_mode: std::env::var("HERMES_CONTAINER_CONNECT_MODE")
-            .ok()
-            .map(|value| HermesContainerConnectMode::parse(&value))
-            .unwrap_or(HermesContainerConnectMode::Network),
-        published_host_ip: std::env::var("HERMES_CONTAINER_PUBLISHED_HOST_IP")
-            .unwrap_or_else(|_| "127.0.0.1".to_string()),
-        published_base_url: std::env::var("HERMES_CONTAINER_PUBLISHED_BASE_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1".to_string()),
         hub_llm_base_url: std::env::var("HERMES_HUB_LLM_BASE_URL")
             .unwrap_or_else(|_| "http://hermes-hub:8080/internal/llm/v1".to_string()),
         memory_limit: optional_env("HERMES_CONTAINER_MEMORY_LIMIT").or(Some("1g".to_string())),
@@ -232,9 +220,6 @@ fn default_hermes_docker_config() -> HermesDockerConfig {
         data_root: PathBuf::from("/tmp/hermes-hub/users"),
         network: "hermes-hub-net".to_string(),
         internal_port: 8000,
-        connect_mode: HermesContainerConnectMode::Network,
-        published_host_ip: "127.0.0.1".to_string(),
-        published_base_url: "http://127.0.0.1".to_string(),
         hub_llm_base_url: "http://hermes-hub:8080/internal/llm/v1".to_string(),
         memory_limit: Some("1g".to_string()),
         cpu_limit: Some("1.0".to_string()),

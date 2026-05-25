@@ -26,7 +26,6 @@ pub struct HermesInstance {
     pub kind: HermesInstanceKind,
     pub status: HermesInstanceStatus,
     pub name: String,
-    pub base_url: String,
     #[serde(skip_serializing)]
     pub api_token_secret_ref: Option<String>,
     #[serde(skip_serializing)]
@@ -42,7 +41,6 @@ impl HermesInstance {
     /// 为用户创建一个托管 Docker 实例记录，真实容器动作由 provisioner 执行。
     pub fn managed_docker(
         user_id: &str,
-        base_url: String,
         host_workspace_path: String,
         host_sandbox_path: String,
         host_config_path: String,
@@ -53,7 +51,6 @@ impl HermesInstance {
             kind: HermesInstanceKind::ManagedDocker,
             status: HermesInstanceStatus::Running,
             name: format!("hermes-user-{user_id}"),
-            base_url,
             api_token_secret_ref: None,
             llm_api_key: None,
             container_id: None,

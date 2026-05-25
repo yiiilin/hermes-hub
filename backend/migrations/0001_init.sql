@@ -43,7 +43,6 @@ create table if not exists hermes_instances (
     kind text not null check (kind in ('managed_docker')),
     status text not null default 'provisioning' check (status in ('provisioning', 'running', 'stopped', 'error')),
     name text not null,
-    base_url text not null,
     api_token_secret_ref text,
     container_id text,
     host_workspace_path text,
@@ -59,6 +58,8 @@ delete from hermes_instances where kind <> 'managed_docker';
 alter table hermes_instances drop constraint if exists hermes_instances_kind_check;
 alter table hermes_instances add constraint hermes_instances_kind_check
     check (kind in ('managed_docker'));
+-- Adapter-only 之后 Hub 不再通过 Hermes inbound URL 访问容器，旧 base_url 运行时元数据可以直接删除。
+alter table hermes_instances drop column if exists base_url;
 
 create table if not exists instance_tokens (
     id uuid primary key,

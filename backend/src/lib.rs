@@ -176,9 +176,6 @@ pub fn docker_config_from_app(
         data_root: config.hermes_docker.data_root.clone(),
         network: config.hermes_docker.network.clone(),
         internal_port: config.hermes_docker.internal_port,
-        connect_mode: config.hermes_docker.connect_mode.clone(),
-        published_host_ip: config.hermes_docker.published_host_ip.clone(),
-        published_base_url: config.hermes_docker.published_base_url.clone(),
         hub_llm_base_url: config.hermes_docker.hub_llm_base_url.clone(),
         default_model: model_config.default_model.clone(),
         // 启动时还没有读取管理员的图片模型配置；实际创建/重建容器时会用数据库中的

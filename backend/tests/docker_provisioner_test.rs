@@ -1,7 +1,6 @@
 use hermes_hub_backend::hermes::{
     docker_provisioner::{
         DockerProvisioner, DockerProvisionerConfig, DockerRuntime, DockerRuntimeOutput,
-        HermesContainerConnectMode,
     },
     instance::{HermesInstanceKind, HermesInstanceStatus},
     provisioner::HermesProvisioner,
@@ -98,9 +97,6 @@ fn test_config() -> DockerProvisionerConfig {
         data_root: PathBuf::from("/tmp/hermes-hub-test/users"),
         network: "hermes-hub-net".to_string(),
         internal_port: 8000,
-        connect_mode: HermesContainerConnectMode::Network,
-        published_host_ip: "127.0.0.1".to_string(),
-        published_base_url: "http://127.0.0.1".to_string(),
         hub_llm_base_url: "http://hermes-hub:8080/internal/llm/v1".to_string(),
         default_model: "gpt-4.1-mini".to_string(),
         image_model: "gpt-image-2-medium".to_string(),
@@ -112,25 +108,18 @@ fn test_config() -> DockerProvisionerConfig {
 }
 
 #[tokio::test]
-async fn docker_provisioner_publishes_random_host_port_for_host_development() {
+async fn docker_provisioner_never_publishes_host_ports() {
     let runtime = FakeDockerRuntime::default();
-    let mut config = test_config();
-    config.connect_mode = HermesContainerConnectMode::PublishedHost;
-    config.published_host_ip = "127.0.0.1".to_string();
-    config.published_base_url = "http://127.0.0.1".to_string();
-    let provisioner = DockerProvisioner::new_with_runtime(config, Arc::new(runtime.clone()));
+    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime.clone()));
 
     let instance = provisioner
         .ensure_instance("user-456", "instance-token")
         .await
         .expect("instance can be created");
 
-    assert_eq!(instance.base_url, "http://127.0.0.1:32080");
-
-    let spec = provisioner
+    let _spec = provisioner
         .container_spec_for(&instance)
         .expect("container spec can be rendered");
-    assert_eq!(spec.published_ports, vec!["127.0.0.1::8000".to_string()]);
 
     let calls = runtime.calls.lock().expect("calls lock").clone();
     let create_call = calls
@@ -139,16 +128,16 @@ async fn docker_provisioner_publishes_random_host_port_for_host_development() {
         .expect("container create command is issued");
     assert!(
         create_call
-            .windows(2)
-            .any(|args| args[0] == "--publish" && args[1] == "127.0.0.1::8000"),
-        "host development mode must publish a random loopback port"
+            .iter()
+            .all(|arg| arg != "-p" && arg != "--publish"),
+        "adapter-only Hermes containers must not publish host ports"
     );
-    assert!(calls.iter().any(|args| args
-        == &vec![
-            "port".to_string(),
-            "hermes-user-user-456".to_string(),
-            "8000/tcp".to_string(),
-        ]));
+    assert!(
+        calls
+            .iter()
+            .all(|args| args.first().map(String::as_str) != Some("port")),
+        "Hub no longer needs to resolve a published Hermes port"
+    );
 }
 
 #[tokio::test]
@@ -371,7 +360,6 @@ async fn docker_provisioner_test() {
     assert_eq!(instance.user_id, "user-123");
     assert_eq!(instance.kind, HermesInstanceKind::ManagedDocker);
     assert_eq!(instance.status, HermesInstanceStatus::Running);
-    assert_eq!(instance.base_url, "http://hermes-user-user-123:8000");
     assert_eq!(
         instance.host_workspace_path.as_deref(),
         Some("/tmp/hermes-hub-test/users/user-123/workspace")
@@ -409,10 +397,6 @@ async fn docker_provisioner_test() {
 
     assert_eq!(spec.image, "nousresearch/hermes-agent:latest");
     assert_eq!(spec.network, "hermes-hub-net");
-    assert!(
-        spec.published_ports.is_empty(),
-        "managed Hermes must not expose host ports"
-    );
     assert!(spec
         .env
         .iter()
@@ -420,7 +404,7 @@ async fn docker_provisioner_test() {
     assert!(spec
         .env
         .iter()
-        .any(|entry| entry == "API_SERVER_HOST=0.0.0.0"));
+        .any(|entry| entry == "API_SERVER_HOST=127.0.0.1"));
     assert!(spec.env.iter().any(|entry| entry == "API_SERVER_PORT=8000"));
     assert!(spec
         .env
@@ -460,10 +444,6 @@ async fn docker_provisioner_test() {
         .env
         .iter()
         .any(|entry| entry == "HERMES_HUB_USER_ID=user-123"));
-    assert!(spec
-        .env
-        .iter()
-        .any(|entry| entry == "HERMES_HUB_INBOUND_PORT=8000"));
     assert!(spec
         .env
         .iter()

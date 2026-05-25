@@ -688,9 +688,6 @@ pub struct DockerProvisionerConfig {
     pub data_root: PathBuf,
     pub network: String,
     pub internal_port: u16,
-    pub connect_mode: HermesContainerConnectMode,
-    pub published_host_ip: String,
-    pub published_base_url: String,
     pub hub_llm_base_url: String,
     pub default_model: String,
     pub image_model: String,
@@ -698,24 +695,6 @@ pub struct DockerProvisionerConfig {
     pub memory_limit: Option<String>,
     pub cpu_limit: Option<String>,
     pub docker_binary: String,
-}
-
-/// Hub 连接托管 Hermes 容器的方式。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HermesContainerConnectMode {
-    /// backend 与 Hermes 容器位于同一个 Docker 网络，直接使用容器名访问。
-    Network,
-    /// backend 跑在宿主机时，Hermes 随机发布宿主机端口，Hub 通过该端口访问。
-    PublishedHost,
-}
-
-impl HermesContainerConnectMode {
-    pub fn parse(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "published-host" | "published_host" | "host" => Self::PublishedHost,
-            _ => Self::Network,
-        }
-    }
 }
 
 /// 容器挂载定义。测试和真实 Docker adapter 共用同一份 spec，避免部署行为漂移。
@@ -726,8 +705,7 @@ pub struct ContainerMount {
     pub read_only: bool,
 }
 
-/// 可渲染为 Docker create 参数的规范。这里显式保存 published_ports，
-/// 用测试保证托管 Hermes 不暴露宿主机端口。
+/// 可渲染为 Docker create 参数的规范。adapter-only 托管 Hermes 不包含任何端口发布配置。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ContainerSpec {
     pub name: String,
@@ -737,7 +715,6 @@ pub struct ContainerSpec {
     pub env: Vec<String>,
     pub mounts: Vec<ContainerMount>,
     pub labels: Vec<(String, String)>,
-    pub published_ports: Vec<String>,
     pub memory_limit: Option<String>,
     pub cpu_limit: Option<String>,
     pub workdir: Option<String>,
@@ -876,7 +853,8 @@ impl DockerProvisioner {
             internal_port: self.config.internal_port,
             env: vec![
                 "API_SERVER_ENABLED=true".to_string(),
-                "API_SERVER_HOST=0.0.0.0".to_string(),
+                // API server 仅作为容器内本地能力保留；Hub 通信全部由 adapter 主动连接。
+                "API_SERVER_HOST=127.0.0.1".to_string(),
                 format!("API_SERVER_PORT={}", self.config.internal_port),
                 format!(
                     "API_SERVER_KEY={}",
@@ -900,7 +878,6 @@ impl DockerProvisioner {
                 ),
                 format!("HERMES_HUB_INSTANCE_ID={}", instance.id),
                 format!("HERMES_HUB_USER_ID={}", instance.user_id),
-                format!("HERMES_HUB_INBOUND_PORT={}", self.config.internal_port),
                 format!("HERMES_HUB_INBOX_PATH={HUB_INBOX_PATH}"),
                 format!("HERMES_HUB_INBOX_TIMEOUT_SECONDS={HUB_INBOX_TIMEOUT_SECONDS}"),
                 format!("HERMES_HUB_INBOX_LIMIT={HUB_INBOX_LIMIT}"),
@@ -944,7 +921,6 @@ impl DockerProvisioner {
                     MANAGED_CONTAINER_SPEC_VERSION.to_string(),
                 ),
             ],
-            published_ports: self.published_ports(),
             memory_limit: self.config.memory_limit.clone(),
             cpu_limit: self.config.cpu_limit.clone(),
             workdir: Some("/workspace".to_string()),
@@ -971,16 +947,13 @@ impl DockerProvisioner {
                 && !config_changed
                 && inspection.spec_version.as_deref() == Some(MANAGED_CONTAINER_SPEC_VERSION)
             {
-                if let Some(base_url) = self.resolve_running_base_url(&next.name).await? {
-                    next.base_url = base_url;
-                    next.container_id = Some(inspection.id);
-                    next.status = HermesInstanceStatus::Running;
-                    self.remember(next.clone())?;
-                    return Ok(next);
-                }
+                next.container_id = Some(inspection.id);
+                next.status = HermesInstanceStatus::Running;
+                self.remember(next.clone())?;
+                return Ok(next);
             }
 
-            // 旧版本可能创建了交互式 CLI、只读 /config 或未发布端口的容器；
+            // 旧版本可能创建了交互式 CLI、只读 /config 或发布宿主机端口的容器；
             // 模型配置变化时也需要重建，保证 gateway 读取 Hub 管理的 config.yaml。
             self.remove_container_if_exists(&next.name).await?;
         }
@@ -990,10 +963,6 @@ impl DockerProvisioner {
             .await?;
         next.container_id = Some(container_id);
         next.status = HermesInstanceStatus::Running;
-        next.base_url = self
-            .running_base_url(&next.name)
-            .await?
-            .unwrap_or_else(|| self.network_base_url(&next.name));
         self.remember(next.clone())?;
 
         Ok(next)
@@ -1030,7 +999,6 @@ impl DockerProvisioner {
     }
 
     fn build_instance(&self, user_id: &str) -> HermesInstance {
-        let container_name = managed_container_name(user_id);
         let user_root = self.config.data_root.join(user_id);
         let workspace = user_root.join("workspace");
         let sandbox = user_root.join("sandbox");
@@ -1038,7 +1006,6 @@ impl DockerProvisioner {
 
         HermesInstance::managed_docker(
             user_id,
-            self.network_base_url(&container_name),
             path_to_string(workspace),
             path_to_string(sandbox),
             path_to_string(config),
@@ -1183,11 +1150,6 @@ impl DockerProvisioner {
             args.push("--cpus".to_string());
             args.push(cpu_limit);
         }
-        for published_port in spec.published_ports {
-            args.push("--publish".to_string());
-            args.push(published_port);
-        }
-
         args.push(spec.image);
         args.extend(spec.command);
 
@@ -1315,68 +1277,6 @@ impl DockerProvisioner {
         ensure_hermes_hub_pairing(&config_path, &instance.user_id)?;
         Ok(changed)
     }
-
-    fn published_ports(&self) -> Vec<String> {
-        if self.config.connect_mode != HermesContainerConnectMode::PublishedHost {
-            return Vec::new();
-        }
-
-        vec![format!(
-            "{}::{}",
-            self.config.published_host_ip, self.config.internal_port
-        )]
-    }
-
-    fn network_base_url(&self, container_name: &str) -> String {
-        format!("http://{container_name}:{}", self.config.internal_port)
-    }
-
-    async fn resolve_running_base_url(
-        &self,
-        container_name: &str,
-    ) -> Result<Option<String>, ProvisionerError> {
-        match self.config.connect_mode {
-            HermesContainerConnectMode::Network => Ok(Some(self.network_base_url(container_name))),
-            HermesContainerConnectMode::PublishedHost => {
-                self.running_base_url(container_name).await
-            }
-        }
-    }
-
-    async fn running_base_url(
-        &self,
-        container_name: &str,
-    ) -> Result<Option<String>, ProvisionerError> {
-        if self.config.connect_mode != HermesContainerConnectMode::PublishedHost {
-            return Ok(Some(self.network_base_url(container_name)));
-        }
-
-        let output = self
-            .runtime
-            .run(vec![
-                "port".to_string(),
-                container_name.to_string(),
-                format!("{}/tcp", self.config.internal_port),
-            ])
-            .await?;
-
-        if !output.success || output.stdout.trim().is_empty() {
-            return Ok(None);
-        }
-
-        let Some(port) = output
-            .stdout
-            .lines()
-            .find_map(|line| line.rsplit(':').next())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            return Ok(None);
-        };
-        let base = self.config.published_base_url.trim_end_matches('/');
-
-        Ok(Some(format!("{base}:{port}")))
-    }
 }
 
 #[async_trait]
@@ -1404,9 +1304,6 @@ impl HermesProvisioner for DockerProvisioner {
         let mut next = instance.clone();
         next.container_id = Some(inspection.id);
         next.status = HermesInstanceStatus::Running;
-        if let Some(base_url) = self.resolve_running_base_url(&next.name).await? {
-            next.base_url = base_url;
-        }
         self.remember(next.clone())?;
         Ok(next)
     }
@@ -1448,17 +1345,9 @@ impl HermesProvisioner for DockerProvisioner {
 
         next.container_id = Some(container_id);
         next.status = HermesInstanceStatus::Running;
-        next.base_url = self
-            .running_base_url(&next.name)
-            .await?
-            .unwrap_or_else(|| self.network_base_url(&next.name));
         self.remember(next.clone())?;
         Ok(next)
     }
-}
-
-fn managed_container_name(user_id: &str) -> String {
-    format!("hermes-user-{user_id}")
 }
 
 fn path_to_string(path: PathBuf) -> String {

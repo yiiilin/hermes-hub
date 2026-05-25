@@ -306,7 +306,6 @@ async fn admin_workspace_test() {
         &format!("/api/admin/users/{admin_id}/hermes-instance/external-config"),
         json!({
             "name": "legacy runtime",
-            "base_url": "https://legacy.example",
             "api_token": "external-token"
         }),
         Some(&admin_cookie),

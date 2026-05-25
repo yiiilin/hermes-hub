@@ -378,7 +378,6 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                 <th>{t("admin.owner")}</th>
                 <th>{t("admin.kind")}</th>
                 <th>{t("admin.status")}</th>
-                <th>{t("admin.baseUrl")}</th>
                 <th>{t("admin.action")}</th>
               </tr>
             </thead>
@@ -390,7 +389,6 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                     <td>{owner.email}</td>
                     <td>{instance?.kind ?? "not_created"}</td>
                     <td>{instance?.status ?? "not_created"}</td>
-                    <td>{instance?.base_url ?? "-"}</td>
                     <td>
                       {!instance ? (
                         <button

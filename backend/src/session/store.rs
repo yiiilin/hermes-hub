@@ -729,20 +729,19 @@ impl SessionStore {
                 sqlx::query(
                     r#"
                     insert into hermes_instances (
-                        id, user_id, kind, status, name, base_url, api_token_secret_ref,
+                        id, user_id, kind, status, name, api_token_secret_ref,
                         container_id, host_workspace_path, host_sandbox_path, host_config_path,
                         health_status, updated_at
                     )
                     values (
-                        $1::uuid, $2::uuid, $3, $4, $5, $6, $7,
-                        $8, $9, $10, $11, $12, now()
+                        $1::uuid, $2::uuid, $3, $4, $5, $6,
+                        $7, $8, $9, $10, $11, now()
                     )
                     on conflict (user_id) do update
                     set id = excluded.id,
                         kind = excluded.kind,
                         status = excluded.status,
                         name = excluded.name,
-                        base_url = excluded.base_url,
                         api_token_secret_ref = excluded.api_token_secret_ref,
                         container_id = excluded.container_id,
                         host_workspace_path = excluded.host_workspace_path,
@@ -757,7 +756,6 @@ impl SessionStore {
                 .bind(hermes_kind_as_str(&instance.kind))
                 .bind(hermes_status_as_str(&instance.status))
                 .bind(&instance.name)
-                .bind(&instance.base_url)
                 .bind(encrypted_token)
                 .bind(&instance.container_id)
                 .bind(&instance.host_workspace_path)
@@ -857,7 +855,6 @@ impl SessionStore {
                               kind,
                               status,
                               name,
-                              base_url,
                               api_token_secret_ref,
                               container_id,
                               host_workspace_path,
@@ -1511,7 +1508,6 @@ fn hermes_instance_select(prefix: &str, filter: &str, suffix: &str) -> String {
            kind,
            status,
            name,
-           base_url,
            api_token_secret_ref,
            container_id,
            host_workspace_path,
@@ -1610,9 +1606,6 @@ fn row_to_hermes_instance(
         status: parse_hermes_status(&status)?,
         name: row
             .try_get("name")
-            .map_err(|_| StoreError::DatabaseFailed)?,
-        base_url: row
-            .try_get("base_url")
             .map_err(|_| StoreError::DatabaseFailed)?,
         api_token_secret_ref,
         llm_api_key: None,

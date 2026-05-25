@@ -207,7 +207,6 @@ fn managed_instance_for(user_id: &str) -> HermesInstance {
         kind: HermesInstanceKind::ManagedDocker,
         status: HermesInstanceStatus::Running,
         name: "hermes-user-admin".to_string(),
-        base_url: "http://hermes-user-admin:8000".to_string(),
         api_token_secret_ref: Some("hermes-secret-token".to_string()),
         llm_api_key: None,
         container_id: Some("container-1".to_string()),

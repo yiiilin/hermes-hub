@@ -67,7 +67,6 @@ export type HermesInstance = {
   kind: "managed_docker";
   status: "provisioning" | "running" | "stopped" | "error";
   name?: string;
-  base_url: string;
   container_id?: string | null;
   health_status?: string;
 };
@@ -907,7 +906,6 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     user_id: "user-1",
     kind: "managed_docker",
     status: "running",
-    base_url: "http://hermes-user-user-1:8000",
   };
   let modelConfig: ModelConfig = {
     config_kind: "llm",
@@ -1021,7 +1019,6 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
         user_id: userId,
         kind: "managed_docker",
         status: "running",
-        base_url: `http://hermes-user-${userId}:8000`,
       };
       return instance;
     },
@@ -1207,7 +1204,6 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
         user_id: "user-1",
         kind: "managed_docker",
         status: "running",
-        base_url: "http://hermes-user-user-1:8000",
       };
       return instance;
     },

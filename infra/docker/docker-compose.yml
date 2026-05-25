@@ -81,7 +81,6 @@ services:
       HERMES_DOCKER_IMAGE: nousresearch/hermes-agent:latest
       HERMES_CONTAINER_NETWORK: hermes-hub-net
       HERMES_CONTAINER_INTERNAL_PORT: 8000
-      HERMES_CONTAINER_CONNECT_MODE: network
       HERMES_HUB_LLM_BASE_URL: http://hermes-hub:8080/internal/llm/v1
       HERMES_OBJECT_STORAGE_ENDPOINT: http://rustfs:9000
       HERMES_OBJECT_STORAGE_BUCKET: ${HERMES_OBJECT_STORAGE_BUCKET:-hermes-hub}

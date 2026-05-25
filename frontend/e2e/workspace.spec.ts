@@ -110,7 +110,6 @@ test("renders channel and session workspace panels", async ({ page }) => {
           user_id: "user-1",
           kind: "managed_docker",
           status: "running",
-          base_url: "http://hermes-user-user-1:8000",
         },
       },
     });
@@ -318,7 +317,6 @@ test("shows Hermes input state and opens image attachments in a lightbox", async
           user_id: "user-1",
           kind: "managed_docker",
           status: "running",
-          base_url: "http://hermes-user-user-1:8000",
         },
       },
     });
@@ -512,7 +510,6 @@ test("uses a left drawer for the chat sidebar on mobile", async ({ page }) => {
           user_id: "user-1",
           kind: "managed_docker",
           status: "running",
-          base_url: "http://hermes-user-user-1:8000",
         },
       },
     });
