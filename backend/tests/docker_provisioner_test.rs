@@ -1,6 +1,7 @@
 use hermes_hub_backend::hermes::{
     docker_provisioner::{
-        DockerProvisioner, DockerProvisionerConfig, DockerRuntime, DockerRuntimeOutput,
+        ContainerMount, DockerProvisioner, DockerProvisionerConfig, DockerRuntime,
+        DockerRuntimeOutput, ManagedSkillsMountConfig,
     },
     instance::{HermesInstanceKind, HermesInstanceStatus},
     provisioner::HermesProvisioner,
@@ -104,7 +105,19 @@ fn test_config() -> DockerProvisionerConfig {
         memory_limit: Some("1g".to_string()),
         cpu_limit: Some("1.0".to_string()),
         docker_binary: "docker".to_string(),
+        managed_skills: None,
     }
+}
+
+fn test_config_with_managed_skills() -> DockerProvisionerConfig {
+    let mut config = test_config();
+    config.managed_skills = Some(ManagedSkillsMountConfig {
+        volume_name: "hermes-managed-skills-test".to_string(),
+        addr: "127.0.0.1:12049".to_string(),
+        export: "/skills".to_string(),
+        container_path: "/hub-managed-skills".to_string(),
+    });
+    config
 }
 
 #[tokio::test]
@@ -348,6 +361,75 @@ async fn docker_provisioner_preserves_approved_pairing_and_clears_stale_pending_
 }
 
 #[tokio::test]
+async fn docker_provisioner_mounts_managed_skills_readonly_as_external_dir() {
+    let runtime = FakeDockerRuntime::default();
+    let provisioner = DockerProvisioner::new_with_runtime(
+        test_config_with_managed_skills(),
+        Arc::new(runtime.clone()),
+    );
+
+    let instance = provisioner
+        .ensure_instance("user-managed-skills", "instance-token")
+        .await
+        .expect("instance can be created");
+    let spec = provisioner
+        .container_spec_for(&instance)
+        .expect("container spec can be rendered");
+
+    assert!(spec.mounts.iter().any(|mount| matches!(
+        mount,
+        ContainerMount::NfsVolume(volume)
+            if volume.volume_name == "hermes-managed-skills-test"
+                && volume.container_path == "/hub-managed-skills"
+                && volume.read_only
+                && volume.addr == "127.0.0.1:12049"
+                && volume.export == "/skills"
+    )));
+    assert!(
+        spec.mounts
+            .iter()
+            .all(|mount| !mount.container_path().starts_with("/config/skills")),
+        "managed skills must not be mounted into Hermes curator's /config/skills tree"
+    );
+
+    let managed_config = std::fs::read_to_string(
+        "/tmp/hermes-hub-test/users/user-managed-skills/config/config.yaml",
+    )
+    .expect("managed Hermes config is written");
+    assert!(managed_config.contains("skills:"));
+    assert!(managed_config.contains("external_dirs:"));
+    assert!(managed_config.contains("- \"/hub-managed-skills\""));
+
+    let calls = runtime.calls.lock().expect("calls lock").clone();
+    assert!(
+        calls.iter().any(|args| {
+            args.first().map(String::as_str) == Some("volume")
+                && args.get(1).map(String::as_str) == Some("create")
+                && args.contains(&"type=nfs".to_string())
+                && args.contains(
+                    &"o=addr=127.0.0.1,port=12049,mountport=12049,vers=3,tcp,nolock,soft,ro"
+                        .to_string(),
+                )
+                && args.contains(&"device=:/skills".to_string())
+                && args.last().map(String::as_str) == Some("hermes-managed-skills-test")
+        }),
+        "managed skills NFS volume must be created before container create"
+    );
+    let create_call = calls
+        .iter()
+        .find(|args| args.first().map(String::as_str) == Some("create"))
+        .expect("container create command is issued");
+    assert!(
+        create_call.windows(2).any(|args| {
+            args[0] == "--mount"
+                && args[1]
+                    == "type=volume,src=hermes-managed-skills-test,dst=/hub-managed-skills,volume-driver=local,readonly"
+        }),
+        "managed skills must be mounted readonly into Hermes containers"
+    );
+}
+
+#[tokio::test]
 async fn docker_provisioner_test() {
     let runtime = FakeDockerRuntime::default();
     let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime.clone()));
@@ -470,16 +552,21 @@ async fn docker_provisioner_test() {
         .iter()
         .any(|entry| entry == "HERMES_ACCEPT_HOOKS=1"));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version" && value == "2026-05-25-hermes-hub-adapter-only-no-ports"
+        key == "hermes_hub_spec_version"
+            && value == "2026-05-25-hermes-hub-adapter-only-managed-skills"
     }));
     assert!(spec
         .mounts
         .iter()
-        .any(|mount| mount.container_path == "/config" && !mount.read_only));
+        .any(|mount| mount.container_path() == "/config" && !mount.read_only()));
     assert!(spec.mounts.iter().any(|mount| {
-        mount.container_path == "/opt/data"
-            && mount.host_path == "/tmp/hermes-hub-test/users/user-123/sandbox"
-            && !mount.read_only
+        matches!(
+            mount,
+            ContainerMount::Bind(bind)
+                if bind.container_path == "/opt/data"
+                    && bind.host_path == "/tmp/hermes-hub-test/users/user-123/sandbox"
+                    && !bind.read_only
+        )
     }));
     assert_eq!(instance.container_id.as_deref(), Some("container-created"));
     assert_eq!(
@@ -616,7 +703,8 @@ async fn docker_provisioner_test() {
     assert!(
         create_call.windows(2).any(|args| {
             args[0] == "--label"
-                && args[1] == "hermes_hub_spec_version=2026-05-25-hermes-hub-adapter-only-no-ports"
+                && args[1]
+                    == "hermes_hub_spec_version=2026-05-25-hermes-hub-adapter-only-managed-skills"
         }),
         "managed Hermes containers must carry the current spec label"
     );

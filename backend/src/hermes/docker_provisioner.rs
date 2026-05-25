@@ -21,7 +21,7 @@ use super::{
 
 /// Hub 托管 Hermes 容器规格版本。只要 env、挂载、工作目录或安全策略有变化，
 /// 就提升这个值，确保已存在的旧容器会被重建并拿到新行为。
-const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-25-hermes-hub-adapter-only-no-ports";
+const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-25-hermes-hub-adapter-only-managed-skills";
 const MANAGED_CONTAINER_SPEC_LABEL: &str = "hermes_hub_spec_version";
 const HUB_INBOX_PATH: &str = "/internal/channel/v1/inbox";
 const HUB_INBOX_TIMEOUT_SECONDS: u16 = 25;
@@ -695,14 +695,72 @@ pub struct DockerProvisionerConfig {
     pub memory_limit: Option<String>,
     pub cpu_limit: Option<String>,
     pub docker_binary: String,
+    pub managed_skills: Option<ManagedSkillsMountConfig>,
 }
 
 /// 容器挂载定义。测试和真实 Docker adapter 共用同一份 spec，避免部署行为漂移。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct ContainerMount {
+pub enum ContainerMount {
+    Bind(ContainerBindMount),
+    NfsVolume(ContainerNfsVolumeMount),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ContainerBindMount {
     pub host_path: String,
     pub container_path: String,
     pub read_only: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ContainerNfsVolumeMount {
+    pub volume_name: String,
+    pub container_path: String,
+    pub read_only: bool,
+    pub addr: String,
+    pub export: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedSkillsMountConfig {
+    pub volume_name: String,
+    pub addr: String,
+    pub export: String,
+    pub container_path: String,
+}
+
+impl ContainerMount {
+    pub fn bind(host_path: String, container_path: impl Into<String>, read_only: bool) -> Self {
+        Self::Bind(ContainerBindMount {
+            host_path,
+            container_path: container_path.into(),
+            read_only,
+        })
+    }
+
+    pub fn nfs_volume(config: &ManagedSkillsMountConfig, read_only: bool) -> Self {
+        Self::NfsVolume(ContainerNfsVolumeMount {
+            volume_name: config.volume_name.clone(),
+            container_path: config.container_path.clone(),
+            read_only,
+            addr: config.addr.clone(),
+            export: config.export.clone(),
+        })
+    }
+
+    pub fn container_path(&self) -> &str {
+        match self {
+            Self::Bind(mount) => &mount.container_path,
+            Self::NfsVolume(mount) => &mount.container_path,
+        }
+    }
+
+    pub fn read_only(&self) -> bool {
+        match self {
+            Self::Bind(mount) => mount.read_only,
+            Self::NfsVolume(mount) => mount.read_only,
+        }
+    }
 }
 
 /// 可渲染为 Docker create 参数的规范。adapter-only 托管 Hermes 不包含任何端口发布配置。
@@ -846,6 +904,16 @@ impl DockerProvisioner {
             .clone()
             .ok_or(ProvisionerError::InvalidManagedInstance)?;
 
+        let mut mounts = vec![
+            ContainerMount::bind(workspace, "/workspace", false),
+            ContainerMount::bind(sandbox.clone(), "/sandbox", false),
+            ContainerMount::bind(sandbox, "/opt/data", false),
+            ContainerMount::bind(config, "/config", false),
+        ];
+        if let Some(managed_skills) = &self.config.managed_skills {
+            mounts.push(ContainerMount::nfs_volume(managed_skills, true));
+        }
+
         Ok(ContainerSpec {
             name: instance.name.clone(),
             image: self.config.image.clone(),
@@ -889,29 +957,9 @@ impl DockerProvisioner {
                 "HERMES_YOLO_MODE=1".to_string(),
                 "HERMES_ACCEPT_HOOKS=1".to_string(),
             ],
-            mounts: vec![
-                ContainerMount {
-                    host_path: workspace,
-                    container_path: "/workspace".to_string(),
-                    read_only: false,
-                },
-                ContainerMount {
-                    host_path: sandbox.clone(),
-                    container_path: "/sandbox".to_string(),
-                    read_only: false,
-                },
-                ContainerMount {
-                    host_path: sandbox,
-                    container_path: "/opt/data".to_string(),
-                    read_only: false,
-                },
-                ContainerMount {
-                    host_path: config,
-                    container_path: "/config".to_string(),
-                    // Hermes gateway 会在 HERMES_HOME 下写入 sessions、logs、skills 等运行态文件。
-                    read_only: false,
-                },
-            ],
+            // Hermes gateway 会在 HERMES_HOME 下写入 sessions、logs、skills 等运行态文件；
+            // 统一管理 skills 通过单独只读挂载提供，避免进入 /config/skills 的 curator 路径。
+            mounts,
             labels: vec![
                 ("app".to_string(), "hermes-hub".to_string()),
                 ("user_id".to_string(), instance.user_id.clone()),
@@ -1110,6 +1158,7 @@ impl DockerProvisioner {
         instance: &HermesInstance,
     ) -> Result<String, ProvisionerError> {
         let spec = self.container_spec_for(instance)?;
+        self.ensure_nfs_volumes(&spec.mounts).await?;
         let mut args = vec![
             "create".to_string(),
             "--name".to_string(),
@@ -1133,14 +1182,7 @@ impl DockerProvisioner {
         }
         for mount in spec.mounts {
             args.push("--mount".to_string());
-            let mut value = format!(
-                "type=bind,src={},dst={}",
-                mount.host_path, mount.container_path
-            );
-            if mount.read_only {
-                value.push_str(",readonly");
-            }
-            args.push(value);
+            args.push(render_container_mount(&mount));
         }
         if let Some(memory_limit) = spec.memory_limit {
             args.push("--memory".to_string());
@@ -1155,6 +1197,29 @@ impl DockerProvisioner {
 
         let output = self.run_required(args).await?;
         Ok(output.stdout.lines().next().unwrap_or_default().to_string())
+    }
+
+    async fn ensure_nfs_volumes(&self, mounts: &[ContainerMount]) -> Result<(), ProvisionerError> {
+        for mount in mounts {
+            let ContainerMount::NfsVolume(mount) = mount else {
+                continue;
+            };
+            self.run_required(vec![
+                "volume".to_string(),
+                "create".to_string(),
+                "--driver".to_string(),
+                "local".to_string(),
+                "--opt".to_string(),
+                "type=nfs".to_string(),
+                "--opt".to_string(),
+                format!("o={}", nfs_mount_options(&mount.addr)),
+                "--opt".to_string(),
+                format!("device=:{}", normalize_nfs_export(&mount.export)),
+                mount.volume_name.clone(),
+            ])
+            .await?;
+        }
+        Ok(())
     }
 
     async fn run_required(
@@ -1217,8 +1282,21 @@ impl DockerProvisioner {
         let api_mode = yaml_string(normalize_hermes_api_mode(&self.config.api_mode))?;
         let instance_id = yaml_string(&instance.id)?;
         let user_id = yaml_string(&instance.user_id)?;
+        let managed_skills_section = self
+            .config
+            .managed_skills
+            .as_ref()
+            .map(|managed_skills| {
+                Ok(format!(
+                    "skills:\n  external_dirs:\n    - {}\n",
+                    yaml_string(&managed_skills.container_path)?
+                ))
+            })
+            .transpose()?
+            .unwrap_or_default();
         let content = format!(
             "# Managed by Hermes Hub. Do not edit model settings inside this container.\n\
+             {managed_skills_section}\
              plugins:\n\
              \x20\x20enabled: [platforms/hermes_hub]\n\
              model:\n\
@@ -1352,6 +1430,45 @@ impl HermesProvisioner for DockerProvisioner {
 
 fn path_to_string(path: PathBuf) -> String {
     path.to_string_lossy().into_owned()
+}
+
+fn render_container_mount(mount: &ContainerMount) -> String {
+    let mut value = match mount {
+        ContainerMount::Bind(mount) => {
+            format!(
+                "type=bind,src={},dst={}",
+                mount.host_path, mount.container_path
+            )
+        }
+        ContainerMount::NfsVolume(mount) => {
+            format!(
+                "type=volume,src={},dst={},volume-driver=local",
+                mount.volume_name, mount.container_path
+            )
+        }
+    };
+    if mount.read_only() {
+        value.push_str(",readonly");
+    }
+    value
+}
+
+fn nfs_mount_options(addr: &str) -> String {
+    let (host, port) = split_nfs_addr(addr);
+    format!("addr={host},port={port},mountport={port},vers=3,tcp,nolock,soft,ro")
+}
+
+fn split_nfs_addr(addr: &str) -> (&str, &str) {
+    addr.rsplit_once(':').unwrap_or((addr, "2049"))
+}
+
+fn normalize_nfs_export(export: &str) -> String {
+    let trimmed = export.trim();
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
 }
 
 fn normalize_hermes_api_mode(api_mode: &str) -> &str {

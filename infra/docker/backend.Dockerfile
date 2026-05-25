@@ -8,7 +8,7 @@ COPY backend/Cargo.toml backend/Cargo.toml
 COPY backend/src backend/src
 COPY backend/migrations backend/migrations
 
-RUN cargo build --release -p hermes-hub-backend
+RUN cargo build --release -p hermes-hub-backend --bins
 
 FROM node:24-alpine AS frontend-builder
 
@@ -31,11 +31,12 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY --from=builder /app/target/release/hermes-hub-backend /usr/local/bin/hermes-hub-backend
+COPY --from=builder /app/target/release/hermes-hub-skills-fs /usr/local/bin/hermes-hub-skills-fs
 COPY --from=frontend-builder /app/frontend/dist /app/public
 
 ENV HERMES_HUB_BIND_ADDR=0.0.0.0:8080
 ENV HERMES_HUB_STATIC_DIR=/app/public
 
-EXPOSE 8080
+EXPOSE 8080 12049
 
 CMD ["hermes-hub-backend"]

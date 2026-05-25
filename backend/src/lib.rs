@@ -7,6 +7,7 @@ pub mod llm_proxy;
 pub mod model_config;
 pub mod model_registry;
 pub mod security;
+pub mod skills_fs;
 pub mod storage;
 pub mod session {
     pub mod store;
@@ -22,7 +23,9 @@ use axum::{
     Json, Router,
 };
 use channel::service::ChannelStore;
-use hermes::docker_provisioner::{DockerProvisioner, DockerProvisionerConfig, NoopDockerRuntime};
+use hermes::docker_provisioner::{
+    DockerProvisioner, DockerProvisionerConfig, ManagedSkillsMountConfig, NoopDockerRuntime,
+};
 use llm_proxy::{DynLlmProviderClient, InMemoryLlmProviderClient, ReqwestLlmProviderClient};
 use model_config::{ModelConfig, ModelRegistry};
 use serde::Serialize;
@@ -185,5 +188,14 @@ pub fn docker_config_from_app(
         memory_limit: config.hermes_docker.memory_limit.clone(),
         cpu_limit: config.hermes_docker.cpu_limit.clone(),
         docker_binary: config.hermes_docker.docker_binary.clone(),
+        managed_skills: config
+            .skills_fs
+            .mount_enabled
+            .then(|| ManagedSkillsMountConfig {
+                volume_name: config.skills_fs.mount_volume_name.clone(),
+                addr: config.skills_fs.mount_addr.clone(),
+                export: config.skills_fs.mount_export.clone(),
+                container_path: config.skills_fs.container_path.clone(),
+            }),
     }
 }

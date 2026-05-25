@@ -16,6 +16,7 @@ pub struct AppConfig {
     pub initial_model_config: ModelConfig,
     pub hermes_docker: HermesDockerConfig,
     pub object_storage: ObjectStorageConfig,
+    pub skills_fs: SkillsFsConfig,
     pub max_proxy_body_bytes: usize,
     pub static_dir: PathBuf,
 }
@@ -46,6 +47,20 @@ pub struct ObjectStorageConfig {
     pub max_upload_bytes: usize,
 }
 
+/// 统一 skill 文件系统服务配置。服务进程用它启动只读 NFS；backend 用其中的
+/// Docker volume 配置把该 NFS export 挂进每个托管 Hermes 容器。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillsFsConfig {
+    pub bind_addr: SocketAddr,
+    pub prefix: String,
+    pub export_name: String,
+    pub mount_enabled: bool,
+    pub mount_volume_name: String,
+    pub mount_addr: String,
+    pub mount_export: String,
+    pub container_path: String,
+}
+
 impl AppConfig {
     /// 测试环境使用固定的本地配置，避免依赖真实端口和外部环境变量。
     pub fn for_tests() -> Self {
@@ -57,6 +72,7 @@ impl AppConfig {
             initial_model_config: default_model_config(),
             hermes_docker: default_hermes_docker_config(),
             object_storage: default_object_storage_config(),
+            skills_fs: default_skills_fs_config(),
             max_proxy_body_bytes: 10 * 1024 * 1024,
             static_dir: PathBuf::from("frontend/dist"),
         }
@@ -78,6 +94,7 @@ impl AppConfig {
             initial_model_config: model_config_from_env(),
             hermes_docker: hermes_docker_config_from_env(),
             object_storage: object_storage_config_from_env(),
+            skills_fs: skills_fs_config_from_env(),
             max_proxy_body_bytes: env_usize("HERMES_HUB_MAX_PROXY_BODY_BYTES", 10 * 1024 * 1024),
             static_dir: PathBuf::from(
                 std::env::var("HERMES_HUB_STATIC_DIR")
@@ -199,6 +216,31 @@ fn hermes_docker_config_from_env() -> HermesDockerConfig {
     }
 }
 
+fn skills_fs_config_from_env() -> SkillsFsConfig {
+    SkillsFsConfig {
+        bind_addr: std::env::var("HERMES_HUB_SKILLS_FS_BIND_ADDR")
+            .ok()
+            .and_then(|value| SocketAddr::from_str(&value).ok())
+            .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 12049)),
+        prefix: std::env::var("HERMES_HUB_SKILLS_FS_PREFIX")
+            .unwrap_or_else(|_| "managed-skills/current".to_string()),
+        export_name: std::env::var("HERMES_HUB_SKILLS_FS_EXPORT_NAME")
+            .unwrap_or_else(|_| "skills".to_string()),
+        mount_enabled: std::env::var("HERMES_HUB_MANAGED_SKILLS_MOUNT_ENABLED")
+            .ok()
+            .and_then(|value| value.parse::<bool>().ok())
+            .unwrap_or(true),
+        mount_volume_name: std::env::var("HERMES_HUB_MANAGED_SKILLS_VOLUME_NAME")
+            .unwrap_or_else(|_| "hermes-hub-managed-skills".to_string()),
+        mount_addr: std::env::var("HERMES_HUB_MANAGED_SKILLS_NFS_ADDR")
+            .unwrap_or_else(|_| "127.0.0.1:12049".to_string()),
+        mount_export: std::env::var("HERMES_HUB_MANAGED_SKILLS_NFS_EXPORT")
+            .unwrap_or_else(|_| "/skills".to_string()),
+        container_path: std::env::var("HERMES_HUB_MANAGED_SKILLS_CONTAINER_PATH")
+            .unwrap_or_else(|_| "/hub-managed-skills".to_string()),
+    }
+}
+
 fn default_model_config() -> ModelConfig {
     ModelConfig {
         config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
@@ -237,6 +279,19 @@ fn default_object_storage_config() -> ObjectStorageConfig {
         force_path_style: true,
         prefix: "attachments".to_string(),
         max_upload_bytes: 25 * 1024 * 1024,
+    }
+}
+
+fn default_skills_fs_config() -> SkillsFsConfig {
+    SkillsFsConfig {
+        bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 12049),
+        prefix: "managed-skills/current".to_string(),
+        export_name: "skills".to_string(),
+        mount_enabled: false,
+        mount_volume_name: "hermes-hub-managed-skills-test".to_string(),
+        mount_addr: "127.0.0.1:12049".to_string(),
+        mount_export: "/skills".to_string(),
+        container_path: "/hub-managed-skills".to_string(),
     }
 }
 
@@ -282,7 +337,7 @@ fn env_usize_any(names: &[&str], default: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{model_config_from_env, object_storage_config_from_env};
+    use super::{model_config_from_env, object_storage_config_from_env, skills_fs_config_from_env};
 
     #[test]
     fn object_storage_accepts_hub_prefixed_env_aliases() {
@@ -357,6 +412,57 @@ mod tests {
 
         if let Some(value) = saved {
             std::env::set_var("HERMES_HUB_MODEL_REQUEST_TIMEOUT_SECONDS", value);
+        }
+    }
+
+    #[test]
+    fn skills_fs_config_reads_nfs_and_mount_env() {
+        const NAMES: &[&str] = &[
+            "HERMES_HUB_SKILLS_FS_BIND_ADDR",
+            "HERMES_HUB_SKILLS_FS_PREFIX",
+            "HERMES_HUB_SKILLS_FS_EXPORT_NAME",
+            "HERMES_HUB_MANAGED_SKILLS_MOUNT_ENABLED",
+            "HERMES_HUB_MANAGED_SKILLS_VOLUME_NAME",
+            "HERMES_HUB_MANAGED_SKILLS_NFS_ADDR",
+            "HERMES_HUB_MANAGED_SKILLS_NFS_EXPORT",
+            "HERMES_HUB_MANAGED_SKILLS_CONTAINER_PATH",
+        ];
+        let saved = NAMES
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect::<Vec<_>>();
+        for name in NAMES {
+            std::env::remove_var(name);
+        }
+
+        std::env::set_var("HERMES_HUB_SKILLS_FS_BIND_ADDR", "127.0.0.1:12050");
+        std::env::set_var("HERMES_HUB_SKILLS_FS_PREFIX", "managed-skills/release-a");
+        std::env::set_var("HERMES_HUB_SKILLS_FS_EXPORT_NAME", "hub-skills");
+        std::env::set_var("HERMES_HUB_MANAGED_SKILLS_MOUNT_ENABLED", "false");
+        std::env::set_var("HERMES_HUB_MANAGED_SKILLS_VOLUME_NAME", "skills-vol");
+        std::env::set_var("HERMES_HUB_MANAGED_SKILLS_NFS_ADDR", "10.0.0.5:12049");
+        std::env::set_var("HERMES_HUB_MANAGED_SKILLS_NFS_EXPORT", "/hub-skills");
+        std::env::set_var(
+            "HERMES_HUB_MANAGED_SKILLS_CONTAINER_PATH",
+            "/managed-skills",
+        );
+
+        let config = skills_fs_config_from_env();
+        assert_eq!(config.bind_addr.to_string(), "127.0.0.1:12050");
+        assert_eq!(config.prefix, "managed-skills/release-a");
+        assert_eq!(config.export_name, "hub-skills");
+        assert!(!config.mount_enabled);
+        assert_eq!(config.mount_volume_name, "skills-vol");
+        assert_eq!(config.mount_addr, "10.0.0.5:12049");
+        assert_eq!(config.mount_export, "/hub-skills");
+        assert_eq!(config.container_path, "/managed-skills");
+
+        for (name, value) in saved {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
         }
     }
 }
