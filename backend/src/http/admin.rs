@@ -28,6 +28,8 @@ use crate::{
         RESPONSES_API_TYPE,
     },
     session::store::SystemSettings,
+    skills_fs::normalize_skills_path,
+    storage::ObjectStorageError,
     AppState,
 };
 
@@ -64,6 +66,13 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/admin/system-settings",
             get(get_system_settings).put(update_system_settings),
+        )
+        .route("/api/admin/managed-skills", get(list_managed_skills))
+        .route(
+            "/api/admin/managed-skills/{*path}",
+            get(get_managed_skill)
+                .put(save_managed_skill)
+                .delete(delete_managed_skill),
         )
 }
 
@@ -123,6 +132,33 @@ struct SystemSettingsResponse {
 }
 
 type UpdateSystemSettingsRequest = SystemSettings;
+
+#[derive(Serialize)]
+struct ManagedSkillSummary {
+    path: String,
+    size: u64,
+}
+
+#[derive(Serialize)]
+struct ManagedSkillsResponse {
+    skills: Vec<ManagedSkillSummary>,
+}
+
+#[derive(Serialize)]
+struct ManagedSkillContent {
+    path: String,
+    content: String,
+}
+
+#[derive(Serialize)]
+struct ManagedSkillResponse {
+    skill: ManagedSkillContent,
+}
+
+#[derive(Deserialize)]
+struct SaveManagedSkillRequest {
+    content: String,
+}
 
 async fn list_users(
     State(state): State<AppState>,
@@ -444,6 +480,92 @@ async fn update_system_settings(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn list_managed_skills(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    let prefix = managed_skills_prefix(&state)?;
+    let list_prefix = managed_skills_list_prefix(&prefix);
+    let mut skills = state
+        .object_storage
+        .list_prefix(&list_prefix)
+        .await
+        .map_err(map_object_storage_error)?
+        .into_iter()
+        .filter_map(|object| {
+            managed_skill_relative_path(&prefix, &object.key).map(|path| ManagedSkillSummary {
+                path,
+                size: object.size,
+            })
+        })
+        .collect::<Vec<_>>();
+    skills.sort_by(|left, right| left.path.cmp(&right.path));
+
+    Ok(Json(ManagedSkillsResponse { skills }))
+}
+
+async fn get_managed_skill(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    let path = normalize_managed_skill_path(&path)?;
+    let key = managed_skill_object_key(&managed_skills_prefix(&state)?, &path);
+    let bytes = state
+        .object_storage
+        .get(&key)
+        .await
+        .map_err(map_object_storage_error)?;
+    let content = String::from_utf8(bytes.to_vec())
+        .map_err(|_| ApiError::BadGateway("managed skill is not valid utf-8"))?;
+
+    Ok(Json(ManagedSkillResponse {
+        skill: ManagedSkillContent { path, content },
+    }))
+}
+
+async fn save_managed_skill(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+    Json(payload): Json<SaveManagedSkillRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    let path = normalize_managed_skill_path(&path)?;
+    let key = managed_skill_object_key(&managed_skills_prefix(&state)?, &path);
+    state
+        .object_storage
+        .put(&key, payload.content.clone().into())
+        .await
+        .map_err(map_object_storage_error)?;
+
+    Ok(Json(ManagedSkillResponse {
+        skill: ManagedSkillContent {
+            path,
+            content: payload.content,
+        },
+    }))
+}
+
+async fn delete_managed_skill(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    let path = normalize_managed_skill_path(&path)?;
+    let key = managed_skill_object_key(&managed_skills_prefix(&state)?, &path);
+    state
+        .object_storage
+        .delete(&key)
+        .await
+        .map_err(map_object_storage_error)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn model_config_from_payload(
     state: &AppState,
     config_kind: Option<&str>,
@@ -479,6 +601,72 @@ async fn model_config_from_payload(
         allow_streaming: payload.allow_streaming,
         request_timeout_seconds: payload.request_timeout_seconds,
     })
+}
+
+fn managed_skills_prefix(state: &AppState) -> Result<String, ApiError> {
+    let prefix = state.config.skills_fs.prefix.trim_matches('/');
+    if prefix.is_empty() {
+        return Ok(String::new());
+    }
+    normalize_skills_path(prefix).ok_or(ApiError::Internal)
+}
+
+fn managed_skills_list_prefix(prefix: &str) -> String {
+    if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}/")
+    }
+}
+
+fn managed_skill_object_key(prefix: &str, path: &str) -> String {
+    if prefix.is_empty() {
+        path.to_string()
+    } else {
+        format!("{prefix}/{path}")
+    }
+}
+
+fn managed_skill_relative_path(prefix: &str, key: &str) -> Option<String> {
+    let key = key.trim_start_matches('/');
+    if key.is_empty() || key.ends_with('/') {
+        return None;
+    }
+    let relative = if prefix.is_empty() {
+        key
+    } else {
+        key.strip_prefix(&format!("{prefix}/"))?
+    };
+    normalize_managed_skill_path(relative).ok()
+}
+
+fn normalize_managed_skill_path(path: &str) -> Result<String, ApiError> {
+    let path = path.trim_start_matches('/');
+    if path.ends_with('/') {
+        return Err(ApiError::BadRequest("invalid managed skill path"));
+    }
+    let normalized =
+        normalize_skills_path(path).ok_or(ApiError::BadRequest("invalid managed skill path"))?;
+    if normalized.is_empty() || has_hidden_managed_skill_segment(&normalized) {
+        return Err(ApiError::BadRequest("invalid managed skill path"));
+    }
+    Ok(normalized)
+}
+
+fn has_hidden_managed_skill_segment(path: &str) -> bool {
+    // 这些路径属于 Hermes curator 的内部状态，统一管理的 Skill 不能覆盖或暴露它们。
+    path.split('/')
+        .any(|segment| matches!(segment, ".curator_state" | ".bundled_manifest"))
+}
+
+fn map_object_storage_error(error: ObjectStorageError) -> ApiError {
+    match error {
+        ObjectStorageError::NotFound => ApiError::NotFound("managed skill not found"),
+        ObjectStorageError::NotConfigured => ApiError::Internal,
+        ObjectStorageError::LockFailed | ObjectStorageError::OperationFailed => {
+            ApiError::BadGateway("object storage operation failed")
+        }
+    }
 }
 
 fn model_test_request(config: &ModelConfig) -> Result<(String, Vec<u8>), ApiError> {

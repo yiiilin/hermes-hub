@@ -107,6 +107,16 @@ export type SystemSettings = {
   oidc: OidcSettings;
 };
 
+export type ManagedSkill = {
+  path: string;
+  size: number;
+};
+
+export type ManagedSkillContent = {
+  path: string;
+  content: string;
+};
+
 export type OidcSettings = {
   enabled: boolean;
   display_name: string;
@@ -262,6 +272,10 @@ export type ApiClient = {
   testModelConfig: (config: ModelConfig) => Promise<ModelConfigTestResult>;
   systemSettings: () => Promise<SystemSettings>;
   updateSystemSettings: (settings: SystemSettings) => Promise<void>;
+  listManagedSkills: () => Promise<ManagedSkill[]>;
+  readManagedSkill: (path: string) => Promise<ManagedSkillContent>;
+  saveManagedSkill: (path: string, content: string) => Promise<ManagedSkillContent>;
+  deleteManagedSkill: (path: string) => Promise<void>;
   activeHermesRun: (channelId: string, sessionId: string) => Promise<HermesActiveRun | null>;
   subscribeSessionEvents: (
     channelId: string,
@@ -382,6 +396,16 @@ function normalizedModelConfig(config: ModelConfig): ModelConfig {
     reasoning_effort: config.config_kind === "image" ? null : config.reasoning_effort,
     allowed_models: [config.default_model],
   };
+}
+
+function managedSkillUrl(path: string): string {
+  return `/api/admin/managed-skills/${path
+    .split("/")
+    .filter(Boolean)
+    .map(encodeURIComponent)
+    // 点号段可能被浏览器在发出请求前规范化，显式编码后交给后端统一校验。
+    .map((segment) => segment.replace(/\./g, "%2E"))
+    .join("/")}`;
 }
 
 export function defaultOidcSettings(): OidcSettings {
@@ -685,6 +709,24 @@ export function createApiClient(): ApiClient {
         body: settings,
       });
     },
+    async listManagedSkills() {
+      const payload = await request<{ skills: ManagedSkill[] }>("/api/admin/managed-skills");
+      return payload.skills;
+    },
+    async readManagedSkill(path) {
+      const payload = await request<{ skill: ManagedSkillContent }>(managedSkillUrl(path));
+      return payload.skill;
+    },
+    async saveManagedSkill(path, content) {
+      const payload = await request<{ skill: ManagedSkillContent }>(managedSkillUrl(path), {
+        method: "PUT",
+        body: { content },
+      });
+      return payload.skill;
+    },
+    async deleteManagedSkill(path) {
+      await request<void>(managedSkillUrl(path), { method: "DELETE" });
+    },
     async activeHermesRun(channelId, sessionId) {
       const payload = await request<{ active_run: HermesActiveRun | null }>(
         `/api/channels/${channelId}/sessions/${sessionId}/active-run`,
@@ -864,6 +906,9 @@ type MockApiClientOptions = {
   stopHermesRun?: ApiClient["stopHermesRun"];
   deleteSession?: ApiClient["deleteSession"];
   createSession?: ApiClient["createSession"];
+  initialManagedSkills?: Record<string, string>;
+  saveManagedSkill?: ApiClient["saveManagedSkill"];
+  deleteManagedSkill?: ApiClient["deleteManagedSkill"];
 };
 
 export function createMockApiClient(options: MockApiClientOptions = {}): ApiClient {
@@ -940,6 +985,10 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
   let systemSettings: SystemSettings = {
     max_sessions_per_user: 20,
     oidc: defaultOidcSettings(),
+  };
+  let managedSkills: Record<string, string> = {
+    "writing/SKILL.md": "# Writing\n\nUse concise prose.\n",
+    ...(options.initialManagedSkills ?? {}),
   };
 
   function emitSessionEvent(sessionId: string, event: ChannelSessionEvent) {
@@ -1250,6 +1299,32 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     },
     async updateSystemSettings(settings) {
       systemSettings = settings;
+    },
+    async listManagedSkills() {
+      return Object.entries(managedSkills)
+        .map(([path, content]) => ({ path, size: new Blob([content]).size }))
+        .sort((left, right) => left.path.localeCompare(right.path));
+    },
+    async readManagedSkill(path) {
+      if (!(path in managedSkills)) {
+        throw new Error("managed skill not found");
+      }
+      return { path, content: managedSkills[path] };
+    },
+    async saveManagedSkill(path, content) {
+      if (options.saveManagedSkill) {
+        const saved = await options.saveManagedSkill(path, content);
+        managedSkills[saved.path] = saved.content;
+        return saved;
+      }
+      managedSkills[path] = content;
+      return { path, content };
+    },
+    async deleteManagedSkill(path) {
+      if (options.deleteManagedSkill) {
+        await options.deleteManagedSkill(path);
+      }
+      delete managedSkills[path];
     },
     async activeHermesRun(_channelId, sessionId) {
       return activeRunsBySessionId[sessionId] ?? null;

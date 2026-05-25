@@ -2,6 +2,7 @@ import type {
   ApiClient,
   HermesInstance,
   Invite,
+  ManagedSkill,
   ModelApiType,
   ModelConfig,
   ModelConfigKind,
@@ -13,7 +14,7 @@ import { defaultOidcSettings } from "../api/client";
 import { useI18n } from "../i18n";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
-type AdminSection = "users" | "models" | "hermes" | "settings";
+type AdminSection = "users" | "models" | "hermes" | "skills" | "settings";
 
 type AdminRouteProps = {
   apiClient: ApiClient;
@@ -29,12 +30,28 @@ const apiTypeLabels: Record<ModelApiType, string> = {
 };
 const reasoningEfforts: Array<ReasoningEffort | ""> = ["", "minimal", "low", "medium", "high"];
 
+function formatBytes(size: number): string {
+  if (size < 1024) {
+    return `${size} B`;
+  }
+  if (size < 1024 * 1024) {
+    return `${(size / 1024).toFixed(1)} KB`;
+  }
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps) {
   const { language, t } = useI18n();
   const [users, setUsers] = useState<User[]>([]);
   const [invites, setInvites] = useState<Invite[]>([]);
   const [instances, setInstances] = useState<HermesInstance[]>([]);
   const [modelConfigs, setModelConfigs] = useState<ModelConfig[]>([]);
+  const [managedSkills, setManagedSkills] = useState<ManagedSkill[]>([]);
+  const [selectedSkillPath, setSelectedSkillPath] = useState<string | null>(null);
+  const [skillPathInput, setSkillPathInput] = useState("writing/SKILL.md");
+  const [skillContent, setSkillContent] = useState("");
+  const [skillSaved, setSkillSaved] = useState(false);
+  const [skillLoading, setSkillLoading] = useState(false);
   const [systemSettings, setSystemSettings] = useState<SystemSettings>({
     max_sessions_per_user: 20,
     oidc: defaultOidcSettings(),
@@ -83,6 +100,9 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
       setMissingRequiredModels(nextModelStatus.missing_required_model_config_kinds);
       if (nextSettings) {
         setSystemSettings(nextSettings);
+      }
+      if (section === "skills") {
+        setManagedSkills(await apiClient.listManagedSkills());
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("chat.workspaceLoadFailed"));
@@ -193,6 +213,75 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
       setSettingsSaved(true);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("admin.settingsSaveFailed"));
+    }
+  }
+
+  async function openManagedSkill(path: string) {
+    setSkillSaved(false);
+    setSkillLoading(true);
+    setError(null);
+    try {
+      const skill = await apiClient.readManagedSkill(path);
+      setSelectedSkillPath(skill.path);
+      setSkillPathInput(skill.path);
+      setSkillContent(skill.content);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("admin.skillLoadFailed"));
+    } finally {
+      setSkillLoading(false);
+    }
+  }
+
+  function newManagedSkill() {
+    setSelectedSkillPath(null);
+    setSkillPathInput("writing/SKILL.md");
+    setSkillContent("");
+    setSkillSaved(false);
+    setError(null);
+  }
+
+  async function saveManagedSkill(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSkillSaved(false);
+    setSkillLoading(true);
+    setError(null);
+    try {
+      const path = skillPathInput.trim();
+      if (!path) {
+        setError(t("admin.skillPathRequired"));
+        return;
+      }
+      const saved = await apiClient.saveManagedSkill(path, skillContent);
+      setSelectedSkillPath(saved.path);
+      setSkillPathInput(saved.path);
+      setSkillContent(saved.content);
+      setSkillSaved(true);
+      setManagedSkills(await apiClient.listManagedSkills());
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("admin.skillSaveFailed"));
+    } finally {
+      setSkillLoading(false);
+    }
+  }
+
+  async function deleteManagedSkill() {
+    const path = selectedSkillPath ?? skillPathInput.trim();
+    if (!path) {
+      return;
+    }
+    setSkillSaved(false);
+    setSkillLoading(true);
+    setError(null);
+    try {
+      await apiClient.deleteManagedSkill(path);
+      setSelectedSkillPath(null);
+      setSkillPathInput("writing/SKILL.md");
+      setSkillContent("");
+      setManagedSkills(await apiClient.listManagedSkills());
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("admin.skillDeleteFailed"));
+    } finally {
+      setSkillLoading(false);
     }
   }
 
@@ -654,6 +743,88 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
             <button type="submit">{t("admin.saveSettings")}</button>
           </div>
         </form>
+      </section>
+    );
+  }
+
+  if (section === "skills") {
+    return (
+      <section className="admin-page" id="admin-skills">
+        <div className="panel-heading">
+          <h1>{t("admin.skillManagement")}</h1>
+          <div className="button-row">
+            <button type="button" className="secondary" onClick={() => void refresh()}>
+              {t("admin.refresh")}
+            </button>
+            <button type="button" className="secondary" onClick={newManagedSkill}>
+              {t("admin.skillNew")}
+            </button>
+          </div>
+        </div>
+        {error ? <p className="error">{error}</p> : null}
+        {skillSaved ? <p className="copy-line">{t("admin.skillSaved")}</p> : null}
+        <div className="skills-layout">
+          <div className="panel skills-list-panel">
+            {managedSkills.length === 0 ? (
+              <p className="notice">{t("admin.skillEmpty")}</p>
+            ) : (
+              <ul className="list compact-list skill-list">
+                {managedSkills.map((skill) => (
+                  <li
+                    key={skill.path}
+                    className={selectedSkillPath === skill.path ? "selected" : undefined}
+                  >
+                    <button
+                      type="button"
+                      className="list-button"
+                      onClick={() => void openManagedSkill(skill.path)}
+                    >
+                      <strong>{skill.path}</strong>
+                      <span>{formatBytes(skill.size)}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+          <form className="panel form skill-editor" onSubmit={(event) => void saveManagedSkill(event)}>
+            <label>
+              {t("admin.skillPath")}
+              <input
+                value={skillPathInput}
+                onChange={(event) => {
+                  setSkillPathInput(event.target.value);
+                  setSkillSaved(false);
+                }}
+                required
+              />
+            </label>
+            <label>
+              {t("admin.skillContent")}
+              <textarea
+                value={skillContent}
+                onChange={(event) => {
+                  setSkillContent(event.target.value);
+                  setSkillSaved(false);
+                }}
+                spellCheck={false}
+              />
+            </label>
+            <div className="button-row">
+              <button type="submit" disabled={skillLoading || skillPathInput.trim() === ""}>
+                {t("admin.save")}
+              </button>
+              <button
+                type="button"
+                className="secondary"
+                disabled={skillLoading || !selectedSkillPath}
+                onClick={() => void deleteManagedSkill()}
+              >
+                {t("admin.delete")}
+              </button>
+            </div>
+          </form>
+        </div>
       </section>
     );
   }

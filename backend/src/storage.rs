@@ -5,6 +5,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::TryStreamExt;
 use object_store::{aws::AmazonS3Builder, path::Path as ObjectPath, ObjectStore, ObjectStoreExt};
 use thiserror::Error;
 
@@ -29,7 +30,14 @@ pub trait HubObjectStorage: Send + Sync + 'static {
     async fn put(&self, key: &str, bytes: Bytes) -> Result<(), ObjectStorageError>;
     async fn get(&self, key: &str) -> Result<Bytes, ObjectStorageError>;
     async fn delete(&self, key: &str) -> Result<(), ObjectStorageError>;
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<ObjectInfo>, ObjectStorageError>;
     fn bucket(&self) -> &str;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectInfo {
+    pub key: String,
+    pub size: u64,
 }
 
 #[derive(Clone)]
@@ -82,6 +90,23 @@ impl HubObjectStorage for InMemoryObjectStorage {
             .map_err(|_| ObjectStorageError::LockFailed)?
             .remove(key);
         Ok(())
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<ObjectInfo>, ObjectStorageError> {
+        let mut objects = self
+            .objects
+            .lock()
+            .map_err(|_| ObjectStorageError::LockFailed)?
+            .iter()
+            .filter_map(|(key, bytes)| {
+                key.starts_with(prefix).then(|| ObjectInfo {
+                    key: key.clone(),
+                    size: bytes.len() as u64,
+                })
+            })
+            .collect::<Vec<_>>();
+        objects.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(objects)
     }
 
     fn bucket(&self) -> &str {
@@ -200,6 +225,31 @@ impl HubObjectStorage for S3ObjectStorage {
                 );
                 ObjectStorageError::OperationFailed
             })
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<ObjectInfo>, ObjectStorageError> {
+        let mut objects = self
+            .store
+            .list(Some(&ObjectPath::from(prefix)))
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    bucket = %self.bucket,
+                    prefix = %prefix,
+                    error = %error,
+                    "object storage list failed"
+                );
+                ObjectStorageError::OperationFailed
+            })?
+            .into_iter()
+            .map(|metadata| ObjectInfo {
+                key: metadata.location.to_string(),
+                size: metadata.size,
+            })
+            .collect::<Vec<_>>();
+        objects.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(objects)
     }
 
     fn bucket(&self) -> &str {

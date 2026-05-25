@@ -421,3 +421,81 @@ async fn admin_can_configure_per_user_session_limit() {
     assert_eq!(body["message"], "session limit exceeded");
     assert_eq!(body["max_sessions_per_user"], 2);
 }
+
+#[tokio::test]
+async fn admin_can_manage_hub_skills() {
+    let app = test_app();
+    let admin_cookie = bootstrap_admin(&app).await;
+
+    let save = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/managed-skills/writing/SKILL.md",
+        json!({
+            "content": "# Writing\n\nUse concise prose.\n"
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(save).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["skill"]["path"], "writing/SKILL.md");
+    assert_eq!(
+        body["skill"]["content"],
+        "# Writing\n\nUse concise prose.\n"
+    );
+
+    let list = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/managed-skills",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(list).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["skills"][0]["path"], "writing/SKILL.md");
+    assert_eq!(body["skills"][0]["size"], 30);
+
+    let read = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/managed-skills/writing/SKILL.md",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(read).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["skill"]["content"],
+        "# Writing\n\nUse concise prose.\n"
+    );
+
+    let hidden = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/managed-skills/.curator_state/state.json",
+        json!({ "content": "{}" }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(hidden.status(), StatusCode::BAD_REQUEST);
+
+    let delete = request_empty(
+        &app,
+        Method::DELETE,
+        "/api/admin/managed-skills/writing/SKILL.md",
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+
+    let read_deleted = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/managed-skills/writing/SKILL.md",
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(read_deleted.status(), StatusCode::NOT_FOUND);
+}

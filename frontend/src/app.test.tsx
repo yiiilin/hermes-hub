@@ -1717,6 +1717,69 @@ describe("App", () => {
     });
   });
 
+  it("lets admins manage shared skills from the Chinese navigation", async () => {
+    localStorage.setItem("hermes-hub-language", "zh");
+    // 用可观测的 mock API 验证页面不会只更新本地状态。
+    const saveManagedSkill = vi.fn(async (path: string, content: string) => ({ path, content }));
+    const deleteManagedSkill = vi.fn(async () => undefined);
+
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialManagedSkills: {
+            "image/SKILL.md": "# Image\n\nUse sharp visual prompts.\n",
+          },
+          saveManagedSkill,
+          deleteManagedSkill,
+        })}
+      />,
+    );
+
+    const skillNav = await screen.findByRole("button", { name: "统一 Skill 管理" });
+    expect(skillNav).toBeInTheDocument();
+    fireEvent.click(skillNav);
+
+    expect(await screen.findByRole("heading", { name: "统一 Skill 管理" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /image\/SKILL\.md/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /writing\/SKILL\.md/ })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /image\/SKILL\.md/ }));
+    expect(await screen.findByLabelText("Skill 路径")).toHaveValue("image/SKILL.md");
+    expect(screen.getByLabelText("Skill 内容")).toHaveValue(
+      "# Image\n\nUse sharp visual prompts.\n",
+    );
+
+    fireEvent.change(screen.getByLabelText("Skill 内容"), {
+      target: { value: "# Image\n\nUse cinematic visual prompts.\n" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => {
+      expect(saveManagedSkill).toHaveBeenCalledWith(
+        "image/SKILL.md",
+        "# Image\n\nUse cinematic visual prompts.\n",
+      );
+    });
+    expect(await screen.findByText("Skill 已保存")).toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "删除" })).not.toBeDisabled();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "删除" }));
+
+    await waitFor(() => {
+      expect(deleteManagedSkill).toHaveBeenCalledWith("image/SKILL.md");
+      expect(screen.queryByRole("button", { name: /image\/SKILL\.md/ })).not.toBeInTheDocument();
+    });
+    expect(screen.getByLabelText("Skill 路径")).toHaveValue("writing/SKILL.md");
+    expect(screen.getByLabelText("Skill 内容")).toHaveValue("");
+    expect(screen.getByRole("button", { name: "删除" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "新建 Skill" }));
+    expect(screen.getByLabelText("Skill 路径")).toHaveValue("writing/SKILL.md");
+    expect(screen.getByLabelText("Skill 内容")).toHaveValue("");
+  });
+
   it("keeps returned model API keys in the real API client while password inputs hide them", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: true,

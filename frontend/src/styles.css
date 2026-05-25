@@ -595,6 +595,38 @@ td {
   grid-template-columns: minmax(240px, 0.8fr) minmax(280px, 1.2fr);
 }
 
+.skills-layout {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
+}
+
+.skills-list-panel {
+  align-self: start;
+}
+
+.skill-list {
+  max-height: calc(100vh - 220px);
+  overflow: auto;
+}
+
+.skill-list li {
+  padding: 10px;
+}
+
+.skill-list span {
+  color: #66777f;
+  font-size: 12px;
+}
+
+.skill-editor textarea {
+  font-family:
+    "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  line-height: 1.5;
+  min-height: 440px;
+  white-space: pre;
+}
+
 .chat-workspace {
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(246, 248, 249, 0.96)),
@@ -1290,7 +1322,8 @@ td {
   .grid-section,
   .model-config-grid,
   .inline-form,
-  .session-grid {
+  .session-grid,
+  .skills-layout {
     grid-template-columns: 1fr;
   }
 
@@ -1610,6 +1643,14 @@ td {
   .admin-page,
   .model-config-grid {
     gap: 14px;
+  }
+
+  .skill-list {
+    max-height: 220px;
+  }
+
+  .skill-editor textarea {
+    min-height: 320px;
   }
 
   .panel {
