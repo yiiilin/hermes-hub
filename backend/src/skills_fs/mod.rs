@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Component, Path},
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
@@ -8,12 +8,13 @@ use std::{
 use async_trait::async_trait;
 use nfsserve::{
     nfs::{
-        fattr3, fileid3, filename3, fsinfo3, ftype3, gid3, nfspath3, nfsstat3, nfstime3,
+        fattr3, fileid3, filename3, fsinfo3, ftype3, gid3, nfs_fh3, nfspath3, nfsstat3, nfstime3,
         post_op_attr, sattr3, specdata3, uid3, FSF_HOMOGENEOUS,
     },
     vfs::{NFSFileSystem, ReadDirResult, VFSCapabilities},
 };
 use opendal::{services::S3, Entry, ErrorKind, Metadata, Operator};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::app_config::ObjectStorageConfig;
@@ -52,7 +53,6 @@ pub struct SkillsNode {
 
 #[derive(Debug)]
 struct SkillsFsIndex {
-    next_id: fileid3,
     path_to_id: HashMap<String, fileid3>,
     id_to_node: HashMap<fileid3, SkillsNode>,
 }
@@ -75,7 +75,6 @@ impl Default for SkillsFsIndex {
         );
 
         Self {
-            next_id: ROOT_ID + 1,
             path_to_id,
             id_to_node,
         }
@@ -268,15 +267,9 @@ impl ReadonlySkillsFs {
     ) -> Result<SkillsNode, SkillsFsError> {
         let path = normalize_skills_path(&path).ok_or(SkillsFsError::InvalidPrefix)?;
         let name = basename(&path).to_string();
+        let id = stable_fileid_for_path(&path);
         let mut index = self.index.lock().map_err(|_| SkillsFsError::LockFailed)?;
-        let id = if let Some(id) = index.path_to_id.get(&path).copied() {
-            id
-        } else {
-            let id = index.next_id;
-            index.next_id += 1;
-            index.path_to_id.insert(path.clone(), id);
-            id
-        };
+        index.path_to_id.insert(path.clone(), id);
 
         let node = SkillsNode {
             id,
@@ -290,14 +283,70 @@ impl ReadonlySkillsFs {
         Ok(node)
     }
 
-    fn node_by_id(&self, id: fileid3) -> Result<SkillsNode, nfsstat3> {
-        self.index
+    async fn node_by_id(&self, id: fileid3) -> Result<SkillsNode, nfsstat3> {
+        if id == ROOT_ID {
+            return Ok(self.root_node());
+        }
+        if let Some(node) = self
+            .index
             .lock()
             .map_err(|_| nfsstat3::NFS3ERR_IO)?
             .id_to_node
             .get(&id)
             .cloned()
+        {
+            return Ok(node);
+        }
+        self.find_node_by_id(id)
+            .await
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?
             .ok_or(nfsstat3::NFS3ERR_STALE)
+    }
+
+    async fn find_node_by_id(&self, id: fileid3) -> Result<Option<SkillsNode>, SkillsFsError> {
+        let mut pending_dirs = vec![String::new()];
+        let mut visited_dirs = HashSet::new();
+
+        while let Some(dir) = pending_dirs.pop() {
+            if !visited_dirs.insert(dir.clone()) {
+                continue;
+            }
+            let mut entries = self
+                .operator
+                .list(&list_object_prefix(&self.prefix, &dir))
+                .await?;
+            entries.sort_by(|lhs, rhs| lhs.path().cmp(rhs.path()));
+
+            for entry in entries {
+                let Some(relative) = relative_entry_path(&self.prefix, entry.path()) else {
+                    continue;
+                };
+                if relative.is_empty() || has_hidden_segment(&relative) {
+                    continue;
+                }
+                let Some((child_path, is_virtual_dir)) = direct_child_path(&dir, &relative) else {
+                    continue;
+                };
+                let is_dir = is_virtual_dir || entry.metadata().mode().is_dir();
+                if is_dir && !self.directory_has_visible_entry(&child_path).await? {
+                    continue;
+                }
+
+                if stable_fileid_for_path(&child_path) == id {
+                    if is_dir {
+                        return self.node_for_path(child_path, true, 0, None).map(Some);
+                    }
+                    let (entry_path, metadata) = entry.into_parts();
+                    return self.node_for_entry_path(entry_path, metadata).map(Some);
+                }
+
+                if is_dir {
+                    pending_dirs.push(child_path);
+                }
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -311,8 +360,41 @@ impl NFSFileSystem for ReadonlySkillsFs {
         ROOT_ID
     }
 
+    fn id_to_fh(&self, id: fileid3) -> nfs_fh3 {
+        // nfsserve 默认会把服务启动代号写进 file handle，进程重启后内核客户端会立刻
+        // 收到 ESTALE。Hub 的 Skill 挂载是长期只读挂载，因此这里使用稳定 handle。
+        nfs_fh3 {
+            data: id.to_le_bytes().to_vec(),
+        }
+    }
+
+    fn fh_to_id(&self, handle: &nfs_fh3) -> Result<fileid3, nfsstat3> {
+        let id = match handle.data.len() {
+            8 => fileid3::from_le_bytes(
+                handle.data[0..8]
+                    .try_into()
+                    .map_err(|_| nfsstat3::NFS3ERR_BADHANDLE)?,
+            ),
+            16 => {
+                // 兼容已经挂载在旧版本 nfsserve 默认 handle 上的客户端：忽略旧的启动代号，
+                // 只取后 8 字节 fileid，避免升级后仍必须人工重新挂载。
+                fileid3::from_le_bytes(
+                    handle.data[8..16]
+                        .try_into()
+                        .map_err(|_| nfsstat3::NFS3ERR_BADHANDLE)?,
+                )
+            }
+            _ => return Err(nfsstat3::NFS3ERR_BADHANDLE),
+        };
+        if id == 0 {
+            Err(nfsstat3::NFS3ERR_BADHANDLE)
+        } else {
+            Ok(id)
+        }
+    }
+
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
-        let dir = self.node_by_id(dirid)?;
+        let dir = self.node_by_id(dirid).await?;
         if !dir.is_dir {
             return Err(nfsstat3::NFS3ERR_NOTDIR);
         }
@@ -330,7 +412,7 @@ impl NFSFileSystem for ReadonlySkillsFs {
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
-        let node = self.node_by_id(id)?;
+        let node = self.node_by_id(id).await?;
         Ok(fattr_for_node(&node))
     }
 
@@ -344,7 +426,7 @@ impl NFSFileSystem for ReadonlySkillsFs {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        let node = self.node_by_id(id)?;
+        let node = self.node_by_id(id).await?;
         if node.is_dir {
             return Err(nfsstat3::NFS3ERR_ISDIR);
         }
@@ -410,7 +492,7 @@ impl NFSFileSystem for ReadonlySkillsFs {
         start_after: fileid3,
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
-        let dir = self.node_by_id(dirid)?;
+        let dir = self.node_by_id(dirid).await?;
         if !dir.is_dir {
             return Err(nfsstat3::NFS3ERR_NOTDIR);
         }
@@ -588,6 +670,20 @@ fn basename(path: &str) -> &str {
 fn has_hidden_segment(path: &str) -> bool {
     path.split('/')
         .any(|segment| HIDDEN_SEGMENTS.contains(&segment))
+}
+
+fn stable_fileid_for_path(path: &str) -> fileid3 {
+    if path.is_empty() {
+        return ROOT_ID;
+    }
+    let digest = Sha256::digest(path.as_bytes());
+    let mut id = fileid3::from_le_bytes(digest[0..8].try_into().expect("sha256 has 32 bytes"));
+    id &= 0x7fff_ffff_ffff_ffff;
+    if id <= ROOT_ID {
+        id + ROOT_ID + 1
+    } else {
+        id
+    }
 }
 
 fn fattr_for_node(node: &SkillsNode) -> fattr3 {

@@ -1,6 +1,6 @@
 use hermes_hub_backend::skills_fs::{normalize_skills_path, ReadonlySkillsFs};
 use nfsserve::{
-    nfs::{ftype3, nfsstat3, FSF_CANSETTIME, FSF_SYMLINK},
+    nfs::{ftype3, nfs_fh3, nfsstat3, FSF_CANSETTIME, FSF_SYMLINK},
     vfs::{NFSFileSystem, VFSCapabilities},
 };
 use opendal::{services::Memory, Operator};
@@ -167,4 +167,43 @@ async fn readonly_skills_fs_rejects_writes() {
         fs.remove(root_id, &b"writing".as_slice().into()).await,
         Err(nfsstat3::NFS3ERR_ROFS)
     ));
+}
+
+#[tokio::test]
+async fn readonly_skills_fs_file_handles_survive_server_restart() {
+    let operator = test_operator().await;
+    let fs = ReadonlySkillsFs::new(operator.clone(), "managed-skills/current")
+        .expect("fs can be created");
+    let root_id = fs.root_dir();
+    let writing_id = fs
+        .lookup(root_id, &b"writing".as_slice().into())
+        .await
+        .expect("writing dir can be looked up");
+    let skill_id = fs
+        .lookup(writing_id, &b"SKILL.md".as_slice().into())
+        .await
+        .expect("skill file can be looked up");
+    let skill_handle = fs.id_to_fh(skill_id);
+
+    let restarted = ReadonlySkillsFs::new(operator, "managed-skills/current")
+        .expect("restarted fs can be created");
+    let restored_id = restarted
+        .fh_to_id(&skill_handle)
+        .expect("stable handle can be decoded after restart");
+    let (bytes, eof) = restarted
+        .read(restored_id, 0, 1024)
+        .await
+        .expect("stable handle can be read after restart");
+    assert_eq!(bytes, b"# Writing\n");
+    assert!(eof);
+
+    let mut legacy_handle = Vec::new();
+    legacy_handle.extend_from_slice(&123_u64.to_le_bytes());
+    legacy_handle.extend_from_slice(&root_id.to_le_bytes());
+    let decoded_legacy_root = restarted
+        .fh_to_id(&nfs_fh3 {
+            data: legacy_handle,
+        })
+        .expect("旧版 nfsserve 默认 handle 也要兼容，否则升级后仍会要求手动重新挂载");
+    assert_eq!(decoded_legacy_root, root_id);
 }
