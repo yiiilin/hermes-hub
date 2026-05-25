@@ -21,9 +21,9 @@ use crate::{
     channel::{
         events::SessionEvent,
         service::{
-            Channel, ChannelAttachment, ChannelAttachmentDirection, ChannelMessage,
-            ChannelMessageRole, ChannelRun, ChannelRunStatus, ChannelSession, ChannelSessionKind,
-            ChannelStoreError,
+            Channel, ChannelActiveRun, ChannelAttachment, ChannelAttachmentDirection,
+            ChannelMessage, ChannelMessageRole, ChannelRun, ChannelRunStatus, ChannelSession,
+            ChannelSessionKind, ChannelStoreError,
         },
     },
     http::{
@@ -152,7 +152,7 @@ struct AttachmentListResponse {
 
 #[derive(Serialize)]
 struct ActiveRunResponse {
-    active_run: Option<crate::hermes::event_streams::HermesSessionRun>,
+    active_run: Option<ChannelActiveRun>,
 }
 
 async fn list_channels(
@@ -289,7 +289,7 @@ async fn get_active_run(
         .get_active_run_for_session(&user.id, &channel_id, &session_id)
         .await
         .map_err(map_channel_error)?
-        .map(channel_run_to_active_run);
+        .map(ChannelActiveRun::from);
 
     Ok(Json(ActiveRunResponse { active_run }))
 }
@@ -473,7 +473,7 @@ async fn session_events(
         .get_active_run_for_session(&user.id, &channel_id, &session_id)
         .await
         .map_err(map_channel_error)?
-        .map(channel_run_to_active_run);
+        .map(ChannelActiveRun::from);
 
     // 浏览器进入 room 时先拿到持久化历史和当前 run，再接收后续实时事件。
     let snapshot = json!({
@@ -543,7 +543,7 @@ async fn stop_active_run_for_session(
     user_id: &str,
     channel_id: &str,
     session_id: &str,
-) -> Result<Option<crate::hermes::event_streams::HermesSessionRun>, ApiError> {
+) -> Result<Option<ChannelActiveRun>, ApiError> {
     let Some(run) = state
         .channel_store
         .get_active_run_for_session(user_id, channel_id, session_id)
@@ -573,7 +573,7 @@ async fn stop_active_run_for_session(
         session_id: session_id.to_string(),
     });
 
-    Ok(Some(channel_run_to_active_run(updated)))
+    Ok(Some(ChannelActiveRun::from(updated)))
 }
 
 async fn clear_persisted_hermes_run(
@@ -588,18 +588,6 @@ async fn clear_persisted_hermes_run(
         .await
         .map_err(map_channel_error)?;
     Ok(())
-}
-
-fn channel_run_to_active_run(run: ChannelRun) -> crate::hermes::event_streams::HermesSessionRun {
-    crate::hermes::event_streams::HermesSessionRun {
-        run_id: run.run_id,
-        status: run.status.as_str().to_string(),
-        output: None,
-        error: run.error,
-        output_message_id: run.output_message_id,
-        created_at: run.created_at,
-        updated_at: run.updated_at,
-    }
 }
 
 fn session_live_event_stream(

@@ -10,11 +10,7 @@ use hermes_hub_backend::{
     build_router_with_state,
     channel::service::ChannelStore,
     docker_config_from_app,
-    hermes::{
-        docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
-        event_streams::HermesEventStreamRegistry,
-        proxy_client::InMemoryHermesProxyClient,
-    },
+    hermes::docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
     llm_proxy::{
         DynLlmProviderClient, InMemoryLlmProviderClient, LlmProviderResponse,
         ReqwestLlmProviderClient,
@@ -46,8 +42,6 @@ fn test_state_with_provider(provider: DynLlmProviderClient, registry: ModelRegis
         config,
         store: SessionStore::default(),
         channel_store: ChannelStore::default(),
-        hermes_proxy: InMemoryHermesProxyClient::default().shared(),
-        hermes_event_streams: HermesEventStreamRegistry::default(),
         model_registry: registry,
         llm_provider: provider,
         object_storage: InMemoryObjectStorage::default().shared(),

@@ -22,11 +22,7 @@ use axum::{
     Json, Router,
 };
 use channel::service::ChannelStore;
-use hermes::{
-    docker_provisioner::{DockerProvisioner, DockerProvisionerConfig, NoopDockerRuntime},
-    event_streams::HermesEventStreamRegistry,
-    proxy_client::{DynHermesProxyClient, InMemoryHermesProxyClient, ReqwestHermesProxyClient},
-};
+use hermes::docker_provisioner::{DockerProvisioner, DockerProvisionerConfig, NoopDockerRuntime};
 use llm_proxy::{DynLlmProviderClient, InMemoryLlmProviderClient, ReqwestLlmProviderClient};
 use model_config::{ModelConfig, ModelRegistry};
 use serde::Serialize;
@@ -47,8 +43,6 @@ pub struct AppState {
     pub config: AppConfig,
     pub store: SessionStore,
     pub channel_store: ChannelStore,
-    pub hermes_proxy: DynHermesProxyClient,
-    pub hermes_event_streams: HermesEventStreamRegistry,
     pub model_registry: ModelRegistry,
     pub llm_provider: DynLlmProviderClient,
     pub docker_provisioner: DockerProvisioner,
@@ -85,8 +79,6 @@ pub fn build_router(config: AppConfig) -> Router {
         config,
         store: SessionStore::default(),
         channel_store: ChannelStore::default(),
-        hermes_proxy: InMemoryHermesProxyClient::default().shared(),
-        hermes_event_streams: HermesEventStreamRegistry::default(),
         llm_provider: InMemoryLlmProviderClient::default().shared(),
         docker_provisioner,
         object_storage,
@@ -110,8 +102,6 @@ pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppIn
             config,
             store: SessionStore::default(),
             channel_store: ChannelStore::default(),
-            hermes_proxy: ReqwestHermesProxyClient::default().shared(),
-            hermes_event_streams: HermesEventStreamRegistry::default(),
             llm_provider: ReqwestLlmProviderClient::default().shared(),
             docker_provisioner,
             object_storage,
@@ -136,8 +126,6 @@ pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppIn
         config,
         store: SessionStore::postgres(pool.clone(), cipher),
         channel_store: ChannelStore::postgres(pool),
-        hermes_proxy: ReqwestHermesProxyClient::default().shared(),
-        hermes_event_streams: HermesEventStreamRegistry::default(),
         model_registry,
         llm_provider: ReqwestLlmProviderClient::default().shared(),
         docker_provisioner,

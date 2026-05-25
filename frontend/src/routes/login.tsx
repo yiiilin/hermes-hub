@@ -23,6 +23,7 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [oidc, setOidc] = useState<OidcPublicConfig | null>(null);
+  const [bootstrapOpen, setBootstrapOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const isRegistering = mode !== "login";
@@ -41,6 +42,7 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
       .then(([status, oidcConfig]) => {
         if (alive) {
           setOidc(oidcConfig);
+          setBootstrapOpen(status.bootstrap_open);
         }
         if (alive && status.bootstrap_open) {
           setMode("bootstrap");
@@ -48,6 +50,7 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
       })
       .catch(() => {
         if (alive) {
+          setBootstrapOpen(false);
           setMode("login");
         }
       })
@@ -157,7 +160,7 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
             {t("auth.signInWith", { provider: oidc.display_name })}
           </a>
         ) : null}
-        {!inviteToken && !checkingBootstrap ? (
+        {!inviteToken && !checkingBootstrap && (isRegistering || bootstrapOpen) ? (
           <button
             type="button"
             className="text-button"

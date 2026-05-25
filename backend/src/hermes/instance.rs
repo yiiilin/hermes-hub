@@ -1,11 +1,10 @@
 use serde::Serialize;
 use uuid::Uuid;
 
-/// Hermes 实例来源。v1 支持管理员外部绑定和 Hub 托管 Docker 两种模式。
+/// Hermes 实例来源。Hub 只创建并管理内置 adapter 的 Docker Hermes 容器。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HermesInstanceKind {
-    External,
     ManagedDocker,
 }
 

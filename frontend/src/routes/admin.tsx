@@ -49,12 +49,6 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
     Partial<Record<ModelConfigKind, string>>
   >({});
   const [testingModel, setTestingModel] = useState<ModelConfigKind | null>(null);
-  const [editingExternalUserId, setEditingExternalUserId] = useState<string | null>(null);
-  const [externalDraft, setExternalDraft] = useState({
-    name: "",
-    base_url: "",
-    api_token: "",
-  });
   const [error, setError] = useState<string | null>(null);
 
   const instancesByUserId = useMemo(
@@ -66,6 +60,10 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
     image: t("admin.imageModel"),
     title: t("admin.titleModel"),
   };
+  const oidcRedirectUri = useMemo(
+    () => `${window.location.origin}/api/auth/oidc/callback`,
+    [],
+  );
 
   async function refresh() {
     setError(null);
@@ -182,26 +180,6 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
       return;
     }
     await apiClient.createHermesInstance(userId);
-    await refresh();
-  }
-
-  function openExternalEditor(instance: HermesInstance) {
-    setEditingExternalUserId(instance.user_id);
-    setExternalDraft({
-      name: instance.name ?? "",
-      base_url: instance.base_url,
-      api_token: "",
-    });
-  }
-
-  async function saveExternalHermesConfig(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!editingExternalUserId) {
-      return;
-    }
-    await apiClient.updateExternalHermesInstanceConfig(editingExternalUserId, externalDraft);
-    setEditingExternalUserId(null);
-    setExternalDraft({ name: "", base_url: "", api_token: "" });
     await refresh();
   }
 
@@ -423,7 +401,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                         >
                           {t("admin.create")}
                         </button>
-                      ) : instance.kind === "managed_docker" ? (
+                      ) : (
                         <div className="button-row">
                           <button
                             type="button"
@@ -449,14 +427,6 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                             {t("admin.rebuild")}
                           </button>
                         </div>
-                      ) : (
-                        <button
-                          type="button"
-                          className="secondary"
-                          onClick={() => openExternalEditor(instance)}
-                        >
-                          {t("admin.edit")}
-                        </button>
                       )}
                     </td>
                   </tr>
@@ -465,54 +435,6 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
             </tbody>
           </table>
         </div>
-        {editingExternalUserId ? (
-          <form className="panel form" onSubmit={(event) => void saveExternalHermesConfig(event)}>
-            <div className="panel-heading">
-              <h2>{t("admin.hermesConfig")}</h2>
-              <button
-                type="button"
-                className="secondary"
-                onClick={() => setEditingExternalUserId(null)}
-              >
-                {t("admin.cancel")}
-              </button>
-            </div>
-            <label>
-              {t("admin.name")}
-              <input
-                value={externalDraft.name}
-                onChange={(event) =>
-                  setExternalDraft((draft) => ({ ...draft, name: event.target.value }))
-                }
-                required
-              />
-            </label>
-            <label>
-              {t("admin.baseUrl")}
-              <input
-                value={externalDraft.base_url}
-                onChange={(event) =>
-                  setExternalDraft((draft) => ({ ...draft, base_url: event.target.value }))
-                }
-                required
-              />
-            </label>
-            <label>
-              {t("admin.apiKey")}
-              <input
-                type="password"
-                value={externalDraft.api_token}
-                onChange={(event) =>
-                  setExternalDraft((draft) => ({ ...draft, api_token: event.target.value }))
-                }
-                placeholder={t("admin.externalTokenHint")}
-              />
-            </label>
-            <div className="button-row">
-              <button type="submit">{t("admin.saveConfig")}</button>
-            </div>
-          </form>
-        ) : null}
       </section>
     );
   }
@@ -559,6 +481,10 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                 }
               />
               {t("admin.oidcEnabled")}
+            </label>
+            <label className="readonly-field">
+              {t("admin.oidcRedirectUri")}
+              <input readOnly value={oidcRedirectUri} />
             </label>
             <label>
               {t("admin.oidcDisplayName")}

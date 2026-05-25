@@ -77,60 +77,58 @@ pub async fn ensure_managed_hermes_for_user(
     user_id: &str,
 ) -> Result<HermesInstance, ApiError> {
     if let Ok(instance) = state.store.hermes_instance_for_user(user_id).await {
-        if instance.kind != HermesInstanceKind::ManagedDocker {
-            return Ok(instance);
-        }
-
-        ensure_required_model_configs(state).await?;
-        let llm_config = state
-            .model_registry
-            .active_config()
-            .await
-            .map_err(|_| ApiError::Internal)?;
-        let image_config = state
-            .model_registry
-            .config_for_kind(IMAGE_MODEL_CONFIG_KIND)
-            .await
-            .map_err(|_| ApiError::Internal)?;
-        // 数据库里的容器状态可能滞后于 Docker daemon；ensure 操作会幂等检查并启动容器。
-        let llm_api_key = match instance.api_token_secret_ref.as_deref() {
-            Some(existing_token) => {
-                state
-                    .model_registry
-                    .add_instance_token_for_instance(&instance.id, existing_token)
-                    .await
-                    .map_err(|_| ApiError::Internal)?;
-                existing_token.to_string()
-            }
-            None => state
+        if instance.kind == HermesInstanceKind::ManagedDocker {
+            ensure_required_model_configs(state).await?;
+            let llm_config = state
                 .model_registry
-                .issue_instance_token_for_instance(&instance.id)
+                .active_config()
                 .await
-                .map_err(|_| ApiError::Internal)?,
-        };
-        let ensured = state
-            .docker_provisioner
-            .ensure_container_with_default_model(
-                &instance,
-                &llm_api_key,
-                &llm_config.default_model,
-                &image_config.default_model,
-                &llm_config.api_type,
-            )
-            .await
-            .map_err(|_| ApiError::Internal)?;
-        state
-            .store
-            .bind_hermes_instance(ensured.clone())
-            .await
-            .map_err(|_| ApiError::Internal)?;
-        state
-            .channel_store
-            .bind_hub_channel_to_instance(user_id, &ensured.id)
-            .await
-            .map_err(|_| ApiError::Internal)?;
+                .map_err(|_| ApiError::Internal)?;
+            let image_config = state
+                .model_registry
+                .config_for_kind(IMAGE_MODEL_CONFIG_KIND)
+                .await
+                .map_err(|_| ApiError::Internal)?;
+            // 数据库里的容器状态可能滞后于 Docker daemon；ensure 操作会幂等检查并启动容器。
+            let llm_api_key = match instance.api_token_secret_ref.as_deref() {
+                Some(existing_token) => {
+                    state
+                        .model_registry
+                        .add_instance_token_for_instance(&instance.id, existing_token)
+                        .await
+                        .map_err(|_| ApiError::Internal)?;
+                    existing_token.to_string()
+                }
+                None => state
+                    .model_registry
+                    .issue_instance_token_for_instance(&instance.id)
+                    .await
+                    .map_err(|_| ApiError::Internal)?,
+            };
+            let ensured = state
+                .docker_provisioner
+                .ensure_container_with_default_model(
+                    &instance,
+                    &llm_api_key,
+                    &llm_config.default_model,
+                    &image_config.default_model,
+                    &llm_config.api_type,
+                )
+                .await
+                .map_err(|_| ApiError::Internal)?;
+            state
+                .store
+                .bind_hermes_instance(ensured.clone())
+                .await
+                .map_err(|_| ApiError::Internal)?;
+            state
+                .channel_store
+                .bind_hub_channel_to_instance(user_id, &ensured.id)
+                .await
+                .map_err(|_| ApiError::Internal)?;
 
-        return Ok(ensured);
+            return Ok(ensured);
+        }
     }
 
     ensure_required_model_configs(state).await?;

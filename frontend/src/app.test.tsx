@@ -68,6 +68,13 @@ describe("App", () => {
     expect(document.querySelector(".typing-dots")).not.toBeInTheDocument();
   }
 
+  function expectedMessageTime(timestampSeconds: number) {
+    return new Intl.DateTimeFormat("en", {
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(new Date(timestampSeconds * 1000));
+  }
+
   function createHubRunMock(
     options: {
       answer?: string;
@@ -508,6 +515,58 @@ describe("App", () => {
     });
   });
 
+  it("shows each message updated time on the correct bubble edge", async () => {
+    localStorage.setItem("hermes-hub-language", "en");
+    const userUpdatedAt = 1_717_231_500;
+    const assistantUpdatedAt = 1_717_232_100;
+
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialMessagesBySessionId: {
+            "session-1": [
+              {
+                id: "message-user-time",
+                session_id: "session-1",
+                role: "user",
+                content: "show my time",
+                attachments: [],
+                created_at: 1,
+                updated_at: userUpdatedAt,
+              } as ChannelMessage,
+              {
+                id: "message-assistant-time",
+                session_id: "session-1",
+                role: "assistant",
+                content: "reply with time",
+                attachments: [],
+                created_at: 2,
+                updated_at: assistantUpdatedAt,
+              } as ChannelMessage,
+            ],
+          },
+        })}
+      />,
+    );
+
+    const userBubble = (await screen.findByText("show my time")).closest(".message-bubble");
+    const assistantBubble = screen.getByText("reply with time").closest(".message-bubble");
+    const userTime = userBubble?.querySelector("time.message-time");
+    const assistantTime = assistantBubble?.querySelector("time.message-time");
+
+    expect(userBubble).toHaveClass("user");
+    expect(assistantBubble).toHaveClass("assistant");
+    expect(userTime).toHaveClass("message-time-end");
+    expect(assistantTime).toHaveClass("message-time-start");
+    expect(userTime).toHaveTextContent(expectedMessageTime(userUpdatedAt));
+    expect(assistantTime).toHaveTextContent(expectedMessageTime(assistantUpdatedAt));
+    expect(userTime).toHaveAttribute("dateTime", new Date(userUpdatedAt * 1000).toISOString());
+    expect(assistantTime).toHaveAttribute(
+      "dateTime",
+      new Date(assistantUpdatedAt * 1000).toISOString(),
+    );
+  });
+
   it("renders markdown content and file chips inside message bubbles", async () => {
     const absolutePptUrl = `${window.location.origin}/api/attachments/attachment-ppt/download`;
     render(
@@ -931,7 +990,7 @@ describe("App", () => {
     expect(screen.queryByText(`completed terminal：${longToolResult}`)).not.toBeInTheDocument();
     expect(screen.getByText("Hermes is typing")).toBeInTheDocument();
     const pendingBubble = document.querySelector(".message-bubble.assistant.pending");
-    expect(pendingBubble?.lastElementChild).toHaveClass("typing-indicator");
+    expect(pendingBubble?.querySelector(".typing-indicator")).toBeInTheDocument();
 
     deferred.resolve();
     await waitFor(() => {
@@ -956,7 +1015,7 @@ describe("App", () => {
     expect(await screen.findByText("Hermes is typing")).toBeInTheDocument();
     await waitFor(() => {
       const pendingBubble = document.querySelector(".message-bubble.assistant.pending");
-      expect(pendingBubble?.lastElementChild).toHaveClass("typing-indicator");
+      expect(pendingBubble?.querySelector(".typing-indicator")).toBeInTheDocument();
     });
   });
 
@@ -1010,7 +1069,7 @@ describe("App", () => {
     await waitFor(() => {
       const pendingBubble = document.querySelector(".message-bubble.assistant.pending");
       expect(pendingBubble?.textContent).toContain("call terminal：early tool");
-      expect(pendingBubble?.lastElementChild).toHaveClass("typing-indicator");
+      expect(pendingBubble?.querySelector(".typing-indicator")).toBeInTheDocument();
     });
   });
 
@@ -1467,6 +1526,18 @@ describe("App", () => {
     });
   });
 
+  it("shows the OIDC redirect URI directly below Enable OIDC", async () => {
+    render(<App apiClient={createMockApiClient()} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "System settings" }));
+
+    const enableOidcRow = screen.getByLabelText("Enable OIDC").closest("label");
+    const redirectInput = await screen.findByLabelText("OIDC Redirect URI");
+
+    expect(redirectInput).toHaveValue(`${window.location.origin}/api/auth/oidc/callback`);
+    expect(enableOidcRow?.nextElementSibling).toBe(redirectInput.closest("label"));
+  });
+
   it("localizes the configured session limit message in Chinese", async () => {
     localStorage.setItem("hermes-hub-language", "zh");
     const client = createMockApiClient({
@@ -1525,6 +1596,18 @@ describe("App", () => {
 
     const oidcButton = await screen.findByRole("link", { name: "Sign in with Acme SSO" });
     expect(oidcButton).toHaveAttribute("href", "/api/auth/oidc/start");
+  });
+
+  it("hides first-admin registration entry when bootstrap is closed", async () => {
+    const client = createMockApiClient({ initialUser: null, bootstrapOpen: false });
+
+    render(<App apiClient={client} />);
+
+    expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Need to create the first admin?" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Confirm password")).not.toBeInTheDocument();
   });
 
   it("shows the first-user registration form without the app sidebar", async () => {
@@ -1663,275 +1746,6 @@ describe("App", () => {
     fetchMock.mockRestore();
   });
 
-  it("uses Hermes runs input and reads run events in the real API client", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (path, init) => {
-      if (path === "/api/hermes/v1/runs") {
-        expect(JSON.parse(String(init?.body))).toMatchObject({
-          input: "hello",
-          stream: true,
-          session_id: "session-1",
-        });
-        return {
-          ok: true,
-          status: 202,
-          json: async () => ({ run_id: "run-1", status: "started" }),
-        } as Response;
-      }
-
-      expect(path).toBe("/api/hermes/v1/runs/run-1/events");
-      const encoder = new TextEncoder();
-      return {
-        ok: true,
-        status: 200,
-        body: new ReadableStream({
-          start(controller) {
-            controller.enqueue(encoder.encode('data: {"event":"message.delta","delta":"he"}\n'));
-            controller.enqueue(
-              encoder.encode('data: {"event":"message.delta","delta":"llo"}\n'),
-            );
-            controller.enqueue(
-              encoder.encode('data: {"event":"run.completed","output":"hello"}\n\n'),
-            );
-            controller.close();
-          },
-        }),
-      } as Response;
-    });
-
-    const deltas: string[] = [];
-    await expect(
-      createApiClient().sendHermesPrompt("hello", [], "session-1", {
-        onDelta(delta) {
-          deltas.push(delta);
-        },
-      }),
-    ).resolves.toBe("hello");
-    expect(deltas).toEqual(["he", "llo"]);
-    fetchMock.mockRestore();
-  });
-
-  it("reads Hermes verbose SSE events in the real API client", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (path) => {
-      if (path === "/api/hermes/v1/runs") {
-        return {
-          ok: true,
-          status: 202,
-          json: async () => ({ run_id: "run-verbose", status: "started" }),
-        } as Response;
-      }
-
-      expect(path).toBe("/api/hermes/v1/runs/run-verbose/events");
-      const encoder = new TextEncoder();
-      return {
-        ok: true,
-        status: 200,
-        body: new ReadableStream({
-          start(controller) {
-            controller.enqueue(
-              encoder.encode(
-                `event: tool.started\ndata: ${JSON.stringify({
-                  tool: "terminal",
-                  preview:
-                    "node -e \"try{require('pptxgenjs'); console.log('pptxgenjs ok')}\"",
-                })}\n\n`,
-              ),
-            );
-            controller.enqueue(
-              encoder.encode(
-                `event: approval.request\ndata: ${JSON.stringify({
-                  command:
-                    "node -e \"try{require('pptxgenjs'); console.log('pptxgenjs ok')}\"",
-                  description: "script execution via -e/-c flag",
-                })}\n\n`,
-              ),
-            );
-            controller.enqueue(
-              encoder.encode(
-                `event: approval.responded\ndata: ${JSON.stringify({
-                  choice: "session",
-                  resolved: 1,
-                })}\n\n`,
-              ),
-            );
-            controller.enqueue(
-              encoder.encode(
-                `event: tool.completed\ndata: ${JSON.stringify({
-                  tool: "terminal",
-                  command:
-                    "node -e \"try{require('pptxgenjs'); console.log('pptxgenjs ok')}\"",
-                  output: "command finished",
-                  duration: 1.234,
-                })}\n\n`,
-              ),
-            );
-            controller.enqueue(
-              encoder.encode(
-                `event: response.output_item.added\ndata: ${JSON.stringify({
-                  item: {
-                    type: "function_call",
-                    name: "image_generate",
-                    arguments: "{\"prompt\":\"小学生加减法配图\"}",
-                  },
-                })}\n\n`,
-              ),
-            );
-            controller.enqueue(
-              encoder.encode(
-                `data: ${JSON.stringify({
-                  event: "reasoning.available",
-                  text: "准备生成 PPT 文件",
-                })}\n\n`,
-              ),
-            );
-            controller.enqueue(
-              encoder.encode('data: {"event":"run.completed","output":"done"}\n\n'),
-            );
-            controller.close();
-          },
-        }),
-      } as Response;
-    });
-
-    const verbose: unknown[] = [];
-    await expect(
-      createApiClient().sendHermesPrompt("hello", [], "session-1", {
-        onVerbose(message) {
-          verbose.push(message);
-        },
-      }),
-    ).resolves.toBe("done");
-    expect(verbose).toHaveLength(6);
-    expect(verbose[0]).toMatchObject({
-      kind: "tool.started",
-      tool: "terminal",
-      detail: "node -e \"try{require('pptxgenjs'); console.log('pptxgenjs ok')}\"",
-    });
-    expect(verbose[1]).toMatchObject({
-      kind: "approval.request",
-      detail: "node -e \"try{require('pptxgenjs'); console.log('pptxgenjs ok')}\"",
-    });
-    expect(verbose[2]).toMatchObject({ kind: "approval.responded", choice: "session" });
-    expect(verbose[3]).toMatchObject({
-      kind: "tool.completed",
-      tool: "terminal",
-      detail: "command finished",
-    });
-    expect(verbose[4]).toMatchObject({
-      kind: "tool.call",
-      tool: "image_generate",
-      detail: "{\"prompt\":\"小学生加减法配图\"}",
-    });
-    expect(verbose[5]).toMatchObject({
-      kind: "text",
-      detail: "准备生成 PPT 文件",
-    });
-    fetchMock.mockRestore();
-  });
-
-  it("reconnects Hermes run events after a transport interruption", async () => {
-    let eventRequests = 0;
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (path, init) => {
-      if (path === "/api/hermes/v1/runs") {
-        return {
-          ok: true,
-          status: 202,
-          json: async () => ({ run_id: "run-image", status: "started" }),
-        } as Response;
-      }
-
-      expect(path).toBe("/api/hermes/v1/runs/run-image/events");
-      eventRequests += 1;
-      const encoder = new TextEncoder();
-      if (eventRequests === 2) {
-        const headers = new Headers(init?.headers);
-        expect(Number(headers.get("X-Hermes-Hub-Received-Bytes"))).toBeGreaterThan(0);
-        return {
-          ok: true,
-          status: 200,
-          body: new ReadableStream({
-            start(controller) {
-              controller.enqueue(
-                encoder.encode('data: {"event":"message.delta","delta":"cat.png"}\n'),
-              );
-              controller.enqueue(
-                encoder.encode(
-                  'data: {"event":"run.completed","output":"生成好了：\\n/config/cache/images/cat.png"}\n\n',
-                ),
-              );
-              controller.close();
-            },
-          }),
-        } as Response;
-      }
-
-      let sentChunk = false;
-      return {
-        ok: true,
-        status: 200,
-        body: new ReadableStream({
-          pull(controller) {
-            if (sentChunk) {
-              controller.error(new Error("Load failed"));
-              return;
-            }
-
-            sentChunk = true;
-            controller.enqueue(
-              encoder.encode(
-                'data: {"event":"message.delta","delta":"生成好了：\\n/config/cache/images/"}\n',
-              ),
-            );
-          },
-        }),
-      } as Response;
-    });
-
-    const outputs: string[] = [];
-    await expect(
-      createApiClient().sendHermesPrompt("画猫", [], "session-1", {
-        onOutput(output) {
-          outputs.push(output);
-        },
-      }),
-    ).resolves.toBe("生成好了：\n/config/cache/images/cat.png");
-    expect(outputs).toEqual(["生成好了：\n/config/cache/images/cat.png"]);
-    expect(eventRequests).toBe(2);
-    fetchMock.mockRestore();
-  });
-
-  it("does not hide explicit Hermes run failures behind partial stream text", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (path) => {
-      if (path === "/api/hermes/v1/runs") {
-        return {
-          ok: true,
-          status: 202,
-          json: async () => ({ run_id: "run-failed", status: "started" }),
-        } as Response;
-      }
-
-      expect(path).toBe("/api/hermes/v1/runs/run-failed/events");
-      const encoder = new TextEncoder();
-      return {
-        ok: true,
-        status: 200,
-        body: new ReadableStream({
-          start(controller) {
-            controller.enqueue(encoder.encode('data: {"event":"message.delta","delta":"partial"}\n'));
-            controller.enqueue(
-              encoder.encode('data: {"event":"run.failed","error":"tool failed"}\n\n'),
-            );
-            controller.close();
-          },
-        }),
-      } as Response;
-    });
-
-    await expect(createApiClient().sendHermesPrompt("hello", [], "session-1")).rejects.toThrow(
-      "tool failed",
-    );
-    fetchMock.mockRestore();
-  });
-
   it("uploads attachments and reads persisted messages in the real API client", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (path, init) => {
       if (path === "/api/channels/channel-1/sessions/session-1/attachments") {
@@ -2050,7 +1864,7 @@ describe("App", () => {
     fetchMock.mockRestore();
   });
 
-  it("uses active run, stop, resume, clear, and session delete endpoints in the real API client", async () => {
+  it("uses active run, stop, clear, and session delete endpoints in the real API client", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (path, init) => {
       if (path === "/api/channels/channel-1/sessions/session-1/active-run") {
         if (init?.method === "DELETE") {
@@ -2092,22 +1906,6 @@ describe("App", () => {
         } as Response;
       }
 
-      if (path === "/api/hermes/v1/runs/run-1/events") {
-        const encoder = new TextEncoder();
-        return {
-          ok: true,
-          status: 200,
-          body: new ReadableStream({
-            start(controller) {
-              controller.enqueue(
-                encoder.encode('data: {"event":"run.completed","output":"done"}\n\n'),
-              );
-              controller.close();
-            },
-          }),
-        } as Response;
-      }
-
       throw new Error(`unexpected fetch ${String(path)}`);
     });
 
@@ -2115,7 +1913,6 @@ describe("App", () => {
     await expect(client.activeHermesRun("channel-1", "session-1")).resolves.toMatchObject({
       run_id: "run-1",
     });
-    await expect(client.resumeHermesRun("run-1")).resolves.toBe("done");
     await expect(client.stopHermesRun("channel-1", "session-1")).resolves.toBeNull();
     await expect(client.clearHermesRun("channel-1", "session-1")).resolves.toBeUndefined();
     await expect(client.deleteSession("channel-1", "session-1")).resolves.toBeUndefined();

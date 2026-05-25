@@ -339,7 +339,25 @@ test("shows Hermes input state and opens image attachments in a lightbox", async
       },
     });
   });
-  await page.route("**/api/channels/channel-1/sessions/session-1/messages", async (route) => {
+  await page.route("**/api/sessions", async (route) => {
+    await route.fulfill({
+      json: {
+        sessions: [
+          {
+            id: "session-1",
+            title: "Run",
+            created_at: 100,
+            updated_at: 100,
+          },
+        ],
+      },
+    });
+  });
+  let resolveUserSent: () => void = () => {};
+  const userSent = new Promise<void>((resolve) => {
+    resolveUserSent = resolve;
+  });
+  await page.route("**/api/sessions/session-1/messages", async (route) => {
     if (route.request().method() === "GET") {
       await route.fulfill({ json: { messages } });
       return;
@@ -376,6 +394,7 @@ test("shows Hermes input state and opens image attachments in a lightbox", async
               },
             ],
             created_at: 2,
+            updated_at: 2,
           }
         : {
             id: `message-${messages.length + 1}`,
@@ -385,17 +404,36 @@ test("shows Hermes input state and opens image attachments in a lightbox", async
             content: payload.content,
             attachments: [],
             created_at: 2,
+            updated_at: 2,
           };
     messages = [...messages, nextMessage];
+    if (payload.role === "user") {
+      resolveUserSent();
+    }
     await route.fulfill({ json: { message: nextMessage } });
   });
-  await page.route("**/api/hermes/v1/runs", async (route) => {
-    await route.fulfill({
-      status: 202,
-      json: { run_id: "run-image", status: "started" },
-    });
-  });
-  await page.route("**/api/hermes/v1/runs/run-image/events", async (route) => {
+  await page.route("**/api/sessions/session-1/events", async (route) => {
+    await userSent;
+    const assistantMessage = {
+      id: `message-${messages.length + 1}`,
+      session_id: "session-1",
+      role: "assistant" as const,
+      client_message_key: "hermes-run:run-image",
+      content: "生成好了：\\n",
+      attachments: [
+        {
+          id: "attachment-cat",
+          name: "cat.png",
+          content_type: "image/png",
+          kind: "image" as const,
+          size: 12,
+          data_url: "data:image/png;base64,iVBORw0KGgo=",
+        },
+      ],
+      created_at: 3,
+      updated_at: 3,
+    };
+    messages = [...messages, assistantMessage];
     // 人工延迟一下，让页面有机会展示“正在输入”的临时状态。
     await page.waitForTimeout(250);
     await route.fulfill({
@@ -403,8 +441,28 @@ test("shows Hermes input state and opens image attachments in a lightbox", async
         "Content-Type": "text/event-stream",
       },
       body:
-        'data: {"event":"message.delta","delta":"生成好了：\\\\n"}\n' +
-        'data: {"event":"run.completed","output":"生成好了：\\\\n"}\n\n',
+        `event: run_updated\ndata: ${JSON.stringify({
+          type: "run_updated",
+          run: {
+            id: "run-image",
+            run_id: "run-image",
+            session_id: "session-1",
+            status: "running",
+            input: "给我生成一个小猫",
+            input_attachments: [],
+            attempt_count: 1,
+            created_at: 3,
+            updated_at: 3,
+          },
+        })}\n\n` +
+        `event: message_created\ndata: ${JSON.stringify({
+          type: "message_created",
+          message: assistantMessage,
+        })}\n\n` +
+        `event: run_cleared\ndata: ${JSON.stringify({
+          type: "run_cleared",
+          session_id: "session-1",
+        })}\n\n`,
     });
   });
 

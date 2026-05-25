@@ -143,6 +143,7 @@ pub struct ChannelMessage {
     pub content: String,
     pub attachments: Value,
     pub created_at: u64,
+    pub updated_at: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -222,6 +223,31 @@ pub struct ChannelRun {
     pub created_at: u64,
     pub updated_at: u64,
     pub completed_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ChannelActiveRun {
+    pub run_id: String,
+    pub status: String,
+    pub output: Option<String>,
+    pub error: Option<String>,
+    pub output_message_id: Option<String>,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+impl From<ChannelRun> for ChannelActiveRun {
+    fn from(run: ChannelRun) -> Self {
+        Self {
+            run_id: run.run_id,
+            status: run.status.as_str().to_string(),
+            output: None,
+            error: run.error,
+            output_message_id: run.output_message_id,
+            created_at: run.created_at,
+            updated_at: run.updated_at,
+        }
+    }
 }
 
 pub struct NewChannelAttachment {
@@ -988,7 +1014,8 @@ impl ChannelStore {
                            client_message_key,
                            content,
                            attachments,
-                           extract(epoch from created_at)::bigint as created_at
+                           extract(epoch from created_at)::bigint as created_at,
+                           extract(epoch from updated_at)::bigint as updated_at
                     from channel_session_messages
                     where session_id = $1::uuid
                     order by created_at asc
@@ -1072,6 +1099,7 @@ impl ChannelStore {
                     content,
                     attachments,
                     created_at: now,
+                    updated_at: now,
                 };
                 inner
                     .messages_by_session_id
@@ -1114,7 +1142,8 @@ impl ChannelStore {
                               client_message_key,
                               content,
                               attachments,
-                              extract(epoch from created_at)::bigint as created_at
+                              extract(epoch from created_at)::bigint as created_at,
+                              extract(epoch from updated_at)::bigint as updated_at
                     "#,
                 )
                 .bind(&message_id)
@@ -1818,9 +1847,14 @@ impl ChannelStore {
                     .iter_mut()
                     .find(|message| message.id == message_id)
                     .ok_or(ChannelStoreError::ChannelNotFound)?;
+                let now = unix_now();
                 message.content = content;
                 message.attachments = attachments;
+                message.updated_at = now;
                 let message = message.clone();
+                if let Some(session) = inner.sessions_by_id.get_mut(session_id) {
+                    session.updated_at = now;
+                }
                 unbind_memory_attachments(&mut inner, session_id, &message.id);
                 bind_memory_attachments(&mut inner, session_id, &message.id, &message.attachments);
                 Ok(message)
@@ -1830,7 +1864,8 @@ impl ChannelStore {
                     r#"
                     update channel_session_messages
                     set content = $1,
-                        attachments = $2
+                        attachments = $2,
+                        updated_at = now()
                     where id = $3::uuid and session_id = $4::uuid
                     returning id::text as id,
                               session_id::text as session_id,
@@ -1838,7 +1873,8 @@ impl ChannelStore {
                               client_message_key,
                               content,
                               attachments,
-                              extract(epoch from created_at)::bigint as created_at
+                              extract(epoch from created_at)::bigint as created_at,
+                              extract(epoch from updated_at)::bigint as updated_at
                     "#,
                 )
                 .bind(content)
@@ -2331,6 +2367,9 @@ fn row_to_message(row: &sqlx::postgres::PgRow) -> Result<ChannelMessage, Channel
         created_at: row
             .try_get::<i64, _>("created_at")
             .map_err(|_| ChannelStoreError::DatabaseFailed)? as u64,
+        updated_at: row
+            .try_get::<i64, _>("updated_at")
+            .map_err(|_| ChannelStoreError::DatabaseFailed)? as u64,
     })
 }
 
@@ -2487,7 +2526,8 @@ async fn find_postgres_message_by_client_key(
                client_message_key,
                content,
                attachments,
-               extract(epoch from created_at)::bigint as created_at
+               extract(epoch from created_at)::bigint as created_at,
+               extract(epoch from updated_at)::bigint as updated_at
         from channel_session_messages
         where session_id = $1::uuid and client_message_key = $2
         "#,

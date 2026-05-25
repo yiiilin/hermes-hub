@@ -17,7 +17,6 @@ pub struct AppConfig {
     pub initial_model_config: ModelConfig,
     pub hermes_docker: HermesDockerConfig,
     pub object_storage: ObjectStorageConfig,
-    pub proxy_timeout_seconds: u64,
     pub max_proxy_body_bytes: usize,
     pub static_dir: PathBuf,
 }
@@ -62,7 +61,6 @@ impl AppConfig {
             initial_model_config: default_model_config(),
             hermes_docker: default_hermes_docker_config(),
             object_storage: default_object_storage_config(),
-            proxy_timeout_seconds: 60,
             max_proxy_body_bytes: 10 * 1024 * 1024,
             static_dir: PathBuf::from("frontend/dist"),
         }
@@ -84,7 +82,6 @@ impl AppConfig {
             initial_model_config: model_config_from_env(),
             hermes_docker: hermes_docker_config_from_env(),
             object_storage: object_storage_config_from_env(),
-            proxy_timeout_seconds: env_u64("HERMES_HUB_PROXY_TIMEOUT_SECONDS", 300),
             max_proxy_body_bytes: env_usize("HERMES_HUB_MAX_PROXY_BODY_BYTES", 10 * 1024 * 1024),
             static_dir: PathBuf::from(
                 std::env::var("HERMES_HUB_STATIC_DIR")
@@ -280,13 +277,6 @@ fn env_u16(name: &str, default: u16) -> u16 {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(default)
-}
-
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(default)
 }
 

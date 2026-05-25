@@ -300,19 +300,19 @@ async fn admin_workspace_test() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["hermes_instances"][0]["user_id"], admin_id);
 
-    let update_managed_config = request_json(
+    let removed_legacy_config = request_json(
         &app,
         Method::PUT,
         &format!("/api/admin/users/{admin_id}/hermes-instance/external-config"),
         json!({
-            "name": "admin external",
-            "base_url": "https://external.example",
+            "name": "legacy runtime",
+            "base_url": "https://legacy.example",
             "api_token": "external-token"
         }),
         Some(&admin_cookie),
     )
     .await;
-    assert_eq!(update_managed_config.status(), StatusCode::CONFLICT);
+    assert_eq!(removed_legacy_config.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

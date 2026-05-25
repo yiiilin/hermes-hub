@@ -40,7 +40,7 @@ create table if not exists invite_uses (
 create table if not exists hermes_instances (
     id uuid primary key,
     user_id uuid not null unique references users(id) on delete cascade,
-    kind text not null check (kind in ('external', 'managed_docker')),
+    kind text not null check (kind in ('managed_docker')),
     status text not null default 'provisioning' check (status in ('provisioning', 'running', 'stopped', 'error')),
     name text not null,
     base_url text not null,
@@ -54,6 +54,11 @@ create table if not exists hermes_instances (
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
+-- external Hermes 模式已经删除，升级时直接清理旧实例；相关 channel 记录会按外键级联删除。
+delete from hermes_instances where kind <> 'managed_docker';
+alter table hermes_instances drop constraint if exists hermes_instances_kind_check;
+alter table hermes_instances add constraint hermes_instances_kind_check
+    check (kind in ('managed_docker'));
 
 create table if not exists instance_tokens (
     id uuid primary key,
@@ -153,10 +158,15 @@ create table if not exists channel_session_messages (
     client_message_key text,
     content text not null,
     attachments jsonb not null default '[]'::jsonb,
-    created_at timestamptz not null default now()
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
 );
 
 alter table channel_session_messages add column if not exists client_message_key text;
+alter table channel_session_messages add column if not exists updated_at timestamptz;
+update channel_session_messages set updated_at = created_at where updated_at is null;
+alter table channel_session_messages alter column updated_at set default now();
+alter table channel_session_messages alter column updated_at set not null;
 create unique index if not exists channel_session_messages_client_key_idx
     on channel_session_messages(session_id, client_message_key)
     where client_message_key is not null;

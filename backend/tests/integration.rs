@@ -8,11 +8,7 @@ use hermes_hub_backend::{
     build_router_with_state,
     channel::service::ChannelStore,
     docker_config_from_app,
-    hermes::{
-        docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
-        event_streams::HermesEventStreamRegistry,
-        proxy_client::{HermesProxyResponse, InMemoryHermesProxyClient},
-    },
+    hermes::docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
     llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
     model_config::ModelRegistry,
     session::store::SessionStore,
@@ -26,7 +22,7 @@ use std::{
 };
 use tower::ServiceExt;
 
-fn test_state(provider: InMemoryLlmProviderClient, proxy: InMemoryHermesProxyClient) -> AppState {
+fn test_state(provider: InMemoryLlmProviderClient) -> AppState {
     let config = AppConfig::for_tests();
     AppState {
         docker_provisioner: DockerProvisioner::new_with_runtime(
@@ -36,8 +32,6 @@ fn test_state(provider: InMemoryLlmProviderClient, proxy: InMemoryHermesProxyCli
         config,
         store: SessionStore::default(),
         channel_store: ChannelStore::default(),
-        hermes_proxy: proxy.shared(),
-        hermes_event_streams: HermesEventStreamRegistry::default(),
         model_registry: ModelRegistry::default_for_tests(),
         llm_provider: provider.shared(),
         object_storage: InMemoryObjectStorage::default().shared(),
@@ -247,12 +241,7 @@ async fn integration_test() {
         content_type: Some("application/json".to_string()),
         body: br#"{"id":"provider-response"}"#.to_vec(),
     });
-    let proxy = InMemoryHermesProxyClient::new(HermesProxyResponse {
-        status: StatusCode::OK,
-        content_type: Some("application/json".to_string()),
-        body: br#"{"id":"hermes-response"}"#.to_vec(),
-    });
-    let state = test_state(provider.clone(), proxy.clone());
+    let state = test_state(provider.clone());
     let app = test_app(state.clone());
 
     let admin_cookie = bootstrap_admin(&app).await;
@@ -391,19 +380,13 @@ async fn integration_test() {
     let hermes = request_json(
         &app,
         Method::POST,
-        "/api/hermes/v1/runs?stream=true",
+        "/api/removed-hermes/v1/runs?stream=true",
         json!({ "prompt": "hello" }),
         Some(&user_cookie),
         None,
     )
     .await;
-    assert_eq!(hermes.status(), StatusCode::OK);
-    let forwarded = proxy.last_request().expect("hermes proxy request");
-    assert_eq!(forwarded.path_and_query, "/v1/runs?stream=true");
-    assert_eq!(
-        forwarded.authorization,
-        Some(format!("Bearer {instance_llm_token}"))
-    );
+    assert_eq!(hermes.status(), StatusCode::NOT_FOUND);
 
     // Hermes 容器调用 Hub 内部 LLM Gateway，使用 Hub 下发的实例 token。
     let llm_response = request_json(

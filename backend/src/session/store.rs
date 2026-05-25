@@ -787,13 +787,18 @@ impl SessionStore {
                 let mut instances = inner
                     .hermes_instances_by_user_id
                     .values()
+                    .filter(|instance| instance.kind == HermesInstanceKind::ManagedDocker)
                     .cloned()
                     .collect::<Vec<_>>();
                 instances.sort_by(|left, right| left.user_id.cmp(&right.user_id));
                 Ok(instances)
             }
             SessionStoreBackend::Postgres { pool, cipher } => block_on_db(async {
-                let hermes_sql = hermes_instance_select("select", "", "order by user_id");
+                let hermes_sql = hermes_instance_select(
+                    "select",
+                    "where kind = 'managed_docker'",
+                    "order by user_id",
+                );
                 let rows = sqlx::query(&hermes_sql)
                     .fetch_all(pool)
                     .await
@@ -1655,7 +1660,6 @@ fn parse_invite_status(value: &str) -> Result<InviteStatus, StoreError> {
 
 fn parse_hermes_kind(value: &str) -> Result<HermesInstanceKind, StoreError> {
     match value {
-        "external" => Ok(HermesInstanceKind::External),
         "managed_docker" => Ok(HermesInstanceKind::ManagedDocker),
         _ => Err(StoreError::DatabaseFailed),
     }
@@ -1696,7 +1700,6 @@ fn invite_status_as_str(status: &InviteStatus) -> &'static str {
 
 fn hermes_kind_as_str(kind: &HermesInstanceKind) -> &'static str {
     match kind {
-        HermesInstanceKind::External => "external",
         HermesInstanceKind::ManagedDocker => "managed_docker",
     }
 }

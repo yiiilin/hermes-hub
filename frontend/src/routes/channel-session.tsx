@@ -47,6 +47,7 @@ type BrowserCrypto = {
 };
 
 type Translate = ReturnType<typeof useI18n>["t"];
+type Language = ReturnType<typeof useI18n>["language"];
 type ExecutionHistoryEntry = HermesVerboseEvent;
 
 export function ChannelSessionRoute({
@@ -54,7 +55,7 @@ export function ChannelSessionRoute({
   apiClient,
   onOpenChat,
 }: ChannelSessionRouteProps) {
-  const { t } = useI18n();
+  const { t, language } = useI18n();
   const setChatSidebar = useChatSidebar();
   const sidebarCollapsed = useSidebarCollapsed();
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -890,6 +891,7 @@ export function ChannelSessionRoute({
                   }
                   onPreviewImage={setPreviewAttachment}
                   t={t}
+                  language={language}
                 />
               );
             })
@@ -1431,12 +1433,14 @@ function MessageBubble({
   executionEvents: executionEventsOverride,
   onPreviewImage,
   t,
+  language,
 }: {
   message: ChannelMessage;
   pending?: boolean;
   executionEvents?: ExecutionHistoryEntry[];
   onPreviewImage: (attachment: HermesAttachment) => void;
   t: Translate;
+  language: Language;
 }) {
   const executionEvents = executionEventsOverride ?? executionHistoryEvents(message.content);
   const hasExecutionEvents = Array.isArray(executionEvents) && executionEvents.length > 0;
@@ -1444,6 +1448,7 @@ function MessageBubble({
     message.content || message.attachments?.length || hasExecutionEvents || pending,
   );
   const attachments = message.attachments ?? [];
+  const updatedAt = messageUpdatedAtDate(message);
 
   return (
     <article
@@ -1493,8 +1498,37 @@ function MessageBubble({
           </span>
         </div>
       ) : null}
+      {updatedAt ? (
+        <time
+          className={[
+            "message-time",
+            message.role === "user" ? "message-time-end" : "message-time-start",
+          ].join(" ")}
+          dateTime={updatedAt.toISOString()}
+          title={updatedAt.toLocaleString(language)}
+        >
+          {formatMessageUpdatedTime(updatedAt, language)}
+        </time>
+      ) : null}
     </article>
   );
+}
+
+function formatMessageUpdatedTime(date: Date, language: Language) {
+  return new Intl.DateTimeFormat(language, {
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function messageUpdatedAtDate(message: ChannelMessage) {
+  const timestamp = message.updated_at ?? message.created_at;
+  if (!Number.isFinite(timestamp)) {
+    return null;
+  }
+
+  // 后端返回秒级时间戳；本地 pending/mock 消息沿用 Date.now() 的毫秒值。
+  return new Date(timestamp > 1_000_000_000_000 ? timestamp : timestamp * 1000);
 }
 
 function sortMessagesForDisplay(messages: ChannelMessage[]) {

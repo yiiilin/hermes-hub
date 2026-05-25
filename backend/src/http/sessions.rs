@@ -21,8 +21,8 @@ use crate::{
     channel::{
         events::SessionEvent,
         service::{
-            ChannelAttachment, ChannelAttachmentDirection, ChannelMessage, ChannelMessageRole,
-            ChannelRun, ChannelRunStatus, ChannelSession, ChannelSessionKind,
+            ChannelActiveRun, ChannelAttachment, ChannelAttachmentDirection, ChannelMessage,
+            ChannelMessageRole, ChannelRunStatus, ChannelSession, ChannelSessionKind,
         },
     },
     http::{
@@ -329,7 +329,7 @@ async fn session_events(
         .get_active_run_for_session(&user.id, &channel.id, &session_id)
         .await
         .map_err(map_channel_error)?
-        .map(channel_run_to_active_run);
+        .map(ChannelActiveRun::from);
 
     let snapshot = json!({
         "type": "messages_snapshot",
@@ -369,7 +369,7 @@ async fn stop_active_run_for_session(
     user_id: &str,
     channel_id: &str,
     session_id: &str,
-) -> Result<Option<crate::hermes::event_streams::HermesSessionRun>, ApiError> {
+) -> Result<Option<ChannelActiveRun>, ApiError> {
     let Some(run) = state
         .channel_store
         .get_active_run_for_session(user_id, channel_id, session_id)
@@ -399,7 +399,7 @@ async fn stop_active_run_for_session(
         session_id: session_id.to_string(),
     });
 
-    Ok(Some(channel_run_to_active_run(updated)))
+    Ok(Some(ChannelActiveRun::from(updated)))
 }
 
 async fn clear_persisted_hermes_run(
@@ -434,18 +434,6 @@ async fn ensure_public_channel(
         .ensure_hub_channel(user_id)
         .await
         .map_err(map_channel_error)
-}
-
-fn channel_run_to_active_run(run: ChannelRun) -> crate::hermes::event_streams::HermesSessionRun {
-    crate::hermes::event_streams::HermesSessionRun {
-        run_id: run.run_id,
-        status: run.status.as_str().to_string(),
-        output: None,
-        error: run.error,
-        output_message_id: run.output_message_id,
-        created_at: run.created_at,
-        updated_at: run.updated_at,
-    }
 }
 
 fn session_live_event_stream(

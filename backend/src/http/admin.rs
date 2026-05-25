@@ -13,7 +13,7 @@ use std::time::Instant;
 use crate::{
     domain::user::{PublicUser, UserListItem},
     hermes::{
-        instance::{HermesInstance, HermesInstanceKind, HermesInstanceStatus},
+        instance::{HermesInstance, HermesInstanceKind},
         provisioner::{HermesProvisioner, ProvisionerError},
     },
     http::{
@@ -37,14 +37,6 @@ pub fn router() -> Router<AppState> {
         .route("/api/admin/users/{user_id}/disable", post(disable_user))
         .route("/api/admin/users/{user_id}/enable", post(enable_user))
         .route("/api/admin/hermes-instances", get(list_hermes_instances))
-        .route(
-            "/api/admin/users/{user_id}/hermes-instance/bind-external",
-            post(bind_external_hermes_instance),
-        )
-        .route(
-            "/api/admin/users/{user_id}/hermes-instance/external-config",
-            axum::routing::put(update_external_hermes_instance_config),
-        )
         .route(
             "/api/admin/users/{user_id}/hermes-instance/create-managed",
             post(create_managed_hermes_instance),
@@ -132,20 +124,6 @@ struct SystemSettingsResponse {
 
 type UpdateSystemSettingsRequest = SystemSettings;
 
-#[derive(Deserialize)]
-struct BindExternalHermesRequest {
-    name: String,
-    base_url: String,
-    api_token: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct UpdateExternalHermesConfigRequest {
-    name: String,
-    base_url: String,
-    api_token: Option<String>,
-}
-
 async fn list_users(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -208,89 +186,6 @@ async fn list_hermes_instances(
     Ok(Json(HermesInstancesResponse { hermes_instances }))
 }
 
-async fn bind_external_hermes_instance(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(user_id): Path<String>,
-    Json(payload): Json<BindExternalHermesRequest>,
-) -> Result<impl IntoResponse, ApiError> {
-    require_admin(&state, &headers).await?;
-    ensure_required_model_configs(&state).await?;
-    ensure_user_exists(&state, &user_id).await?;
-    let instance = HermesInstance {
-        id: uuid::Uuid::new_v4().to_string(),
-        user_id: user_id.clone(),
-        kind: HermesInstanceKind::External,
-        status: HermesInstanceStatus::Running,
-        name: payload.name,
-        base_url: payload.base_url,
-        api_token_secret_ref: payload.api_token,
-        llm_api_key: None,
-        container_id: None,
-        host_workspace_path: None,
-        host_sandbox_path: None,
-        host_config_path: None,
-        health_status: "unknown".to_string(),
-    };
-    state
-        .store
-        .bind_hermes_instance(instance.clone())
-        .await
-        .map_err(|_| ApiError::Internal)?;
-    state
-        .channel_store
-        .bind_hub_channel_to_instance(&user_id, &instance.id)
-        .await
-        .map_err(|_| ApiError::Internal)?;
-
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn update_external_hermes_instance_config(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(user_id): Path<String>,
-    Json(payload): Json<UpdateExternalHermesConfigRequest>,
-) -> Result<impl IntoResponse, ApiError> {
-    require_admin(&state, &headers).await?;
-    ensure_user_exists(&state, &user_id).await?;
-    let mut instance = state
-        .store
-        .hermes_instance_for_user(&user_id)
-        .await
-        .map_err(|_| ApiError::NotFound("hermes instance not found"))?;
-
-    if instance.kind != HermesInstanceKind::External {
-        return Err(ApiError::Conflict(
-            "managed hermes runtime config is controlled by hub",
-        ));
-    }
-
-    instance.name = payload.name;
-    instance.base_url = payload.base_url;
-    if let Some(api_token) = payload.api_token {
-        // 空字符串表示沿用已保存 token，便于管理员只修改名称或地址。
-        if !api_token.trim().is_empty() {
-            instance.api_token_secret_ref = Some(api_token);
-        }
-    }
-    instance.status = HermesInstanceStatus::Running;
-    state
-        .store
-        .bind_hermes_instance(instance.clone())
-        .await
-        .map_err(|_| ApiError::Internal)?;
-    state
-        .channel_store
-        .bind_hub_channel_to_instance(&user_id, &instance.id)
-        .await
-        .map_err(|_| ApiError::Internal)?;
-
-    Ok(Json(HermesInstanceResponse {
-        hermes_instance: instance,
-    }))
-}
-
 async fn create_managed_hermes_instance(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -299,9 +194,6 @@ async fn create_managed_hermes_instance(
     require_admin(&state, &headers).await?;
     ensure_required_model_configs(&state).await?;
     ensure_user_exists(&state, &user_id).await?;
-    if let Ok(instance) = state.store.hermes_instance_for_user(&user_id).await {
-        reject_external_instance(&instance)?;
-    }
 
     // 管理员补建和用户工作区 ensure 共用同一条幂等编排路径，避免两套 Docker 创建逻辑漂移。
     let instance = ensure_managed_hermes_for_user(&state, &user_id).await?;
@@ -336,7 +228,7 @@ async fn rebuild_managed_hermes_instance(
         .hermes_instance_for_user(&user_id)
         .await
         .map_err(|_| ApiError::NotFound("hermes instance not found"))?;
-    reject_external_instance(&instance)?;
+    ensure_hub_managed_instance(&instance)?;
     state
         .model_registry
         .revoke_instance_tokens_for_instance(&instance.id)
@@ -394,7 +286,7 @@ async fn stop_managed_hermes_instance(
         .hermes_instance_for_user(&user_id)
         .await
         .map_err(|_| ApiError::NotFound("hermes instance not found"))?;
-    reject_external_instance(&instance)?;
+    ensure_hub_managed_instance(&instance)?;
     let instance = state
         .docker_provisioner
         .stop_instance(&instance)
@@ -422,7 +314,7 @@ async fn start_managed_hermes_instance(
         .hermes_instance_for_user(&user_id)
         .await
         .map_err(|_| ApiError::NotFound("hermes instance not found"))?;
-    reject_external_instance(&instance)?;
+    ensure_hub_managed_instance(&instance)?;
     let instance = ensure_managed_hermes_for_user(&state, &user_id).await?;
     Ok(Json(HermesInstanceResponse {
         hermes_instance: instance,
@@ -669,11 +561,9 @@ fn map_model_test_provider_error(error: LlmProviderError) -> ApiError {
     }
 }
 
-fn reject_external_instance(instance: &HermesInstance) -> Result<(), ApiError> {
+fn ensure_hub_managed_instance(instance: &HermesInstance) -> Result<(), ApiError> {
     if instance.kind != HermesInstanceKind::ManagedDocker {
-        return Err(ApiError::Conflict(
-            "external hermes instance is managed outside hub",
-        ));
+        return Err(ApiError::Conflict("hermes runtime must be managed by hub"));
     }
 
     Ok(())
