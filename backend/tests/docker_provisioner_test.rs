@@ -552,8 +552,7 @@ async fn docker_provisioner_test() {
         .iter()
         .any(|entry| entry == "HERMES_ACCEPT_HOOKS=1"));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version"
-            && value == "2026-05-25-hermes-hub-adapter-only-managed-skills"
+        key == "hermes_hub_spec_version" && value == "2026-05-25-hermes-hub-run-context"
     }));
     assert!(spec
         .mounts
@@ -636,15 +635,24 @@ async fn docker_provisioner_test() {
     assert!(plugin_adapter.contains("thread_id=session_id"));
     assert!(plugin_adapter.contains("raw_message[\"run_id\"] = run_id"));
     assert!(plugin_adapter.contains("await self.handle_message(event)"));
+    assert!(plugin_adapter.contains("async def on_processing_start("));
     assert!(plugin_adapter.contains("async def on_processing_complete("));
     assert!(plugin_adapter.contains("ProcessingOutcome.CANCELLED"));
     assert!(plugin_adapter.contains("MAX_MESSAGE_LENGTH = 8000"));
     assert!(plugin_adapter.contains("self._last_output_messages: dict[str, dict[str, Any]] = {}"));
+    assert!(plugin_adapter.contains("self._active_run_ids_by_session: dict[str, str] = {}"));
     assert!(plugin_adapter.contains("self._remember_output_message(metadata, message)"));
+    assert!(plugin_adapter
+        .contains("run_id = self._normalize_run_id(metadata.get(\"run_id\") or \"\")"));
+    assert!(plugin_adapter.contains("return self._active_run_ids_by_session.get(session_id, \"\")"));
+    assert!(!plugin_adapter
+        .contains("run_id = metadata.get(\"run_id\") or metadata.get(\"thread_id\")"));
     assert!(
-        plugin_adapter.contains("run_id = metadata.get(\"run_id\") or metadata.get(\"thread_id\")")
+        !plugin_adapter.contains("metadata.get(\"message_id\")"),
+        "adapter must not treat a Hermes message id as a Hub run id"
     );
-    assert!(plugin_adapter.contains("return self._normalize_run_id(run_id)"));
+    assert!(plugin_adapter.contains("def _session_id_from_metadata("));
+    assert!(plugin_adapter.contains("def _forget_active_run("));
     assert!(plugin_adapter.contains("def _normalize_run_id(self, run_id: Any) -> str:"));
     assert!(plugin_adapter.contains("return f\"hub-run-{value}\""));
     assert!(plugin_adapter.contains("\"output_message_id\": output_message_id"));
@@ -703,8 +711,7 @@ async fn docker_provisioner_test() {
     assert!(
         create_call.windows(2).any(|args| {
             args[0] == "--label"
-                && args[1]
-                    == "hermes_hub_spec_version=2026-05-25-hermes-hub-adapter-only-managed-skills"
+                && args[1] == "hermes_hub_spec_version=2026-05-25-hermes-hub-run-context"
         }),
         "managed Hermes containers must carry the current spec label"
     );

@@ -21,7 +21,7 @@ use super::{
 
 /// Hub 托管 Hermes 容器规格版本。只要 env、挂载、工作目录或安全策略有变化，
 /// 就提升这个值，确保已存在的旧容器会被重建并拿到新行为。
-const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-25-hermes-hub-adapter-only-managed-skills";
+const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-25-hermes-hub-run-context";
 const MANAGED_CONTAINER_SPEC_LABEL: &str = "hermes_hub_spec_version";
 const HUB_INBOX_PATH: &str = "/internal/channel/v1/inbox";
 const HUB_INBOX_TIMEOUT_SECONDS: u16 = 25;
@@ -115,6 +115,9 @@ class HermesHubAdapter(BasePlatformAdapter):
         # Hermes 会把 thread_id 作为通用路由 metadata 传给所有输出；
         # Hub 追踪最后一条输出消息，便于图片/文件回传时更新同一气泡。
         self._last_output_messages: dict[str, dict[str, Any]] = {}
+        # thread_id 在 Hub 中稳定等于 session_id，不能当作每轮 run_id 使用；
+        # 处理开始/结束钩子用这个表把当前 session 映射到真实 Hub run。
+        self._active_run_ids_by_session: dict[str, str] = {}
 
     @property
     def name(self) -> str:
@@ -331,33 +334,42 @@ class HermesHubAdapter(BasePlatformAdapter):
         )
         await self.handle_message(event)
 
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        run_id = self._run_id_from_event(event)
+        session_id = self._session_id_from_event(event)
+        if run_id and session_id:
+            self._active_run_ids_by_session[session_id] = run_id
+
     async def on_processing_complete(self, event: MessageEvent, outcome) -> None:
         run_id = self._run_id_from_event(event)
-        if not run_id:
-            return
-        if outcome == ProcessingOutcome.CANCELLED:
-            status = "cancelled"
-        elif getattr(outcome, "value", str(outcome)) == "success":
-            status = "completed"
-        else:
-            status = "failed"
         try:
-            if status == "completed":
-                output_message_id = self._last_output_message_id(run_id)
-                payload = {"output_message_id": output_message_id} if output_message_id else {}
-                await self._request_json("POST", f"/inbox/{run_id}/ack", json=payload)
+            if not run_id:
+                return
+            if outcome == ProcessingOutcome.CANCELLED:
+                status = "cancelled"
+            elif getattr(outcome, "value", str(outcome)) == "success":
+                status = "completed"
             else:
-                output_message_id = self._last_output_message_id(run_id)
-                payload = {"status": status, "error": self._outcome_text(outcome)}
-                if output_message_id:
-                    payload["output_message_id"] = output_message_id
-                await self._request_json(
-                    "POST",
-                    f"/runs/{run_id}/status",
-                    json=payload,
-                )
-        except Exception as error:
-            logger.warning("Hermes Hub run completion callback failed: %s", error)
+                status = "failed"
+            try:
+                if status == "completed":
+                    output_message_id = self._last_output_message_id(run_id)
+                    payload = {"output_message_id": output_message_id} if output_message_id else {}
+                    await self._request_json("POST", f"/inbox/{run_id}/ack", json=payload)
+                else:
+                    output_message_id = self._last_output_message_id(run_id)
+                    payload = {"status": status, "error": self._outcome_text(outcome)}
+                    if output_message_id:
+                        payload["output_message_id"] = output_message_id
+                    await self._request_json(
+                        "POST",
+                        f"/runs/{run_id}/status",
+                        json=payload,
+                    )
+            except Exception as error:
+                logger.warning("Hermes Hub run completion callback failed: %s", error)
+        finally:
+            self._forget_active_run(event, run_id)
 
     async def _upload_and_send(
         self,
@@ -598,20 +610,49 @@ class HermesHubAdapter(BasePlatformAdapter):
 
     def _run_id(self, metadata: Optional[Dict[str, Any]]) -> str:
         metadata = metadata or {}
-        run_id = metadata.get("run_id") or metadata.get("thread_id") or metadata.get("message_id") or ""
-        return self._normalize_run_id(run_id)
+        run_id = self._normalize_run_id(metadata.get("run_id") or "")
+        if run_id:
+            return run_id
+        session_id = self._session_id_from_metadata(metadata)
+        if not session_id:
+            return ""
+        # 这里只用 thread_id/session_id 查找当前运行中的 run，不能把它本身当 run_id；
+        # 否则同一会话多轮回复会复用同一个 client_message_key。
+        return self._active_run_ids_by_session.get(session_id, "")
 
     def _run_id_from_event(self, event: MessageEvent) -> str:
         raw = getattr(event, "raw_message", {}) or {}
         if isinstance(raw, dict) and raw.get("run_id"):
             return self._normalize_run_id(raw["run_id"])
+        session_id = self._session_id_from_event(event)
+        return self._active_run_ids_by_session.get(session_id, "") if session_id else ""
+
+    def _session_id_from_event(self, event: MessageEvent) -> str:
+        raw = getattr(event, "raw_message", {}) or {}
+        if isinstance(raw, dict):
+            session_id = raw.get("session_id") or raw.get("channel_session_id")
+            if session_id:
+                return str(session_id)
         source = getattr(event, "source", None)
-        thread_id = getattr(source, "thread_id", "") if source else ""
-        normalized_thread_id = self._normalize_run_id(thread_id)
-        if normalized_thread_id:
-            return normalized_thread_id
-        message_id = getattr(event, "message_id", "") or ""
-        return self._normalize_run_id(message_id)
+        session_id = getattr(source, "chat_id", "") if source else ""
+        return str(session_id or "")
+
+    def _session_id_from_metadata(self, metadata: Optional[Dict[str, Any]]) -> str:
+        metadata = metadata or {}
+        session_id = (
+            metadata.get("session_id")
+            or metadata.get("channel_id")
+            or metadata.get("thread_id")
+            or ""
+        )
+        return str(session_id or "")
+
+    def _forget_active_run(self, event: MessageEvent, run_id: str) -> None:
+        session_id = self._session_id_from_event(event)
+        if not session_id or not run_id:
+            return
+        if self._active_run_ids_by_session.get(session_id) == run_id:
+            self._active_run_ids_by_session.pop(session_id, None)
 
     def _normalize_run_id(self, run_id: Any) -> str:
         value = str(run_id or "").strip()
