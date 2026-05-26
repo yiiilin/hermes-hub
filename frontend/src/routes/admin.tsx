@@ -87,6 +87,67 @@ function collectManagedSkillDirectories(node: ManagedSkillTreeNode): string[] {
   return directories;
 }
 
+function managedSkillTreeFromList(skills: ManagedSkill[]): ManagedSkillTreeNode {
+  const root: ManagedSkillTreeNode = {
+    name: "",
+    path: "",
+    kind: "dir",
+    size: 0,
+    children: [],
+  };
+
+  function ensureDir(path: string) {
+    let node = root;
+    let currentPath = "";
+    for (const segment of path.split("/").filter(Boolean)) {
+      currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+      let child = node.children.find((item) => item.kind === "dir" && item.name === segment);
+      if (!child) {
+        child = {
+          name: segment,
+          path: currentPath,
+          kind: "dir",
+          size: 0,
+          children: [],
+        };
+        node.children.push(child);
+      }
+      node = child;
+    }
+    return node;
+  }
+
+  for (const skill of skills) {
+    const segments = skill.path.split("/").filter(Boolean);
+    const name = segments.pop();
+    if (!name) {
+      continue;
+    }
+    ensureDir(segments.join("/")).children.push({
+      name,
+      path: skill.path,
+      kind: "file",
+      size: skill.size,
+      children: [],
+    });
+  }
+
+  // 旧后端还没有 tree 接口时只能从文件列表推导目录；排序保持和后端树接口一致。
+  function sortNode(node: ManagedSkillTreeNode) {
+    node.children.sort((left, right) => {
+      if (left.kind !== right.kind) {
+        return left.kind === "dir" ? -1 : 1;
+      }
+      return left.name.localeCompare(right.name);
+    });
+    for (const child of node.children) {
+      sortNode(child);
+    }
+  }
+  sortNode(root);
+  return root;
+}
+
 export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps) {
   const { language, t } = useI18n();
   const [users, setUsers] = useState<User[]>([]);
@@ -166,10 +227,16 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
   }, []);
 
   async function refreshManagedSkills() {
-    const [nextSkills, nextTree] = await Promise.all([
-      apiClient.listManagedSkills(),
-      apiClient.listManagedSkillTree(),
-    ]);
+    const nextSkills = await apiClient.listManagedSkills();
+    let nextTree: ManagedSkillTreeNode;
+    try {
+      nextTree = await apiClient.listManagedSkillTree();
+    } catch (cause) {
+      if (!(cause instanceof Error) || cause.message !== "managed skill not found") {
+        throw cause;
+      }
+      nextTree = managedSkillTreeFromList(nextSkills);
+    }
     setManagedSkills(nextSkills);
     setManagedSkillTree(nextTree);
   }

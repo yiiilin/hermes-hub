@@ -1810,6 +1810,26 @@ describe("App", () => {
     expect(screen.getByLabelText("Skill 内容")).toHaveValue("");
   });
 
+  it("opens managed skill management when the tree endpoint is not available yet", async () => {
+    localStorage.setItem("hermes-hub-language", "zh");
+    const apiClient = createMockApiClient({
+      initialManagedSkills: {
+        "image/SKILL.md": "# Image\n",
+      },
+    });
+    apiClient.listManagedSkillTree = vi.fn(async () => {
+      throw new Error("managed skill not found");
+    });
+
+    render(<App apiClient={apiClient} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "统一 Skill 管理" }));
+
+    expect(await screen.findByRole("heading", { name: "统一 Skill 管理" })).toBeInTheDocument();
+    expect(screen.queryByText("managed skill not found")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /image\/SKILL\.md/ })).toBeInTheDocument();
+  });
+
   it("uploads managed skill folders and zip archives from the admin tree", async () => {
     localStorage.setItem("hermes-hub-language", "zh");
     const uploadManagedSkills = vi.fn(async (files: File[], targetPath?: string) =>
