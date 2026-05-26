@@ -3,11 +3,13 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use crate::model_config::{
-    normalize_reasoning_effort, ModelConfig, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND,
+    normalize_reasoning_effort, ModelConfig, CHAT_COMPLETIONS_API_TYPE,
+    DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_TEMPERATURE,
+    LLM_MODEL_CONFIG_KIND,
 };
 
 /// 应用启动配置。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AppConfig {
     pub bind_addr: SocketAddr,
     pub cookie_name: String,
@@ -178,6 +180,25 @@ fn model_config_from_env() -> ModelConfig {
     let reasoning_effort =
         normalize_reasoning_effort(std::env::var("HERMES_HUB_MODEL_REASONING_EFFORT").ok())
             .unwrap_or(None);
+    let context_window_tokens = std::env::var("HERMES_HUB_MODEL_CONTEXT_WINDOW_TOKENS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS);
+    let max_output_tokens = std::env::var("HERMES_HUB_MODEL_MAX_OUTPUT_TOKENS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+    let temperature = std::env::var("HERMES_HUB_MODEL_TEMPERATURE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| (0.0..=2.0).contains(value))
+        .unwrap_or(DEFAULT_TEMPERATURE);
+    let supports_parallel_tools = std::env::var("HERMES_HUB_MODEL_SUPPORTS_PARALLEL_TOOLS")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(true);
 
     ModelConfig {
         config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
@@ -191,15 +212,20 @@ fn model_config_from_env() -> ModelConfig {
         allowed_models,
         api_type,
         reasoning_effort,
+        enabled: true,
         allow_streaming,
         request_timeout_seconds,
+        context_window_tokens,
+        max_output_tokens,
+        temperature,
+        supports_parallel_tools,
     }
 }
 
 fn hermes_docker_config_from_env() -> HermesDockerConfig {
     HermesDockerConfig {
         image: std::env::var("HERMES_DOCKER_IMAGE")
-            .unwrap_or_else(|_| "nousresearch/hermes-agent:latest".to_string()),
+            .unwrap_or_else(|_| "ghcr.io/yiiilin/hermes-hub-hermes:latest".to_string()),
         data_root: PathBuf::from(
             std::env::var("HERMES_DATA_ROOT")
                 .unwrap_or_else(|_| "/data/hermes-hub/users".to_string()),
@@ -251,14 +277,19 @@ fn default_model_config() -> ModelConfig {
         allowed_models: vec!["gpt-4.1-mini".to_string()],
         api_type: CHAT_COMPLETIONS_API_TYPE.to_string(),
         reasoning_effort: None,
+        enabled: true,
         allow_streaming: true,
         request_timeout_seconds: 60,
+        context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
+        max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+        temperature: DEFAULT_TEMPERATURE,
+        supports_parallel_tools: true,
     }
 }
 
 fn default_hermes_docker_config() -> HermesDockerConfig {
     HermesDockerConfig {
-        image: "nousresearch/hermes-agent:latest".to_string(),
+        image: "ghcr.io/yiiilin/hermes-hub-hermes:latest".to_string(),
         data_root: PathBuf::from("/tmp/hermes-hub/users"),
         network: "hermes-hub-net".to_string(),
         internal_port: 8000,
@@ -337,7 +368,10 @@ fn env_usize_any(names: &[&str], default: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{model_config_from_env, object_storage_config_from_env, skills_fs_config_from_env};
+    use super::{
+        hermes_docker_config_from_env, model_config_from_env, object_storage_config_from_env,
+        skills_fs_config_from_env,
+    };
 
     #[test]
     fn object_storage_accepts_hub_prefixed_env_aliases() {
@@ -412,6 +446,21 @@ mod tests {
 
         if let Some(value) = saved {
             std::env::set_var("HERMES_HUB_MODEL_REQUEST_TIMEOUT_SECONDS", value);
+        }
+    }
+
+    #[test]
+    fn hermes_docker_config_defaults_to_ghcr_wrapper_image() {
+        let saved = std::env::var("HERMES_DOCKER_IMAGE").ok();
+        std::env::remove_var("HERMES_DOCKER_IMAGE");
+
+        // Hub 托管的 Hermes 运行时默认使用 GHCR 上的薄包装镜像；
+        // 具体官方 Hermes 版本由镜像 tag 跟随。
+        let config = hermes_docker_config_from_env();
+        assert_eq!(config.image, "ghcr.io/yiiilin/hermes-hub-hermes:latest");
+
+        if let Some(value) = saved {
+            std::env::set_var("HERMES_DOCKER_IMAGE", value);
         }
     }
 

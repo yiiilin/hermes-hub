@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./app";
@@ -73,6 +73,13 @@ describe("App", () => {
       hour: "2-digit",
       minute: "2-digit",
     }).format(new Date(timestampSeconds * 1000));
+  }
+
+  async function openSettingsTab(tabName: string, settingsName = "System settings") {
+    fireEvent.click(await screen.findByRole("button", { name: settingsName }));
+    const settingsTabs = await screen.findByRole("tablist", { name: settingsName });
+    fireEvent.click(within(settingsTabs).getByRole("tab", { name: tabName }));
+    return settingsTabs;
   }
 
   function createHubRunMock(
@@ -399,9 +406,9 @@ describe("App", () => {
     expect(screen.queryByText("running")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "New chat" })).toBeInTheDocument();
     expect(await screen.findByRole("button", { name: "Session" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "User management" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Model configuration" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Hermes management" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "User management" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Model configuration" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Hermes management" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "System settings" })).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Message"), {
@@ -427,16 +434,26 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "新建对话" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "English" }));
 
-    fireEvent.click(screen.getByRole("button", { name: "User management" }));
-    expect(await screen.findByRole("heading", { name: "User management" })).toBeInTheDocument();
+    const settingsTabs = await openSettingsTab("User management");
     expect(await screen.findByRole("heading", { name: "Invites" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "User management" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "New chat" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Session" })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Model configuration" }));
+    fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Model configuration" }));
     expect(await screen.findByRole("heading", { name: "Large language model" })).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: "Image model" })).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: "Title model" })).toBeInTheDocument();
+    expect(
+      screen
+        .getAllByRole("heading", { level: 2 })
+        .map((heading) => heading.textContent),
+    ).toEqual(["Large language model", "Title model", "Image model"]);
+    expect(screen.getByLabelText("Context window tokens")).toHaveValue(128000);
+    expect(screen.getByLabelText("Max output tokens")).toHaveValue(4096);
+    expect(screen.getByLabelText("Temperature")).toHaveValue(0.7);
+    expect(screen.getByLabelText("Parallel tool calls")).toBeChecked();
+    expect(screen.getByLabelText("Enable image generation")).not.toBeChecked();
     expect(screen.getAllByRole("button", { name: "Save" })).toHaveLength(1);
     expect(screen.getAllByRole("button", { name: "Test" })).toHaveLength(3);
     const apiKeyInputs = screen.getAllByLabelText("API key");
@@ -445,10 +462,16 @@ describe("App", () => {
     fireEvent.click(screen.getAllByRole("button", { name: "Test" })[0]);
     expect(await screen.findByText("model test succeeded")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "System settings" }));
-    expect(await screen.findByRole("heading", { name: "System settings" })).toBeInTheDocument();
-    const maxSessionsInput = screen.getByLabelText("Max sessions per user");
+    fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Session settings" }));
+    const maxSessionsInput = await screen.findByLabelText("Max sessions per user");
+    expect(screen.queryByRole("heading", { name: "Session settings" })).not.toBeInTheDocument();
     fireEvent.change(maxSessionsInput, { target: { value: "12" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    expect(await screen.findByText("Settings saved")).toBeInTheDocument();
+
+    fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Authentication settings" }));
+    expect(await screen.findByLabelText("Enable OIDC")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Authentication settings" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByLabelText("Enable OIDC"));
     fireEvent.change(screen.getByLabelText("OIDC display name"), {
       target: { value: "Acme SSO" },
@@ -471,8 +494,97 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
     expect(await screen.findByText("Settings saved")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Hermes management" }));
-    expect(await screen.findByRole("heading", { name: "Hermes management" })).toBeInTheDocument();
+    fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Hermes management" }));
+    expect(await screen.findByRole("columnheader", { name: "Owner" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Hermes management" })).not.toBeInTheDocument();
+  });
+
+  it("groups admin modules under system settings tabs", async () => {
+    render(<App apiClient={createMockApiClient()} />);
+
+    const systemSettingsNav = await screen.findByRole("button", { name: "System settings" });
+    expect(screen.queryByRole("button", { name: "User management" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Model configuration" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Hermes management" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Managed skills" })).not.toBeInTheDocument();
+
+    fireEvent.click(systemSettingsNav);
+    expect(await screen.findByRole("heading", { name: "System settings" })).toBeInTheDocument();
+
+    const settingsTabs = screen.getByRole("tablist", { name: "System settings" });
+    expect(within(settingsTabs).getByRole("tab", { name: "User management" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(within(settingsTabs).getByRole("tab", { name: "Model configuration" })).toBeInTheDocument();
+    expect(within(settingsTabs).getByRole("tab", { name: "Hermes management" })).toBeInTheDocument();
+    expect(within(settingsTabs).getByRole("tab", { name: "Managed skills" })).toBeInTheDocument();
+    expect(within(settingsTabs).getByRole("tab", { name: "Session settings" })).toBeInTheDocument();
+    expect(within(settingsTabs).getByRole("tab", { name: "Authentication settings" })).toBeInTheDocument();
+
+    fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Model configuration" }));
+    expect(await screen.findByRole("heading", { name: "Large language model" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Model configuration" })).not.toBeInTheDocument();
+
+    fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Session settings" }));
+    expect(await screen.findByLabelText("Max sessions per user")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Session settings" })).not.toBeInTheDocument();
+
+    fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Authentication settings" }));
+    const enableOidcRow = await screen.findByLabelText("Enable OIDC");
+    expect(enableOidcRow).toBeInTheDocument();
+    expect(screen.getByLabelText("OIDC Redirect URI")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Authentication settings" })).not.toBeInTheDocument();
+  });
+
+  it("saves the optional image generation toggle and keeps it at the bottom of the image card", async () => {
+    render(<App apiClient={createMockApiClient()} />);
+
+    await openSettingsTab("Model configuration");
+    const imageHeading = await screen.findByRole("heading", { name: "Image model" });
+    const imageCard = imageHeading.closest("section.panel");
+    expect(imageCard).toBeInTheDocument();
+
+    const imageLabels = Array.from(imageCard!.querySelectorAll("label")).map((label) =>
+      label.textContent?.replace(/\s+/g, " ").trim(),
+    );
+    expect(imageLabels.at(-1)).toBe("Enable image generation");
+
+    const imageToggle = within(imageCard as HTMLElement).getByLabelText("Enable image generation");
+    expect(imageToggle).not.toBeChecked();
+    fireEvent.click(imageToggle);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(await screen.findByText("Model configuration saved")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByLabelText("Enable image generation")).toBeChecked();
+    });
+  });
+
+  it("saves main model runtime limits and parallel tool support", async () => {
+    const client = createMockApiClient();
+    render(<App apiClient={client} />);
+
+    await openSettingsTab("Model configuration");
+    fireEvent.change(await screen.findByLabelText("Context window tokens"), {
+      target: { value: "200000" },
+    });
+    fireEvent.change(screen.getByLabelText("Max output tokens"), {
+      target: { value: "8192" },
+    });
+    fireEvent.change(screen.getByLabelText("Temperature"), {
+      target: { value: "0.3" },
+    });
+    fireEvent.click(screen.getByLabelText("Parallel tool calls"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(await screen.findByText("Model configuration saved")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByLabelText("Context window tokens")).toHaveValue(200000);
+      expect(screen.getByLabelText("Max output tokens")).toHaveValue(8192);
+      expect(screen.getByLabelText("Temperature")).toHaveValue(0.3);
+      expect(screen.getByLabelText("Parallel tool calls")).not.toBeChecked();
+    });
   });
 
   it("opens image attachments in a preview dialog", async () => {
@@ -608,6 +720,35 @@ describe("App", () => {
     const markdown = document.querySelector(".markdown-content");
     expect(markdown?.textContent).toContain("文件：练习.pptx");
     expect(document.querySelector(".message-attachments")).not.toBeInTheDocument();
+  });
+
+  it("renders bare links inside user message bubbles", async () => {
+    const link = "https://example.com/docs?tab=chat";
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialMessagesBySessionId: {
+            "session-1": [
+              {
+                id: "message-user-link",
+                session_id: "session-1",
+                role: "user",
+                content: `看这个 ${link}`,
+                attachments: [],
+                created_at: 1,
+              },
+            ],
+          },
+        })}
+      />,
+    );
+
+    const userBubble = (await screen.findByText(/看这个/)).closest(".message-bubble");
+    const renderedLink = screen.getByRole("link", { name: link });
+
+    expect(userBubble).toHaveClass("user");
+    expect(userBubble).toHaveTextContent(link);
+    expect(renderedLink).toHaveAttribute("href", link);
   });
 
   it("shows Hermes input status while a response is pending", async () => {
@@ -1529,7 +1670,7 @@ describe("App", () => {
   it("shows the OIDC redirect URI directly below Enable OIDC", async () => {
     render(<App apiClient={createMockApiClient()} />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "System settings" }));
+    await openSettingsTab("Authentication settings");
 
     const enableOidcRow = screen.getByLabelText("Enable OIDC").closest("label");
     const redirectInput = await screen.findByLabelText("OIDC Redirect URI");
@@ -1683,7 +1824,7 @@ describe("App", () => {
       />,
     );
 
-    fireEvent.click(await screen.findByRole("button", { name: "User management" }));
+    const settingsTabs = await openSettingsTab("User management");
     expect(await screen.findByRole("heading", { name: "Invites" })).toBeInTheDocument();
     expect(
       screen.getByText(
@@ -1692,8 +1833,9 @@ describe("App", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Create invite" })).toBeDisabled();
 
-    fireEvent.click(screen.getByRole("button", { name: "Hermes management" }));
-    expect(await screen.findByRole("heading", { name: "Hermes management" })).toBeInTheDocument();
+    fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Hermes management" }));
+    expect(await screen.findByRole("columnheader", { name: "Owner" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Hermes management" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Start" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Rebuild" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Stop" })).not.toBeDisabled();
@@ -1708,7 +1850,7 @@ describe("App", () => {
       />,
     );
 
-    fireEvent.click(await screen.findByRole("button", { name: "Hermes management" }));
+    await openSettingsTab("Hermes management");
     expect(await screen.findAllByText("not_created")).toHaveLength(2);
     fireEvent.click(screen.getByRole("button", { name: "Create" }));
 
@@ -1716,6 +1858,116 @@ describe("App", () => {
       expect(screen.getByRole("button", { name: "Start" })).toBeInTheDocument();
     });
   });
+
+  it("shows Hermes runtime version in the management table", async () => {
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialInstance: {
+            id: "instance-1",
+            user_id: "user-1",
+            kind: "managed_docker",
+            status: "running",
+            runtime_image: "ghcr.io/yiiilin/hermes-hub-hermes:1.2.3",
+            runtime_version: "1.2.3",
+          },
+        })}
+      />,
+    );
+
+    await openSettingsTab("Hermes management");
+
+    expect(await screen.findByRole("columnheader", { name: "Version" })).toBeInTheDocument();
+    expect(screen.getByText("1.2.3")).toBeInTheDocument();
+  });
+
+  it("does not show latest as the Hermes runtime version", async () => {
+    render(<App apiClient={createMockApiClient()} />);
+
+    await openSettingsTab("Hermes management");
+
+    expect(await screen.findByRole("columnheader", { name: "Version" })).toBeInTheDocument();
+    expect(screen.queryByText("ghcr.io/yiiilin/hermes-hub-hermes:latest")).not.toBeInTheDocument();
+  });
+
+  it("shows one Hermes status and the error detail in the management table", async () => {
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialInstance: {
+            id: "instance-1",
+            user_id: "user-1",
+            kind: "managed_docker",
+            status: "error",
+            health_status: "unhealthy",
+            status_message: "curl: connection refused",
+          },
+        })}
+      />,
+    );
+
+    await openSettingsTab("Hermes management");
+
+    expect(await screen.findByText("error")).toBeInTheDocument();
+    expect(screen.getByText("curl: connection refused")).toBeInTheDocument();
+    expect(screen.queryByText("error / unhealthy")).not.toBeInTheDocument();
+  });
+
+  it("shows pending feedback while creating a managed Hermes instance", async () => {
+    const deferred = createDeferred<void>();
+    const client = createMockApiClient({ initialInstance: null });
+    const originalCreateHermesInstance = client.createHermesInstance;
+    const createHermesInstance = vi.fn(async (userId: string) => {
+      await deferred.promise;
+      return originalCreateHermesInstance(userId);
+    });
+    client.createHermesInstance = createHermesInstance;
+
+    render(<App apiClient={client} />);
+
+    await openSettingsTab("Hermes management");
+    fireEvent.click(await screen.findByRole("button", { name: "Create" }));
+
+    expect(await screen.findByRole("button", { name: "Creating..." })).toBeDisabled();
+    expect(createHermesInstance).toHaveBeenCalledWith("user-1");
+
+    deferred.resolve();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Start" })).toBeInTheDocument();
+    });
+  });
+
+  it.each([
+    ["Start", "Starting...", "startHermesInstance", "running"],
+    ["Stop", "Stopping...", "stopHermesInstance", "stopped"],
+    ["Rebuild", "Rebuilding...", "rebuildHermesInstance", "running"],
+  ] as const)(
+    "shows pending feedback while %s runs",
+    async (buttonName, pendingName, methodName, nextStatus) => {
+      const deferred = createDeferred<void>();
+      const client = createMockApiClient();
+      const originalAction = client[methodName];
+      const action = vi.fn(async (userId: string) => {
+        await deferred.promise;
+        return originalAction(userId);
+      });
+      client[methodName] = action;
+
+      render(<App apiClient={client} />);
+
+      await openSettingsTab("Hermes management");
+      fireEvent.click(await screen.findByRole("button", { name: buttonName }));
+
+      expect(await screen.findByRole("button", { name: pendingName })).toBeDisabled();
+      expect(action).toHaveBeenCalledWith("user-1");
+
+      expect(nextStatus).toMatch(/running|stopped/);
+      deferred.resolve();
+      await waitFor(() => {
+        expect(screen.getByRole("button", { name: buttonName })).toBeInTheDocument();
+      });
+    },
+  );
 
   it("lets admins manage shared skills from the Chinese navigation", async () => {
     localStorage.setItem("hermes-hub-language", "zh");
@@ -1739,12 +1991,10 @@ describe("App", () => {
       />,
     );
 
-    const skillNav = await screen.findByRole("button", { name: "统一 Skill 管理" });
-    expect(skillNav).toBeInTheDocument();
-    fireEvent.click(skillNav);
+    await openSettingsTab("统一 Skill 管理", "系统设置");
 
-    expect(await screen.findByRole("heading", { name: "统一 Skill 管理" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "文件夹 writing" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "文件夹 writing" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "统一 Skill 管理" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "文件夹 research" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /writing\/references\/style\.md/ })).toBeInTheDocument();
 
@@ -1823,11 +2073,11 @@ describe("App", () => {
 
     render(<App apiClient={apiClient} />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "统一 Skill 管理" }));
+    await openSettingsTab("统一 Skill 管理", "系统设置");
 
-    expect(await screen.findByRole("heading", { name: "统一 Skill 管理" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /image\/SKILL\.md/ })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "统一 Skill 管理" })).not.toBeInTheDocument();
     expect(screen.queryByText("managed skill not found")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /image\/SKILL\.md/ })).toBeInTheDocument();
   });
 
   it("uploads managed skill folders and zip archives from the admin tree", async () => {
@@ -1847,7 +2097,7 @@ describe("App", () => {
       />,
     );
 
-    fireEvent.click(await screen.findByRole("button", { name: "统一 Skill 管理" }));
+    await openSettingsTab("统一 Skill 管理", "系统设置");
     fireEvent.click(await screen.findByRole("button", { name: "文件夹 writing" }));
 
     const folderFile = new File(["# Research\n"], "SKILL.md", { type: "text/markdown" });
@@ -1887,6 +2137,10 @@ describe("App", () => {
           reasoning_effort: "medium",
           allow_streaming: true,
           request_timeout_seconds: 60,
+          context_window_tokens: 200000,
+          max_output_tokens: 8192,
+          temperature: 0.3,
+          supports_parallel_tools: true,
         },
         model_configs: [],
         required_models_ready: true,
@@ -1897,6 +2151,51 @@ describe("App", () => {
     const status = await createApiClient().modelConfigStatus();
 
     expect(status.model_config.provider_api_key).toBe("stored-provider-key");
+    expect(status.model_config.context_window_tokens).toBe(200000);
+    expect(status.model_config.max_output_tokens).toBe(8192);
+    expect(status.model_config.temperature).toBe(0.3);
+    expect(status.model_config.supports_parallel_tools).toBe(true);
+    fetchMock.mockRestore();
+  });
+
+  it("sends main model runtime limits through the real API client", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      status: 204,
+    } as Response);
+
+    await createApiClient().updateModelConfig({
+      config_kind: "llm",
+      enabled: true,
+      provider_name: "openai-compatible",
+      provider_base_url: "https://ready-provider.example/v1",
+      provider_api_key: "stored-provider-key",
+      default_model: "gpt-4.1-mini",
+      allowed_models: ["gpt-4.1-mini"],
+      api_type: "responses",
+      reasoning_effort: "medium",
+      allow_streaming: true,
+      request_timeout_seconds: 60,
+      context_window_tokens: 200000,
+      max_output_tokens: 8192,
+      temperature: 0.3,
+      supports_parallel_tools: false,
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/admin/model-config",
+      expect.objectContaining({
+        method: "PUT",
+        body: expect.stringContaining('"context_window_tokens":200000'),
+      }),
+    );
+    const requestBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(requestBody).toMatchObject({
+      context_window_tokens: 200000,
+      max_output_tokens: 8192,
+      temperature: 0.3,
+      supports_parallel_tools: false,
+    });
     fetchMock.mockRestore();
   });
 

@@ -63,8 +63,13 @@ fn test_registry() -> ModelRegistry {
         allowed_models: vec!["gpt-4.1-mini".to_string(), "gpt-4.1".to_string()],
         api_type: CHAT_COMPLETIONS_API_TYPE.to_string(),
         reasoning_effort: None,
+        enabled: true,
         allow_streaming: true,
         request_timeout_seconds: 60,
+        context_window_tokens: 128_000,
+        max_output_tokens: 4096,
+        temperature: 0.7,
+        supports_parallel_tools: true,
     })
 }
 
@@ -257,6 +262,9 @@ async fn llm_proxy_test() {
     assert_eq!(forwarded.authorization, "Bearer provider-secret");
     let forwarded_body: Value = serde_json::from_slice(&forwarded.body).expect("json forwarded");
     assert_eq!(forwarded_body["model"], "gpt-4.1-mini");
+    assert_eq!(forwarded_body["max_tokens"], 4096);
+    assert_eq!(forwarded_body["temperature"], 0.7);
+    assert_eq!(forwarded_body["parallel_tool_calls"], true);
 
     let denied = request_json(
         &app,
@@ -279,6 +287,58 @@ async fn llm_proxy_test() {
     assert_eq!(responses.status(), StatusCode::OK);
     let forwarded = provider.last_request().expect("provider request");
     assert_eq!(forwarded.path, "/responses");
+    let forwarded_body: Value = serde_json::from_slice(&forwarded.body).expect("json forwarded");
+    assert_eq!(forwarded_body["max_output_tokens"], 4096);
+    assert_eq!(forwarded_body["temperature"], 0.7);
+    assert_eq!(forwarded_body["parallel_tool_calls"], true);
+}
+
+#[tokio::test]
+async fn llm_proxy_caps_requested_output_tokens_at_model_config_limit() {
+    let provider = InMemoryLlmProviderClient::new(LlmProviderResponse {
+        status: StatusCode::OK,
+        content_type: Some("application/json".to_string()),
+        body: b"{}".to_vec(),
+    });
+    let registry = ModelRegistry::new(ModelConfig {
+        config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
+        provider_name: "openai-compatible".to_string(),
+        provider_base_url: "https://provider.example/v1".to_string(),
+        provider_api_key: "provider-secret".to_string(),
+        default_model: "gpt-4.1-mini".to_string(),
+        allowed_models: vec!["gpt-4.1-mini".to_string()],
+        api_type: CHAT_COMPLETIONS_API_TYPE.to_string(),
+        reasoning_effort: None,
+        enabled: true,
+        allow_streaming: true,
+        request_timeout_seconds: 60,
+        context_window_tokens: 64_000,
+        max_output_tokens: 512,
+        temperature: 0.2,
+        supports_parallel_tools: false,
+    });
+    registry.add_instance_token("instance-token");
+    let app = test_app(provider.clone(), registry);
+
+    let chat = request_json(
+        &app,
+        Method::POST,
+        "/internal/llm/v1/chat/completions",
+        json!({
+            "messages": [],
+            "max_tokens": 4096,
+            "temperature": 1.2,
+            "parallel_tool_calls": true
+        }),
+        Some("instance-token"),
+    )
+    .await;
+    assert_eq!(chat.status(), StatusCode::OK);
+    let forwarded = provider.last_request().expect("provider request");
+    let forwarded_body: Value = serde_json::from_slice(&forwarded.body).expect("json forwarded");
+    assert_eq!(forwarded_body["max_tokens"], 512);
+    assert_eq!(forwarded_body["temperature"], 1.2);
+    assert!(forwarded_body.get("parallel_tool_calls").is_none());
 }
 
 #[tokio::test]
@@ -297,8 +357,13 @@ async fn llm_proxy_injects_reasoning_for_chat_and_responses_requests() {
         allowed_models: vec!["gpt-5.5".to_string()],
         api_type: RESPONSES_API_TYPE.to_string(),
         reasoning_effort: Some("high".to_string()),
+        enabled: true,
         allow_streaming: true,
         request_timeout_seconds: 60,
+        context_window_tokens: 128_000,
+        max_output_tokens: 4096,
+        temperature: 0.7,
+        supports_parallel_tools: true,
     });
     registry.add_instance_token("instance-token");
     let app = test_app(provider.clone(), registry);
@@ -351,8 +416,13 @@ async fn llm_proxy_uses_image_config_for_image_generation_requests() {
             allowed_models: vec!["gpt-image-2-medium".to_string()],
             api_type: IMAGES_GENERATIONS_API_TYPE.to_string(),
             reasoning_effort: None,
+            enabled: true,
             allow_streaming: false,
             request_timeout_seconds: 180,
+            context_window_tokens: 128_000,
+            max_output_tokens: 4096,
+            temperature: 0.7,
+            supports_parallel_tools: true,
         })
         .await
         .expect("image config can be replaced");
@@ -395,6 +465,52 @@ async fn llm_proxy_uses_image_config_for_image_generation_requests() {
 }
 
 #[tokio::test]
+async fn llm_proxy_rejects_image_generation_when_image_model_is_disabled() {
+    let provider = InMemoryLlmProviderClient::default();
+    let registry = test_registry();
+    registry
+        .replace(ModelConfig {
+            config_kind: IMAGE_MODEL_CONFIG_KIND.to_string(),
+            provider_name: "openai-compatible-image".to_string(),
+            provider_base_url: "https://image-provider.example/v1".to_string(),
+            provider_api_key: "image-secret".to_string(),
+            default_model: "gpt-image-2-medium".to_string(),
+            allowed_models: vec!["gpt-image-2-medium".to_string()],
+            api_type: IMAGES_GENERATIONS_API_TYPE.to_string(),
+            reasoning_effort: None,
+            enabled: false,
+            allow_streaming: false,
+            request_timeout_seconds: 180,
+            context_window_tokens: 128_000,
+            max_output_tokens: 4096,
+            temperature: 0.7,
+            supports_parallel_tools: true,
+        })
+        .await
+        .expect("disabled image config can be saved");
+    registry.add_instance_token("instance-token");
+    let app = test_app(provider.clone(), registry);
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/internal/llm/v1/images/generations",
+        json!({
+            "model": "gpt-image-2-medium",
+            "prompt": "画一张架构图"
+        }),
+        Some("instance-token"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(
+        provider.last_request().is_none(),
+        "disabled image generation must not reach the provider"
+    );
+}
+
+#[tokio::test]
 async fn llm_proxy_uses_real_http_provider_and_records_usage() {
     let captured = CapturedProviderRequest::default();
     let provider_base_url = format!("{}/v1", spawn_provider_server(captured.clone()).await);
@@ -407,8 +523,13 @@ async fn llm_proxy_uses_real_http_provider_and_records_usage() {
         allowed_models: vec!["gpt-4.1-mini".to_string()],
         api_type: CHAT_COMPLETIONS_API_TYPE.to_string(),
         reasoning_effort: None,
+        enabled: true,
         allow_streaming: true,
         request_timeout_seconds: 5,
+        context_window_tokens: 128_000,
+        max_output_tokens: 4096,
+        temperature: 0.7,
+        supports_parallel_tools: true,
     });
     registry
         .add_instance_token_for_instance("instance-for-usage", "instance-token")
@@ -468,8 +589,13 @@ async fn llm_proxy_allows_longer_timeout_for_streaming_provider_requests() {
         allowed_models: vec!["gpt-4.1-mini".to_string()],
         api_type: CHAT_COMPLETIONS_API_TYPE.to_string(),
         reasoning_effort: None,
+        enabled: true,
         allow_streaming: true,
         request_timeout_seconds: 1,
+        context_window_tokens: 128_000,
+        max_output_tokens: 4096,
+        temperature: 0.7,
+        supports_parallel_tools: true,
     });
     registry
         .add_instance_token_for_instance("instance-for-slow-stream", "instance-token")

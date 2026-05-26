@@ -68,8 +68,13 @@ async fn test_state(pool: PgPool, provider: InMemoryLlmProviderClient) -> AppSta
         allowed_models: vec!["gpt-4.1-mini".to_string()],
         api_type: CHAT_COMPLETIONS_API_TYPE.to_string(),
         reasoning_effort: None,
+        enabled: true,
         allow_streaming: true,
         request_timeout_seconds: 60,
+        context_window_tokens: 128_000,
+        max_output_tokens: 4096,
+        temperature: 0.7,
+        supports_parallel_tools: true,
     };
     let model_registry = ModelRegistry::postgres(pool.clone(), cipher.clone(), default_config)
         .await

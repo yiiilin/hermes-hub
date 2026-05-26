@@ -181,8 +181,13 @@ pub fn docker_config_from_app(
         internal_port: config.hermes_docker.internal_port,
         hub_llm_base_url: config.hermes_docker.hub_llm_base_url.clone(),
         default_model: model_config.default_model.clone(),
+        context_window_tokens: model_config.context_window_tokens,
+        max_output_tokens: model_config.max_output_tokens,
+        temperature: model_config.temperature,
+        supports_parallel_tools: model_config.supports_parallel_tools,
         // 启动时还没有读取管理员的图片模型配置；实际创建/重建容器时会用数据库中的
         // image 配置覆盖这里的默认值。
+        image_model_enabled: false,
         image_model: "gpt-image-1".to_string(),
         api_mode: model_config.api_type.clone(),
         memory_limit: config.hermes_docker.memory_limit.clone(),

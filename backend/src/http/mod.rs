@@ -15,7 +15,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::AppState;
+use crate::{hermes::provisioner::ProvisionerError, AppState};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -31,6 +31,60 @@ pub fn router() -> Router<AppState> {
         .merge(crate::channel::routes::router())
 }
 
+pub(crate) fn map_provisioner_error(error: ProvisionerError) -> ApiError {
+    match error {
+        ProvisionerError::InstanceNotFound => ApiError::NotFound("hermes container not found"),
+        ProvisionerError::InvalidManagedInstance => {
+            ApiError::Conflict("hermes instance is not managed by docker")
+        }
+        ProvisionerError::DockerRuntime(message) | ProvisionerError::DockerCommand(message) => {
+            // Docker daemon/CLI 错误通常是管理员可处理的环境问题，要把摘要返回给页面。
+            ApiError::BadGatewayMessage(format!("hermes docker operation failed: {message}"))
+        }
+        ProvisionerError::LockFailed | ProvisionerError::Filesystem(_) => ApiError::Internal,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{map_provisioner_error, ApiError};
+    use crate::hermes::provisioner::ProvisionerError;
+    use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
+    use serde_json::Value;
+
+    #[tokio::test]
+    async fn dynamic_bad_gateway_error_exposes_message() {
+        let response =
+            ApiError::BadGatewayMessage("docker pull failed".to_string()).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error response body can be read");
+        let payload: Value = serde_json::from_slice(&body).expect("error response is json");
+        assert_eq!(payload["error"], "bad_gateway");
+        assert_eq!(payload["message"], "docker pull failed");
+    }
+
+    #[tokio::test]
+    async fn docker_provisioner_errors_become_visible_bad_gateway_errors() {
+        let response = map_provisioner_error(ProvisionerError::DockerCommand(
+            "docker pull failed: EOF".to_string(),
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error response body can be read");
+        let payload: Value = serde_json::from_slice(&body).expect("error response is json");
+        assert_eq!(
+            payload["message"],
+            "hermes docker operation failed: docker pull failed: EOF"
+        );
+    }
+}
+
 #[derive(Debug)]
 pub enum ApiError {
     BadRequest(&'static str),
@@ -41,6 +95,7 @@ pub enum ApiError {
     Gone(&'static str),
     NotFound(&'static str),
     BadGateway(&'static str),
+    BadGatewayMessage(String),
     GatewayTimeout(&'static str),
     Internal,
 }
@@ -98,6 +153,9 @@ impl IntoResponse for ApiError {
                 message.to_string(),
                 None,
             ),
+            ApiError::BadGatewayMessage(message) => {
+                (StatusCode::BAD_GATEWAY, "bad_gateway", message, None)
+            }
             ApiError::GatewayTimeout(message) => (
                 StatusCode::GATEWAY_TIMEOUT,
                 "gateway_timeout",

@@ -49,6 +49,9 @@ create table if not exists hermes_instances (
     host_sandbox_path text,
     host_config_path text,
     health_status text not null default 'unknown',
+    status_message text,
+    runtime_image text,
+    runtime_version text,
     last_health_check_at timestamptz,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
@@ -60,6 +63,9 @@ alter table hermes_instances add constraint hermes_instances_kind_check
     check (kind in ('managed_docker'));
 -- Adapter-only 之后 Hub 不再通过 Hermes inbound URL 访问容器，旧 base_url 运行时元数据可以直接删除。
 alter table hermes_instances drop column if exists base_url;
+alter table hermes_instances add column if not exists status_message text;
+alter table hermes_instances add column if not exists runtime_image text;
+alter table hermes_instances add column if not exists runtime_version text;
 
 create table if not exists instance_tokens (
     id uuid primary key,
@@ -73,6 +79,7 @@ create table if not exists instance_tokens (
 create table if not exists model_configs (
     id uuid primary key,
     config_kind text not null default 'llm' check (config_kind in ('llm', 'image', 'title')),
+    enabled boolean not null default true,
     provider_name text not null,
     provider_base_url text not null,
     provider_api_key_secret_ref text not null,
@@ -82,6 +89,10 @@ create table if not exists model_configs (
     reasoning_effort text check (reasoning_effort in ('minimal', 'low', 'medium', 'high')),
     allow_streaming boolean not null default true,
     request_timeout_seconds integer not null default 60,
+    context_window_tokens bigint not null default 128000 check (context_window_tokens > 0),
+    max_output_tokens bigint not null default 4096 check (max_output_tokens > 0),
+    temperature double precision not null default 0.7 check (temperature >= 0 and temperature <= 2),
+    supports_parallel_tools boolean not null default true,
     is_active boolean not null default true,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
@@ -90,6 +101,23 @@ create table if not exists model_configs (
 alter table model_configs add column if not exists config_kind text not null default 'llm';
 alter table model_configs add column if not exists api_type text not null default 'chat_completions';
 alter table model_configs add column if not exists reasoning_effort text;
+alter table model_configs add column if not exists context_window_tokens bigint not null default 128000;
+alter table model_configs add column if not exists max_output_tokens bigint not null default 4096;
+alter table model_configs add column if not exists temperature double precision not null default 0.7;
+alter table model_configs add column if not exists supports_parallel_tools boolean not null default true;
+do $$
+begin
+    if not exists (
+        select 1
+        from information_schema.columns
+        where table_name = 'model_configs'
+          and column_name = 'enabled'
+    ) then
+        alter table model_configs add column enabled boolean not null default true;
+        -- 旧版本会自动创建图片模型占位配置；升级后必须由管理员显式打开图片生成功能。
+        update model_configs set enabled = false where config_kind = 'image';
+    end if;
+end $$;
 
 create table if not exists proxy_audit_logs (
     id uuid primary key,

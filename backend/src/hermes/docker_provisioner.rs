@@ -21,7 +21,7 @@ use super::{
 
 /// Hub 托管 Hermes 容器规格版本。只要 env、挂载、工作目录或安全策略有变化，
 /// 就提升这个值，确保已存在的旧容器会被重建并拿到新行为。
-const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-25-hermes-hub-run-context";
+const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-26-model-runtime-settings";
 const MANAGED_CONTAINER_SPEC_LABEL: &str = "hermes_hub_spec_version";
 const HUB_INBOX_PATH: &str = "/internal/channel/v1/inbox";
 const HUB_INBOX_TIMEOUT_SECONDS: u16 = 25;
@@ -53,6 +53,7 @@ const HERMES_HUB_ADAPTER_PY: &str = r#"
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import json
 import logging
 import mimetypes
@@ -118,6 +119,7 @@ class HermesHubAdapter(BasePlatformAdapter):
         # thread_id 在 Hub 中稳定等于 session_id，不能当作每轮 run_id 使用；
         # 处理开始/结束钩子用这个表把当前 session 映射到真实 Hub run。
         self._active_run_ids_by_session: dict[str, str] = {}
+        self._runtime_status_reported = False
 
     @property
     def name(self) -> str:
@@ -143,6 +145,7 @@ class HermesHubAdapter(BasePlatformAdapter):
             )
         if self._poll_task is None or self._poll_task.done():
             self._closed.clear()
+            await self._report_runtime_status_once()
             self._poll_task = asyncio.create_task(self._poll_loop())
         self._mark_connected()
         return True
@@ -295,6 +298,47 @@ class HermesHubAdapter(BasePlatformAdapter):
         if isinstance(response, list):
             return response
         return response.get("messages") or response.get("items") or response.get("inbox") or []
+
+    async def _report_runtime_status_once(self) -> None:
+        if self._runtime_status_reported:
+            return
+        payload = self._runtime_status_payload()
+        if not payload:
+            return
+        try:
+            await self._request_json("POST", "/instance/status", json=payload)
+            self._runtime_status_reported = True
+        except Exception as error:
+            # 版本上报不应阻断 adapter 长轮询；下一次重连时再补报。
+            logger.warning("Hermes Hub runtime status report failed: %s", error)
+
+    def _runtime_status_payload(self) -> dict[str, str]:
+        payload: dict[str, str] = {}
+        runtime_version = self._runtime_version()
+        if runtime_version:
+            payload["runtime_version"] = runtime_version
+        runtime_image = os.getenv("HERMES_RUNTIME_IMAGE", "").strip()
+        if runtime_image:
+            payload["runtime_image"] = runtime_image
+        return payload
+
+    def _runtime_version(self) -> str:
+        for package_name in ("hermes-agent", "hermes", "gateway"):
+            try:
+                version = importlib.metadata.version(package_name).strip()
+            except importlib.metadata.PackageNotFoundError:
+                continue
+            if self._usable_runtime_version(version):
+                return version
+        fallback = (
+            os.getenv("HERMES_RUNTIME_VERSION")
+            or os.getenv("HERMES_VERSION")
+            or ""
+        ).strip()
+        return fallback if self._usable_runtime_version(fallback) else ""
+
+    def _usable_runtime_version(self, value: str) -> bool:
+        return bool(value and value.strip() and value.strip() != "latest")
 
     async def _dispatch_inbox_item(self, item: dict[str, Any]) -> None:
         inbox_id = str(item.get("id") or item.get("message_id") or "")
@@ -723,7 +767,7 @@ def register(ctx: Any) -> None:
 "#;
 
 /// Docker 托管 Hermes 的运行配置。
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DockerProvisionerConfig {
     pub image: String,
     pub data_root: PathBuf,
@@ -731,12 +775,27 @@ pub struct DockerProvisionerConfig {
     pub internal_port: u16,
     pub hub_llm_base_url: String,
     pub default_model: String,
+    pub context_window_tokens: u64,
+    pub max_output_tokens: u64,
+    pub temperature: f64,
+    pub supports_parallel_tools: bool,
+    pub image_model_enabled: bool,
     pub image_model: String,
     pub api_mode: String,
     pub memory_limit: Option<String>,
     pub cpu_limit: Option<String>,
     pub docker_binary: String,
     pub managed_skills: Option<ManagedSkillsMountConfig>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeModelSettings {
+    pub default_model: String,
+    pub api_mode: String,
+    pub context_window_tokens: u64,
+    pub max_output_tokens: u64,
+    pub temperature: f64,
+    pub supports_parallel_tools: bool,
 }
 
 /// 容器挂载定义。测试和真实 Docker adapter 共用同一份 spec，避免部署行为漂移。
@@ -781,7 +840,7 @@ impl ContainerMount {
 
     pub fn nfs_volume(config: &ManagedSkillsMountConfig, read_only: bool) -> Self {
         Self::NfsVolume(ContainerNfsVolumeMount {
-            volume_name: config.volume_name.clone(),
+            volume_name: managed_skills_volume_name(&config.volume_name, read_only),
             container_path: config.container_path.clone(),
             read_only,
             addr: config.addr.clone(),
@@ -817,6 +876,7 @@ pub struct ContainerSpec {
     pub memory_limit: Option<String>,
     pub cpu_limit: Option<String>,
     pub workdir: Option<String>,
+    pub healthcheck: Option<ContainerHealthcheck>,
     pub command: Vec<String>,
 }
 
@@ -824,7 +884,19 @@ pub struct ContainerSpec {
 struct ContainerInspection {
     id: String,
     running: bool,
+    health_status: Option<String>,
+    health_error: Option<String>,
     spec_version: Option<String>,
+    image: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ContainerHealthcheck {
+    pub command: String,
+    pub interval: String,
+    pub timeout: String,
+    pub retries: u8,
+    pub start_period: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -882,7 +954,9 @@ impl DockerRuntime for NoopDockerRuntime {
         let stdout = if args.get(0).map(String::as_str) == Some("container")
             && args.get(1).map(String::as_str) == Some("inspect")
         {
-            "noop-container-id".to_string()
+            format!(
+                r#"{{"Id":"noop-container-id","State":{{"Running":true}},"Config":{{"Labels":{{"{MANAGED_CONTAINER_SPEC_LABEL}":"{MANAGED_CONTAINER_SPEC_VERSION}"}}}}}}"#
+            )
         } else if args.first().map(String::as_str) == Some("create") {
             "noop-container-id".to_string()
         } else {
@@ -952,7 +1026,57 @@ impl DockerProvisioner {
             ContainerMount::bind(config, "/config", false),
         ];
         if let Some(managed_skills) = &self.config.managed_skills {
-            mounts.push(ContainerMount::nfs_volume(managed_skills, true));
+            mounts.push(ContainerMount::nfs_volume(
+                managed_skills,
+                !instance.global_skills_write_enabled,
+            ));
+        }
+
+        let mut env = vec![
+            "API_SERVER_ENABLED=true".to_string(),
+            // API server 仅作为容器内本地能力保留；Hub 通信全部由 adapter 主动连接。
+            "API_SERVER_HOST=127.0.0.1".to_string(),
+            format!("API_SERVER_PORT={}", self.config.internal_port),
+            format!(
+                "API_SERVER_KEY={}",
+                instance.llm_api_key.as_deref().unwrap_or("unissued")
+            ),
+            "HERMES_HOME=/config".to_string(),
+            "HERMES_INFERENCE_PROVIDER=custom".to_string(),
+            format!("CUSTOM_BASE_URL={}", self.config.hub_llm_base_url),
+            format!("OPENAI_BASE_URL={}", self.config.hub_llm_base_url),
+            format!(
+                "OPENAI_API_KEY={}",
+                instance.llm_api_key.as_deref().unwrap_or("unissued")
+            ),
+            format!(
+                "HERMES_HUB_CHANNEL_BASE_URL={}",
+                hub_channel_base_url(&self.config.hub_llm_base_url)
+            ),
+            format!(
+                "HERMES_HUB_CHANNEL_TOKEN={}",
+                instance.llm_api_key.as_deref().unwrap_or("unissued")
+            ),
+            format!("HERMES_HUB_INSTANCE_ID={}", instance.id),
+            format!("HERMES_HUB_USER_ID={}", instance.user_id),
+            format!("HERMES_HUB_INBOX_PATH={HUB_INBOX_PATH}"),
+            format!("HERMES_HUB_INBOX_TIMEOUT_SECONDS={HUB_INBOX_TIMEOUT_SECONDS}"),
+            format!("HERMES_HUB_INBOX_LIMIT={HUB_INBOX_LIMIT}"),
+            format!("OPENAI_MODEL={}", self.config.default_model),
+            format!("HERMES_RUNTIME_IMAGE={}", self.config.image),
+            format!(
+                "HERMES_RUNTIME_VERSION={}",
+                runtime_version_from_image(&self.config.image).unwrap_or_default()
+            ),
+            "HERMES_TOOL_PROGRESS_MODE=verbose".to_string(),
+            // Hub 托管 Hermes 已经运行在用户独立容器里，命令安全边界由容器承担；
+            // 默认自动批准可以避免长任务卡在无人值守的 approval prompt。
+            "HERMES_YOLO_MODE=1".to_string(),
+            "HERMES_ACCEPT_HOOKS=1".to_string(),
+        ];
+        if self.config.image_model_enabled {
+            // 只有管理员显式启用图片模型时，才把图片生成模型暴露给 Hermes。
+            env.push(format!("OPENAI_IMAGE_MODEL={}", self.config.image_model));
         }
 
         Ok(ContainerSpec {
@@ -960,44 +1084,7 @@ impl DockerProvisioner {
             image: self.config.image.clone(),
             network: self.config.network.clone(),
             internal_port: self.config.internal_port,
-            env: vec![
-                "API_SERVER_ENABLED=true".to_string(),
-                // API server 仅作为容器内本地能力保留；Hub 通信全部由 adapter 主动连接。
-                "API_SERVER_HOST=127.0.0.1".to_string(),
-                format!("API_SERVER_PORT={}", self.config.internal_port),
-                format!(
-                    "API_SERVER_KEY={}",
-                    instance.llm_api_key.as_deref().unwrap_or("unissued")
-                ),
-                "HERMES_HOME=/config".to_string(),
-                "HERMES_INFERENCE_PROVIDER=custom".to_string(),
-                format!("CUSTOM_BASE_URL={}", self.config.hub_llm_base_url),
-                format!("OPENAI_BASE_URL={}", self.config.hub_llm_base_url),
-                format!(
-                    "OPENAI_API_KEY={}",
-                    instance.llm_api_key.as_deref().unwrap_or("unissued")
-                ),
-                format!(
-                    "HERMES_HUB_CHANNEL_BASE_URL={}",
-                    hub_channel_base_url(&self.config.hub_llm_base_url)
-                ),
-                format!(
-                    "HERMES_HUB_CHANNEL_TOKEN={}",
-                    instance.llm_api_key.as_deref().unwrap_or("unissued")
-                ),
-                format!("HERMES_HUB_INSTANCE_ID={}", instance.id),
-                format!("HERMES_HUB_USER_ID={}", instance.user_id),
-                format!("HERMES_HUB_INBOX_PATH={HUB_INBOX_PATH}"),
-                format!("HERMES_HUB_INBOX_TIMEOUT_SECONDS={HUB_INBOX_TIMEOUT_SECONDS}"),
-                format!("HERMES_HUB_INBOX_LIMIT={HUB_INBOX_LIMIT}"),
-                format!("OPENAI_MODEL={}", self.config.default_model),
-                format!("OPENAI_IMAGE_MODEL={}", self.config.image_model),
-                "HERMES_TOOL_PROGRESS_MODE=verbose".to_string(),
-                // Hub 托管 Hermes 已经运行在用户独立容器里，命令安全边界由容器承担；
-                // 默认自动批准可以避免长任务卡在无人值守的 approval prompt。
-                "HERMES_YOLO_MODE=1".to_string(),
-                "HERMES_ACCEPT_HOOKS=1".to_string(),
-            ],
+            env,
             // Hermes gateway 会在 HERMES_HOME 下写入 sessions、logs、skills 等运行态文件；
             // 统一管理 skills 通过单独只读挂载提供，避免进入 /config/skills 的 curator 路径。
             mounts,
@@ -1013,6 +1100,18 @@ impl DockerProvisioner {
             memory_limit: self.config.memory_limit.clone(),
             cpu_limit: self.config.cpu_limit.clone(),
             workdir: Some("/workspace".to_string()),
+            healthcheck: Some(ContainerHealthcheck {
+                // healthcheck 同时验证 Hermes 本地 gateway 和 Hub 内网地址；
+                // 这样“进程还在但 adapter 连不上 Hub”不会继续被误判为健康。
+                command: format!(
+                    "fetch() {{ if command -v curl >/dev/null 2>&1; then curl -fsS --max-time 5 \"$1\" >/dev/null; elif command -v wget >/dev/null 2>&1; then wget -q -T 5 -O /dev/null \"$1\"; else exit 1; fi; }}; fetch \"http://127.0.0.1:{}/health\" && hub=\"${{HERMES_HUB_CHANNEL_BASE_URL%/internal/channel/v1}}\" && fetch \"$hub/health\"",
+                    self.config.internal_port
+                ),
+                interval: "10s".to_string(),
+                timeout: "6s".to_string(),
+                retries: 3,
+                start_period: "20s".to_string(),
+            }),
             command: vec!["gateway".to_string()],
         })
     }
@@ -1033,11 +1132,11 @@ impl DockerProvisioner {
 
         if let Some(inspection) = self.inspect_container(&next.name).await? {
             if inspection.running
+                && inspection.health_status.as_deref() != Some("unhealthy")
                 && !config_changed
                 && inspection.spec_version.as_deref() == Some(MANAGED_CONTAINER_SPEC_VERSION)
             {
-                next.container_id = Some(inspection.id);
-                next.status = HermesInstanceStatus::Running;
+                apply_inspection_status(&mut next, &inspection);
                 self.remember(next.clone())?;
                 return Ok(next);
             }
@@ -1052,6 +1151,8 @@ impl DockerProvisioner {
             .await?;
         next.container_id = Some(container_id);
         next.status = HermesInstanceStatus::Running;
+        next.health_status = "starting".to_string();
+        next.status_message = None;
         self.remember(next.clone())?;
 
         Ok(next)
@@ -1061,29 +1162,60 @@ impl DockerProvisioner {
         &self,
         instance: &HermesInstance,
         llm_api_key: &str,
-        default_model: &str,
-        image_model: &str,
-        api_mode: &str,
+        model_settings: &RuntimeModelSettings,
+        image_model: Option<&str>,
     ) -> Result<HermesInstance, ProvisionerError> {
         let mut provisioner = self.clone();
-        provisioner.config.default_model = default_model.to_string();
-        provisioner.config.image_model = image_model.to_string();
-        provisioner.config.api_mode = api_mode.to_string();
+        provisioner.config.default_model = model_settings.default_model.clone();
+        provisioner.config.api_mode = model_settings.api_mode.clone();
+        provisioner.config.context_window_tokens = model_settings.context_window_tokens;
+        provisioner.config.max_output_tokens = model_settings.max_output_tokens;
+        provisioner.config.temperature = model_settings.temperature;
+        provisioner.config.supports_parallel_tools = model_settings.supports_parallel_tools;
+        provisioner.config.image_model_enabled = image_model.is_some();
+        if let Some(image_model) = image_model {
+            provisioner.config.image_model = image_model.to_string();
+        }
         provisioner.ensure_container(instance, llm_api_key).await
+    }
+
+    pub async fn refresh_instance_status(
+        &self,
+        instance: &HermesInstance,
+    ) -> Result<HermesInstance, ProvisionerError> {
+        self.ensure_managed(instance)?;
+        let mut next = instance.clone();
+        match self.inspect_container(&instance.name).await? {
+            Some(inspection) => apply_inspection_status(&mut next, &inspection),
+            None => {
+                next.container_id = None;
+                next.status = HermesInstanceStatus::Error;
+                next.health_status = "missing".to_string();
+                next.status_message = Some("Docker container is missing".to_string());
+            }
+        }
+        self.remember(next.clone())?;
+        Ok(next)
     }
 
     pub async fn rebuild_instance_with_default_model(
         &self,
         instance: &HermesInstance,
         llm_api_key: &str,
-        default_model: &str,
-        image_model: &str,
-        api_mode: &str,
+        model_settings: &RuntimeModelSettings,
+        image_model: Option<&str>,
     ) -> Result<HermesInstance, ProvisionerError> {
         let mut provisioner = self.clone();
-        provisioner.config.default_model = default_model.to_string();
-        provisioner.config.image_model = image_model.to_string();
-        provisioner.config.api_mode = api_mode.to_string();
+        provisioner.config.default_model = model_settings.default_model.clone();
+        provisioner.config.api_mode = model_settings.api_mode.clone();
+        provisioner.config.context_window_tokens = model_settings.context_window_tokens;
+        provisioner.config.max_output_tokens = model_settings.max_output_tokens;
+        provisioner.config.temperature = model_settings.temperature;
+        provisioner.config.supports_parallel_tools = model_settings.supports_parallel_tools;
+        provisioner.config.image_model_enabled = image_model.is_some();
+        if let Some(image_model) = image_model {
+            provisioner.config.image_model = image_model.to_string();
+        }
         provisioner.rebuild_instance(instance, llm_api_key).await
     }
 
@@ -1093,12 +1225,14 @@ impl DockerProvisioner {
         let sandbox = user_root.join("sandbox");
         let config = user_root.join("config");
 
-        HermesInstance::managed_docker(
+        let mut instance = HermesInstance::managed_docker(
             user_id,
             path_to_string(workspace),
             path_to_string(sandbox),
             path_to_string(config),
-        )
+        );
+        apply_runtime_image(&mut instance, &self.config.image);
+        instance
     }
 
     fn ensure_managed(&self, instance: &HermesInstance) -> Result<(), ProvisionerError> {
@@ -1169,26 +1303,13 @@ impl DockerProvisioner {
                 "container".to_string(),
                 "inspect".to_string(),
                 "--format".to_string(),
-                format!(
-                    "{{{{.Id}}}} {{{{.State.Running}}}} {{{{ index .Config.Labels \"{MANAGED_CONTAINER_SPEC_LABEL}\" }}}}"
-                ),
+                "{{json .}}".to_string(),
                 name.to_string(),
             ])
             .await?;
 
         if output.success && !output.stdout.is_empty() {
-            let mut parts = output.stdout.split_whitespace();
-            let id = parts.next().unwrap_or_default().to_string();
-            let running = parts
-                .next()
-                .and_then(|value| value.parse::<bool>().ok())
-                .unwrap_or(true);
-            let spec_version = parts.next().map(ToOwned::to_owned);
-            Ok(Some(ContainerInspection {
-                id,
-                running,
-                spec_version,
-            }))
+            Ok(parse_container_inspection(&output.stdout))
         } else {
             Ok(None)
         }
@@ -1199,6 +1320,7 @@ impl DockerProvisioner {
         instance: &HermesInstance,
     ) -> Result<String, ProvisionerError> {
         let spec = self.container_spec_for(instance)?;
+        self.ensure_image_available(&spec.image).await?;
         self.ensure_nfs_volumes(&spec.mounts).await?;
         let mut args = vec![
             "create".to_string(),
@@ -1233,11 +1355,42 @@ impl DockerProvisioner {
             args.push("--cpus".to_string());
             args.push(cpu_limit);
         }
+        if let Some(healthcheck) = spec.healthcheck {
+            args.push("--health-cmd".to_string());
+            args.push(healthcheck.command);
+            args.push("--health-interval".to_string());
+            args.push(healthcheck.interval);
+            args.push("--health-timeout".to_string());
+            args.push(healthcheck.timeout);
+            args.push("--health-retries".to_string());
+            args.push(healthcheck.retries.to_string());
+            args.push("--health-start-period".to_string());
+            args.push(healthcheck.start_period);
+        }
         args.push(spec.image);
         args.extend(spec.command);
 
         let output = self.run_required(args).await?;
         Ok(output.stdout.lines().next().unwrap_or_default().to_string())
+    }
+
+    async fn ensure_image_available(&self, image: &str) -> Result<(), ProvisionerError> {
+        let inspected = self
+            .runtime
+            .run(vec![
+                "image".to_string(),
+                "inspect".to_string(),
+                image.to_string(),
+            ])
+            .await?;
+        if inspected.success {
+            return Ok(());
+        }
+
+        // docker create 不会自动拉镜像；这里兜底拉取，避免管理员首次点击创建直接失败。
+        self.run_required(vec!["pull".to_string(), image.to_string()])
+            .await?;
+        Ok(())
     }
 
     async fn ensure_nfs_volumes(&self, mounts: &[ContainerMount]) -> Result<(), ProvisionerError> {
@@ -1253,7 +1406,7 @@ impl DockerProvisioner {
                 "--opt".to_string(),
                 "type=nfs".to_string(),
                 "--opt".to_string(),
-                format!("o={}", nfs_mount_options(&mount.addr)),
+                format!("o={}", nfs_mount_options(&mount.addr, mount.read_only)),
                 "--opt".to_string(),
                 format!("device=:{}", normalize_nfs_export(&mount.export)),
                 mount.volume_name.clone(),
@@ -1316,7 +1469,18 @@ impl DockerProvisioner {
             .ok_or(ProvisionerError::InvalidManagedInstance)?;
         let config_path = PathBuf::from(config_path);
         let model = yaml_string(&self.config.default_model)?;
-        let image_model = yaml_string(&self.config.image_model)?;
+        let image_gen_section = if self.config.image_model_enabled {
+            let image_model = yaml_string(&self.config.image_model)?;
+            format!(
+                "image_gen:\n\
+                 \x20\x20provider: \"openai\"\n\
+                 \x20\x20model: {image_model}\n\
+                 \x20\x20openai:\n\
+                 \x20\x20\x20\x20model: {image_model}\n"
+            )
+        } else {
+            String::new()
+        };
         let base_url = yaml_string(&self.config.hub_llm_base_url)?;
         let channel_base_url = yaml_string(&hub_channel_base_url(&self.config.hub_llm_base_url))?;
         let api_key = yaml_string(instance.llm_api_key.as_deref().unwrap_or(""))?;
@@ -1338,19 +1502,26 @@ impl DockerProvisioner {
         let content = format!(
             "# Managed by Hermes Hub. Do not edit model settings inside this container.\n\
              {managed_skills_section}\
+             memory:\n\
+             \x20\x20provider: holographic\n\
              plugins:\n\
              \x20\x20enabled: [platforms/hermes_hub]\n\
+             \x20\x20hermes-memory-store:\n\
+             \x20\x20\x20\x20db_path: \"$HERMES_HOME/memory_store.db\"\n\
+             \x20\x20\x20\x20default_trust: 0.5\n\
+             \x20\x20\x20\x20hrr_dim: 1024\n\
+             \x20\x20\x20\x20auto_extract: false\n\
              model:\n\
              \x20\x20default: {model}\n\
              \x20\x20provider: \"custom\"\n\
              \x20\x20base_url: {base_url}\n\
              \x20\x20api_key: {api_key}\n\
              \x20\x20api_mode: {api_mode}\n\
-             image_gen:\n\
-             \x20\x20provider: \"openai\"\n\
-             \x20\x20model: {image_model}\n\
-             \x20\x20openai:\n\
-             \x20\x20\x20\x20model: {image_model}\n\
+             \x20\x20context_window_tokens: {context_window_tokens}\n\
+             \x20\x20max_output_tokens: {max_output_tokens}\n\
+             \x20\x20temperature: {temperature}\n\
+             \x20\x20parallel_tool_calls: {parallel_tool_calls}\n\
+             {image_gen_section}\
              display:\n\
              \x20\x20tool_progress: \"verbose\"\n\
              \x20\x20tool_progress_command: true\n\
@@ -1382,7 +1553,11 @@ impl DockerProvisioner {
              \x20\x20timeout: 3600\n\
              \x20\x20cron_mode: \"approve\"\n\
              \x20\x20mcp_reload_confirm: false\n\
-             \x20\x20destructive_slash_confirm: false\n"
+             \x20\x20destructive_slash_confirm: false\n",
+            context_window_tokens = self.config.context_window_tokens,
+            max_output_tokens = self.config.max_output_tokens,
+            temperature = self.config.temperature,
+            parallel_tool_calls = self.config.supports_parallel_tools,
         );
         let config_file = config_path.join("config.yaml");
         let plugin_root = config_path.join("plugins/platforms/hermes_hub");
@@ -1396,6 +1571,149 @@ impl DockerProvisioner {
         ensure_hermes_hub_pairing(&config_path, &instance.user_id)?;
         Ok(changed)
     }
+}
+
+fn parse_container_inspection(raw: &str) -> Option<ContainerInspection> {
+    let value = serde_json::from_str::<Value>(raw).ok()?;
+    let id = value
+        .get("Id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if id.is_empty() {
+        return None;
+    }
+    let state = value.get("State").and_then(Value::as_object);
+    let running = state
+        .and_then(|state| state.get("Running"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let health_status = state
+        .and_then(|state| state.get("Health"))
+        .and_then(|health| health.get("Status"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let health_error = state
+        .and_then(|state| state.get("Health"))
+        .and_then(docker_health_error);
+    let spec_version = value
+        .get("Config")
+        .and_then(|config| config.get("Labels"))
+        .and_then(|labels| labels.get(MANAGED_CONTAINER_SPEC_LABEL))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let image = value
+        .get("Config")
+        .and_then(|config| config.get("Image"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    Some(ContainerInspection {
+        id,
+        running,
+        health_status,
+        health_error,
+        spec_version,
+        image,
+    })
+}
+
+fn docker_health_error(health: &Value) -> Option<String> {
+    health
+        .get("Log")
+        .and_then(Value::as_array)
+        .and_then(|logs| logs.iter().rev().find_map(docker_health_log_error))
+}
+
+fn docker_health_log_error(log: &Value) -> Option<String> {
+    let output = log
+        .get("Output")
+        .and_then(Value::as_str)
+        .map(clean_status_message)
+        .filter(|output| !output.is_empty());
+    if output.is_some() {
+        return output;
+    }
+    log.get("ExitCode")
+        .and_then(Value::as_i64)
+        .filter(|code| *code != 0)
+        .map(|code| format!("Docker healthcheck exited with code {code}"))
+}
+
+fn clean_status_message(message: &str) -> String {
+    // Docker health log 可能包含多行 curl/wget 输出；前端只需要可读摘要，避免撑爆表格。
+    message.trim().chars().take(1024).collect()
+}
+
+fn apply_inspection_status(instance: &mut HermesInstance, inspection: &ContainerInspection) {
+    instance.container_id = Some(inspection.id.clone());
+    if let Some(image) = &inspection.image {
+        apply_runtime_image(instance, image);
+    }
+    if !inspection.running {
+        instance.status = HermesInstanceStatus::Stopped;
+        instance.health_status = "stopped".to_string();
+        instance.status_message = None;
+        return;
+    }
+
+    match inspection.health_status.as_deref() {
+        Some("healthy") => {
+            instance.status = HermesInstanceStatus::Running;
+            instance.health_status = "healthy".to_string();
+            instance.status_message = None;
+        }
+        Some("starting") => {
+            instance.status = HermesInstanceStatus::Provisioning;
+            instance.health_status = "starting".to_string();
+            instance.status_message = None;
+        }
+        Some("unhealthy") => {
+            instance.status = HermesInstanceStatus::Error;
+            instance.health_status = "unhealthy".to_string();
+            instance.status_message = inspection
+                .health_error
+                .clone()
+                .or_else(|| Some("Docker healthcheck reported unhealthy".to_string()));
+        }
+        Some(other) => {
+            instance.status = HermesInstanceStatus::Running;
+            instance.health_status = other.to_string();
+            instance.status_message = None;
+        }
+        None => {
+            // 兼容旧容器：没有 Docker healthcheck 时只能确认进程运行。
+            instance.status = HermesInstanceStatus::Running;
+            instance.health_status = "running".to_string();
+            instance.status_message = None;
+        }
+    }
+}
+
+fn apply_runtime_image(instance: &mut HermesInstance, image: &str) {
+    // 镜像 tag 是 adapter 尚未上报前的兜底；一旦容器内上报了真实版本，就不再覆盖。
+    let previous_image_version = instance
+        .runtime_image
+        .as_deref()
+        .and_then(runtime_version_from_image);
+    let next_image_version = runtime_version_from_image(image);
+    instance.runtime_image = Some(image.to_string());
+    if instance.runtime_version.is_none() || instance.runtime_version == previous_image_version {
+        instance.runtime_version = next_image_version;
+    }
+}
+
+fn runtime_version_from_image(image: &str) -> Option<String> {
+    let image_without_digest = image.split('@').next().unwrap_or(image);
+    let last_segment = image_without_digest
+        .rsplit('/')
+        .next()
+        .unwrap_or(image_without_digest);
+    last_segment
+        .rsplit_once(':')
+        .map(|(_, tag)| tag.trim())
+        .filter(|tag| !tag.is_empty() && *tag != "latest")
+        .map(ToOwned::to_owned)
 }
 
 #[async_trait]
@@ -1423,6 +1741,8 @@ impl HermesProvisioner for DockerProvisioner {
         let mut next = instance.clone();
         next.container_id = Some(inspection.id);
         next.status = HermesInstanceStatus::Running;
+        next.health_status = "starting".to_string();
+        next.status_message = None;
         self.remember(next.clone())?;
         Ok(next)
     }
@@ -1440,6 +1760,8 @@ impl HermesProvisioner for DockerProvisioner {
 
         let mut next = instance.clone();
         next.status = HermesInstanceStatus::Stopped;
+        next.health_status = "stopped".to_string();
+        next.status_message = None;
         self.remember(next.clone())?;
         Ok(next)
     }
@@ -1464,6 +1786,8 @@ impl HermesProvisioner for DockerProvisioner {
 
         next.container_id = Some(container_id);
         next.status = HermesInstanceStatus::Running;
+        next.health_status = "starting".to_string();
+        next.status_message = None;
         self.remember(next.clone())?;
         Ok(next)
     }
@@ -1494,9 +1818,20 @@ fn render_container_mount(mount: &ContainerMount) -> String {
     value
 }
 
-fn nfs_mount_options(addr: &str) -> String {
+fn nfs_mount_options(addr: &str, read_only: bool) -> String {
     let (host, port) = split_nfs_addr(addr);
-    format!("addr={host},port={port},mountport={port},vers=3,tcp,nolock,soft,ro")
+    let mode = if read_only { "ro" } else { "rw" };
+    format!("addr={host},port={port},mountport={port},vers=3,tcp,nolock,soft,{mode}")
+}
+
+fn managed_skills_volume_name(base_name: &str, read_only: bool) -> String {
+    if read_only {
+        base_name.to_string()
+    } else {
+        // Docker volume create 不会更新已有同名 volume 的 NFS mount options；
+        // rw 挂载必须使用独立名称，避免复用普通用户的 ro volume。
+        format!("{base_name}-rw")
+    }
 }
 
 fn split_nfs_addr(addr: &str) -> (&str, &str) {

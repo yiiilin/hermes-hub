@@ -32,7 +32,8 @@ Requirements:
 Create `.env` in the repository root:
 
 ```bash
-HERMES_HUB_BACKEND_IMAGE=ghcr.io/yiiilin/hermes-hub:0.0.6
+HERMES_HUB_BACKEND_IMAGE=ghcr.io/yiiilin/hermes-hub:latest
+HERMES_VERSION=latest
 HERMES_HUB_HTTP_PORT=8080
 
 POSTGRES_PASSWORD=change-me
@@ -51,9 +52,13 @@ HERMES_OBJECT_STORAGE_SECRET_KEY=change-me-rustfs-secret
 Start Hermes Hub:
 
 ```bash
+docker compose --project-directory . --env-file .env -f infra/docker/docker-compose.hub.yml --profile hermes-runtime build hermes-runtime
 docker compose --project-directory . --env-file .env -f infra/docker/docker-compose.hub.yml pull
 docker compose --project-directory . --env-file .env -f infra/docker/docker-compose.hub.yml up -d --no-build
 ```
+
+`HERMES_VERSION` selects the official `nousresearch/hermes-agent` tag used by the thin `hermes-hub-hermes` wrapper image. Keep it aligned with the Hermes version you want to run.
+By default the wrapper image is tagged as `ghcr.io/yiiilin/hermes-hub-hermes:${HERMES_VERSION}`; set `HERMES_DOCKER_IMAGE` if you want to use a registry proxy or a local tag.
 
 Open `http://localhost:8080`, create the first admin account, configure models, and create invite links for users.
 
@@ -84,14 +89,15 @@ cargo run -p hermes-hub-backend
 Release images are published to GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/yiiilin/hermes-hub:0.0.6
+docker pull ghcr.io/yiiilin/hermes-hub:latest
+make hermes-image
 ```
 
-The image contains the Rust backend and the built React frontend. The service listens on port `8080`.
+The Hub image contains the Rust backend and the built React frontend. `make hermes-image` builds the thin Hermes runtime wrapper used by managed Hermes containers and tags it under GHCR by default. The service listens on port `8080`.
 
 ## Release
 
-Releases are tag-driven. Pushing a tag such as `v0.0.6` triggers the release workflow, builds the Docker image, pushes GHCR tags, and creates a GitHub Release with the commit list.
+Releases are tag-driven. Pushing a release tag triggers the release workflow, builds the Docker image, pushes GHCR tags, and creates a GitHub Release with the commit list.
 
 ## Security
 

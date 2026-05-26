@@ -840,8 +840,13 @@ mod tests {
             allowed_models: vec!["gpt-4.1-mini".to_string()],
             api_type: RESPONSES_API_TYPE.to_string(),
             reasoning_effort: None,
+            enabled: true,
             allow_streaming: false,
             request_timeout_seconds: 30,
+            context_window_tokens: 128_000,
+            max_output_tokens: 4096,
+            temperature: 0.7,
+            supports_parallel_tools: true,
         };
 
         let (_path, body) = title_generation_request(&config, "你能画图吗？");

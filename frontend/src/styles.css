@@ -363,6 +363,21 @@ nav,
   padding: 20px;
 }
 
+.status-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.status-detail {
+  color: #65717a;
+  font-size: 12px;
+  line-height: 1.35;
+  max-width: 280px;
+  overflow-wrap: anywhere;
+}
+
 .panel-heading {
   align-items: center;
   display: flex;
@@ -493,6 +508,46 @@ button:disabled {
   background: #1d6f8f;
   border-color: #1d6f8f;
   color: #ffffff;
+}
+
+.settings-tabs {
+  align-items: center;
+  background: #eef3f5;
+  border: 1px solid #d8e3e7;
+  border-radius: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px;
+}
+
+.settings-tabs button {
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  box-shadow: none;
+  color: #536a74;
+  flex: 1 1 136px;
+  justify-content: center;
+  min-height: 36px;
+  padding: 8px 12px;
+}
+
+.settings-tabs button.active,
+.settings-tabs button[aria-selected="true"] {
+  background: #ffffff;
+  color: #123f53;
+  box-shadow: 0 1px 2px rgba(15, 35, 45, 0.12);
+}
+
+.settings-tabs button:focus,
+.settings-tabs button:hover {
+  color: #123f53;
+}
+
+.tab-actions {
+  display: flex;
+  justify-content: flex-end;
 }
 
 .inline-form {

@@ -17,7 +17,13 @@ use uuid::Uuid;
 #[derive(Clone, Default)]
 struct FakeDockerRuntime {
     calls: Arc<Mutex<Vec<Vec<String>>>>,
+    image_exists: Arc<Mutex<bool>>,
     container_exists: Arc<Mutex<bool>>,
+    container_running: Arc<Mutex<bool>>,
+    health_status: Arc<Mutex<Option<String>>>,
+    health_output: Arc<Mutex<Option<String>>>,
+    spec_version: Arc<Mutex<Option<String>>>,
+    image: Arc<Mutex<Option<String>>>,
 }
 
 #[async_trait::async_trait]
@@ -28,6 +34,34 @@ impl DockerRuntime for FakeDockerRuntime {
     ) -> Result<DockerRuntimeOutput, hermes_hub_backend::hermes::provisioner::ProvisionerError>
     {
         self.calls.lock().expect("calls lock").push(args.clone());
+
+        if args.get(0).map(String::as_str) == Some("image")
+            && args.get(1).map(String::as_str) == Some("inspect")
+        {
+            let image_exists = *self.image_exists.lock().expect("image exists lock");
+            return Ok(DockerRuntimeOutput {
+                success: image_exists,
+                stdout: if image_exists {
+                    "image-existing".to_string()
+                } else {
+                    String::new()
+                },
+                stderr: if image_exists {
+                    String::new()
+                } else {
+                    "image not found".to_string()
+                },
+            });
+        }
+
+        if args.get(0).map(String::as_str) == Some("pull") {
+            *self.image_exists.lock().expect("image exists lock") = true;
+            return Ok(DockerRuntimeOutput {
+                success: true,
+                stdout: "image-pulled".to_string(),
+                stderr: String::new(),
+            });
+        }
 
         if args.get(0).map(String::as_str) == Some("network")
             && args.get(1).map(String::as_str) == Some("inspect")
@@ -43,10 +77,35 @@ impl DockerRuntime for FakeDockerRuntime {
             && args.get(1).map(String::as_str) == Some("inspect")
         {
             let exists = *self.container_exists.lock().expect("exists lock");
+            let running = *self.container_running.lock().expect("running lock");
+            let health_status = self.health_status.lock().expect("health lock").clone();
+            let health_output = self
+                .health_output
+                .lock()
+                .expect("health output lock")
+                .clone();
+            let spec_version = self.spec_version.lock().expect("spec lock").clone();
+            let image = self.image.lock().expect("image lock").clone();
+            let health_json = health_status
+                .map(|status| {
+                    let log_json = health_output
+                        .map(|output| format!(r#","Log":[{{"Output":"{output}"}}]"#))
+                        .unwrap_or_default();
+                    format!(r#","Health":{{"Status":"{status}"{log_json}}}"#)
+                })
+                .unwrap_or_default();
+            let labels_json = spec_version
+                .map(|version| format!(r#""hermes_hub_spec_version":"{version}""#))
+                .unwrap_or_default();
+            let image_json = image
+                .map(|image| format!(r#""Image":"{image}","#))
+                .unwrap_or_default();
             return Ok(DockerRuntimeOutput {
                 success: exists,
                 stdout: if exists {
-                    "container-existing".to_string()
+                    format!(
+                        r#"{{"Id":"container-existing","State":{{"Running":{running}{health_json}}},"Config":{{{image_json}"Labels":{{{labels_json}}}}}}}"#
+                    )
                 } else {
                     String::new()
                 },
@@ -60,6 +119,7 @@ impl DockerRuntime for FakeDockerRuntime {
 
         if args.get(0).map(String::as_str) == Some("create") {
             *self.container_exists.lock().expect("exists lock") = true;
+            *self.container_running.lock().expect("running lock") = false;
             return Ok(DockerRuntimeOutput {
                 success: true,
                 stdout: "container-created".to_string(),
@@ -82,6 +142,15 @@ impl DockerRuntime for FakeDockerRuntime {
 
         if args.get(0).map(String::as_str) == Some("rm") {
             *self.container_exists.lock().expect("exists lock") = false;
+            *self.container_running.lock().expect("running lock") = false;
+        }
+
+        if args.get(0).map(String::as_str) == Some("start") {
+            *self.container_running.lock().expect("running lock") = true;
+        }
+
+        if args.get(0).map(String::as_str) == Some("stop") {
+            *self.container_running.lock().expect("running lock") = false;
         }
 
         Ok(DockerRuntimeOutput {
@@ -94,12 +163,17 @@ impl DockerRuntime for FakeDockerRuntime {
 
 fn test_config() -> DockerProvisionerConfig {
     DockerProvisionerConfig {
-        image: "nousresearch/hermes-agent:latest".to_string(),
+        image: "ghcr.io/yiiilin/hermes-hub-hermes:latest".to_string(),
         data_root: PathBuf::from("/tmp/hermes-hub-test/users"),
         network: "hermes-hub-net".to_string(),
         internal_port: 8000,
         hub_llm_base_url: "http://hermes-hub:8080/internal/llm/v1".to_string(),
         default_model: "gpt-4.1-mini".to_string(),
+        context_window_tokens: 128_000,
+        max_output_tokens: 4096,
+        temperature: 0.7,
+        supports_parallel_tools: true,
+        image_model_enabled: true,
         image_model: "gpt-image-2-medium".to_string(),
         api_mode: "chat_completions".to_string(),
         memory_limit: Some("1g".to_string()),
@@ -118,6 +192,52 @@ fn test_config_with_managed_skills() -> DockerProvisionerConfig {
         container_path: "/hub-managed-skills".to_string(),
     });
     config
+}
+
+#[tokio::test]
+async fn docker_provisioner_reports_runtime_image_and_version_from_container() {
+    let runtime = FakeDockerRuntime::default();
+    *runtime.container_exists.lock().expect("exists lock") = true;
+    *runtime.container_running.lock().expect("running lock") = true;
+    *runtime.health_status.lock().expect("health lock") = Some("healthy".to_string());
+    *runtime.image.lock().expect("image lock") =
+        Some("ghcr.io/yiiilin/hermes-hub-hermes:1.2.3".to_string());
+    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime));
+
+    let instance = provisioner.prepare_instance("user-version");
+    let refreshed = provisioner
+        .refresh_instance_status(&instance)
+        .await
+        .expect("container status can be refreshed");
+
+    assert_eq!(
+        refreshed.runtime_image.as_deref(),
+        Some("ghcr.io/yiiilin/hermes-hub-hermes:1.2.3")
+    );
+    assert_eq!(refreshed.runtime_version.as_deref(), Some("1.2.3"));
+}
+
+#[tokio::test]
+async fn docker_provisioner_does_not_report_latest_as_runtime_version() {
+    let runtime = FakeDockerRuntime::default();
+    *runtime.container_exists.lock().expect("exists lock") = true;
+    *runtime.container_running.lock().expect("running lock") = true;
+    *runtime.health_status.lock().expect("health lock") = Some("healthy".to_string());
+    *runtime.image.lock().expect("image lock") =
+        Some("ghcr.io/yiiilin/hermes-hub-hermes:latest".to_string());
+    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime));
+
+    let instance = provisioner.prepare_instance("user-latest-version");
+    let refreshed = provisioner
+        .refresh_instance_status(&instance)
+        .await
+        .expect("container status can be refreshed");
+
+    assert_eq!(
+        refreshed.runtime_image.as_deref(),
+        Some("ghcr.io/yiiilin/hermes-hub-hermes:latest")
+    );
+    assert_eq!(refreshed.runtime_version, None);
 }
 
 #[tokio::test]
@@ -232,6 +352,85 @@ async fn docker_provisioner_writes_configured_image_model_to_env_and_config() {
     assert!(managed_config.contains("image_gen:"));
     assert!(managed_config.contains("model: \"gpt-image-1\""));
     assert!(!managed_config.contains("gpt-image-2-medium"));
+}
+
+#[tokio::test]
+async fn docker_provisioner_writes_adapter_runtime_version_reporter() {
+    let runtime = FakeDockerRuntime::default();
+    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime));
+
+    provisioner
+        .ensure_instance("user-runtime-report", "instance-token")
+        .await
+        .expect("instance can be created");
+
+    let adapter = std::fs::read_to_string(
+        "/tmp/hermes-hub-test/users/user-runtime-report/config/plugins/platforms/hermes_hub/adapter.py",
+    )
+    .expect("managed Hermes adapter is written");
+    assert!(adapter.contains("import importlib.metadata"));
+    assert!(adapter.contains("_report_runtime_status_once"));
+    assert!(adapter.contains("\"/instance/status\""));
+    assert!(adapter.contains("\"runtime_version\""));
+}
+
+#[tokio::test]
+async fn docker_provisioner_omits_image_generation_when_image_model_is_disabled() {
+    let runtime = FakeDockerRuntime::default();
+    let mut config = test_config();
+    config.image_model_enabled = false;
+    let provisioner = DockerProvisioner::new_with_runtime(config, Arc::new(runtime.clone()));
+
+    let instance = provisioner
+        .ensure_instance("user-no-image-model", "instance-token")
+        .await
+        .expect("instance can be created");
+    let spec = provisioner
+        .container_spec_for(&instance)
+        .expect("container spec can be rendered");
+
+    assert!(!spec
+        .env
+        .iter()
+        .any(|entry| entry.starts_with("OPENAI_IMAGE_MODEL=")));
+    let managed_config = std::fs::read_to_string(
+        "/tmp/hermes-hub-test/users/user-no-image-model/config/config.yaml",
+    )
+    .expect("managed Hermes config is written");
+    assert!(!managed_config.contains("image_gen:"));
+    assert!(!managed_config.contains("gpt-image-2-medium"));
+}
+
+#[tokio::test]
+async fn docker_provisioner_pulls_missing_runtime_image_before_create() {
+    let runtime = FakeDockerRuntime::default();
+    *runtime.image_exists.lock().expect("image exists lock") = false;
+    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime.clone()));
+
+    provisioner
+        .ensure_instance("user-missing-image", "instance-token")
+        .await
+        .expect("missing image can be pulled before container create");
+
+    let calls = runtime.calls.lock().expect("calls lock").clone();
+    let inspect_index = calls
+        .iter()
+        .position(|args| {
+            args.get(0).map(String::as_str) == Some("image")
+                && args.get(1).map(String::as_str) == Some("inspect")
+        })
+        .expect("image inspect is called");
+    let pull_index = calls
+        .iter()
+        .position(|args| args.get(0).map(String::as_str) == Some("pull"))
+        .expect("missing image is pulled");
+    let create_index = calls
+        .iter()
+        .position(|args| args.get(0).map(String::as_str) == Some("create"))
+        .expect("container is created after image is ready");
+
+    assert!(inspect_index < pull_index);
+    assert!(pull_index < create_index);
 }
 
 #[tokio::test]
@@ -361,7 +560,7 @@ async fn docker_provisioner_preserves_approved_pairing_and_clears_stale_pending_
 }
 
 #[tokio::test]
-async fn docker_provisioner_mounts_managed_skills_readonly_as_external_dir() {
+async fn docker_provisioner_mounts_managed_skills_readonly_for_regular_users() {
     let runtime = FakeDockerRuntime::default();
     let provisioner = DockerProvisioner::new_with_runtime(
         test_config_with_managed_skills(),
@@ -430,6 +629,115 @@ async fn docker_provisioner_mounts_managed_skills_readonly_as_external_dir() {
 }
 
 #[tokio::test]
+async fn docker_provisioner_mounts_managed_skills_writable_for_admin_users() {
+    let runtime = FakeDockerRuntime::default();
+    let provisioner = DockerProvisioner::new_with_runtime(
+        test_config_with_managed_skills(),
+        Arc::new(runtime.clone()),
+    );
+
+    let mut instance = provisioner.prepare_instance("admin-managed-skills");
+    instance.global_skills_write_enabled = true;
+    let spec = provisioner
+        .container_spec_for(&instance)
+        .expect("container spec can be rendered");
+
+    assert!(spec.mounts.iter().any(|mount| matches!(
+        mount,
+        ContainerMount::NfsVolume(volume)
+            if volume.volume_name == "hermes-managed-skills-test-rw"
+                && volume.container_path == "/hub-managed-skills"
+                && !volume.read_only
+    )));
+
+    provisioner
+        .ensure_container(&instance, "instance-token")
+        .await
+        .expect("admin instance can be created");
+    let calls = runtime.calls.lock().expect("calls lock").clone();
+    assert!(
+        calls.iter().any(|args| {
+            args.first().map(String::as_str) == Some("volume")
+                && args.get(1).map(String::as_str) == Some("create")
+                && args.contains(
+                    &"o=addr=127.0.0.1,port=12049,mountport=12049,vers=3,tcp,nolock,soft,rw"
+                        .to_string(),
+                )
+        }),
+        "admin managed skills NFS volume must be mounted read-write"
+    );
+    let create_call = calls
+        .iter()
+        .find(|args| args.first().map(String::as_str) == Some("create"))
+        .expect("container create command is issued");
+    assert!(
+        create_call.windows(2).any(|args| {
+            args[0] == "--mount"
+                && args[1]
+                    == "type=volume,src=hermes-managed-skills-test-rw,dst=/hub-managed-skills,volume-driver=local"
+        }),
+        "admin managed skills mount must not include Docker readonly flag"
+    );
+}
+
+#[tokio::test]
+async fn docker_provisioner_refreshes_status_from_docker_health() {
+    let runtime = FakeDockerRuntime::default();
+    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime.clone()));
+    let instance = provisioner.prepare_instance("user-health");
+
+    *runtime.container_exists.lock().expect("exists lock") = true;
+    *runtime.container_running.lock().expect("running lock") = true;
+    *runtime.health_status.lock().expect("health lock") = Some("unhealthy".to_string());
+    *runtime.health_output.lock().expect("health output lock") =
+        Some("curl: connection refused".to_string());
+    let unhealthy = provisioner
+        .refresh_instance_status(&instance)
+        .await
+        .expect("status can be refreshed");
+    assert_eq!(unhealthy.status, HermesInstanceStatus::Error);
+    assert_eq!(unhealthy.health_status, "unhealthy");
+    assert_eq!(
+        unhealthy.status_message.as_deref(),
+        Some("curl: connection refused")
+    );
+    assert_eq!(
+        unhealthy.container_id.as_deref(),
+        Some("container-existing")
+    );
+
+    *runtime.health_status.lock().expect("health lock") = Some("healthy".to_string());
+    let healthy = provisioner
+        .refresh_instance_status(&unhealthy)
+        .await
+        .expect("status can be refreshed");
+    assert_eq!(healthy.status, HermesInstanceStatus::Running);
+    assert_eq!(healthy.health_status, "healthy");
+
+    *runtime.container_running.lock().expect("running lock") = false;
+    *runtime.health_status.lock().expect("health lock") = None;
+    let stopped = provisioner
+        .refresh_instance_status(&healthy)
+        .await
+        .expect("status can be refreshed");
+    assert_eq!(stopped.status, HermesInstanceStatus::Stopped);
+    assert_eq!(stopped.health_status, "stopped");
+
+    *runtime.container_exists.lock().expect("exists lock") = false;
+    let missing = provisioner
+        .refresh_instance_status(&stopped)
+        .await
+        .expect("missing container is still a refresh result");
+    assert_eq!(missing.status, HermesInstanceStatus::Error);
+    assert_eq!(missing.health_status, "missing");
+    assert_eq!(
+        missing.status_message.as_deref(),
+        Some("Docker container is missing")
+    );
+    assert_eq!(missing.container_id, None);
+}
+
+#[tokio::test]
 async fn docker_provisioner_test() {
     let runtime = FakeDockerRuntime::default();
     let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime.clone()));
@@ -477,7 +785,7 @@ async fn docker_provisioner_test() {
         .container_spec_for(&instance)
         .expect("container spec can be rendered");
 
-    assert_eq!(spec.image, "nousresearch/hermes-agent:latest");
+    assert_eq!(spec.image, "ghcr.io/yiiilin/hermes-hub-hermes:latest");
     assert_eq!(spec.network, "hermes-hub-net");
     assert!(spec
         .env
@@ -552,7 +860,7 @@ async fn docker_provisioner_test() {
         .iter()
         .any(|entry| entry == "HERMES_ACCEPT_HOOKS=1"));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version" && value == "2026-05-25-hermes-hub-run-context"
+        key == "hermes_hub_spec_version" && value == "2026-05-26-model-runtime-settings"
     }));
     assert!(spec
         .mounts
@@ -592,6 +900,13 @@ async fn docker_provisioner_test() {
     assert!(managed_config.contains("api_key: \"instance-token\""));
     assert!(managed_config.contains("plugins:"));
     assert!(managed_config.contains("enabled: [platforms/hermes_hub]"));
+    assert!(managed_config.contains("memory:"));
+    assert!(managed_config.contains("provider: holographic"));
+    assert!(managed_config.contains("hermes-memory-store:"));
+    assert!(managed_config.contains("db_path: \"$HERMES_HOME/memory_store.db\""));
+    assert!(managed_config.contains("default_trust: 0.5"));
+    assert!(managed_config.contains("hrr_dim: 1024"));
+    assert!(managed_config.contains("auto_extract: false"));
     assert!(managed_config.contains("gateway:"));
     assert!(managed_config.contains("platforms:"));
     assert!(managed_config.contains("hermes_hub:"));
@@ -606,6 +921,10 @@ async fn docker_provisioner_test() {
     assert!(managed_config.contains("image_gen:"));
     assert!(managed_config.contains("provider: \"openai\""));
     assert!(managed_config.contains("model: \"gpt-image-2-medium\""));
+    assert!(managed_config.contains("context_window_tokens: 128000"));
+    assert!(managed_config.contains("max_output_tokens: 4096"));
+    assert!(managed_config.contains("temperature: 0.7"));
+    assert!(managed_config.contains("parallel_tool_calls: true"));
     assert!(managed_config.contains("display:"));
     assert!(managed_config.contains("tool_progress: \"verbose\""));
     assert!(managed_config.contains("tool_progress_command: true"));
@@ -711,9 +1030,23 @@ async fn docker_provisioner_test() {
     assert!(
         create_call.windows(2).any(|args| {
             args[0] == "--label"
-                && args[1] == "hermes_hub_spec_version=2026-05-25-hermes-hub-run-context"
+                && args[1] == "hermes_hub_spec_version=2026-05-26-model-runtime-settings"
         }),
         "managed Hermes containers must carry the current spec label"
+    );
+    assert!(
+        create_call.windows(2).any(|args| {
+            args[0] == "--health-cmd"
+                && args[1].contains("http://127.0.0.1:8000/health")
+                && args[1].contains("HERMES_HUB_CHANNEL_BASE_URL")
+        }),
+        "managed Hermes healthcheck must verify both the gateway and Hub reachability"
+    );
+    assert!(
+        create_call
+            .windows(2)
+            .any(|args| args[0] == "--health-interval" && args[1] == "10s"),
+        "managed Hermes healthcheck interval must be stable"
     );
     assert!(
         create_call.windows(2).any(|args| {

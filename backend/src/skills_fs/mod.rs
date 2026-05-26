@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use nfsserve::{
     nfs::{
         fattr3, fileid3, filename3, fsinfo3, ftype3, gid3, nfs_fh3, nfspath3, nfsstat3, nfstime3,
-        post_op_attr, sattr3, specdata3, uid3, FSF_HOMOGENEOUS,
+        post_op_attr, sattr3, set_size3, specdata3, uid3, FSF_HOMOGENEOUS,
     },
     vfs::{NFSFileSystem, ReadDirResult, VFSCapabilities},
 };
@@ -21,14 +21,16 @@ use crate::app_config::ObjectStorageConfig;
 
 const ROOT_ID: fileid3 = 1;
 const FS_ID: u64 = 0x4848_534b_494c_4c53;
-const DIR_MODE: u32 = 0o555;
-const FILE_MODE: u32 = 0o444;
+const DIR_MODE: u32 = 0o755;
+const FILE_MODE: u32 = 0o644;
 const HIDDEN_SEGMENTS: [&str; 3] = [".curator_state", ".bundled_manifest", ".hub-directory"];
 
 #[derive(Debug, Error)]
 pub enum SkillsFsError {
     #[error("invalid skills filesystem prefix")]
     InvalidPrefix,
+    #[error("skills path not found")]
+    NotFound,
     #[error("object storage endpoint is required")]
     MissingEndpoint,
     #[error("object storage access key is required")]
@@ -39,6 +41,8 @@ pub enum SkillsFsError {
     Opendal(#[from] opendal::Error),
     #[error("skills filesystem lock failed")]
     LockFailed,
+    #[error("skills directory is not empty")]
+    DirectoryNotEmpty,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,13 +86,13 @@ impl Default for SkillsFsIndex {
 }
 
 /// OpenDAL 负责实时读取 S3/RustFS；这里的索引只保存 NFS fileid 与路径映射。
-pub struct ReadonlySkillsFs {
+pub struct SkillsFs {
     operator: Operator,
     prefix: String,
     index: Mutex<SkillsFsIndex>,
 }
 
-impl ReadonlySkillsFs {
+impl SkillsFs {
     pub fn new(operator: Operator, prefix: impl AsRef<str>) -> Result<Self, SkillsFsError> {
         let prefix = normalize_prefix(prefix.as_ref()).ok_or(SkillsFsError::InvalidPrefix)?;
         Ok(Self {
@@ -180,6 +184,190 @@ impl ReadonlySkillsFs {
         let path = normalize_skills_path(path).ok_or(SkillsFsError::InvalidPrefix)?;
         let bytes = self.operator.read(&object_key(&self.prefix, &path)).await?;
         Ok(bytes.to_vec())
+    }
+
+    async fn write_path_at(
+        &self,
+        path: &str,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<SkillsNode, SkillsFsError> {
+        let path = writable_skills_path(path).ok_or(SkillsFsError::InvalidPrefix)?;
+        let mut bytes = match self.read_path(&path).await {
+            Ok(bytes) => bytes,
+            Err(SkillsFsError::Opendal(error)) if error.kind() == ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let start = usize::try_from(offset).map_err(|_| SkillsFsError::InvalidPrefix)?;
+        if bytes.len() < start {
+            bytes.resize(start, 0);
+        }
+        let end = start.saturating_add(data.len());
+        if bytes.len() < end {
+            bytes.resize(end, 0);
+        }
+        bytes[start..end].copy_from_slice(data);
+        let key = object_key(&self.prefix, &path);
+        let metadata = self.operator.write(&key, bytes).await?;
+        self.node_for_path(
+            path,
+            false,
+            metadata.content_length(),
+            metadata.last_modified().map(Into::into),
+        )
+    }
+
+    async fn truncate_path(&self, path: &str, size: u64) -> Result<SkillsNode, SkillsFsError> {
+        let path = writable_skills_path(path).ok_or(SkillsFsError::InvalidPrefix)?;
+        let mut bytes = match self.read_path(&path).await {
+            Ok(bytes) => bytes,
+            Err(SkillsFsError::Opendal(error)) if error.kind() == ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let size = usize::try_from(size).map_err(|_| SkillsFsError::InvalidPrefix)?;
+        bytes.resize(size, 0);
+        let metadata = self
+            .operator
+            .write(&object_key(&self.prefix, &path), bytes)
+            .await?;
+        self.node_for_path(
+            path,
+            false,
+            metadata.content_length(),
+            metadata.last_modified().map(Into::into),
+        )
+    }
+
+    async fn create_empty_file(&self, path: &str) -> Result<SkillsNode, SkillsFsError> {
+        self.write_path_at(path, 0, &[]).await
+    }
+
+    async fn create_directory(&self, path: &str) -> Result<SkillsNode, SkillsFsError> {
+        let path = writable_skills_path(path).ok_or(SkillsFsError::InvalidPrefix)?;
+        // NFS 新建的空目录需要跨进程重启可见；对象存储没有真实目录时，用目录对象持久化。
+        self.operator
+            .create_dir(&object_key(&self.prefix, &dir_path(&path)))
+            .await?;
+        self.operator
+            .write(
+                &object_key(&self.prefix, &format!("{path}/.hub-directory")),
+                "",
+            )
+            .await?;
+        self.node_for_path(path, true, 0, Some(SystemTime::now()))
+    }
+
+    async fn delete_path(&self, path: &str) -> Result<(), SkillsFsError> {
+        let path = writable_skills_path(path).ok_or(SkillsFsError::InvalidPrefix)?;
+        let node = match self.lookup_path(&path).await {
+            Ok(node) => node,
+            Err(nfsstat3::NFS3ERR_NOENT) => self
+                .cached_node_for_path(&path)?
+                .ok_or(SkillsFsError::NotFound)?,
+            Err(_) => return Err(SkillsFsError::InvalidPrefix),
+        };
+        if node.is_dir {
+            if !self.list_dir(&path).await?.is_empty() {
+                return Err(SkillsFsError::DirectoryNotEmpty);
+            }
+            self.delete_object_if_exists(&format!("{path}/.hub-directory"))
+                .await?;
+            self.delete_object_if_exists(&dir_path(&path)).await?;
+        } else {
+            self.operator
+                .delete(&object_key(&self.prefix, &path))
+                .await?;
+        }
+        self.remove_index_prefix(&path)?;
+        Ok(())
+    }
+
+    async fn rename_path(&self, from: &str, to: &str) -> Result<(), SkillsFsError> {
+        let from = writable_skills_path(from).ok_or(SkillsFsError::InvalidPrefix)?;
+        let to = writable_skills_path(to).ok_or(SkillsFsError::InvalidPrefix)?;
+        let node = match self.lookup_path(&from).await {
+            Ok(node) => node,
+            Err(nfsstat3::NFS3ERR_NOENT) => self
+                .cached_node_for_path(&from)?
+                .ok_or(SkillsFsError::NotFound)?,
+            Err(_) => return Err(SkillsFsError::InvalidPrefix),
+        };
+        if node.is_dir {
+            let entries = self
+                .operator
+                .list(&object_key(&self.prefix, &dir_path(&from)))
+                .await?;
+            for entry in entries {
+                let Some(relative) = relative_entry_path(&self.prefix, entry.path()) else {
+                    continue;
+                };
+                if relative == from || !relative.starts_with(&format!("{from}/")) {
+                    continue;
+                }
+                let target_relative = format!("{to}{}", &relative[from.len()..]);
+                if entry.metadata().mode().is_dir() {
+                    self.operator
+                        .create_dir(&object_key(&self.prefix, &dir_path(&target_relative)))
+                        .await?;
+                } else {
+                    let bytes = self.read_path(&relative).await?;
+                    self.operator
+                        .write(&object_key(&self.prefix, &target_relative), bytes)
+                        .await?;
+                    self.operator
+                        .delete(&object_key(&self.prefix, &relative))
+                        .await?;
+                }
+            }
+            self.operator
+                .delete(&object_key(&self.prefix, &dir_path(&from)))
+                .await?;
+        } else {
+            let bytes = self.read_path(&from).await?;
+            self.operator
+                .write(&object_key(&self.prefix, &to), bytes)
+                .await?;
+            self.operator
+                .delete(&object_key(&self.prefix, &from))
+                .await?;
+        }
+        self.remove_index_prefix(&from)?;
+        Ok(())
+    }
+
+    async fn delete_object_if_exists(&self, path: &str) -> Result<(), SkillsFsError> {
+        match self.operator.delete(&object_key(&self.prefix, path)).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn cached_node_for_path(&self, path: &str) -> Result<Option<SkillsNode>, SkillsFsError> {
+        let index = self.index.lock().map_err(|_| SkillsFsError::LockFailed)?;
+        Ok(index
+            .path_to_id
+            .get(path)
+            .and_then(|id| index.id_to_node.get(id))
+            .cloned())
+    }
+
+    fn remove_index_prefix(&self, path: &str) -> Result<(), SkillsFsError> {
+        let mut index = self.index.lock().map_err(|_| SkillsFsError::LockFailed)?;
+        let removed_ids = index
+            .path_to_id
+            .iter()
+            .filter_map(|(cached_path, id)| {
+                (cached_path == path || cached_path.starts_with(&format!("{path}/"))).then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        index.path_to_id.retain(|cached_path, _| {
+            cached_path != path && !cached_path.starts_with(&format!("{path}/"))
+        });
+        for id in removed_ids {
+            index.id_to_node.remove(&id);
+        }
+        Ok(())
     }
 
     fn root_node(&self) -> SkillsNode {
@@ -351,9 +539,9 @@ impl ReadonlySkillsFs {
 }
 
 #[async_trait]
-impl NFSFileSystem for ReadonlySkillsFs {
+impl NFSFileSystem for SkillsFs {
     fn capabilities(&self) -> VFSCapabilities {
-        VFSCapabilities::ReadOnly
+        VFSCapabilities::ReadWrite
     }
 
     fn root_dir(&self) -> fileid3 {
@@ -416,8 +604,19 @@ impl NFSFileSystem for ReadonlySkillsFs {
         Ok(fattr_for_node(&node))
     }
 
-    async fn setattr(&self, _id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+    async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
+        let node = self.node_by_id(id).await?;
+        if let set_size3::size(size) = setattr.size {
+            if node.is_dir {
+                return Err(nfsstat3::NFS3ERR_ISDIR);
+            }
+            return self
+                .truncate_path(&node.path, size)
+                .await
+                .map(|node| fattr_for_node(&node))
+                .map_err(skills_error_to_nfs);
+        }
+        Ok(fattr_for_node(&node))
     }
 
     async fn read(
@@ -443,47 +642,98 @@ impl NFSFileSystem for ReadonlySkillsFs {
         Ok((bytes[start..end].to_vec(), end >= bytes.len()))
     }
 
-    async fn write(&self, _id: fileid3, _offset: u64, _data: &[u8]) -> Result<fattr3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+    async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+        let node = self.node_by_id(id).await?;
+        if node.is_dir {
+            return Err(nfsstat3::NFS3ERR_ISDIR);
+        }
+        self.write_path_at(&node.path, offset, data)
+            .await
+            .map(|node| fattr_for_node(&node))
+            .map_err(skills_error_to_nfs)
     }
 
     async fn create(
         &self,
-        _dirid: fileid3,
-        _filename: &filename3,
-        _attr: sattr3,
+        dirid: fileid3,
+        filename: &filename3,
+        attr: sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let dir = self.node_by_id(dirid).await?;
+        if !dir.is_dir {
+            return Err(nfsstat3::NFS3ERR_NOTDIR);
+        }
+        let path = child_path_for_nfs_name(&dir.path, filename)?;
+        let mut node = self
+            .create_empty_file(&path)
+            .await
+            .map_err(skills_error_to_nfs)?;
+        if let set_size3::size(size) = attr.size {
+            node = self
+                .truncate_path(&path, size)
+                .await
+                .map_err(skills_error_to_nfs)?;
+        }
+        Ok((node.id, fattr_for_node(&node)))
     }
 
     async fn create_exclusive(
         &self,
-        _dirid: fileid3,
-        _filename: &filename3,
+        dirid: fileid3,
+        filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let dir = self.node_by_id(dirid).await?;
+        let path = child_path_for_nfs_name(&dir.path, filename)?;
+        if self.lookup_path(&path).await.is_ok() {
+            return Err(nfsstat3::NFS3ERR_EXIST);
+        }
+        let (id, _) = self.create(dirid, filename, sattr3::default()).await?;
+        Ok(id)
     }
 
     async fn mkdir(
         &self,
-        _dirid: fileid3,
-        _dirname: &filename3,
+        dirid: fileid3,
+        dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let dir = self.node_by_id(dirid).await?;
+        if !dir.is_dir {
+            return Err(nfsstat3::NFS3ERR_NOTDIR);
+        }
+        let path = child_path_for_nfs_name(&dir.path, dirname)?;
+        let node = self
+            .create_directory(&path)
+            .await
+            .map_err(skills_error_to_nfs)?;
+        Ok((node.id, fattr_for_node(&node)))
     }
 
-    async fn remove(&self, _dirid: fileid3, _filename: &filename3) -> Result<(), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+    async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
+        let dir = self.node_by_id(dirid).await?;
+        if !dir.is_dir {
+            return Err(nfsstat3::NFS3ERR_NOTDIR);
+        }
+        let path = child_path_for_nfs_name(&dir.path, filename)?;
+        self.delete_path(&path).await.map_err(skills_error_to_nfs)
     }
 
     async fn rename(
         &self,
-        _from_dirid: fileid3,
-        _from_filename: &filename3,
-        _to_dirid: fileid3,
-        _to_filename: &filename3,
+        from_dirid: fileid3,
+        from_filename: &filename3,
+        to_dirid: fileid3,
+        to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let from_dir = self.node_by_id(from_dirid).await?;
+        let to_dir = self.node_by_id(to_dirid).await?;
+        if !from_dir.is_dir || !to_dir.is_dir {
+            return Err(nfsstat3::NFS3ERR_NOTDIR);
+        }
+        let from = child_path_for_nfs_name(&from_dir.path, from_filename)?;
+        let to = child_path_for_nfs_name(&to_dir.path, to_filename)?;
+        self.rename_path(&from, &to)
+            .await
+            .map_err(skills_error_to_nfs)
     }
 
     async fn readdir(
@@ -542,9 +792,9 @@ impl NFSFileSystem for ReadonlySkillsFs {
             rtmax: 1024 * 1024,
             rtpref: 1024 * 124,
             rtmult: 1024 * 1024,
-            wtmax: 0,
-            wtpref: 0,
-            wtmult: 0,
+            wtmax: 1024 * 1024,
+            wtpref: 1024 * 1024,
+            wtmult: 1024 * 1024,
             dtpref: 1024 * 1024,
             maxfilesize: 128 * 1024 * 1024 * 1024,
             time_delta: nfstime3 {
@@ -555,6 +805,8 @@ impl NFSFileSystem for ReadonlySkillsFs {
         })
     }
 }
+
+pub type ReadonlySkillsFs = SkillsFs;
 
 pub fn normalize_skills_path(path: &str) -> Option<String> {
     if path.is_empty() || path.contains('\0') {
@@ -670,6 +922,40 @@ fn basename(path: &str) -> &str {
 fn has_hidden_segment(path: &str) -> bool {
     path.split('/')
         .any(|segment| HIDDEN_SEGMENTS.contains(&segment))
+}
+
+fn writable_skills_path(path: &str) -> Option<String> {
+    let path = normalize_skills_path(path)?;
+    if path.is_empty() || has_hidden_segment(&path) {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+fn child_path_for_nfs_name(parent: &str, filename: &filename3) -> Result<String, nfsstat3> {
+    let filename = std::str::from_utf8(filename.as_ref()).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
+    if filename.is_empty() || filename.contains('/') {
+        return Err(nfsstat3::NFS3ERR_INVAL);
+    }
+    let path = if parent.is_empty() {
+        filename.to_string()
+    } else {
+        format!("{parent}/{filename}")
+    };
+    writable_skills_path(&path).ok_or(nfsstat3::NFS3ERR_ACCES)
+}
+
+fn skills_error_to_nfs(error: SkillsFsError) -> nfsstat3 {
+    match error {
+        SkillsFsError::InvalidPrefix => nfsstat3::NFS3ERR_ACCES,
+        SkillsFsError::Opendal(error) if error.kind() == ErrorKind::NotFound => {
+            nfsstat3::NFS3ERR_NOENT
+        }
+        SkillsFsError::DirectoryNotEmpty => nfsstat3::NFS3ERR_NOTEMPTY,
+        SkillsFsError::NotFound => nfsstat3::NFS3ERR_NOENT,
+        _ => nfsstat3::NFS3ERR_IO,
+    }
 }
 
 fn stable_fileid_for_path(path: &str) -> fileid3 {

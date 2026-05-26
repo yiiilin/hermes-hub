@@ -1,16 +1,10 @@
 import type { Dispatch, MouseEvent, ReactNode, SetStateAction } from "react";
 import type { User } from "../api/client";
-import { Bot, Cpu, FolderCode, Languages, LogOut, Menu, PanelLeftClose, PanelLeftOpen, Settings, SlidersHorizontal, Users, X } from "lucide-react";
+import { Bot, Languages, LogOut, Menu, PanelLeftClose, PanelLeftOpen, SlidersHorizontal, X } from "lucide-react";
 import { useI18n } from "../i18n";
 import { createContext, useContext, useEffect, useState } from "react";
 
-export type AppView =
-  | "chat"
-  | "admin-users"
-  | "admin-models"
-  | "admin-hermes"
-  | "admin-skills"
-  | "admin-settings";
+export type AppView = "chat" | "admin-settings";
 
 type ChatSidebarSetter = Dispatch<SetStateAction<ReactNode>>;
 
@@ -146,42 +140,6 @@ export function Layout({ children, user, activeView, onNavigate, onLogout }: Lay
           <nav className="sidebar-bottom">
             {user?.role === "admin" ? (
               <div className="nav-group">
-                <button
-                  type="button"
-                  className={activeView === "admin-users" ? "nav-link active" : "nav-link"}
-                  onClick={() => navigate("admin-users")}
-                  title={t("admin.userManagement")}
-                >
-                  <Users aria-hidden="true" size={18} />
-                  <span>{t("admin.userManagement")}</span>
-                </button>
-                <button
-                  type="button"
-                  className={activeView === "admin-models" ? "nav-link active" : "nav-link"}
-                  onClick={() => navigate("admin-models")}
-                  title={t("admin.modelConfig")}
-                >
-                  <Settings aria-hidden="true" size={18} />
-                  <span>{t("admin.modelConfig")}</span>
-                </button>
-                <button
-                  type="button"
-                  className={activeView === "admin-hermes" ? "nav-link active" : "nav-link"}
-                  onClick={() => navigate("admin-hermes")}
-                  title={t("admin.title")}
-                >
-                  <Cpu aria-hidden="true" size={18} />
-                  <span>{t("admin.title")}</span>
-                </button>
-                <button
-                  type="button"
-                  className={activeView === "admin-skills" ? "nav-link active" : "nav-link"}
-                  onClick={() => navigate("admin-skills")}
-                  title={t("admin.skillManagement")}
-                >
-                  <FolderCode aria-hidden="true" size={18} />
-                  <span>{t("admin.skillManagement")}</span>
-                </button>
                 <button
                   type="button"
                   className={activeView === "admin-settings" ? "nav-link active" : "nav-link"}

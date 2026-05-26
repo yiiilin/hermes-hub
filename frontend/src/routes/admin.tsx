@@ -16,12 +16,11 @@ import { useI18n } from "../i18n";
 import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { FileArchive, FilePlus2, FolderPlus, Upload } from "lucide-react";
 
-type AdminSection = "users" | "models" | "hermes" | "skills" | "settings";
+type AdminSettingsTab = "users" | "models" | "hermes" | "skills" | "sessions" | "auth";
 
 type AdminRouteProps = {
   apiClient: ApiClient;
   currentUser: User;
-  section: AdminSection;
 };
 
 type SelectedSkillNode = {
@@ -29,7 +28,10 @@ type SelectedSkillNode = {
   kind: "dir" | "file";
 } | null;
 
+type HermesAction = "create" | "start" | "stop" | "rebuild";
+
 const defaultInviteHours = 24;
+const modelConfigOrder: ModelConfigKind[] = ["llm", "title", "image"];
 const apiTypeLabels: Record<ModelApiType, string> = {
   chat_completions: "Chat Completions",
   responses: "Responses",
@@ -45,6 +47,55 @@ function formatBytes(size: number): string {
     return `${(size / 1024).toFixed(1)} KB`;
   }
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+type HermesInstanceStatusDisplay = {
+  label: string;
+  detail?: string;
+};
+
+function hermesInstanceStatusDisplay(instance?: HermesInstance): HermesInstanceStatusDisplay {
+  if (!instance) {
+    return { label: "not_created" };
+  }
+  if (instance.status === "error") {
+    return {
+      label: "error",
+      detail: readableHermesStatusDetail(instance),
+    };
+  }
+  const healthStatus = instance.health_status?.trim();
+  if (healthStatus && !["unknown", "running"].includes(healthStatus)) {
+    return { label: healthStatus };
+  }
+  return { label: instance.status };
+}
+
+function readableHermesStatusDetail(instance: HermesInstance): string | undefined {
+  const statusMessage = instance.status_message?.trim();
+  if (statusMessage) {
+    return statusMessage;
+  }
+  const healthStatus = instance.health_status?.trim();
+  if (healthStatus && !["unknown", "error"].includes(healthStatus)) {
+    return healthStatus;
+  }
+  return undefined;
+}
+
+function formatHermesRuntimeVersion(instance?: HermesInstance): string {
+  const reportedVersion = instance?.runtime_version?.trim();
+  if (reportedVersion && reportedVersion !== "latest") {
+    return reportedVersion;
+  }
+  return hermesImageVersion(instance?.runtime_image) ?? "-";
+}
+
+function hermesImageVersion(image?: string | null): string | undefined {
+  const imageWithoutDigest = image?.split("@")[0]?.trim();
+  const lastSegment = imageWithoutDigest?.split("/").at(-1);
+  const tag = lastSegment?.includes(":") ? lastSegment.split(":").at(-1)?.trim() : undefined;
+  return tag && tag !== "latest" ? tag : undefined;
 }
 
 function parentPath(path: string): string {
@@ -148,8 +199,9 @@ function managedSkillTreeFromList(skills: ManagedSkill[]): ManagedSkillTreeNode 
   return root;
 }
 
-export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps) {
+export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
   const { language, t } = useI18n();
+  const [activeTab, setActiveTab] = useState<AdminSettingsTab>("users");
   const [users, setUsers] = useState<User[]>([]);
   const [invites, setInvites] = useState<Invite[]>([]);
   const [instances, setInstances] = useState<HermesInstance[]>([]);
@@ -178,7 +230,12 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
   const [modelTestMessages, setModelTestMessages] = useState<
     Partial<Record<ModelConfigKind, string>>
   >({});
+  const [modelSaved, setModelSaved] = useState(false);
   const [testingModel, setTestingModel] = useState<ModelConfigKind | null>(null);
+  const [pendingHermesAction, setPendingHermesAction] = useState<{
+    userId: string;
+    action: HermesAction;
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const instancesByUserId = useMemo(
@@ -190,10 +247,27 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
     image: t("admin.imageModel"),
     title: t("admin.titleModel"),
   };
+  const orderedModelConfigs = useMemo(
+    () =>
+      [...modelConfigs].sort(
+        (left, right) =>
+          modelConfigOrder.indexOf(left.config_kind) -
+          modelConfigOrder.indexOf(right.config_kind),
+      ),
+    [modelConfigs],
+  );
   const oidcRedirectUri = useMemo(
     () => `${window.location.origin}/api/auth/oidc/callback`,
     [],
   );
+  const adminSettingsTabs: Array<{ key: AdminSettingsTab; label: string }> = [
+    { key: "users", label: t("admin.userManagement") },
+    { key: "models", label: t("admin.modelConfig") },
+    { key: "hermes", label: t("admin.title") },
+    { key: "skills", label: t("admin.skillManagement") },
+    { key: "sessions", label: t("admin.sessionSettings") },
+    { key: "auth", label: t("admin.authSettings") },
+  ];
 
   async function refresh() {
     setError(null);
@@ -203,7 +277,9 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
         apiClient.listInvites(),
         apiClient.listHermesInstances(),
         apiClient.modelConfigStatus(),
-        section === "settings" ? apiClient.systemSettings() : Promise.resolve(null),
+        activeTab === "sessions" || activeTab === "auth"
+          ? apiClient.systemSettings()
+          : Promise.resolve(null),
       ]);
       setUsers(nextUsers);
       setInvites(nextInvites);
@@ -214,7 +290,7 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
       if (nextSettings) {
         setSystemSettings(nextSettings);
       }
-      if (section === "skills") {
+      if (activeTab === "skills") {
         await refreshManagedSkills();
       }
     } catch (cause) {
@@ -224,7 +300,15 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
 
   useEffect(() => {
     void refresh();
-  }, []);
+  }, [activeTab]);
+
+  function selectAdminTab(tab: AdminSettingsTab) {
+    setError(null);
+    setModelSaved(false);
+    setSettingsSaved(false);
+    setSkillSaved(false);
+    setActiveTab(tab);
+  }
 
   async function refreshManagedSkills() {
     const nextSkills = await apiClient.listManagedSkills();
@@ -258,11 +342,20 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
 
   async function saveModels(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    await apiClient.updateModelConfigs(modelConfigs);
-    await refresh();
+    setModelSaved(false);
+    setError(null);
+    try {
+      await apiClient.updateModelConfigs(modelConfigs);
+      await refresh();
+      // 保存后给管理员一个明确反馈，避免开关变更看起来像“点了没反应”。
+      setModelSaved(true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("admin.modelSaveFailed"));
+    }
   }
 
   function updateModel(kind: ModelConfigKind, patch: Partial<ModelConfig>) {
+    setModelSaved(false);
     setModelConfigs((configs) =>
       configs.map((config) =>
         config.config_kind === kind ? { ...config, ...patch } : config,
@@ -307,19 +400,51 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
     await refresh();
   }
 
+  function isHermesActionPending(userId: string) {
+    return pendingHermesAction?.userId === userId;
+  }
+
+  function hermesActionLabel(
+    userId: string,
+    action: HermesAction,
+    fallbackKey: "admin.create" | "admin.start" | "admin.stop" | "admin.rebuild",
+  ) {
+    if (pendingHermesAction?.userId === userId && pendingHermesAction.action === action) {
+      const pendingKeys: Record<
+        HermesAction,
+        "admin.creating" | "admin.starting" | "admin.stopping" | "admin.rebuilding"
+      > = {
+        create: "admin.creating",
+        start: "admin.starting",
+        stop: "admin.stopping",
+        rebuild: "admin.rebuilding",
+      };
+      return t(pendingKeys[action]);
+    }
+    return t(fallbackKey);
+  }
+
   async function controlInstance(action: "start" | "stop" | "rebuild", instance: HermesInstance) {
     if (action !== "stop" && !requiredModelsReady) {
       setError(modelGateMessage);
       return;
     }
-    if (action === "start") {
-      await apiClient.startHermesInstance(instance.user_id);
-    } else if (action === "stop") {
-      await apiClient.stopHermesInstance(instance.user_id);
-    } else {
-      await apiClient.rebuildHermesInstance(instance.user_id);
+    setPendingHermesAction({ userId: instance.user_id, action });
+    setError(null);
+    try {
+      if (action === "start") {
+        await apiClient.startHermesInstance(instance.user_id);
+      } else if (action === "stop") {
+        await apiClient.stopHermesInstance(instance.user_id);
+      } else {
+        await apiClient.rebuildHermesInstance(instance.user_id);
+      }
+      await refresh();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("chat.requestFailed"));
+    } finally {
+      setPendingHermesAction(null);
     }
-    await refresh();
   }
 
   async function createManagedHermes(userId: string) {
@@ -327,8 +452,16 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
       setError(modelGateMessage);
       return;
     }
-    await apiClient.createHermesInstance(userId);
-    await refresh();
+    setPendingHermesAction({ userId, action: "create" });
+    setError(null);
+    try {
+      await apiClient.createHermesInstance(userId);
+      await refresh();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("chat.requestFailed"));
+    } finally {
+      setPendingHermesAction(null);
+    }
   }
 
   async function saveSystemSettings(event: FormEvent<HTMLFormElement>) {
@@ -542,12 +675,36 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
     );
   }
 
-  if (section === "models") {
+  function renderSystemSettingsShell(content: ReactNode) {
     return (
+      <section className="admin-page" id="admin-settings">
+        <div className="panel-heading">
+          <h1>{t("admin.systemSettings")}</h1>
+        </div>
+        <div className="settings-tabs" role="tablist" aria-label={t("admin.systemSettings")}>
+          {adminSettingsTabs.map((tab) => (
+            <button
+              type="button"
+              key={tab.key}
+              role="tab"
+              aria-selected={activeTab === tab.key}
+              className={activeTab === tab.key ? "active" : ""}
+              onClick={() => selectAdminTab(tab.key)}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+        {content}
+      </section>
+    );
+  }
+
+  if (activeTab === "models") {
+    return renderSystemSettingsShell(
       <section className="admin-page" id="admin-models">
         <form className="admin-page" onSubmit={(event) => void saveModels(event)}>
-          <div className="panel-heading">
-            <h1>{t("admin.modelConfig")}</h1>
+          <div className="tab-actions">
             <div className="button-row">
               <button type="button" className="secondary" onClick={() => void refresh()}>
                 {t("admin.refresh")}
@@ -556,8 +713,9 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
             </div>
           </div>
           {error ? <p className="error">{error}</p> : null}
+          {modelSaved ? <p className="copy-line">{t("admin.modelSaved")}</p> : null}
           <div className="model-config-grid">
-            {modelConfigs.map((config) => (
+            {orderedModelConfigs.map((config) => (
               <section className="panel" key={config.config_kind}>
                 <div className="model-card-heading">
                   <h2>{modelLabels[config.config_kind]}</h2>
@@ -664,6 +822,51 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                       </select>
                     </label>
                   ) : null}
+                  {config.config_kind === "llm" ? (
+                    <>
+                      <label>
+                        {t("admin.contextWindowTokens")}
+                        <input
+                          type="number"
+                          min={1}
+                          value={config.context_window_tokens}
+                          onChange={(event) =>
+                            updateModel(config.config_kind, {
+                              context_window_tokens: Number(event.target.value),
+                            })
+                          }
+                        />
+                      </label>
+                      <label>
+                        {t("admin.maxOutputTokens")}
+                        <input
+                          type="number"
+                          min={1}
+                          value={config.max_output_tokens}
+                          onChange={(event) =>
+                            updateModel(config.config_kind, {
+                              max_output_tokens: Number(event.target.value),
+                            })
+                          }
+                        />
+                      </label>
+                      <label>
+                        {t("admin.temperature")}
+                        <input
+                          type="number"
+                          min={0}
+                          max={2}
+                          step={0.1}
+                          value={config.temperature}
+                          onChange={(event) =>
+                            updateModel(config.config_kind, {
+                              temperature: Number(event.target.value),
+                            })
+                          }
+                        />
+                      </label>
+                    </>
+                  ) : null}
                   <label>
                     {t("admin.timeout")}
                     <input
@@ -687,8 +890,36 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                             allow_streaming: event.target.checked,
                           })
                         }
-                      />
+                        />
                       {t("admin.streaming")}
+                    </label>
+                  ) : null}
+                  {config.config_kind === "llm" ? (
+                    <label className="checkbox-row">
+                      <input
+                        type="checkbox"
+                        checked={config.supports_parallel_tools}
+                        onChange={(event) =>
+                          updateModel(config.config_kind, {
+                            supports_parallel_tools: event.target.checked,
+                          })
+                        }
+                      />
+                      {t("admin.supportsParallelTools")}
+                    </label>
+                  ) : null}
+                  {config.config_kind === "image" ? (
+                    <label className="checkbox-row">
+                      <input
+                        type="checkbox"
+                        checked={config.enabled}
+                        onChange={(event) =>
+                          updateModel(config.config_kind, {
+                            enabled: event.target.checked,
+                          })
+                        }
+                      />
+                      {t("admin.imageEnabled")}
                     </label>
                   ) : null}
                 </div>
@@ -696,15 +927,14 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
             ))}
           </div>
         </form>
-      </section>
+      </section>,
     );
   }
 
-  if (section === "hermes") {
-    return (
+  if (activeTab === "hermes") {
+    return renderSystemSettingsShell(
       <section className="admin-page" id="admin-hermes">
-        <div className="panel-heading">
-          <h1>{t("admin.title")}</h1>
+        <div className="tab-actions">
           <button type="button" className="secondary" onClick={() => void refresh()}>
             {t("admin.refresh")}
           </button>
@@ -718,51 +948,64 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
                 <th>{t("admin.owner")}</th>
                 <th>{t("admin.kind")}</th>
                 <th>{t("admin.status")}</th>
+                <th>{t("admin.version")}</th>
                 <th>{t("admin.action")}</th>
               </tr>
             </thead>
             <tbody>
               {users.map((owner) => {
                 const instance = instancesByUserId.get(owner.id);
+                const statusDisplay = hermesInstanceStatusDisplay(instance);
                 return (
                   <tr key={owner.id}>
                     <td>{owner.email}</td>
                     <td>{instance?.kind ?? "not_created"}</td>
-                    <td>{instance?.status ?? "not_created"}</td>
+                    <td>
+                      <span className="status-cell">
+                        <span>{statusDisplay.label}</span>
+                        {statusDisplay.detail ? (
+                          <span className="status-detail">{statusDisplay.detail}</span>
+                        ) : null}
+                      </span>
+                    </td>
+                    <td title={instance?.runtime_image ?? undefined}>
+                      {formatHermesRuntimeVersion(instance)}
+                    </td>
                     <td>
                       {!instance ? (
                         <button
                           type="button"
                           className="secondary"
-                          disabled={!requiredModelsReady}
+                          disabled={!requiredModelsReady || isHermesActionPending(owner.id)}
                           onClick={() => void createManagedHermes(owner.id)}
                         >
-                          {t("admin.create")}
+                          {hermesActionLabel(owner.id, "create", "admin.create")}
                         </button>
                       ) : (
                         <div className="button-row">
                           <button
                             type="button"
                             className="secondary"
-                            disabled={!requiredModelsReady}
+                            disabled={!requiredModelsReady || isHermesActionPending(owner.id)}
                             onClick={() => void controlInstance("start", instance)}
                           >
-                            {t("admin.start")}
+                            {hermesActionLabel(owner.id, "start", "admin.start")}
                           </button>
                           <button
                             type="button"
                             className="secondary"
+                            disabled={isHermesActionPending(owner.id)}
                             onClick={() => void controlInstance("stop", instance)}
                           >
-                            {t("admin.stop")}
+                            {hermesActionLabel(owner.id, "stop", "admin.stop")}
                           </button>
                           <button
                             type="button"
                             className="secondary"
-                            disabled={!requiredModelsReady}
+                            disabled={!requiredModelsReady || isHermesActionPending(owner.id)}
                             onClick={() => void controlInstance("rebuild", instance)}
                           >
-                            {t("admin.rebuild")}
+                            {hermesActionLabel(owner.id, "rebuild", "admin.rebuild")}
                           </button>
                         </div>
                       )}
@@ -773,16 +1016,15 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
             </tbody>
           </table>
         </div>
-      </section>
+      </section>,
     );
   }
 
-  if (section === "settings") {
-    return (
-      <section className="admin-page" id="admin-settings">
+  if (activeTab === "sessions") {
+    return renderSystemSettingsShell(
+      <section className="admin-page" id="admin-session-settings">
         <form className="panel form" onSubmit={(event) => void saveSystemSettings(event)}>
-          <div className="panel-heading">
-            <h1>{t("admin.systemSettings")}</h1>
+          <div className="tab-actions">
             <button type="button" className="secondary" onClick={() => void refresh()}>
               {t("admin.refresh")}
             </button>
@@ -805,6 +1047,25 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
               required
             />
           </label>
+          <div className="button-row">
+            <button type="submit">{t("admin.saveSettings")}</button>
+          </div>
+        </form>
+      </section>,
+    );
+  }
+
+  if (activeTab === "auth") {
+    return renderSystemSettingsShell(
+      <section className="admin-page" id="admin-auth-settings">
+        <form className="panel form" onSubmit={(event) => void saveSystemSettings(event)}>
+          <div className="tab-actions">
+            <button type="button" className="secondary" onClick={() => void refresh()}>
+              {t("admin.refresh")}
+            </button>
+          </div>
+          {error ? <p className="error">{error}</p> : null}
+          {settingsSaved ? <p className="copy-line">{t("admin.settingsSaved")}</p> : null}
           <fieldset className="form-section">
             <legend>{t("admin.oidcSettings")}</legend>
             <label className="checkbox-row">
@@ -994,15 +1255,14 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
             <button type="submit">{t("admin.saveSettings")}</button>
           </div>
         </form>
-      </section>
+      </section>,
     );
   }
 
-  if (section === "skills") {
-    return (
+  if (activeTab === "skills") {
+    return renderSystemSettingsShell(
       <section className="admin-page" id="admin-skills">
-        <div className="panel-heading">
-          <h1>{t("admin.skillManagement")}</h1>
+        <div className="tab-actions">
           <div className="button-row">
             <button type="button" className="secondary" onClick={() => void refresh()}>
               {t("admin.refresh")}
@@ -1129,10 +1389,9 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
     );
   }
 
-  return (
+  return renderSystemSettingsShell(
     <section className="admin-page" id="admin-users">
-      <div className="panel-heading">
-        <h1>{t("admin.userManagement")}</h1>
+      <div className="tab-actions">
         <button type="button" className="secondary" onClick={() => void refresh()}>
           {t("admin.refresh")}
         </button>
@@ -1224,6 +1483,6 @@ export function AdminRoute({ apiClient, currentUser, section }: AdminRouteProps)
           </ul>
         </div>
       </div>
-    </section>
+    </section>,
   );
 }

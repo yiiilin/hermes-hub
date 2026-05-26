@@ -59,8 +59,13 @@ fn ready_model_registry() -> ModelRegistry {
         allowed_models: vec!["gpt-4.1-mini".to_string()],
         api_type: CHAT_COMPLETIONS_API_TYPE.to_string(),
         reasoning_effort: None,
+        enabled: true,
         allow_streaming: true,
         request_timeout_seconds: 60,
+        context_window_tokens: 128_000,
+        max_output_tokens: 4096,
+        temperature: 0.7,
+        supports_parallel_tools: true,
     })
 }
 
@@ -214,6 +219,10 @@ fn managed_instance_for(user_id: &str) -> HermesInstance {
         host_sandbox_path: Some("/tmp/hermes/admin/sandbox".to_string()),
         host_config_path: Some("/tmp/hermes/admin/config".to_string()),
         health_status: "healthy".to_string(),
+        status_message: None,
+        runtime_image: Some("ghcr.io/yiiilin/hermes-hub-hermes:1.2.3".to_string()),
+        runtime_version: Some("1.2.3".to_string()),
+        global_skills_write_enabled: false,
     }
 }
 
@@ -1464,6 +1473,49 @@ async fn channel_inbox_waits_briefly_when_no_runs_are_ready() {
         elapsed >= std::time::Duration::from_millis(200),
         "empty Hub inbox polls must not spin in a tight loop"
     );
+}
+
+#[tokio::test]
+async fn hermes_adapter_can_report_runtime_version_to_hub() {
+    let store = SessionStore::default();
+    let state = test_state(store.clone());
+    let app = build_router_with_state(state.clone());
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    let instance_token = "instance-runtime-version-token";
+    store
+        .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
+        .expect("instance can be bound");
+    state
+        .model_registry
+        .add_instance_token_for_instance("instance-1", instance_token)
+        .await
+        .expect("instance token can be registered");
+
+    let reported = request_raw(
+        &app,
+        Method::POST,
+        "/internal/channel/v1/instance/status",
+        "application/json",
+        br#"{"runtime_version":"0.13.7"}"#.to_vec(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, body) = response_json(reported).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["hermes_instance"]["runtime_version"], "0.13.7");
+    let stored = store
+        .hermes_instance_for_user(&user_id)
+        .await
+        .expect("reported runtime version is persisted");
+    assert_eq!(stored.runtime_version.as_deref(), Some("0.13.7"));
 }
 
 #[tokio::test]

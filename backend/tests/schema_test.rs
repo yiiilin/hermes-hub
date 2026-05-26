@@ -18,6 +18,13 @@ fn schema_migrations_include_initial_tables() {
     assert!(sql.contains("channel_runs_user_message_idx"));
     assert!(sql.contains("client_message_key text"));
     assert!(sql.contains("channel_session_messages_client_key_idx"));
+    assert!(sql.contains("context_window_tokens bigint not null default 128000"));
+    assert!(
+        sql.contains("alter table model_configs add column if not exists context_window_tokens")
+    );
+    assert!(sql.contains("max_output_tokens bigint not null default 4096"));
+    assert!(sql.contains("temperature double precision not null default 0.7"));
+    assert!(sql.contains("supports_parallel_tools boolean not null default true"));
     assert!(
         !sql.contains("\n    base_url text not null,"),
         "Hermes instances no longer store an inbound base URL"

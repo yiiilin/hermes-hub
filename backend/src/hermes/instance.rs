@@ -35,6 +35,11 @@ pub struct HermesInstance {
     pub host_sandbox_path: Option<String>,
     pub host_config_path: Option<String>,
     pub health_status: String,
+    pub status_message: Option<String>,
+    pub runtime_image: Option<String>,
+    pub runtime_version: Option<String>,
+    #[serde(skip_serializing)]
+    pub global_skills_write_enabled: bool,
 }
 
 impl HermesInstance {
@@ -58,6 +63,10 @@ impl HermesInstance {
             host_sandbox_path: Some(host_sandbox_path),
             host_config_path: Some(host_config_path),
             health_status: "unknown".to_string(),
+            status_message: None,
+            runtime_image: None,
+            runtime_version: None,
+            global_skills_write_enabled: false,
         }
     }
 }

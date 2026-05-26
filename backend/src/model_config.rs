@@ -20,8 +20,8 @@ pub const IMAGE_MODEL_CONFIG_KIND: &str = "image";
 pub const TITLE_MODEL_CONFIG_KIND: &str = "title";
 pub const MODEL_CONFIG_KINDS: [&str; 3] = [
     LLM_MODEL_CONFIG_KIND,
-    IMAGE_MODEL_CONFIG_KIND,
     TITLE_MODEL_CONFIG_KIND,
+    IMAGE_MODEL_CONFIG_KIND,
 ];
 pub const REQUIRED_RUNTIME_MODEL_CONFIG_KINDS: [&str; 2] =
     [LLM_MODEL_CONFIG_KIND, TITLE_MODEL_CONFIG_KIND];
@@ -29,10 +29,14 @@ pub const CHAT_COMPLETIONS_API_TYPE: &str = "chat_completions";
 pub const RESPONSES_API_TYPE: &str = "responses";
 pub const IMAGES_GENERATIONS_API_TYPE: &str = "images_generations";
 pub const REASONING_EFFORTS: [&str; 4] = ["minimal", "low", "medium", "high"];
+pub const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 128_000;
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 4096;
+pub const DEFAULT_TEMPERATURE: f64 = 0.7;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ModelConfig {
     pub config_kind: String,
+    pub enabled: bool,
     pub provider_name: String,
     pub provider_base_url: String,
     pub provider_api_key: String,
@@ -42,6 +46,10 @@ pub struct ModelConfig {
     pub reasoning_effort: Option<String>,
     pub allow_streaming: bool,
     pub request_timeout_seconds: u64,
+    pub context_window_tokens: u64,
+    pub max_output_tokens: u64,
+    pub temperature: f64,
+    pub supports_parallel_tools: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -82,7 +90,7 @@ pub struct InstanceTokenContext {
     pub user_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PreparedModelRequest {
     pub config: ModelConfig,
     pub body: Vec<u8>,
@@ -93,6 +101,8 @@ pub struct PreparedModelRequest {
 pub enum ModelRegistryError {
     #[error("model registry lock failed")]
     LockFailed,
+    #[error("model config is disabled")]
+    ModelDisabled,
     #[error("model is not allowed")]
     ModelNotAllowed,
     #[error("invalid model request")]
@@ -138,8 +148,13 @@ impl ModelRegistry {
             allowed_models: vec!["gpt-4.1-mini".to_string()],
             api_type: CHAT_COMPLETIONS_API_TYPE.to_string(),
             reasoning_effort: None,
+            enabled: true,
             allow_streaming: true,
             request_timeout_seconds: 60,
+            context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            temperature: DEFAULT_TEMPERATURE,
+            supports_parallel_tools: true,
         })
     }
 
@@ -342,6 +357,9 @@ impl ModelRegistry {
         api_type: &str,
     ) -> Result<PreparedModelRequest, ModelRegistryError> {
         let config = self.config_for_kind(config_kind).await?;
+        if !config.enabled {
+            return Err(ModelRegistryError::ModelDisabled);
+        }
         validate_api_type_for_kind(config_kind, api_type)?;
         let object = body
             .as_object_mut()
@@ -375,6 +393,7 @@ impl ModelRegistry {
         object.insert("model".to_string(), Value::String(model.clone()));
         if config_kind != IMAGE_MODEL_CONFIG_KIND {
             apply_reasoning_config(object, &config, api_type);
+            apply_runtime_model_defaults(object, &config, api_type);
         } else {
             sanitize_image_generation_request(object);
         }
@@ -482,8 +501,9 @@ impl PostgresModelRegistry {
     async fn active_config(&self, kind: &str) -> Result<ModelConfig, ModelRegistryError> {
         validate_config_kind(kind)?;
         let row = sqlx::query(
-                "select config_kind, provider_name, provider_base_url, provider_api_key_secret_ref, default_model, \
-                    allowed_models, api_type, reasoning_effort, allow_streaming, request_timeout_seconds \
+                "select config_kind, enabled, provider_name, provider_base_url, provider_api_key_secret_ref, default_model, \
+                    allowed_models, api_type, reasoning_effort, allow_streaming, request_timeout_seconds, \
+                    context_window_tokens, max_output_tokens, temperature, supports_parallel_tools \
              from model_configs where is_active = true and config_kind = $1 \
              order by updated_at desc limit 1",
         )
@@ -501,11 +521,13 @@ impl PostgresModelRegistry {
         let encrypted_key = encrypt_secret(&self.cipher, &config.provider_api_key);
         let updated = sqlx::query(
             "update model_configs set \
-               provider_name = $1, provider_base_url = $2, provider_api_key_secret_ref = $3, \
-               default_model = $4, allowed_models = $5, api_type = $6, reasoning_effort = $7, \
-               allow_streaming = $8, request_timeout_seconds = $9, updated_at = now() \
-             where is_active = true and config_kind = $10",
+               enabled = $1, provider_name = $2, provider_base_url = $3, provider_api_key_secret_ref = $4, \
+               default_model = $5, allowed_models = $6, api_type = $7, reasoning_effort = $8, \
+               allow_streaming = $9, request_timeout_seconds = $10, context_window_tokens = $11, \
+               max_output_tokens = $12, temperature = $13, supports_parallel_tools = $14, updated_at = now() \
+             where is_active = true and config_kind = $15",
         )
+        .bind(config.enabled)
         .bind(&config.provider_name)
         .bind(&config.provider_base_url)
         .bind(&encrypted_key)
@@ -515,6 +537,10 @@ impl PostgresModelRegistry {
         .bind(&config.reasoning_effort)
         .bind(config.allow_streaming)
         .bind(timeout_as_i32(config.request_timeout_seconds)?)
+        .bind(tokens_as_i64(config.context_window_tokens)?)
+        .bind(tokens_as_i64(config.max_output_tokens)?)
+        .bind(config.temperature)
+        .bind(config.supports_parallel_tools)
         .bind(&config.config_kind)
         .execute(&self.pool)
         .await
@@ -533,11 +559,12 @@ impl PostgresModelRegistry {
         let encrypted_key = encrypt_secret(&self.cipher, &config.provider_api_key);
         sqlx::query(
             "insert into model_configs \
-             (id, config_kind, provider_name, provider_base_url, provider_api_key_secret_ref, default_model, allowed_models, api_type, reasoning_effort, allow_streaming, request_timeout_seconds, is_active) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true)",
+             (id, config_kind, enabled, provider_name, provider_base_url, provider_api_key_secret_ref, default_model, allowed_models, api_type, reasoning_effort, allow_streaming, request_timeout_seconds, context_window_tokens, max_output_tokens, temperature, supports_parallel_tools, is_active) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, true)",
         )
         .bind(Uuid::new_v4())
         .bind(&config.config_kind)
+        .bind(config.enabled)
         .bind(&config.provider_name)
         .bind(&config.provider_base_url)
         .bind(&encrypted_key)
@@ -547,6 +574,10 @@ impl PostgresModelRegistry {
         .bind(&config.reasoning_effort)
         .bind(config.allow_streaming)
         .bind(timeout_as_i32(config.request_timeout_seconds)?)
+        .bind(tokens_as_i64(config.context_window_tokens)?)
+        .bind(tokens_as_i64(config.max_output_tokens)?)
+        .bind(config.temperature)
+        .bind(config.supports_parallel_tools)
         .execute(&self.pool)
         .await
         .map_err(|_| ModelRegistryError::DatabaseFailed)?;
@@ -562,11 +593,15 @@ pub fn is_runtime_model_config_ready(config: &ModelConfig) -> bool {
     let provider_api_key = config.provider_api_key.trim();
     let default_model = config.default_model.trim();
 
-    !provider_name.is_empty()
+    config.enabled
+        && !provider_name.is_empty()
         && !provider_base_url.is_empty()
         && !provider_api_key.is_empty()
         && !default_model.is_empty()
         && config.request_timeout_seconds > 0
+        && config.context_window_tokens > 0
+        && config.max_output_tokens > 0
+        && (0.0..=2.0).contains(&config.temperature)
         && provider_base_url != "https://provider.example/v1"
         && !matches!(
             provider_api_key,
@@ -596,6 +631,9 @@ fn row_to_model_config(
 
     normalize_model_config(ModelConfig {
         config_kind,
+        enabled: row
+            .try_get("enabled")
+            .map_err(|_| ModelRegistryError::DatabaseFailed)?,
         provider_name: row
             .try_get("provider_name")
             .map_err(|_| ModelRegistryError::DatabaseFailed)?,
@@ -618,6 +656,20 @@ fn row_to_model_config(
                 .map_err(|_| ModelRegistryError::DatabaseFailed)?,
         )
         .map_err(|_| ModelRegistryError::InvalidRequest)?,
+        context_window_tokens: u64::try_from(
+            row.try_get::<i64, _>("context_window_tokens")
+                .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS as i64),
+        )
+        .map_err(|_| ModelRegistryError::InvalidRequest)?,
+        max_output_tokens: u64::try_from(
+            row.try_get::<i64, _>("max_output_tokens")
+                .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS as i64),
+        )
+        .map_err(|_| ModelRegistryError::InvalidRequest)?,
+        temperature: row
+            .try_get::<f64, _>("temperature")
+            .unwrap_or(DEFAULT_TEMPERATURE),
+        supports_parallel_tools: row.try_get("supports_parallel_tools").unwrap_or(true),
     })
 }
 
@@ -634,6 +686,8 @@ fn default_config_set(config: ModelConfig) -> HashMap<String, ModelConfig> {
 fn default_config_for_kind(base: &ModelConfig, kind: &str) -> ModelConfig {
     let mut config = base.clone();
     config.config_kind = kind.to_string();
+    // 图片生成不是所有部署都有可用供应商；必须由管理员显式开启。
+    config.enabled = kind != IMAGE_MODEL_CONFIG_KIND;
     config.api_type = default_api_type_for_kind(kind).to_string();
 
     // 图片生成和标题生成第一版复用同一个 provider 接入形态，但各自保存独立模型名。
@@ -643,6 +697,7 @@ fn default_config_for_kind(base: &ModelConfig, kind: &str) -> ModelConfig {
     if kind != LLM_MODEL_CONFIG_KIND {
         config.allow_streaming = false;
         config.allowed_models = vec![config.default_model.clone()];
+        config.supports_parallel_tools = false;
     }
 
     normalize_model_config(config).unwrap_or_else(|_| base.clone())
@@ -660,6 +715,19 @@ fn normalize_model_config(mut config: ModelConfig) -> Result<ModelConfig, ModelR
         config.api_type = IMAGES_GENERATIONS_API_TYPE.to_string();
         config.reasoning_effort = None;
         config.allow_streaming = false;
+        config.supports_parallel_tools = false;
+    } else {
+        // 大模型和标题模型是运行时必需配置，不暴露关闭开关。
+        config.enabled = true;
+    }
+    if config.context_window_tokens == 0 {
+        config.context_window_tokens = DEFAULT_CONTEXT_WINDOW_TOKENS;
+    }
+    if config.max_output_tokens == 0 {
+        config.max_output_tokens = DEFAULT_MAX_OUTPUT_TOKENS;
+    }
+    if !(0.0..=2.0).contains(&config.temperature) {
+        return Err(ModelRegistryError::InvalidRequest);
     }
     validate_api_type_for_kind(&config.config_kind, &config.api_type)?;
     config.reasoning_effort = normalize_reasoning_effort(config.reasoning_effort)?;
@@ -692,6 +760,36 @@ fn apply_reasoning_config(object: &mut Map<String, Value>, config: &ModelConfig,
             "reasoning_effort".to_string(),
             Value::String(effort.to_string()),
         );
+    }
+}
+
+fn apply_runtime_model_defaults(
+    object: &mut Map<String, Value>,
+    config: &ModelConfig,
+    api_type: &str,
+) {
+    // 这里给 Hub 代理后的主模型请求补管理员默认值；调用方显式要求更小输出时会被保留。
+    let output_key = if api_type == RESPONSES_API_TYPE {
+        "max_output_tokens"
+    } else {
+        "max_tokens"
+    };
+    let requested_output_tokens = object.get(output_key).and_then(Value::as_u64);
+    let output_tokens = requested_output_tokens
+        .map(|requested| requested.min(config.max_output_tokens))
+        .unwrap_or(config.max_output_tokens);
+    object.insert(output_key.to_string(), json!(output_tokens));
+
+    object
+        .entry("temperature".to_string())
+        .or_insert_with(|| json!(config.temperature));
+
+    if config.supports_parallel_tools {
+        object
+            .entry("parallel_tool_calls".to_string())
+            .or_insert(Value::Bool(true));
+    } else {
+        object.remove("parallel_tool_calls");
     }
 }
 
@@ -759,6 +857,10 @@ fn parse_uuid(value: &str) -> Result<Uuid, ModelRegistryError> {
 
 fn timeout_as_i32(value: u64) -> Result<i32, ModelRegistryError> {
     i32::try_from(value).map_err(|_| ModelRegistryError::InvalidRequest)
+}
+
+fn tokens_as_i64(value: u64) -> Result<i64, ModelRegistryError> {
+    i64::try_from(value).map_err(|_| ModelRegistryError::InvalidRequest)
 }
 
 fn decrypt_config_secret(

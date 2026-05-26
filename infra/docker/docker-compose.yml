@@ -64,6 +64,18 @@ services:
     networks:
       - hermes-hub-net
 
+  hermes-runtime:
+    profiles: ["hermes-runtime"]
+    build:
+      context: .
+      dockerfile: infra/docker/hermes/Dockerfile
+      args:
+        HERMES_VERSION: ${HERMES_VERSION:-latest}
+    image: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:${HERMES_VERSION:-latest}}
+    command: ["true"]
+    networks:
+      - hermes-hub-net
+
   # 仅用于本地联调便利：当前服务使用源码挂载，不是生产镜像。
   hermes-hub-skills-fs:
     profiles: ["app-dev"]
@@ -105,7 +117,7 @@ services:
       # backend 通过宿主机 Docker daemon 创建兄弟 Hermes 容器；
       # 这里必须使用宿主机绝对路径，才能让 Docker bind mount 找到真实目录。
       HERMES_DATA_ROOT: ${PWD}/data/hub/users
-      HERMES_DOCKER_IMAGE: nousresearch/hermes-agent:latest
+      HERMES_DOCKER_IMAGE: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:${HERMES_VERSION:-latest}}
       HERMES_CONTAINER_NETWORK: hermes-hub-net
       HERMES_CONTAINER_INTERNAL_PORT: 8000
       HERMES_HUB_LLM_BASE_URL: http://hermes-hub:8080/internal/llm/v1

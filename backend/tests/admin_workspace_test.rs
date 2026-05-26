@@ -4,14 +4,129 @@ use axum::{
     response::Response,
     Router,
 };
-use hermes_hub_backend::{build_router, AppConfig};
+use hermes_hub_backend::{
+    build_router_with_state,
+    channel::service::ChannelStore,
+    docker_config_from_app,
+    hermes::docker_provisioner::{DockerRuntime, DockerRuntimeOutput},
+    llm_proxy::InMemoryLlmProviderClient,
+    model_config::{
+        ModelConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND,
+        TITLE_MODEL_CONFIG_KIND,
+    },
+    session::store::SessionStore,
+    storage::InMemoryObjectStorage,
+    AppConfig, AppState,
+};
 use serde_json::{json, Value};
-use std::io::{Cursor, Write};
+use std::{
+    io::{Cursor, Write},
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tower::ServiceExt;
 use zip::{write::SimpleFileOptions, ZipWriter};
 
 fn test_app() -> Router {
-    build_router(AppConfig::for_tests())
+    hermes_hub_backend::build_router(AppConfig::for_tests())
+}
+
+#[derive(Clone, Default)]
+struct RecordingDockerRuntime {
+    calls: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+#[async_trait::async_trait]
+impl DockerRuntime for RecordingDockerRuntime {
+    async fn run(
+        &self,
+        args: Vec<String>,
+    ) -> Result<DockerRuntimeOutput, hermes_hub_backend::hermes::provisioner::ProvisionerError>
+    {
+        self.calls.lock().expect("calls lock").push(args.clone());
+        if args.get(0).map(String::as_str) == Some("network")
+            && args.get(1).map(String::as_str) == Some("inspect")
+        {
+            return Ok(DockerRuntimeOutput {
+                success: true,
+                stdout: "network-existing".to_string(),
+                stderr: String::new(),
+            });
+        }
+        if args.get(0).map(String::as_str) == Some("image")
+            && args.get(1).map(String::as_str) == Some("inspect")
+        {
+            return Ok(DockerRuntimeOutput {
+                success: true,
+                stdout: "image-existing".to_string(),
+                stderr: String::new(),
+            });
+        }
+        if args.get(0).map(String::as_str) == Some("create") {
+            return Ok(DockerRuntimeOutput {
+                success: true,
+                stdout: "container-created".to_string(),
+                stderr: String::new(),
+            });
+        }
+        Ok(DockerRuntimeOutput {
+            success: true,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+}
+
+fn ready_model_config(kind: &str) -> ModelConfig {
+    ModelConfig {
+        config_kind: kind.to_string(),
+        enabled: true,
+        provider_name: "openai-compatible".to_string(),
+        provider_base_url: "https://models.example/v1".to_string(),
+        provider_api_key: "real-secret".to_string(),
+        default_model: "gpt-4.1-mini".to_string(),
+        allowed_models: vec!["gpt-4.1-mini".to_string()],
+        api_type: CHAT_COMPLETIONS_API_TYPE.to_string(),
+        reasoning_effort: None,
+        allow_streaming: true,
+        request_timeout_seconds: 60,
+        context_window_tokens: 128_000,
+        max_output_tokens: 4096,
+        temperature: 0.7,
+        supports_parallel_tools: true,
+    }
+}
+
+async fn app_state_with_recording_docker_runtime() -> (AppState, RecordingDockerRuntime) {
+    let mut config = AppConfig::for_tests();
+    config.skills_fs.mount_enabled = true;
+    let model_registry = ModelRegistry::new(ready_model_config(LLM_MODEL_CONFIG_KIND));
+    model_registry
+        .replace(ready_model_config(TITLE_MODEL_CONFIG_KIND))
+        .await
+        .expect("title model config is ready");
+    let runtime = RecordingDockerRuntime::default();
+    let docker_provisioner =
+        hermes_hub_backend::hermes::docker_provisioner::DockerProvisioner::new_with_runtime(
+            docker_config_from_app(&config, &ready_model_config(LLM_MODEL_CONFIG_KIND)),
+            Arc::new(runtime.clone()),
+        );
+    let state = AppState {
+        object_storage: InMemoryObjectStorage::new(config.object_storage.bucket.clone()).shared(),
+        config,
+        store: SessionStore::default(),
+        channel_store: ChannelStore::default(),
+        model_registry,
+        llm_provider: InMemoryLlmProviderClient::default().shared(),
+        docker_provisioner,
+        session_events: hermes_hub_backend::channel::events::SessionEventHub::default(),
+    };
+    (state, runtime)
+}
+
+async fn app_with_recording_docker_runtime() -> (Router, RecordingDockerRuntime) {
+    let (state, runtime) = app_state_with_recording_docker_runtime().await;
+    (build_router_with_state(state), runtime)
 }
 
 async fn request_json(
@@ -112,6 +227,13 @@ fn cookie_from(response: &Response<Body>) -> String {
         .to_string()
 }
 
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after unix epoch")
+        .as_secs()
+}
+
 fn multipart_text(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
     body.extend_from_slice(
         format!(
@@ -200,6 +322,222 @@ async fn bootstrap_admin(app: &Router) -> String {
 }
 
 #[tokio::test]
+async fn admin_hermes_gets_writable_global_skills_mount_but_regular_users_do_not() {
+    let (app, runtime) = app_with_recording_docker_runtime().await;
+    let admin_cookie = bootstrap_admin(&app).await;
+
+    let users = request_empty(&app, Method::GET, "/api/admin/users", Some(&admin_cookie)).await;
+    let (_, users_body) = response_json(users).await;
+    let admin_id = users_body["users"][0]["id"].as_str().expect("admin id");
+
+    let admin_create = request_empty(
+        &app,
+        Method::POST,
+        &format!("/api/admin/users/{admin_id}/hermes-instance/create-managed"),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(admin_create.status(), StatusCode::OK);
+    let admin_calls = runtime.calls.lock().expect("calls lock").clone();
+    assert!(
+        admin_calls.iter().any(|args| {
+            args.first().map(String::as_str) == Some("create")
+                && args.windows(2).any(|pair| {
+                    pair[0] == "--mount"
+                        && pair[1].contains("dst=/hub-managed-skills")
+                        && !pair[1].contains("readonly")
+                })
+        }),
+        "admin Hermes must mount global skills read-write"
+    );
+
+    runtime.calls.lock().expect("calls lock").clear();
+    let admin_rebuild = request_empty(
+        &app,
+        Method::POST,
+        &format!("/api/admin/users/{admin_id}/hermes-instance/rebuild-managed"),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(admin_rebuild.status(), StatusCode::OK);
+    let admin_rebuild_calls = runtime.calls.lock().expect("calls lock").clone();
+    assert!(
+        admin_rebuild_calls.iter().any(|args| {
+            args.first().map(String::as_str) == Some("create")
+                && args.windows(2).any(|pair| {
+                    pair[0] == "--mount"
+                        && pair[1].contains("dst=/hub-managed-skills")
+                        && !pair[1].contains("readonly")
+                })
+        }),
+        "rebuilt admin Hermes must keep global skills read-write"
+    );
+
+    runtime.calls.lock().expect("calls lock").clear();
+    let invite = request_json(
+        &app,
+        Method::POST,
+        "/api/invites",
+        json!({
+            "expires_at": unix_now() + 86_400,
+            "max_uses": 1
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, invite_body) = response_json(invite).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let register = request_json(
+        &app,
+        Method::POST,
+        "/api/auth/register",
+        json!({
+            "invite_token": invite_body["token"],
+            "email": "user@example.com",
+            "password": "user-password-123"
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(register.status(), StatusCode::CREATED);
+
+    let user_calls = runtime.calls.lock().expect("calls lock").clone();
+    assert!(
+        user_calls.iter().any(|args| {
+            args.first().map(String::as_str) == Some("create")
+                && args.windows(2).any(|pair| {
+                    pair[0] == "--mount"
+                        && pair[1]
+                            == "type=volume,src=hermes-hub-managed-skills-test,dst=/hub-managed-skills,volume-driver=local,readonly"
+                })
+        }),
+        "regular Hermes must keep global skills readonly"
+    );
+}
+
+#[tokio::test]
+async fn admin_rebuild_managed_hermes_keeps_global_skills_writable() {
+    let (state, runtime) = app_state_with_recording_docker_runtime().await;
+    let app = build_router_with_state(state.clone());
+    let admin_cookie = bootstrap_admin(&app).await;
+
+    let users = request_empty(&app, Method::GET, "/api/admin/users", Some(&admin_cookie)).await;
+    let (_, users_body) = response_json(users).await;
+    let admin_id = users_body["users"][0]["id"].as_str().expect("admin id");
+
+    let created = request_empty(
+        &app,
+        Method::POST,
+        &format!("/api/admin/users/{admin_id}/hermes-instance/create-managed"),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+
+    // Postgres 不持久化这个运行时权限位；测试里主动清掉，复现从存储重新读取后的实例形态。
+    let mut stored_instance = state
+        .store
+        .hermes_instance_for_user(admin_id)
+        .await
+        .expect("admin Hermes instance is stored");
+    stored_instance.global_skills_write_enabled = false;
+    state
+        .store
+        .bind_hermes_instance(stored_instance)
+        .await
+        .expect("stored instance can be rebound");
+
+    runtime.calls.lock().expect("calls lock").clear();
+    let rebuilt = request_empty(
+        &app,
+        Method::POST,
+        &format!("/api/admin/users/{admin_id}/hermes-instance/rebuild-managed"),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(rebuilt.status(), StatusCode::OK);
+
+    let calls = runtime.calls.lock().expect("calls lock").clone();
+    assert!(
+        calls.iter().any(|args| {
+            args.first().map(String::as_str) == Some("create")
+                && args.windows(2).any(|pair| {
+                    pair[0] == "--mount"
+                        && pair[1]
+                            == "type=volume,src=hermes-hub-managed-skills-test-rw,dst=/hub-managed-skills,volume-driver=local"
+                })
+        }),
+        "admin rebuild must preserve writable global skills mount"
+    );
+}
+
+#[tokio::test]
+async fn regular_user_rebuild_managed_hermes_keeps_global_skills_readonly() {
+    let (app, runtime) = app_with_recording_docker_runtime().await;
+    let admin_cookie = bootstrap_admin(&app).await;
+
+    let invite = request_json(
+        &app,
+        Method::POST,
+        "/api/invites",
+        json!({
+            "expires_at": unix_now() + 86_400,
+            "max_uses": 1
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, invite_body) = response_json(invite).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let registered = request_json(
+        &app,
+        Method::POST,
+        "/api/auth/register",
+        json!({
+            "invite_token": invite_body["token"],
+            "email": "regular-rebuild@example.com",
+            "password": "user-password-123"
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(registered.status(), StatusCode::CREATED);
+
+    let users = request_empty(&app, Method::GET, "/api/admin/users", Some(&admin_cookie)).await;
+    let (_, users_body) = response_json(users).await;
+    let user_id = users_body["users"]
+        .as_array()
+        .expect("users list")
+        .iter()
+        .find(|user| user["email"] == "regular-rebuild@example.com")
+        .and_then(|user| user["id"].as_str())
+        .expect("regular user id");
+
+    runtime.calls.lock().expect("calls lock").clear();
+    let rebuilt = request_empty(
+        &app,
+        Method::POST,
+        &format!("/api/admin/users/{user_id}/hermes-instance/rebuild-managed"),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(rebuilt.status(), StatusCode::OK);
+
+    let calls = runtime.calls.lock().expect("calls lock").clone();
+    assert!(
+        calls.iter().any(|args| {
+            args.first().map(String::as_str) == Some("create")
+                && args.windows(2).any(|pair| {
+                    pair[0] == "--mount"
+                        && pair[1]
+                            == "type=volume,src=hermes-hub-managed-skills-test,dst=/hub-managed-skills,volume-driver=local,readonly"
+                })
+        }),
+        "regular user rebuild must keep global skills readonly"
+    );
+}
+
+#[tokio::test]
 async fn admin_workspace_test() {
     let app = test_app();
     let admin_cookie = bootstrap_admin(&app).await;
@@ -232,7 +570,11 @@ async fn admin_workspace_test() {
             "api_type": "responses",
             "reasoning_effort": "medium",
             "allow_streaming": true,
-            "request_timeout_seconds": 30
+            "request_timeout_seconds": 30,
+            "context_window_tokens": 200000,
+            "max_output_tokens": 8192,
+            "temperature": 0.3,
+            "supports_parallel_tools": true
         }),
         Some(&admin_cookie),
     )
@@ -253,6 +595,10 @@ async fn admin_workspace_test() {
     assert_eq!(body["model_config"]["provider_api_key"], "secret-v2");
     assert_eq!(body["model_config"]["api_type"], "responses");
     assert_eq!(body["model_config"]["reasoning_effort"], "medium");
+    assert_eq!(body["model_config"]["context_window_tokens"], 200000);
+    assert_eq!(body["model_config"]["max_output_tokens"], 8192);
+    assert_eq!(body["model_config"]["temperature"], 0.3);
+    assert_eq!(body["model_config"]["supports_parallel_tools"], true);
 
     let status_response = request_empty(
         &app,
@@ -311,6 +657,7 @@ async fn admin_workspace_test() {
         "/api/admin/model-config",
         json!({
             "config_kind": "image",
+            "enabled": true,
             "provider_name": "custom",
             "provider_base_url": "https://models.example/v1",
             "provider_api_key": "image-secret-v2",

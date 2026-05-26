@@ -18,21 +18,26 @@ use std::{
 use zip::ZipArchive;
 
 use crate::{
-    domain::user::{PublicUser, UserListItem},
+    domain::user::{PublicUser, UserListItem, UserRole},
     hermes::{
+        docker_provisioner::RuntimeModelSettings,
         instance::{HermesInstance, HermesInstanceKind},
-        provisioner::{HermesProvisioner, ProvisionerError},
+        provisioner::HermesProvisioner,
     },
     http::{
         auth::require_admin,
-        workspace::{ensure_managed_hermes_for_user, ensure_required_model_configs},
+        map_provisioner_error,
+        workspace::{
+            ensure_managed_hermes_for_user, ensure_required_model_configs,
+            refresh_managed_hermes_status,
+        },
         ApiError,
     },
     llm_proxy::{LlmProviderError, LlmProviderRequest},
     model_config::{
         default_api_type_for_kind, validate_api_type_for_kind, ModelConfig,
-        CHAT_COMPLETIONS_API_TYPE, IMAGE_MODEL_CONFIG_KIND, LLM_MODEL_CONFIG_KIND,
-        RESPONSES_API_TYPE,
+        CHAT_COMPLETIONS_API_TYPE, DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS,
+        DEFAULT_TEMPERATURE, IMAGE_MODEL_CONFIG_KIND, LLM_MODEL_CONFIG_KIND, RESPONSES_API_TYPE,
     },
     session::store::SystemSettings,
     skills_fs::normalize_skills_path,
@@ -129,6 +134,7 @@ struct ModelConfigResponse {
 #[derive(Deserialize)]
 struct UpdateModelConfigRequest {
     config_kind: Option<String>,
+    enabled: Option<bool>,
     provider_name: String,
     provider_base_url: String,
     provider_api_key: String,
@@ -138,6 +144,10 @@ struct UpdateModelConfigRequest {
     reasoning_effort: Option<String>,
     allow_streaming: bool,
     request_timeout_seconds: u64,
+    context_window_tokens: Option<u64>,
+    max_output_tokens: Option<u64>,
+    temperature: Option<f64>,
+    supports_parallel_tools: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -275,7 +285,14 @@ async fn list_hermes_instances(
         .list_hermes_instances()
         .await
         .map_err(|_| ApiError::Internal)?;
-    Ok(Json(HermesInstancesResponse { hermes_instances }))
+    let mut refreshed_instances = Vec::with_capacity(hermes_instances.len());
+    for instance in hermes_instances {
+        // 管理员列表是运维入口，返回前主动同步 Docker 真实状态，避免 stale running 误导排障。
+        refreshed_instances.push(refresh_managed_hermes_status(&state, instance).await?);
+    }
+    Ok(Json(HermesInstancesResponse {
+        hermes_instances: refreshed_instances,
+    }))
 }
 
 async fn create_managed_hermes_instance(
@@ -315,12 +332,15 @@ async fn rebuild_managed_hermes_instance(
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
     ensure_required_model_configs(&state).await?;
-    let instance = state
+    let mut instance = state
         .store
         .hermes_instance_for_user(&user_id)
         .await
         .map_err(|_| ApiError::NotFound("hermes instance not found"))?;
     ensure_hub_managed_instance(&instance)?;
+    // store 中不持久化全局 skills 写权限；管理员重建前必须按用户角色恢复，避免管理员实例被只读挂载。
+    instance.global_skills_write_enabled =
+        user_has_global_skills_write_access_for_rebuild(&state, &user_id).await?;
     state
         .model_registry
         .revoke_instance_tokens_for_instance(&instance.id)
@@ -341,14 +361,16 @@ async fn rebuild_managed_hermes_instance(
         .config_for_kind(IMAGE_MODEL_CONFIG_KIND)
         .await
         .map_err(|_| ApiError::Internal)?;
+    let image_model = image_config
+        .enabled
+        .then_some(image_config.default_model.as_str());
     let instance = state
         .docker_provisioner
         .rebuild_instance_with_default_model(
             &instance,
             &llm_api_key,
-            &llm_config.default_model,
-            &image_config.default_model,
-            &llm_config.api_type,
+            &runtime_model_settings(&llm_config),
+            image_model,
         )
         .await
         .map_err(map_provisioner_error)?;
@@ -365,6 +387,22 @@ async fn rebuild_managed_hermes_instance(
     Ok(Json(HermesInstanceResponse {
         hermes_instance: instance,
     }))
+}
+
+async fn user_has_global_skills_write_access_for_rebuild(
+    state: &AppState,
+    user_id: &str,
+) -> Result<bool, ApiError> {
+    let users = state
+        .store
+        .list_users()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    users
+        .iter()
+        .find(|user| user.id == user_id)
+        .map(|user| user.role == UserRole::Admin)
+        .ok_or(ApiError::NotFound("user not found"))
 }
 
 async fn stop_managed_hermes_instance(
@@ -730,6 +768,18 @@ async fn model_config_from_payload(
     } else {
         payload.provider_api_key
     };
+    let existing_config = state
+        .model_registry
+        .config_for_kind(&config_kind)
+        .await
+        .ok();
+    let enabled = match payload.enabled {
+        Some(enabled) => enabled,
+        None => existing_config
+            .as_ref()
+            .map(|config| config.enabled)
+            .unwrap_or(config_kind != IMAGE_MODEL_CONFIG_KIND),
+    };
 
     Ok(ModelConfig {
         api_type: payload
@@ -737,6 +787,7 @@ async fn model_config_from_payload(
             .unwrap_or_else(|| default_api_type_for_kind(&config_kind).to_string()),
         reasoning_effort: payload.reasoning_effort,
         config_kind,
+        enabled,
         provider_name: payload.provider_name,
         provider_base_url: payload.provider_base_url,
         provider_api_key,
@@ -744,7 +795,46 @@ async fn model_config_from_payload(
         allowed_models: payload.allowed_models.unwrap_or_default(),
         allow_streaming: payload.allow_streaming,
         request_timeout_seconds: payload.request_timeout_seconds,
+        context_window_tokens: payload
+            .context_window_tokens
+            .or_else(|| {
+                existing_config
+                    .as_ref()
+                    .map(|config| config.context_window_tokens)
+            })
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS),
+        max_output_tokens: payload
+            .max_output_tokens
+            .or_else(|| {
+                existing_config
+                    .as_ref()
+                    .map(|config| config.max_output_tokens)
+            })
+            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
+        temperature: payload
+            .temperature
+            .or_else(|| existing_config.as_ref().map(|config| config.temperature))
+            .unwrap_or(DEFAULT_TEMPERATURE),
+        supports_parallel_tools: payload
+            .supports_parallel_tools
+            .or_else(|| {
+                existing_config
+                    .as_ref()
+                    .map(|config| config.supports_parallel_tools)
+            })
+            .unwrap_or(true),
     })
+}
+
+fn runtime_model_settings(config: &ModelConfig) -> RuntimeModelSettings {
+    RuntimeModelSettings {
+        default_model: config.default_model.clone(),
+        api_mode: config.api_type.clone(),
+        context_window_tokens: config.context_window_tokens,
+        max_output_tokens: config.max_output_tokens,
+        temperature: config.temperature,
+        supports_parallel_tools: config.supports_parallel_tools,
+    }
 }
 
 fn managed_skills_prefix(state: &AppState) -> Result<String, ApiError> {
@@ -1219,17 +1309,4 @@ fn ensure_hub_managed_instance(instance: &HermesInstance) -> Result<(), ApiError
     }
 
     Ok(())
-}
-
-fn map_provisioner_error(error: ProvisionerError) -> ApiError {
-    match error {
-        ProvisionerError::InstanceNotFound => ApiError::NotFound("hermes container not found"),
-        ProvisionerError::InvalidManagedInstance => {
-            ApiError::Conflict("hermes instance is not managed by docker")
-        }
-        ProvisionerError::LockFailed
-        | ProvisionerError::Filesystem(_)
-        | ProvisionerError::DockerRuntime(_)
-        | ProvisionerError::DockerCommand(_) => ApiError::Internal,
-    }
 }

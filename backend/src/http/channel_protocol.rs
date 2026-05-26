@@ -56,6 +56,10 @@ pub fn router() -> Router<AppState> {
             "/internal/channel/v1/attachments/{attachment_id}/download",
             get(download_input_attachment),
         )
+        .route(
+            "/internal/channel/v1/instance/status",
+            post(report_instance_status),
+        )
 }
 
 #[derive(Deserialize)]
@@ -86,6 +90,12 @@ struct AckRunRequest {
     output_message_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct InstanceStatusReportRequest {
+    runtime_image: Option<String>,
+    runtime_version: Option<String>,
+}
+
 #[derive(Serialize)]
 struct MessageResponse {
     message: ChannelMessage,
@@ -114,6 +124,11 @@ struct InboxItem {
 #[derive(Serialize)]
 struct RunResponse {
     run: ChannelRun,
+}
+
+#[derive(Serialize)]
+struct HermesInstanceResponse {
+    hermes_instance: crate::hermes::instance::HermesInstance,
 }
 
 async fn deliver_message(
@@ -434,6 +449,31 @@ async fn update_run_status(
     Ok(Json(RunResponse { run }))
 }
 
+async fn report_instance_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<InstanceStatusReportRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let token_context = verify_instance_token(&state, &headers).await?;
+    let instance_id = token_context
+        .hermes_instance_id
+        .as_deref()
+        .ok_or(ApiError::Unauthorized)?;
+    let runtime_image = clean_runtime_report_value(payload.runtime_image, 512);
+    let runtime_version = clean_runtime_version_report_value(payload.runtime_version, 128);
+    if runtime_image.is_none() && runtime_version.is_none() {
+        return Err(ApiError::BadRequest("runtime status report is empty"));
+    }
+
+    // adapter 从 Hermes 容器内部上送真实版本；Docker 镜像 tag 只作为未上报前的兜底。
+    let hermes_instance = state
+        .store
+        .update_hermes_instance_runtime(instance_id, runtime_image, runtime_version)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    Ok(Json(HermesInstanceResponse { hermes_instance }))
+}
+
 async fn download_input_attachment(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -469,6 +509,17 @@ async fn download_input_attachment(
         HeaderValue::from_str(&attachment.content_type).map_err(|_| ApiError::Internal)?,
     );
     Ok(response)
+}
+
+fn clean_runtime_report_value(value: Option<String>, max_len: usize) -> Option<String> {
+    value
+        .map(|value| value.trim().chars().take(max_len).collect::<String>())
+        .filter(|value| !value.is_empty())
+}
+
+fn clean_runtime_version_report_value(value: Option<String>, max_len: usize) -> Option<String> {
+    // latest 只是镜像滚动标签，不是可追溯的 Hermes 发布版本。
+    clean_runtime_report_value(value, max_len).filter(|value| value != "latest")
 }
 
 async fn verify_instance_token(

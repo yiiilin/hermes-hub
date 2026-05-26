@@ -69,6 +69,9 @@ export type HermesInstance = {
   name?: string;
   container_id?: string | null;
   health_status?: string;
+  status_message?: string | null;
+  runtime_image?: string | null;
+  runtime_version?: string | null;
 };
 
 export type ModelConfigKind = "llm" | "image" | "title";
@@ -77,6 +80,7 @@ export type ReasoningEffort = "minimal" | "low" | "medium" | "high";
 
 export type ModelConfig = {
   config_kind: ModelConfigKind;
+  enabled: boolean;
   provider_name: string;
   provider_base_url: string;
   provider_api_key?: string;
@@ -86,6 +90,10 @@ export type ModelConfig = {
   reasoning_effort?: ReasoningEffort | null;
   allow_streaming: boolean;
   request_timeout_seconds: number;
+  context_window_tokens: number;
+  max_output_tokens: number;
+  temperature: number;
+  supports_parallel_tools: boolean;
 };
 
 export type ModelConfigStatus = {
@@ -426,10 +434,44 @@ async function updateModelConfigRequest(config: ModelConfig): Promise<void> {
 function normalizedModelConfig(config: ModelConfig): ModelConfig {
   return {
     ...config,
+    enabled: config.config_kind === "image" ? config.enabled : true,
     api_type: config.config_kind === "image" ? "images_generations" : config.api_type,
     reasoning_effort: config.config_kind === "image" ? null : config.reasoning_effort,
+    context_window_tokens: positiveNumberOrDefault(config.context_window_tokens, 128000),
+    max_output_tokens: positiveNumberOrDefault(config.max_output_tokens, 4096),
+    temperature: boundedNumberOrDefault(config.temperature, 0.7, 0, 2),
+    supports_parallel_tools:
+      config.config_kind === "llm" ? config.supports_parallel_tools !== false : false,
     allowed_models: [config.default_model],
   };
+}
+
+function modelConfigFromPayload(config: ModelConfig): ModelConfig {
+  return {
+    ...config,
+    enabled: config.config_kind === "image" ? Boolean(config.enabled) : true,
+    context_window_tokens: positiveNumberOrDefault(config.context_window_tokens, 128000),
+    max_output_tokens: positiveNumberOrDefault(config.max_output_tokens, 4096),
+    temperature: boundedNumberOrDefault(config.temperature, 0.7, 0, 2),
+    supports_parallel_tools:
+      config.config_kind === "llm" ? config.supports_parallel_tools !== false : false,
+  };
+}
+
+function positiveNumberOrDefault(value: number | undefined, fallback: number) {
+  return Number.isFinite(value) && Number(value) > 0 ? Number(value) : fallback;
+}
+
+function boundedNumberOrDefault(
+  value: number | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+) {
+  if (!Number.isFinite(value)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, Number(value)));
 }
 
 function managedSkillUrl(path: string): string {
@@ -712,10 +754,12 @@ export function createApiClient(): ApiClient {
       const payload = await request<ModelConfigStatus>(
         "/api/admin/model-config",
       );
-      const modelConfigs = payload.model_configs ?? [payload.model_config];
+      const modelConfigs = (payload.model_configs ?? [payload.model_config]).map(
+        modelConfigFromPayload,
+      );
       return {
         ...payload,
-        model_config: payload.model_config,
+        model_config: modelConfigFromPayload(payload.model_config),
         model_configs: modelConfigs,
         required_models_ready: payload.required_models_ready ?? false,
         missing_required_model_config_kinds:
@@ -1024,6 +1068,8 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     user_id: "user-1",
     kind: "managed_docker",
     status: "running",
+    runtime_image: "ghcr.io/yiiilin/hermes-hub-hermes:latest",
+    runtime_version: null,
   };
   let modelConfig: ModelConfig = {
     config_kind: "llm",
@@ -1034,14 +1080,20 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     allowed_models: ["gpt-4.1-mini"],
     api_type: "chat_completions",
     reasoning_effort: null,
+    enabled: true,
     allow_streaming: true,
     request_timeout_seconds: 60,
+    context_window_tokens: 128000,
+    max_output_tokens: 4096,
+    temperature: 0.7,
+    supports_parallel_tools: true,
   };
   let modelConfigs: ModelConfig[] = [
     modelConfig,
     {
       ...modelConfig,
       config_kind: "image",
+      enabled: false,
       default_model: "gpt-image-1",
       allowed_models: ["gpt-image-1"],
       api_type: "images_generations",
@@ -1051,6 +1103,7 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     {
       ...modelConfig,
       config_kind: "title",
+      enabled: true,
       api_type: "chat_completions",
       allow_streaming: false,
     },
@@ -1203,6 +1256,8 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
         user_id: userId,
         kind: "managed_docker",
         status: "running",
+        runtime_image: "ghcr.io/yiiilin/hermes-hub-hermes:latest",
+        runtime_version: null,
       };
       return instance;
     },

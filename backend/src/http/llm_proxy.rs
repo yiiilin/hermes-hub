@@ -191,6 +191,7 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
 
 fn map_model_error(error: ModelRegistryError) -> ApiError {
     match error {
+        ModelRegistryError::ModelDisabled => ApiError::Conflict("model config is disabled"),
         ModelRegistryError::ModelNotAllowed => ApiError::Forbidden,
         ModelRegistryError::InvalidRequest => ApiError::BadRequest("invalid model request"),
         ModelRegistryError::StreamingDisabled => ApiError::Forbidden,

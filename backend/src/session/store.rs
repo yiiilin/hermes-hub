@@ -731,11 +731,11 @@ impl SessionStore {
                     insert into hermes_instances (
                         id, user_id, kind, status, name, api_token_secret_ref,
                         container_id, host_workspace_path, host_sandbox_path, host_config_path,
-                        health_status, updated_at
+                        health_status, status_message, runtime_image, runtime_version, updated_at
                     )
                     values (
                         $1::uuid, $2::uuid, $3, $4, $5, $6,
-                        $7, $8, $9, $10, $11, now()
+                        $7, $8, $9, $10, $11, $12, $13, $14, now()
                     )
                     on conflict (user_id) do update
                     set id = excluded.id,
@@ -748,6 +748,9 @@ impl SessionStore {
                         host_sandbox_path = excluded.host_sandbox_path,
                         host_config_path = excluded.host_config_path,
                         health_status = excluded.health_status,
+                        status_message = excluded.status_message,
+                        runtime_image = excluded.runtime_image,
+                        runtime_version = excluded.runtime_version,
                         updated_at = now()
                     "#,
                 )
@@ -762,6 +765,9 @@ impl SessionStore {
                 .bind(&instance.host_sandbox_path)
                 .bind(&instance.host_config_path)
                 .bind(&instance.health_status)
+                .bind(&instance.status_message)
+                .bind(&instance.runtime_image)
+                .bind(&instance.runtime_version)
                 .execute(pool)
                 .await
                 .map_err(|_| StoreError::DatabaseFailed)?;
@@ -860,11 +866,74 @@ impl SessionStore {
                               host_workspace_path,
                               host_sandbox_path,
                               host_config_path,
-                              health_status
+                              health_status,
+                              status_message,
+                              runtime_image,
+                              runtime_version
                     "#,
                 )
                 .bind(user_id)
                 .bind(hermes_status_as_str(&status))
+                .fetch_optional(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?
+                .ok_or(StoreError::InviteNotFound)?;
+
+                row_to_hermes_instance(&row, cipher)
+            }),
+        }
+    }
+
+    pub async fn update_hermes_instance_runtime(
+        &self,
+        instance_id: &str,
+        runtime_image: Option<String>,
+        runtime_version: Option<String>,
+    ) -> Result<HermesInstance, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let instance = inner
+                    .hermes_instances_by_user_id
+                    .values_mut()
+                    .find(|instance| instance.id == instance_id)
+                    .ok_or(StoreError::InviteNotFound)?;
+                // adapter 上报是运行态事实；空字段表示本次不更新，不能清掉已有兜底值。
+                if runtime_image.is_some() {
+                    instance.runtime_image = runtime_image;
+                }
+                if runtime_version.is_some() {
+                    instance.runtime_version = runtime_version;
+                }
+                Ok(instance.clone())
+            }
+            SessionStoreBackend::Postgres { pool, cipher } => block_on_db(async {
+                let row = sqlx::query(
+                    r#"
+                    update hermes_instances
+                    set runtime_image = coalesce($2, runtime_image),
+                        runtime_version = coalesce($3, runtime_version),
+                        updated_at = now()
+                    where id = $1::uuid
+                    returning id::text as id,
+                              user_id::text as user_id,
+                              kind,
+                              status,
+                              name,
+                              api_token_secret_ref,
+                              container_id,
+                              host_workspace_path,
+                              host_sandbox_path,
+                              host_config_path,
+                              health_status,
+                              status_message,
+                              runtime_image,
+                              runtime_version
+                    "#,
+                )
+                .bind(instance_id)
+                .bind(runtime_image)
+                .bind(runtime_version)
                 .fetch_optional(pool)
                 .await
                 .map_err(|_| StoreError::DatabaseFailed)?
@@ -1513,7 +1582,10 @@ fn hermes_instance_select(prefix: &str, filter: &str, suffix: &str) -> String {
            host_workspace_path,
            host_sandbox_path,
            host_config_path,
-           health_status
+           health_status,
+           status_message,
+           runtime_image,
+           runtime_version
            from hermes_instances
            {filter}
            {suffix}"#
@@ -1624,6 +1696,16 @@ fn row_to_hermes_instance(
         health_status: row
             .try_get("health_status")
             .map_err(|_| StoreError::DatabaseFailed)?,
+        status_message: row
+            .try_get("status_message")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        runtime_image: row
+            .try_get("runtime_image")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        runtime_version: row
+            .try_get("runtime_version")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        global_skills_write_enabled: false,
     })
 }
 

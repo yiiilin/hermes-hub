@@ -8,8 +8,12 @@ use axum::{
 use serde::Serialize;
 
 use crate::{
-    hermes::instance::{HermesInstance, HermesInstanceKind},
-    http::{auth::current_user, ApiError},
+    domain::user::UserRole,
+    hermes::{
+        docker_provisioner::RuntimeModelSettings,
+        instance::{HermesInstance, HermesInstanceKind},
+    },
+    http::{auth::current_user, map_provisioner_error, ApiError},
     model_config::IMAGE_MODEL_CONFIG_KIND,
     AppState,
 };
@@ -39,7 +43,10 @@ async fn status(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = current_user(&state, &headers).await?;
-    let hermes_instance = state.store.hermes_instance_for_user(&user.id).await.ok();
+    let hermes_instance = match state.store.hermes_instance_for_user(&user.id).await {
+        Ok(instance) => Some(refresh_managed_hermes_status(&state, instance).await?),
+        Err(_) => None,
+    };
 
     Ok(Json(WorkspaceStatusResponse { hermes_instance }))
 }
@@ -76,8 +83,11 @@ pub async fn ensure_managed_hermes_for_user(
     state: &AppState,
     user_id: &str,
 ) -> Result<HermesInstance, ApiError> {
+    let global_skills_write_enabled = user_has_global_skills_write_access(state, user_id).await?;
     if let Ok(instance) = state.store.hermes_instance_for_user(user_id).await {
         if instance.kind == HermesInstanceKind::ManagedDocker {
+            let mut instance = instance;
+            instance.global_skills_write_enabled = global_skills_write_enabled;
             ensure_required_model_configs(state).await?;
             let llm_config = state
                 .model_registry
@@ -89,6 +99,9 @@ pub async fn ensure_managed_hermes_for_user(
                 .config_for_kind(IMAGE_MODEL_CONFIG_KIND)
                 .await
                 .map_err(|_| ApiError::Internal)?;
+            let image_model = image_config
+                .enabled
+                .then_some(image_config.default_model.as_str());
             // 数据库里的容器状态可能滞后于 Docker daemon；ensure 操作会幂等检查并启动容器。
             let llm_api_key = match instance.api_token_secret_ref.as_deref() {
                 Some(existing_token) => {
@@ -110,12 +123,11 @@ pub async fn ensure_managed_hermes_for_user(
                 .ensure_container_with_default_model(
                     &instance,
                     &llm_api_key,
-                    &llm_config.default_model,
-                    &image_config.default_model,
-                    &llm_config.api_type,
+                    &runtime_model_settings(&llm_config),
+                    image_model,
                 )
                 .await
-                .map_err(|_| ApiError::Internal)?;
+                .map_err(map_provisioner_error)?;
             state
                 .store
                 .bind_hermes_instance(ensured.clone())
@@ -142,7 +154,11 @@ pub async fn ensure_managed_hermes_for_user(
         .config_for_kind(IMAGE_MODEL_CONFIG_KIND)
         .await
         .map_err(|_| ApiError::Internal)?;
-    let instance = state.docker_provisioner.prepare_instance(user_id);
+    let image_model = image_config
+        .enabled
+        .then_some(image_config.default_model.as_str());
+    let mut instance = state.docker_provisioner.prepare_instance(user_id);
+    instance.global_skills_write_enabled = global_skills_write_enabled;
     state
         .store
         .bind_hermes_instance(instance.clone())
@@ -163,12 +179,11 @@ pub async fn ensure_managed_hermes_for_user(
         .ensure_container_with_default_model(
             &instance,
             &llm_api_key,
-            &llm_config.default_model,
-            &image_config.default_model,
-            &llm_config.api_type,
+            &runtime_model_settings(&llm_config),
+            image_model,
         )
         .await
-        .map_err(|_| ApiError::Internal)?;
+        .map_err(map_provisioner_error)?;
     state
         .store
         .bind_hermes_instance(instance.clone())
@@ -183,6 +198,55 @@ pub async fn ensure_managed_hermes_for_user(
     Ok(instance)
 }
 
+async fn user_has_global_skills_write_access(
+    state: &AppState,
+    user_id: &str,
+) -> Result<bool, ApiError> {
+    let users = state
+        .store
+        .list_users()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    users
+        .iter()
+        .find(|user| user.id == user_id)
+        .map(|user| user.role == UserRole::Admin)
+        .ok_or(ApiError::NotFound("user not found"))
+}
+
+pub async fn refresh_managed_hermes_status(
+    state: &AppState,
+    instance: HermesInstance,
+) -> Result<HermesInstance, ApiError> {
+    if instance.kind != HermesInstanceKind::ManagedDocker {
+        return Ok(instance);
+    }
+
+    // UI 展示必须以 Docker daemon 的当前事实为准，不能只相信数据库里上次写入的状态。
+    let refreshed = state
+        .docker_provisioner
+        .refresh_instance_status(&instance)
+        .await
+        .map_err(map_provisioner_error)?;
+    state
+        .store
+        .bind_hermes_instance(refreshed.clone())
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    Ok(refreshed)
+}
+
+fn runtime_model_settings(config: &crate::model_config::ModelConfig) -> RuntimeModelSettings {
+    RuntimeModelSettings {
+        default_model: config.default_model.clone(),
+        api_mode: config.api_type.clone(),
+        context_window_tokens: config.context_window_tokens,
+        max_output_tokens: config.max_output_tokens,
+        temperature: config.temperature,
+        supports_parallel_tools: config.supports_parallel_tools,
+    }
+}
+
 async fn current_hermes_instance(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -193,6 +257,7 @@ async fn current_hermes_instance(
         .hermes_instance_for_user(&user.id)
         .await
         .map_err(|_| ApiError::NotFound("hermes instance not found"))?;
+    let hermes_instance = refresh_managed_hermes_status(&state, hermes_instance).await?;
 
     Ok(Json(HermesInstanceResponse { hermes_instance }))
 }

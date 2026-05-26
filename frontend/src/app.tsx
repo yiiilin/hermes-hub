@@ -76,20 +76,8 @@ function AppContent({ apiClient }: Required<AppProps>) {
         apiClient={apiClient}
         onOpenChat={() => setActiveView("chat")}
       />
-      {user.role === "admin" && activeView === "admin-users" ? (
-        <AdminRoute apiClient={apiClient} currentUser={user} section="users" />
-      ) : null}
-      {user.role === "admin" && activeView === "admin-models" ? (
-        <AdminRoute apiClient={apiClient} currentUser={user} section="models" />
-      ) : null}
-      {user.role === "admin" && activeView === "admin-hermes" ? (
-        <AdminRoute apiClient={apiClient} currentUser={user} section="hermes" />
-      ) : null}
-      {user.role === "admin" && activeView === "admin-skills" ? (
-        <AdminRoute apiClient={apiClient} currentUser={user} section="skills" />
-      ) : null}
       {user.role === "admin" && activeView === "admin-settings" ? (
-        <AdminRoute apiClient={apiClient} currentUser={user} section="settings" />
+        <AdminRoute apiClient={apiClient} currentUser={user} />
       ) : null}
     </Layout>
   );

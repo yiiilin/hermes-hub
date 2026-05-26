@@ -1,4 +1,4 @@
-use hermes_hub_backend::skills_fs::{normalize_skills_path, ReadonlySkillsFs};
+use hermes_hub_backend::skills_fs::{normalize_skills_path, SkillsFs};
 use nfsserve::{
     nfs::{ftype3, nfs_fh3, nfsstat3, FSF_CANSETTIME, FSF_SYMLINK},
     vfs::{NFSFileSystem, VFSCapabilities},
@@ -65,11 +65,11 @@ fn normalize_skills_path_rejects_escape_paths() {
 }
 
 #[tokio::test]
-async fn readonly_skills_fs_lists_and_reads_from_prefix() {
-    let fs = ReadonlySkillsFs::new(test_operator().await, "managed-skills/current")
-        .expect("fs can be created");
+async fn skills_fs_lists_and_reads_from_prefix() {
+    let fs =
+        SkillsFs::new(test_operator().await, "managed-skills/current").expect("fs can be created");
 
-    assert!(matches!(fs.capabilities(), VFSCapabilities::ReadOnly));
+    assert!(matches!(fs.capabilities(), VFSCapabilities::ReadWrite));
     let root_id = fs.root_dir();
     let root = fs.getattr(root_id).await.expect("root has attributes");
     assert_eq!(root.ftype as u32, ftype3::NF3DIR as u32);
@@ -151,36 +151,220 @@ async fn readonly_skills_fs_lists_and_reads_from_prefix() {
     assert_eq!(
         fsinfo.properties & (FSF_SYMLINK | FSF_CANSETTIME),
         0,
-        "readonly skills NFS must not advertise symlink or settime support"
+        "managed skills NFS must not advertise symlink or settime support"
+    );
+    assert!(fsinfo.wtmax > 0, "managed skills NFS must advertise writes");
+    assert!(
+        fsinfo.wtpref > 0,
+        "managed skills NFS must advertise writes"
+    );
+    assert!(
+        fsinfo.wtmult > 0,
+        "managed skills NFS must advertise writes"
     );
 }
 
 #[tokio::test]
-async fn readonly_skills_fs_rejects_writes() {
-    let fs = ReadonlySkillsFs::new(test_operator().await, "managed-skills/current")
-        .expect("fs can be created");
+async fn skills_fs_writes_global_skills_back_to_object_storage() {
+    let operator = test_operator().await;
+    let fs = SkillsFs::new(operator.clone(), "managed-skills/current").expect("fs can be created");
     let root_id = fs.root_dir();
 
+    assert!(matches!(fs.capabilities(), VFSCapabilities::ReadWrite));
+    let (draft_id, draft_attr) = fs
+        .create(root_id, &b"draft.md".as_slice().into(), Default::default())
+        .await
+        .expect("admin Hermes can create a global skill file");
+    assert_eq!(draft_attr.size, 0);
+    let written_attr = fs
+        .write(draft_id, 0, b"# Draft\n")
+        .await
+        .expect("admin Hermes can write a global skill file");
+    assert_eq!(written_attr.size, "# Draft\n".len() as u64);
+    assert_eq!(
+        operator
+            .read("managed-skills/current/draft.md")
+            .await
+            .expect("written skill can be read from object storage")
+            .to_vec(),
+        b"# Draft\n"
+    );
+
+    let docs_id = fs
+        .mkdir(root_id, &b"docs".as_slice().into())
+        .await
+        .expect("admin Hermes can create a global skill directory")
+        .0;
+    let (guide_id, _) = fs
+        .create(docs_id, &b"guide.md".as_slice().into(), Default::default())
+        .await
+        .expect("file in created directory can be created");
+    fs.write(guide_id, 0, b"guide")
+        .await
+        .expect("file can be written");
+    fs.rename(
+        docs_id,
+        &b"guide.md".as_slice().into(),
+        docs_id,
+        &b"README.md".as_slice().into(),
+    )
+    .await
+    .expect("admin Hermes can rename a global skill file");
+    assert_eq!(
+        operator
+            .read("managed-skills/current/docs/README.md")
+            .await
+            .expect("renamed skill can be read")
+            .to_vec(),
+        b"guide"
+    );
     assert!(matches!(
-        fs.mkdir(root_id, &b"new".as_slice().into()).await,
-        Err(nfsstat3::NFS3ERR_ROFS)
+        operator.stat("managed-skills/current/docs/guide.md").await,
+        Err(error) if error.kind() == opendal::ErrorKind::NotFound
     ));
+
+    fs.remove(root_id, &b"draft.md".as_slice().into())
+        .await
+        .expect("admin Hermes can remove a global skill file");
     assert!(matches!(
-        fs.create(root_id, &b"new.md".as_slice().into(), Default::default())
-            .await,
-        Err(nfsstat3::NFS3ERR_ROFS)
+        operator.stat("managed-skills/current/draft.md").await,
+        Err(error) if error.kind() == opendal::ErrorKind::NotFound
     ));
+
     assert!(matches!(
-        fs.remove(root_id, &b"writing".as_slice().into()).await,
-        Err(nfsstat3::NFS3ERR_ROFS)
+        fs.create(
+            root_id,
+            &b".curator_state".as_slice().into(),
+            Default::default()
+        )
+        .await,
+        Err(nfsstat3::NFS3ERR_ACCES)
     ));
 }
 
 #[tokio::test]
-async fn readonly_skills_fs_file_handles_survive_server_restart() {
+async fn skills_fs_write_from_offset_zero_preserves_existing_tail() {
     let operator = test_operator().await;
-    let fs = ReadonlySkillsFs::new(operator.clone(), "managed-skills/current")
-        .expect("fs can be created");
+    operator
+        .write("managed-skills/current/notes.md", "hello world")
+        .await
+        .expect("fixture can be written");
+    let fs = SkillsFs::new(operator.clone(), "managed-skills/current").expect("fs can be created");
+    let root_id = fs.root_dir();
+    let notes_id = fs
+        .lookup(root_id, &b"notes.md".as_slice().into())
+        .await
+        .expect("notes file can be looked up");
+
+    fs.write(notes_id, 0, b"hi")
+        .await
+        .expect("offset zero write should update prefix only");
+
+    assert_eq!(
+        operator
+            .read("managed-skills/current/notes.md")
+            .await
+            .expect("updated file can be read")
+            .to_vec(),
+        b"hillo world"
+    );
+}
+
+#[tokio::test]
+async fn skills_fs_create_exclusive_rejects_existing_file() {
+    let operator = test_operator().await;
+    let fs = SkillsFs::new(operator.clone(), "managed-skills/current").expect("fs can be created");
+    let root_id = fs.root_dir();
+
+    assert!(matches!(
+        fs.create_exclusive(root_id, &b"writing".as_slice().into())
+            .await,
+        Err(nfsstat3::NFS3ERR_EXIST)
+    ));
+    assert_eq!(
+        operator
+            .read("managed-skills/current/writing/SKILL.md")
+            .await
+            .expect("existing skill must remain untouched")
+            .to_vec(),
+        b"# Writing\n"
+    );
+}
+
+#[tokio::test]
+async fn skills_fs_rejects_removing_non_empty_directory() {
+    let operator = test_operator().await;
+    let fs = SkillsFs::new(operator.clone(), "managed-skills/current").expect("fs can be created");
+    let root_id = fs.root_dir();
+    let writing_id = fs
+        .lookup(root_id, &b"writing".as_slice().into())
+        .await
+        .expect("writing dir can be looked up");
+
+    assert!(matches!(
+        fs.remove(root_id, &b"writing".as_slice().into()).await,
+        Err(nfsstat3::NFS3ERR_NOTEMPTY)
+    ));
+    assert!(matches!(
+        fs.remove(writing_id, &b"SKILL.md".as_slice().into()).await,
+        Ok(())
+    ));
+    fs.remove(root_id, &b"writing".as_slice().into())
+        .await
+        .expect("empty directory can be removed");
+    assert!(matches!(
+        fs.lookup(root_id, &b"writing".as_slice().into()).await,
+        Err(nfsstat3::NFS3ERR_NOENT)
+    ));
+}
+
+#[tokio::test]
+async fn skills_fs_renames_directories_with_children() {
+    let operator = test_operator().await;
+    let fs = SkillsFs::new(operator.clone(), "managed-skills/current").expect("fs can be created");
+    let root_id = fs.root_dir();
+    let writing_id = fs
+        .lookup(root_id, &b"writing".as_slice().into())
+        .await
+        .expect("writing dir can be looked up");
+
+    fs.rename(
+        root_id,
+        &b"writing".as_slice().into(),
+        root_id,
+        &b"writing-renamed".as_slice().into(),
+    )
+    .await
+    .expect("directory rename should succeed");
+
+    assert!(matches!(
+        fs.lookup(root_id, &b"writing".as_slice().into()).await,
+        Err(nfsstat3::NFS3ERR_NOENT)
+    ));
+    let renamed_id = fs
+        .lookup(root_id, &b"writing-renamed".as_slice().into())
+        .await
+        .expect("renamed dir can be looked up");
+    let renamed_skill_id = fs
+        .lookup(renamed_id, &b"SKILL.md".as_slice().into())
+        .await
+        .expect("renamed child file can be looked up");
+    let (bytes, eof) = fs
+        .read(renamed_skill_id, 0, 1024)
+        .await
+        .expect("renamed child file can be read");
+    assert_eq!(bytes, b"# Writing\n");
+    assert!(eof);
+    assert!(matches!(
+        fs.getattr(writing_id).await,
+        Err(nfsstat3::NFS3ERR_STALE)
+    ));
+}
+
+#[tokio::test]
+async fn skills_fs_file_handles_survive_server_restart() {
+    let operator = test_operator().await;
+    let fs = SkillsFs::new(operator.clone(), "managed-skills/current").expect("fs can be created");
     let root_id = fs.root_dir();
     let writing_id = fs
         .lookup(root_id, &b"writing".as_slice().into())
@@ -192,8 +376,8 @@ async fn readonly_skills_fs_file_handles_survive_server_restart() {
         .expect("skill file can be looked up");
     let skill_handle = fs.id_to_fh(skill_id);
 
-    let restarted = ReadonlySkillsFs::new(operator, "managed-skills/current")
-        .expect("restarted fs can be created");
+    let restarted =
+        SkillsFs::new(operator, "managed-skills/current").expect("restarted fs can be created");
     let restored_id = restarted
         .fh_to_id(&skill_handle)
         .expect("stable handle can be decoded after restart");

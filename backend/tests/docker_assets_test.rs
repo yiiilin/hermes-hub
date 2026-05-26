@@ -1,0 +1,24 @@
+use std::path::Path;
+
+#[test]
+fn hermes_wrapper_image_tracks_official_hermes_version() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("backend crate lives under repo root");
+    let dockerfile = std::fs::read_to_string(repo_root.join("infra/docker/hermes/Dockerfile"))
+        .expect("Hermes wrapper Dockerfile is present");
+    let compose = std::fs::read_to_string(repo_root.join("infra/docker/docker-compose.hub.yml"))
+        .expect("deployment compose file is present");
+    let dev_compose = std::fs::read_to_string(repo_root.join("infra/docker/docker-compose.yml"))
+        .expect("development compose file is present");
+
+    assert!(dockerfile.contains("ARG HERMES_VERSION=latest"));
+    assert!(dockerfile.contains("FROM nousresearch/hermes-agent:${HERMES_VERSION}"));
+    assert!(compose.contains("HERMES_VERSION: ${HERMES_VERSION:-latest}"));
+    assert!(compose.contains(
+        "HERMES_DOCKER_IMAGE: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:${HERMES_VERSION:-latest}}"
+    ));
+    assert!(dev_compose.contains(
+        "HERMES_DOCKER_IMAGE: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:${HERMES_VERSION:-latest}}"
+    ));
+}

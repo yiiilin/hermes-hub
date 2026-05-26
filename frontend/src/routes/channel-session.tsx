@@ -1989,6 +1989,26 @@ function renderInlineMarkdown(
           ),
         );
       }
+    } else if (/^https?:\/\//i.test(token)) {
+      const { url, trailing } = splitTrailingUrlPunctuation(token);
+      const href = safeMarkdownUrl(url, false);
+      nodes.push(
+        href ? (
+          <a
+            key={`${keyPrefix}-plain-link-${match.index}`}
+            href={href}
+            rel="noreferrer"
+            target="_blank"
+          >
+            {url}
+          </a>
+        ) : (
+          token
+        ),
+      );
+      if (href && trailing) {
+        nodes.push(trailing);
+      }
     } else if (isPlainAttachmentUrl(token)) {
       const attachment = attachmentForUrl(attachments, token);
       if (attachment) {
@@ -2019,6 +2039,15 @@ function renderInlineMarkdown(
   }
 
   return nodes;
+}
+
+function splitTrailingUrlPunctuation(token: string) {
+  // 裸链接通常会跟着句末标点；标点不能进入 href，否则用户复制或点击时会打开错误地址。
+  const match = /^(.*?)([),.;，。；、]*)$/u.exec(token);
+  return {
+    url: match?.[1] ?? token,
+    trailing: match?.[2] ?? "",
+  };
 }
 
 function InlineAttachments({
