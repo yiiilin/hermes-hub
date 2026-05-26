@@ -32,7 +32,7 @@ Requirements:
 Create `.env` in the repository root:
 
 ```bash
-HERMES_HUB_BACKEND_IMAGE=ghcr.io/yiiilin/hermes-hub:0.0.4
+HERMES_HUB_BACKEND_IMAGE=ghcr.io/yiiilin/hermes-hub:0.0.5
 HERMES_HUB_HTTP_PORT=8080
 
 POSTGRES_PASSWORD=change-me
@@ -84,14 +84,14 @@ cargo run -p hermes-hub-backend
 Release images are published to GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/yiiilin/hermes-hub:0.0.4
+docker pull ghcr.io/yiiilin/hermes-hub:0.0.5
 ```
 
 The image contains the Rust backend and the built React frontend. The service listens on port `8080`.
 
 ## Release
 
-Releases are tag-driven. Pushing a tag such as `v0.0.4` triggers the release workflow, builds the Docker image, pushes GHCR tags, and creates a GitHub Release with the commit list.
+Releases are tag-driven. Pushing a tag such as `v0.0.5` triggers the release workflow, builds the Docker image, pushes GHCR tags, and creates a GitHub Release with the commit list.
 
 ## Security
 
