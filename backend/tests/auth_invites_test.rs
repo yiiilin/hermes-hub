@@ -444,11 +444,18 @@ async fn first_user_bootstrap_registers_admin_and_blocks_second_bootstrap() {
         None,
     )
     .await;
+    let admin_cookie = cookie_from(&response);
     let (status, value) = response_json(response).await;
 
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(value["user"]["email"], "admin@example.com");
     assert_eq!(value["user"]["role"], "admin");
+
+    let response = request_empty(&app, Method::GET, "/api/auth/me", Some(&admin_cookie)).await;
+    let (status, value) = response_json(response).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["user"]["email"], "admin@example.com");
 
     let response = request_json(
         &app,

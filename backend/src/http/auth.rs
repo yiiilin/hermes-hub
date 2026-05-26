@@ -67,7 +67,7 @@ async fn bootstrap_status(State(state): State<AppState>) -> Result<impl IntoResp
 async fn bootstrap_register(
     State(state): State<AppState>,
     Json(payload): Json<BootstrapRegisterRequest>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Response, ApiError> {
     let user = state
         .store
         .create_bootstrap_admin(&payload.email, &payload.password)
@@ -79,13 +79,27 @@ async fn bootstrap_register(
         Err(ApiError::Conflict(_)) => {}
         Err(error) => return Err(error),
     }
+    // 首个管理员创建完成后应立即拥有登录态，否则前端进入工作台后会用无 cookie 的请求访问受保护接口。
+    let session_token = state
+        .store
+        .create_session(&user.id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let cookie = session_cookie(&state.config.cookie_name, &session_token);
 
-    Ok((
+    let mut response = (
         StatusCode::CREATED,
         Json(UserResponse {
             user: user.public(),
         }),
-    ))
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie).map_err(|_| ApiError::Internal)?,
+    );
+
+    Ok(response)
 }
 
 async fn register_with_invite(
