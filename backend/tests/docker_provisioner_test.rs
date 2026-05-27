@@ -8,7 +8,7 @@ use hermes_hub_backend::hermes::{
 };
 use hermes_hub_backend::storage::{HubObjectStorage, InMemoryObjectStorage};
 use std::{
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{symlink, PermissionsExt},
     path::PathBuf,
     process::Command,
     sync::{Arc, Mutex},
@@ -191,7 +191,7 @@ fn test_config_with_managed_skills() -> DockerProvisionerConfig {
         volume_name: "hermes-managed-skills-test".to_string(),
         addr: "127.0.0.1:12049".to_string(),
         export: "/skills".to_string(),
-        container_path: "/hub-managed-skills".to_string(),
+        container_path: "/workspace/hub-managed-skills".to_string(),
     });
     config
 }
@@ -199,7 +199,7 @@ fn test_config_with_managed_skills() -> DockerProvisionerConfig {
 fn test_config_with_managed_profile() -> DockerProvisionerConfig {
     let mut config = test_config_with_managed_skills();
     config.managed_profile = Some(ManagedProfileConfig {
-        container_path: "/hub-managed-skills".to_string(),
+        container_path: "/workspace/hub-managed-skills".to_string(),
         object_prefix: "managed-profile/current".to_string(),
     });
     config
@@ -683,7 +683,7 @@ async fn docker_provisioner_mounts_managed_skills_readonly_for_regular_users() {
         mount,
         ContainerMount::NfsVolume(volume)
             if volume.volume_name == "hermes-managed-skills-test"
-                && volume.container_path == "/hub-managed-skills"
+                && volume.container_path == "/workspace/hub-managed-skills"
                 && volume.read_only
                 && volume.addr == "127.0.0.1:12049"
                 && volume.export == "/skills"
@@ -701,7 +701,7 @@ async fn docker_provisioner_mounts_managed_skills_readonly_for_regular_users() {
     .expect("managed Hermes config is written");
     assert!(managed_config.contains("skills:"));
     assert!(managed_config.contains("external_dirs:"));
-    assert!(managed_config.contains("- \"/hub-managed-skills\""));
+    assert!(managed_config.contains("- \"/workspace/hub-managed-skills\""));
 
     let calls = runtime.calls.lock().expect("calls lock").clone();
     assert!(
@@ -726,7 +726,7 @@ async fn docker_provisioner_mounts_managed_skills_readonly_for_regular_users() {
         create_call.windows(2).any(|args| {
             args[0] == "--mount"
                 && args[1]
-                    == "type=volume,src=hermes-managed-skills-test,dst=/hub-managed-skills,volume-driver=local,readonly"
+                    == "type=volume,src=hermes-managed-skills-test,dst=/workspace/hub-managed-skills,volume-driver=local,readonly"
         }),
         "managed skills must be mounted readonly into Hermes containers"
     );
@@ -750,7 +750,7 @@ async fn docker_provisioner_mounts_managed_skills_writable_for_admin_users() {
         mount,
         ContainerMount::NfsVolume(volume)
             if volume.volume_name == "hermes-managed-skills-test-rw"
-                && volume.container_path == "/hub-managed-skills"
+                && volume.container_path == "/workspace/hub-managed-skills"
                 && !volume.read_only
     )));
 
@@ -778,7 +778,7 @@ async fn docker_provisioner_mounts_managed_skills_writable_for_admin_users() {
         create_call.windows(2).any(|args| {
             args[0] == "--mount"
                 && args[1]
-                    == "type=volume,src=hermes-managed-skills-test-rw,dst=/hub-managed-skills,volume-driver=local"
+                    == "type=volume,src=hermes-managed-skills-test-rw,dst=/workspace/hub-managed-skills,volume-driver=local"
         }),
         "admin managed skills mount must not include Docker readonly flag"
     );
@@ -795,8 +795,40 @@ async fn docker_provisioner_links_managed_profile_files_from_hub_fs() {
         object_storage.shared(),
     );
 
-    let mut instance = provisioner.prepare_instance("admin-managed-profile");
+    let user_id = format!("admin-managed-profile-{}", Uuid::new_v4());
+    let mut instance = provisioner.prepare_instance(&user_id);
     instance.global_skills_write_enabled = true;
+    let workspace_path = PathBuf::from(
+        instance
+            .host_workspace_path
+            .as_ref()
+            .expect("workspace path is set"),
+    );
+    let config_path = PathBuf::from(
+        instance
+            .host_config_path
+            .as_ref()
+            .expect("config path is set"),
+    );
+    std::fs::create_dir_all(&workspace_path).expect("workspace fixture can be created");
+    std::fs::create_dir_all(&config_path).expect("config fixture can be created");
+    symlink(
+        "/hub-managed-skills/AGENTS.md",
+        workspace_path.join("AGENTS.md"),
+    )
+    .expect("old workspace AGENTS.md link can be seeded");
+    symlink(
+        "/hub-managed-skills/SOUL.md",
+        workspace_path.join("SOUL.md"),
+    )
+    .expect("old workspace SOUL.md link can be seeded");
+    symlink(
+        "/hub-managed-skills/AGENTS.md",
+        config_path.join("AGENTS.md"),
+    )
+    .expect("old config AGENTS.md link can be seeded");
+    symlink("/hub-managed-skills/SOUL.md", config_path.join("SOUL.md"))
+        .expect("old config SOUL.md link can be seeded");
 
     // 管理员可以写全局 skills；统一 profile 文件复用同一个 Hub FS，
     // 具体写保护由 NFS 文件系统层拒绝 AGENTS.md/SOUL.md 写入。
@@ -812,7 +844,7 @@ async fn docker_provisioner_links_managed_profile_files_from_hub_fs() {
         mount,
         ContainerMount::NfsVolume(volume)
             if volume.volume_name == "hermes-managed-skills-test-rw"
-                && volume.container_path == "/hub-managed-skills"
+                && volume.container_path == "/workspace/hub-managed-skills"
                 && !volume.read_only
                 && volume.addr == "127.0.0.1:12049"
                 && volume.export == "/skills"
@@ -838,9 +870,30 @@ async fn docker_provisioner_links_managed_profile_files_from_hub_fs() {
             || (command.contains("/config/AGENTS.md") && command.contains("/config/SOUL.md")),
         "managed profile startup command must link both profile files into /config"
     );
-    assert!(command.contains("/hub-managed-skills"));
+    assert!(
+        command.contains("ln -sfn /workspace/$file /config/$file"),
+        "managed profile config compatibility links must point back to the workspace profile entry"
+    );
+    assert!(command.contains("/workspace/hub-managed-skills"));
     assert!(command.contains("$file"));
     assert!(command.contains("exec /opt/hermes/.venv/bin/hermes gateway"));
+    assert_eq!(
+        std::fs::read_link(workspace_path.join("AGENTS.md"))
+            .expect("workspace AGENTS.md is linked"),
+        PathBuf::from("/workspace/hub-managed-skills/AGENTS.md")
+    );
+    assert_eq!(
+        std::fs::read_link(workspace_path.join("SOUL.md")).expect("workspace SOUL.md is linked"),
+        PathBuf::from("/workspace/hub-managed-skills/SOUL.md")
+    );
+    assert_eq!(
+        std::fs::read_link(config_path.join("AGENTS.md")).expect("config AGENTS.md is linked"),
+        PathBuf::from("/workspace/AGENTS.md")
+    );
+    assert_eq!(
+        std::fs::read_link(config_path.join("SOUL.md")).expect("config SOUL.md is linked"),
+        PathBuf::from("/workspace/SOUL.md")
+    );
 
     let agents = readable_storage
         .get("managed-profile/current/AGENTS.md")
@@ -1053,7 +1106,7 @@ async fn docker_provisioner_test() {
         .iter()
         .any(|entry| entry == "HERMES_ACCEPT_HOOKS=1"));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version" && value == "2026-05-27-managed-profile-shell"
+        key == "hermes_hub_spec_version" && value == "2026-05-27-managed-profile-workspace"
     }));
     assert!(spec
         .mounts
@@ -1243,7 +1296,7 @@ async fn docker_provisioner_test() {
     assert!(
         create_call.windows(2).any(|args| {
             args[0] == "--label"
-                && args[1] == "hermes_hub_spec_version=2026-05-27-managed-profile-shell"
+                && args[1] == "hermes_hub_spec_version=2026-05-27-managed-profile-workspace"
         }),
         "managed Hermes containers must carry the current spec label"
     );
