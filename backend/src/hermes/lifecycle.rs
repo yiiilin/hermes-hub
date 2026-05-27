@@ -65,7 +65,7 @@ pub fn decide_hermes_lifecycle_action(
 
     if matches!(input.status, HermesInstanceStatus::Stopped)
         && input.scheduler_enabled
-        && has_task_due_within(&input.tasks, now, settings.wake_margin_seconds)
+        && has_task_requiring_runtime(&input.tasks, now, settings.wake_margin_seconds)
     {
         return HermesLifecycleAction::WakeForScheduledTask;
     }
@@ -75,7 +75,7 @@ pub fn decide_hermes_lifecycle_action(
     }
 
     if input.scheduler_enabled
-        && has_task_due_within(&input.tasks, now, settings.wake_margin_seconds)
+        && has_task_requiring_runtime(&input.tasks, now, settings.wake_margin_seconds)
     {
         return HermesLifecycleAction::KeepRunning;
     }
@@ -188,16 +188,18 @@ fn task_from_snapshot(task: &HermesScheduledTaskSnapshot) -> HermesLifecycleSche
     }
 }
 
-fn has_task_due_within(
+fn has_task_requiring_runtime(
     tasks: &[HermesLifecycleScheduledTask],
     now: u64,
     margin_seconds: u64,
 ) -> bool {
     tasks.iter().any(|task| {
         task.enabled
-            && task
-                .next_run_at
-                .is_some_and(|next_run_at| next_run_at <= now.saturating_add(margin_seconds))
+            // Hermes 的 interval 任务当前可能无法上报精确 next_run_at；
+            // 对这类启用任务必须保守保活，否则会直接错过后续执行。
+            && task.next_run_at.map_or(true, |next_run_at| {
+                next_run_at <= now.saturating_add(margin_seconds)
+            })
     })
 }
 

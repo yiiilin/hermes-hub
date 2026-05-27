@@ -106,13 +106,14 @@ async fn app_state_with_recording_docker_runtime() -> (AppState, RecordingDocker
         .await
         .expect("title model config is ready");
     let runtime = RecordingDockerRuntime::default();
-    let docker_provisioner =
-        hermes_hub_backend::hermes::docker_provisioner::DockerProvisioner::new_with_runtime(
-            docker_config_from_app(&config, &ready_model_config(LLM_MODEL_CONFIG_KIND)),
-            Arc::new(runtime.clone()),
-        );
+    let object_storage = InMemoryObjectStorage::new(config.object_storage.bucket.clone()).shared();
+    let docker_provisioner = hermes_hub_backend::hermes::docker_provisioner::DockerProvisioner::new_with_runtime_and_object_storage(
+        docker_config_from_app(&config, &ready_model_config(LLM_MODEL_CONFIG_KIND)),
+        Arc::new(runtime.clone()),
+        object_storage.clone(),
+    );
     let state = AppState {
-        object_storage: InMemoryObjectStorage::new(config.object_storage.bucket.clone()).shared(),
+        object_storage,
         config,
         store: SessionStore::default(),
         channel_store: ChannelStore::default(),
@@ -127,6 +128,93 @@ async fn app_state_with_recording_docker_runtime() -> (AppState, RecordingDocker
 async fn app_with_recording_docker_runtime() -> (Router, RecordingDockerRuntime) {
     let (state, runtime) = app_state_with_recording_docker_runtime().await;
     (build_router_with_state(state), runtime)
+}
+
+#[tokio::test]
+async fn admin_model_config_update_refreshes_managed_config_and_queues_gateway_restart() {
+    let (state, _runtime) = app_state_with_recording_docker_runtime().await;
+    let app = build_router_with_state(state.clone());
+    let admin_cookie = bootstrap_admin(&app).await;
+    let admin = state
+        .store
+        .user_by_session_cookie(&admin_cookie, "hermes_hub_session")
+        .await
+        .expect("admin can be read from session");
+
+    let created = request_empty(
+        &app,
+        Method::POST,
+        "/api/workspace/ensure-hermes",
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let instance = state
+        .store
+        .hermes_instance_for_user(&admin.id)
+        .await
+        .expect("managed instance exists");
+    let instance_token = instance
+        .api_token_secret_ref
+        .clone()
+        .expect("managed instance token is stored");
+    let config_key = format!("config/users/{}/config.yaml", admin.id);
+    let before = state
+        .object_storage
+        .get(&config_key)
+        .await
+        .expect("initial managed config is written");
+    assert!(String::from_utf8(before.to_vec())
+        .expect("config is utf-8")
+        .contains("default: \"gpt-4.1-mini\""));
+
+    let update = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/model-config",
+        json!({
+            "provider_name": "custom",
+            "provider_base_url": "https://models.example/v1",
+            "provider_api_key": "secret-v2",
+            "default_model": "gpt-4.1",
+            "allowed_models": ["gpt-4.1"],
+            "api_type": "chat_completions",
+            "allow_streaming": true,
+            "request_timeout_seconds": 30,
+            "context_window_tokens": 200000,
+            "max_output_tokens": 8192,
+            "temperature": 0.3,
+            "supports_parallel_tools": true
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+
+    let after = state
+        .object_storage
+        .get(&config_key)
+        .await
+        .expect("updated managed config is written to object storage");
+    let content = String::from_utf8(after.to_vec()).expect("config is utf-8");
+    assert!(content.contains("default: \"gpt-4.1\""));
+    assert!(content.contains("context_window_tokens: 200000"));
+    assert!(content.contains("max_output_tokens: 8192"));
+    assert!(content.contains("temperature: 0.3"));
+
+    let inbox = request_raw_with_bearer(
+        &app,
+        Method::GET,
+        "/internal/channel/v1/inbox?timeout_seconds=0&limit=4",
+        "application/json",
+        Vec::new(),
+        &instance_token,
+    )
+    .await;
+    let (status, body) = response_json(inbox).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"][0]["type"], "control");
+    assert_eq!(body["items"][0]["action"], "restart_gateway");
 }
 
 async fn request_json(
@@ -193,6 +281,28 @@ async fn request_raw(
     app.clone()
         .oneshot(
             builder
+                .body(Body::from(body))
+                .expect("request can be built"),
+        )
+        .await
+        .expect("router responds")
+}
+
+async fn request_raw_with_bearer(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    content_type: &str,
+    body: Vec<u8>,
+    bearer: &str,
+) -> Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
                 .body(Body::from(body))
                 .expect("request can be built"),
         )

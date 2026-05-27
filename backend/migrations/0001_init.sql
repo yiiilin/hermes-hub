@@ -52,6 +52,7 @@ create table if not exists hermes_instances (
     status_message text,
     runtime_image text,
     runtime_version text,
+    gateway_restart_pending boolean not null default false,
     last_user_activity_at timestamptz not null default now(),
     last_started_at timestamptz,
     last_stopped_at timestamptz,
@@ -70,6 +71,7 @@ alter table hermes_instances drop column if exists base_url;
 alter table hermes_instances add column if not exists status_message text;
 alter table hermes_instances add column if not exists runtime_image text;
 alter table hermes_instances add column if not exists runtime_version text;
+alter table hermes_instances add column if not exists gateway_restart_pending boolean not null default false;
 alter table hermes_instances add column if not exists last_user_activity_at timestamptz not null default now();
 alter table hermes_instances add column if not exists last_started_at timestamptz;
 alter table hermes_instances add column if not exists last_stopped_at timestamptz;

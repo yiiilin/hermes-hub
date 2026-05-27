@@ -518,6 +518,7 @@ async fn update_model_config(
         .replace(config)
         .await
         .map_err(|_| ApiError::Internal)?;
+    refresh_managed_hermes_configs(&state).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -595,8 +596,80 @@ async fn update_system_settings(
         .update_system_settings(payload)
         .await
         .map_err(|_| ApiError::BadRequest("invalid system settings"))?;
+    refresh_managed_hermes_configs(&state).await?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn refresh_managed_hermes_configs(state: &AppState) -> Result<(), ApiError> {
+    let instances = state
+        .store
+        .list_hermes_instances()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    if instances.is_empty() {
+        return Ok(());
+    }
+
+    ensure_required_model_configs(state).await?;
+    let llm_config = state
+        .model_registry
+        .active_config()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let image_config = state
+        .model_registry
+        .config_for_kind(IMAGE_MODEL_CONFIG_KIND)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let image_model = image_config
+        .enabled
+        .then_some(image_config.default_model.as_str());
+    let model_settings = runtime_model_settings(&llm_config);
+
+    for mut instance in instances {
+        if instance.kind != HermesInstanceKind::ManagedDocker {
+            continue;
+        }
+        let llm_api_key = match instance.api_token_secret_ref.clone() {
+            Some(existing_token) => {
+                state
+                    .model_registry
+                    .add_instance_token_for_instance(&instance.id, &existing_token)
+                    .await
+                    .map_err(|_| ApiError::Internal)?;
+                existing_token
+            }
+            None => {
+                let token = state
+                    .model_registry
+                    .issue_instance_token_for_instance(&instance.id)
+                    .await
+                    .map_err(|_| ApiError::Internal)?;
+                instance.api_token_secret_ref = Some(token.clone());
+                state
+                    .store
+                    .bind_hermes_instance(instance.clone())
+                    .await
+                    .map_err(|_| ApiError::Internal)?;
+                token
+            }
+        };
+        let changed = state
+            .docker_provisioner
+            .write_config_with_default_model(&instance, &llm_api_key, &model_settings, image_model)
+            .await
+            .map_err(map_provisioner_error)?;
+        if changed {
+            state
+                .store
+                .request_hermes_gateway_restart(&instance.id)
+                .await
+                .map_err(|_| ApiError::Internal)?;
+        }
+    }
+
+    Ok(())
 }
 
 async fn list_managed_skills(

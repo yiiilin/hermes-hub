@@ -6,6 +6,7 @@ use hermes_hub_backend::hermes::{
     instance::{HermesInstanceKind, HermesInstanceStatus},
     provisioner::HermesProvisioner,
 };
+use hermes_hub_backend::storage::{HubObjectStorage, InMemoryObjectStorage};
 use std::{
     os::unix::fs::PermissionsExt,
     path::PathBuf,
@@ -325,6 +326,99 @@ async fn docker_provisioner_writes_codex_responses_api_mode_for_responses_models
         std::fs::read_to_string("/tmp/hermes-hub-test/users/user-responses/config/config.yaml")
             .expect("managed Hermes config is written");
     assert!(managed_config.contains("api_mode: \"codex_responses\""));
+}
+
+#[tokio::test]
+async fn docker_provisioner_writes_user_config_to_object_storage() {
+    let runtime = FakeDockerRuntime::default();
+    let object_storage = InMemoryObjectStorage::default();
+    let readable_storage = object_storage.clone();
+    let provisioner = DockerProvisioner::new_with_runtime_and_object_storage(
+        test_config(),
+        Arc::new(runtime),
+        object_storage.shared(),
+    );
+
+    provisioner
+        .ensure_instance("user-s3-config", "instance-token")
+        .await
+        .expect("instance can be created");
+
+    // Hub 仍然负责生成配置，S3 只保存每个用户当前唯一的一份 config.yaml。
+    let stored = readable_storage
+        .get("config/users/user-s3-config/config.yaml")
+        .await
+        .expect("managed user config is written to object storage");
+    let content = String::from_utf8(stored.to_vec()).expect("managed config is utf-8");
+    assert!(content.contains("provider: \"custom\""));
+    assert!(content.contains("default: \"gpt-4.1-mini\""));
+    assert!(content.contains("api_key: \"instance-token\""));
+}
+
+#[tokio::test]
+async fn docker_provisioner_mounts_user_config_file_readonly_at_hermes_home_config() {
+    let runtime = FakeDockerRuntime::default();
+    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime.clone()));
+
+    let instance = provisioner
+        .ensure_instance("user-readonly-config", "instance-token")
+        .await
+        .expect("instance can be created");
+    let spec = provisioner
+        .container_spec_for(&instance)
+        .expect("container spec can be rendered");
+
+    assert!(spec.mounts.iter().any(|mount| matches!(
+        mount,
+        ContainerMount::Bind(bind)
+            if bind.container_path == "/config"
+                && bind.host_path == "/tmp/hermes-hub-test/users/user-readonly-config/config"
+                && !bind.read_only
+    )));
+    assert!(spec.mounts.iter().any(|mount| matches!(
+        mount,
+        ContainerMount::Bind(bind)
+            if bind.container_path == "/config/config.yaml"
+                && bind.host_path == "/tmp/hermes-hub-test/users/user-readonly-config/config/config.yaml"
+                && bind.read_only
+    )));
+
+    let calls = runtime.calls.lock().expect("calls lock").clone();
+    let create_call = calls
+        .iter()
+        .find(|args| args.first().map(String::as_str) == Some("create"))
+        .expect("container create command is issued");
+    assert!(
+        create_call.windows(2).any(|args| {
+            args[0] == "--mount"
+                && args[1]
+                    == "type=bind,src=/tmp/hermes-hub-test/users/user-readonly-config/config/config.yaml,dst=/config/config.yaml,readonly"
+        }),
+        "managed config file must be mounted readonly at $HERMES_HOME/config.yaml"
+    );
+}
+
+#[tokio::test]
+async fn docker_provisioner_uses_restart_always_for_managed_containers() {
+    let runtime = FakeDockerRuntime::default();
+    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime.clone()));
+
+    provisioner
+        .ensure_instance("user-restart-always", "instance-token")
+        .await
+        .expect("instance can be created");
+
+    let calls = runtime.calls.lock().expect("calls lock").clone();
+    let create_call = calls
+        .iter()
+        .find(|args| args.first().map(String::as_str) == Some("create"))
+        .expect("container create command is issued");
+    assert!(
+        create_call
+            .windows(2)
+            .any(|args| args[0] == "--restart" && args[1] == "always"),
+        "all managed Hermes containers must restart automatically after gateway restart or Docker restart"
+    );
 }
 
 #[tokio::test]
@@ -860,7 +954,7 @@ async fn docker_provisioner_test() {
         .iter()
         .any(|entry| entry == "HERMES_ACCEPT_HOOKS=1"));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version" && value == "2026-05-26-model-runtime-settings"
+        key == "hermes_hub_spec_version" && value == "2026-05-27-managed-config-mount"
     }));
     assert!(spec
         .mounts
@@ -959,6 +1053,9 @@ async fn docker_provisioner_test() {
     assert!(plugin_adapter.contains("self._last_scheduler_snapshot_hash"));
     assert!(plugin_adapter.contains("self._last_scheduler_snapshot_reported_at"));
     assert!(plugin_adapter.contains("hashlib.sha256"));
+    assert!(plugin_adapter.contains("async def _dispatch_control_item("));
+    assert!(plugin_adapter.contains("\"restart_gateway\""));
+    assert!(plugin_adapter.contains("os._exit(0)"));
     assert!(plugin_adapter.contains("MessageEvent("));
     assert!(plugin_adapter.contains("text=content"));
     assert!(plugin_adapter.contains("HERMES_HUB_HOME_CHANNEL"));
@@ -1045,7 +1142,7 @@ async fn docker_provisioner_test() {
     assert!(
         create_call.windows(2).any(|args| {
             args[0] == "--label"
-                && args[1] == "hermes_hub_spec_version=2026-05-26-model-runtime-settings"
+                && args[1] == "hermes_hub_spec_version=2026-05-27-managed-config-mount"
         }),
         "managed Hermes containers must carry the current spec label"
     );

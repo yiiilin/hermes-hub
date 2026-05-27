@@ -41,7 +41,9 @@ pub(crate) fn map_provisioner_error(error: ProvisionerError) -> ApiError {
             // Docker daemon/CLI 错误通常是管理员可处理的环境问题，要把摘要返回给页面。
             ApiError::BadGatewayMessage(format!("hermes docker operation failed: {message}"))
         }
-        ProvisionerError::LockFailed | ProvisionerError::Filesystem(_) => ApiError::Internal,
+        ProvisionerError::LockFailed
+        | ProvisionerError::Filesystem(_)
+        | ProvisionerError::ObjectStorage(_) => ApiError::Internal,
     }
 }
 

@@ -72,11 +72,12 @@ struct HealthResponse {
 
 /// Build the backend HTTP router.
 pub fn build_router(config: AppConfig) -> Router {
-    let docker_provisioner = DockerProvisioner::new_with_runtime(
+    let object_storage = object_storage_from_config(&config.object_storage);
+    let docker_provisioner = DockerProvisioner::new_with_runtime_and_object_storage(
         docker_config_from_app(&config, &config.initial_model_config),
         Arc::new(NoopDockerRuntime),
+        object_storage.clone(),
     );
-    let object_storage = object_storage_from_config(&config.object_storage);
     let state = AppState {
         model_registry: ModelRegistry::new(config.initial_model_config.clone()),
         config,
@@ -93,11 +94,14 @@ pub fn build_router(config: AppConfig) -> Router {
 
 /// 根据运行时配置构建 Router；存在 DATABASE_URL 时启用 PostgreSQL 后端。
 pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppInitError> {
-    let docker_provisioner = DockerProvisioner::new(docker_config_from_app(
-        &config,
-        &config.initial_model_config,
-    ));
     let object_storage = object_storage_from_config(&config.object_storage);
+    let docker_provisioner = DockerProvisioner::new_with_runtime_and_object_storage(
+        docker_config_from_app(&config, &config.initial_model_config),
+        Arc::new(hermes::docker_provisioner::CommandDockerRuntime::new(
+            config.hermes_docker.docker_binary.clone(),
+        )),
+        object_storage.clone(),
+    );
 
     let Some(database_url) = config.database_url.clone() else {
         let state = AppState {

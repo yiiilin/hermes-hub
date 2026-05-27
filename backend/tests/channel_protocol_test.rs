@@ -1571,6 +1571,66 @@ async fn channel_inbox_waits_briefly_when_no_runs_are_ready() {
 }
 
 #[tokio::test]
+async fn channel_inbox_delivers_gateway_restart_control_once() {
+    let store = SessionStore::default();
+    let state = test_state(store.clone());
+    let app = build_router_with_state(state.clone());
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    let instance_token = "instance-restart-control-token";
+    store
+        .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
+        .expect("instance can be bound");
+    store
+        .request_hermes_gateway_restart("instance-1")
+        .await
+        .expect("restart control can be queued");
+    state
+        .model_registry
+        .add_instance_token_for_instance("instance-1", instance_token)
+        .await
+        .expect("instance token can be registered");
+
+    let inbox = request_raw(
+        &app,
+        Method::GET,
+        "/internal/channel/v1/inbox?timeout_seconds=0&limit=4",
+        "application/json",
+        Vec::new(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, inbox_body) = response_json(inbox).await;
+    assert_eq!(status, StatusCode::OK);
+    let items = inbox_body["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["type"], "control");
+    assert_eq!(items[0]["action"], "restart_gateway");
+    assert_eq!(items[0]["id"], "control:restart_gateway:instance-1");
+
+    // 控制项只用于触发一次 gateway 重启，不能在容器重连后反复下发。
+    let inbox = request_raw(
+        &app,
+        Method::GET,
+        "/internal/channel/v1/inbox?timeout_seconds=0&limit=4",
+        "application/json",
+        Vec::new(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, inbox_body) = response_json(inbox).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inbox_body["items"].as_array().expect("items").len(), 0);
+}
+
+#[tokio::test]
 async fn hermes_adapter_can_report_runtime_version_to_hub() {
     let store = SessionStore::default();
     let state = test_state(store.clone());

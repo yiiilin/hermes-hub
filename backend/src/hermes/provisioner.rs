@@ -13,6 +13,8 @@ pub enum ProvisionerError {
     LockFailed,
     #[error("filesystem operation failed: {0}")]
     Filesystem(String),
+    #[error("object storage operation failed: {0}")]
+    ObjectStorage(String),
     #[error("docker runtime failed: {0}")]
     DockerRuntime(String),
     #[error("docker command failed: {0}")]

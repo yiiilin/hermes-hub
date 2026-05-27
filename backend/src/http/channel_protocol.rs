@@ -26,7 +26,7 @@ use crate::{
         ApiError,
     },
     model_config::InstanceTokenContext,
-    session::store::{HermesScheduledTaskSnapshot, HermesSchedulerSnapshotInput},
+    session::store::{HermesScheduledTaskSnapshot, HermesSchedulerSnapshotInput, StoreError},
     AppState,
 };
 
@@ -145,11 +145,19 @@ struct InboxResponse {
 
 #[derive(Serialize)]
 struct InboxItem {
+    #[serde(rename = "type")]
+    item_type: String,
     id: String,
-    run_id: String,
-    session_id: String,
-    user_id: String,
-    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
     attachments: Value,
 }
 
@@ -365,6 +373,13 @@ async fn poll_inbox(
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, ApiError> {
     let token_context = verify_instance_token(&state, &headers).await?;
+    if let Some(instance_id) = token_context.hermes_instance_id.as_deref() {
+        if take_gateway_restart_control(&state, instance_id).await? {
+            return Ok(Json(InboxResponse {
+                items: vec![gateway_restart_control_item(instance_id)],
+            }));
+        }
+    }
     let limit = query
         .get("limit")
         .and_then(|value| value.parse::<usize>().ok())
@@ -388,6 +403,18 @@ async fn poll_inbox(
     }
 
     Ok(Json(InboxResponse { items }))
+}
+
+async fn take_gateway_restart_control(
+    state: &AppState,
+    instance_id: &str,
+) -> Result<bool, ApiError> {
+    match state.store.take_hermes_gateway_restart(instance_id).await {
+        Ok(pending) => Ok(pending),
+        // 兼容仅注册 token 的测试/开发模式；没有实例记录时继续按普通消息队列处理。
+        Err(StoreError::InviteNotFound) => Ok(false),
+        Err(_) => Err(ApiError::Internal),
+    }
 }
 
 async fn poll_runs_for_instance(
@@ -774,13 +801,28 @@ async fn inbox_item_for_run(state: &AppState, run: ChannelRun) -> Result<InboxIt
         .await
         .map_err(map_channel_error)?;
     Ok(InboxItem {
+        item_type: "message".to_string(),
         id: run.run_id.clone(),
-        run_id: run.run_id,
-        session_id: run.session_id,
-        user_id: session_context.user_id,
-        content: run.input,
+        action: None,
+        run_id: Some(run.run_id),
+        session_id: Some(run.session_id),
+        user_id: Some(session_context.user_id),
+        content: Some(run.input),
         attachments,
     })
+}
+
+fn gateway_restart_control_item(instance_id: &str) -> InboxItem {
+    InboxItem {
+        item_type: "control".to_string(),
+        id: format!("control:restart_gateway:{instance_id}"),
+        action: Some("restart_gateway".to_string()),
+        run_id: None,
+        session_id: None,
+        user_id: None,
+        content: None,
+        attachments: json!([]),
+    }
 }
 
 fn with_internal_download_urls(mut attachments: Value) -> Value {

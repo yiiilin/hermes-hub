@@ -20,6 +20,20 @@ fn task(next_run_at: u64) -> HermesLifecycleScheduledTask {
     }
 }
 
+fn enabled_task_without_known_next_run() -> HermesLifecycleScheduledTask {
+    HermesLifecycleScheduledTask {
+        enabled: true,
+        next_run_at: None,
+    }
+}
+
+fn disabled_task_without_known_next_run() -> HermesLifecycleScheduledTask {
+    HermesLifecycleScheduledTask {
+        enabled: false,
+        next_run_at: None,
+    }
+}
+
 #[test]
 fn lifecycle_decision_stops_idle_running_instances_when_no_task_is_due() {
     let now = 1_735_689_600;
@@ -69,6 +83,36 @@ fn lifecycle_decision_keeps_running_instances_for_active_or_imminent_work() {
 }
 
 #[test]
+fn lifecycle_decision_keeps_running_instances_for_enabled_tasks_with_unknown_wake_time() {
+    let now = 1_735_689_600;
+    let enabled_unknown_task = decide_hermes_lifecycle_action(
+        &HermesLifecycleDecisionInput {
+            status: HermesInstanceStatus::Running,
+            last_user_activity_at: Some(now - 60 * 60),
+            has_active_runs: false,
+            scheduler_enabled: true,
+            tasks: vec![enabled_task_without_known_next_run()],
+        },
+        now,
+        settings(),
+    );
+    let disabled_unknown_task = decide_hermes_lifecycle_action(
+        &HermesLifecycleDecisionInput {
+            status: HermesInstanceStatus::Running,
+            last_user_activity_at: Some(now - 60 * 60),
+            has_active_runs: false,
+            scheduler_enabled: true,
+            tasks: vec![disabled_task_without_known_next_run()],
+        },
+        now,
+        settings(),
+    );
+
+    assert_eq!(enabled_unknown_task, HermesLifecycleAction::KeepRunning);
+    assert_eq!(disabled_unknown_task, HermesLifecycleAction::StopIdle);
+}
+
+#[test]
 fn lifecycle_decision_wakes_stopped_instances_before_due_tasks() {
     let now = 1_735_689_600;
     let decision = decide_hermes_lifecycle_action(
@@ -78,6 +122,24 @@ fn lifecycle_decision_wakes_stopped_instances_before_due_tasks() {
             has_active_runs: false,
             scheduler_enabled: true,
             tasks: vec![task(now + 60)],
+        },
+        now,
+        settings(),
+    );
+
+    assert_eq!(decision, HermesLifecycleAction::WakeForScheduledTask);
+}
+
+#[test]
+fn lifecycle_decision_wakes_stopped_instances_for_enabled_tasks_with_unknown_wake_time() {
+    let now = 1_735_689_600;
+    let decision = decide_hermes_lifecycle_action(
+        &HermesLifecycleDecisionInput {
+            status: HermesInstanceStatus::Stopped,
+            last_user_activity_at: Some(now - 60 * 60),
+            has_active_runs: false,
+            scheduler_enabled: true,
+            tasks: vec![enabled_task_without_known_next_run()],
         },
         now,
         settings(),

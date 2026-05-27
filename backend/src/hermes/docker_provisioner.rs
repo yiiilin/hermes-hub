@@ -8,11 +8,12 @@ use std::{
 };
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use tokio::process::Command;
 
-use crate::model_config::RESPONSES_API_TYPE;
+use crate::{model_config::RESPONSES_API_TYPE, storage::DynObjectStorage};
 
 use super::{
     instance::{HermesInstance, HermesInstanceKind, HermesInstanceStatus},
@@ -21,7 +22,7 @@ use super::{
 
 /// Hub 托管 Hermes 容器规格版本。只要 env、挂载、工作目录或安全策略有变化，
 /// 就提升这个值，确保已存在的旧容器会被重建并拿到新行为。
-const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-26-model-runtime-settings";
+const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-27-managed-config-mount";
 const MANAGED_CONTAINER_SPEC_LABEL: &str = "hermes_hub_spec_version";
 const HUB_INBOX_PATH: &str = "/internal/channel/v1/inbox";
 const HUB_INBOX_TIMEOUT_SECONDS: u16 = 25;
@@ -465,6 +466,10 @@ class HermesHubAdapter(BasePlatformAdapter):
             return None
 
     async def _dispatch_inbox_item(self, item: dict[str, Any]) -> None:
+        item_type = str(item.get("type") or item.get("kind") or "")
+        if item_type == "control":
+            await self._dispatch_control_item(item)
+            return
         inbox_id = str(item.get("id") or item.get("message_id") or "")
         run_id = str(item.get("run_id") or inbox_id or "")
         session_id = str(item.get("session_id") or item.get("channel_session_id") or "")
@@ -501,6 +506,21 @@ class HermesHubAdapter(BasePlatformAdapter):
             media_types=media_types,
         )
         await self.handle_message(event)
+
+    async def _dispatch_control_item(self, item: dict[str, Any]) -> None:
+        action = str(item.get("action") or "")
+        if action == "restart_gateway":
+            # Hub 已经把新的 config.yaml 写入只读挂载源；adapter 退出 gateway，
+            # Docker 的 restart: always 会拉起新进程并读取最新配置。
+            logger.info("Hermes Hub requested gateway restart")
+            self._closed.set()
+            asyncio.create_task(self._exit_for_gateway_restart())
+            return
+        logger.warning("Hermes Hub ignored unknown control action: %s", action)
+
+    async def _exit_for_gateway_restart(self) -> None:
+        await asyncio.sleep(0.2)
+        os._exit(0)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         run_id = self._run_id_from_event(event)
@@ -1140,6 +1160,7 @@ impl DockerRuntime for NoopDockerRuntime {
 pub struct DockerProvisioner {
     config: DockerProvisionerConfig,
     runtime: DynDockerRuntime,
+    object_storage: Option<DynObjectStorage>,
     instances: Arc<Mutex<HashMap<String, HermesInstance>>>,
 }
 
@@ -1150,9 +1171,26 @@ impl DockerProvisioner {
     }
 
     pub fn new_with_runtime(config: DockerProvisionerConfig, runtime: DynDockerRuntime) -> Self {
+        Self::new_with_runtime_and_optional_object_storage(config, runtime, None)
+    }
+
+    pub fn new_with_runtime_and_object_storage(
+        config: DockerProvisionerConfig,
+        runtime: DynDockerRuntime,
+        object_storage: DynObjectStorage,
+    ) -> Self {
+        Self::new_with_runtime_and_optional_object_storage(config, runtime, Some(object_storage))
+    }
+
+    fn new_with_runtime_and_optional_object_storage(
+        config: DockerProvisionerConfig,
+        runtime: DynDockerRuntime,
+        object_storage: Option<DynObjectStorage>,
+    ) -> Self {
         Self {
             config,
             runtime,
+            object_storage,
             instances: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -1181,12 +1219,16 @@ impl DockerProvisioner {
             .host_config_path
             .clone()
             .ok_or(ProvisionerError::InvalidManagedInstance)?;
+        let config_file = path_to_string(PathBuf::from(&config).join("config.yaml"));
 
         let mut mounts = vec![
             ContainerMount::bind(workspace, "/workspace", false),
             ContainerMount::bind(sandbox.clone(), "/sandbox", false),
             ContainerMount::bind(sandbox, "/opt/data", false),
             ContainerMount::bind(config, "/config", false),
+            // Hermes 运行态目录保持可写，但 Hub 生成的配置文件本身必须只读挂载，
+            // 这样管理员配置只能从 Hub/S3 更新，不会被容器内进程意外覆盖。
+            ContainerMount::bind(config_file, "/config/config.yaml", true),
         ];
         if let Some(managed_skills) = &self.config.managed_skills {
             mounts.push(ContainerMount::nfs_volume(
@@ -1291,7 +1333,7 @@ impl DockerProvisioner {
         next.llm_api_key = Some(llm_api_key.to_string());
         next.api_token_secret_ref = Some(llm_api_key.to_string());
         self.create_host_directories(&next)?;
-        let config_changed = self.write_managed_config(&next)?;
+        let config_changed = self.write_managed_config(&next).await?;
 
         if let Some(inspection) = self.inspect_container(&next.name).await? {
             if inspection.running
@@ -1340,6 +1382,33 @@ impl DockerProvisioner {
             provisioner.config.image_model = image_model.to_string();
         }
         provisioner.ensure_container(instance, llm_api_key).await
+    }
+
+    pub async fn write_config_with_default_model(
+        &self,
+        instance: &HermesInstance,
+        llm_api_key: &str,
+        model_settings: &RuntimeModelSettings,
+        image_model: Option<&str>,
+    ) -> Result<bool, ProvisionerError> {
+        let mut provisioner = self.clone();
+        provisioner.config.default_model = model_settings.default_model.clone();
+        provisioner.config.api_mode = model_settings.api_mode.clone();
+        provisioner.config.context_window_tokens = model_settings.context_window_tokens;
+        provisioner.config.max_output_tokens = model_settings.max_output_tokens;
+        provisioner.config.temperature = model_settings.temperature;
+        provisioner.config.supports_parallel_tools = model_settings.supports_parallel_tools;
+        provisioner.config.image_model_enabled = image_model.is_some();
+        if let Some(image_model) = image_model {
+            provisioner.config.image_model = image_model.to_string();
+        }
+
+        let mut next = instance.clone();
+        next.llm_api_key = Some(llm_api_key.to_string());
+        next.api_token_secret_ref = Some(llm_api_key.to_string());
+        provisioner.create_host_directories(&next)?;
+        // 只刷新 Hub 管理的配置文件，不重建 Docker 容器；gateway 由 adapter 控制项重启。
+        provisioner.write_managed_config(&next).await
     }
 
     pub async fn refresh_instance_status(
@@ -1491,6 +1560,8 @@ impl DockerProvisioner {
             spec.name.clone(),
             "--network".to_string(),
             spec.network.clone(),
+            "--restart".to_string(),
+            "always".to_string(),
         ];
 
         if let Some(workdir) = spec.workdir {
@@ -1625,7 +1696,10 @@ impl DockerProvisioner {
         Ok(())
     }
 
-    fn write_managed_config(&self, instance: &HermesInstance) -> Result<bool, ProvisionerError> {
+    async fn write_managed_config(
+        &self,
+        instance: &HermesInstance,
+    ) -> Result<bool, ProvisionerError> {
         let config_path = instance
             .host_config_path
             .as_ref()
@@ -1726,6 +1800,15 @@ impl DockerProvisioner {
         let plugin_root = config_path.join("plugins/platforms/hermes_hub");
 
         let mut changed = write_file_if_changed(&config_file, &content)?;
+        if let Some(object_storage) = &self.object_storage {
+            object_storage
+                .put(
+                    &user_config_object_key(&instance.user_id),
+                    Bytes::from(content.clone()),
+                )
+                .await
+                .map_err(|error| ProvisionerError::ObjectStorage(error.to_string()))?;
+        }
         changed |= write_file_if_changed(&plugin_root.join("plugin.yaml"), HERMES_HUB_PLUGIN_YAML)?;
         changed |= write_file_if_changed(&plugin_root.join("__init__.py"), HERMES_HUB_PLUGIN_INIT)?;
         changed |= write_file_if_changed(&plugin_root.join("adapter.py"), HERMES_HUB_ADAPTER_PY)?;
@@ -1734,6 +1817,15 @@ impl DockerProvisioner {
         ensure_hermes_hub_pairing(&config_path, &instance.user_id)?;
         Ok(changed)
     }
+}
+
+fn user_config_object_key(user_id: &str) -> String {
+    // 用户 id 来自 Hub 数据库；这里只兜底去掉对象存储路径分隔符，避免非预期 key 层级。
+    let safe_user_id = user_id
+        .chars()
+        .map(|ch| if ch == '/' || ch == '\\' { '_' } else { ch })
+        .collect::<String>();
+    format!("config/users/{safe_user_id}/config.yaml")
 }
 
 fn parse_container_inspection(raw: &str) -> Option<ContainerInspection> {
@@ -1941,7 +2033,7 @@ impl HermesProvisioner for DockerProvisioner {
         next.llm_api_key = Some(llm_api_key.to_string());
         next.api_token_secret_ref = Some(llm_api_key.to_string());
         self.create_host_directories(&next)?;
-        self.write_managed_config(&next)?;
+        self.write_managed_config(&next).await?;
         self.remove_container_if_exists(&next.name).await?;
         let container_id = self.create_container(&next).await?;
         self.run_required(vec!["start".to_string(), next.name.clone()])

@@ -51,6 +51,7 @@ struct StoreInner {
     invites_by_id: HashMap<String, Invite>,
     invite_ids_by_hash: HashMap<String, String>,
     hermes_instances_by_user_id: HashMap<String, HermesInstance>,
+    hermes_gateway_restart_pending_by_instance_id: HashMap<String, bool>,
     hermes_scheduler_snapshots_by_instance_id: HashMap<String, HermesSchedulerSnapshot>,
     hermes_lifecycle_by_instance_id: HashMap<String, HermesLifecycleState>,
     proxy_audit_logs: Vec<ProxyAuditEvent>,
@@ -67,6 +68,7 @@ impl Default for StoreInner {
             invites_by_id: HashMap::new(),
             invite_ids_by_hash: HashMap::new(),
             hermes_instances_by_user_id: HashMap::new(),
+            hermes_gateway_restart_pending_by_instance_id: HashMap::new(),
             hermes_scheduler_snapshots_by_instance_id: HashMap::new(),
             hermes_lifecycle_by_instance_id: HashMap::new(),
             proxy_audit_logs: Vec::new(),
@@ -1021,6 +1023,83 @@ impl SessionStore {
                 .ok_or(StoreError::InviteNotFound)?;
 
                 row_to_hermes_instance(&row, cipher)
+            }),
+        }
+    }
+
+    pub async fn request_hermes_gateway_restart(
+        &self,
+        instance_id: &str,
+    ) -> Result<(), StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                if !inner
+                    .hermes_instances_by_user_id
+                    .values()
+                    .any(|instance| instance.id == instance_id)
+                {
+                    return Err(StoreError::InviteNotFound);
+                }
+                // 每个实例只保留一个待重启标记，不维护 revision 队列。
+                inner
+                    .hermes_gateway_restart_pending_by_instance_id
+                    .insert(instance_id.to_string(), true);
+                Ok(())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let result = sqlx::query(
+                    r#"
+                    update hermes_instances
+                    set gateway_restart_pending = true,
+                        updated_at = now()
+                    where id = $1::uuid
+                    "#,
+                )
+                .bind(instance_id)
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::InviteNotFound);
+                }
+                Ok(())
+            }),
+        }
+    }
+
+    pub async fn take_hermes_gateway_restart(&self, instance_id: &str) -> Result<bool, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                if !inner
+                    .hermes_instances_by_user_id
+                    .values()
+                    .any(|instance| instance.id == instance_id)
+                {
+                    return Err(StoreError::InviteNotFound);
+                }
+                Ok(inner
+                    .hermes_gateway_restart_pending_by_instance_id
+                    .remove(instance_id)
+                    .unwrap_or(false))
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let row = sqlx::query(
+                    r#"
+                    update hermes_instances
+                    set gateway_restart_pending = false,
+                        updated_at = now()
+                    where id = $1::uuid
+                      and gateway_restart_pending = true
+                    returning id
+                    "#,
+                )
+                .bind(instance_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+                Ok(row.is_some())
             }),
         }
     }
