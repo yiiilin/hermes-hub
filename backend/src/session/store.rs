@@ -24,6 +24,7 @@ const DEFAULT_MAX_SESSIONS_PER_USER: u32 = 20;
 const MAX_CONFIGURABLE_SESSIONS_PER_USER: u32 = 500;
 const MAX_SESSIONS_PER_USER_KEY: &str = "max_sessions_per_user";
 const OIDC_SETTINGS_KEY: &str = "oidc";
+const LDAP_SETTINGS_KEY: &str = "ldap";
 
 #[derive(Clone)]
 pub struct SessionStore {
@@ -83,6 +84,8 @@ pub struct SystemSettings {
     pub max_sessions_per_user: u32,
     #[serde(default)]
     pub oidc: OidcSettings,
+    #[serde(default)]
+    pub ldap: LdapSettings,
 }
 
 /// 管理员可配置的 OIDC 参数。字段名尽量贴近 Outline 的环境变量语义，
@@ -106,10 +109,33 @@ pub struct OidcSettings {
     pub auto_create_users: bool,
 }
 
+/// 管理员可配置的 LDAP 登录参数。Hub 只用邮箱做身份关联，
+/// 因此查询过滤器必须包含 `{email}` 占位符。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct LdapSettings {
+    pub enabled: bool,
+    pub display_name: String,
+    pub url: String,
+    pub bind_dn: String,
+    pub bind_password: String,
+    pub base_dn: String,
+    pub user_filter: String,
+    pub email_attribute: String,
+    pub auto_create_users: bool,
+}
+
 /// OIDC 登录会复用已有用户，也可能按配置自动创建新用户。
 /// HTTP 层需要知道是否新建，才能只在创建用户后补建 Hermes 运行时。
 #[derive(Clone, Debug)]
 pub struct OidcUserResult {
+    pub user: User,
+    pub created: bool,
+}
+
+/// LDAP 登录与 OIDC 一样按邮箱复用用户，HTTP 层需要知道是否刚创建账号。
+#[derive(Clone, Debug)]
+pub struct LdapUserResult {
     pub user: User,
     pub created: bool,
 }
@@ -119,6 +145,7 @@ impl Default for SystemSettings {
         Self {
             max_sessions_per_user: DEFAULT_MAX_SESSIONS_PER_USER,
             oidc: OidcSettings::default(),
+            ldap: LdapSettings::default(),
         }
     }
 }
@@ -139,6 +166,22 @@ impl Default for OidcSettings {
             username_claim: "preferred_username".to_string(),
             email_claim: "email".to_string(),
             allow_password_login: true,
+            auto_create_users: true,
+        }
+    }
+}
+
+impl Default for LdapSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            display_name: "LDAP".to_string(),
+            url: String::new(),
+            bind_dn: String::new(),
+            bind_password: String::new(),
+            base_dn: String::new(),
+            user_filter: "(mail={email})".to_string(),
+            email_attribute: "mail".to_string(),
             auto_create_users: true,
         }
     }
@@ -503,6 +546,47 @@ impl SessionStore {
                 let user = postgres_create_user(pool, email, &placeholder_password, UserRole::User)
                     .await?;
                 Ok(OidcUserResult {
+                    user,
+                    created: true,
+                })
+            }
+        }
+    }
+
+    pub async fn get_or_create_ldap_user(
+        &self,
+        email: &str,
+        auto_create: bool,
+    ) -> Result<LdapUserResult, StoreError> {
+        if let Some(user) = self.user_by_email(email).await? {
+            if user.status == UserStatus::Active {
+                return Ok(LdapUserResult {
+                    user,
+                    created: false,
+                });
+            }
+            return Err(StoreError::InvalidCredentials);
+        }
+
+        if !auto_create {
+            return Err(StoreError::InvalidCredentials);
+        }
+
+        // LDAP 用户不使用本地密码登录；占位密码只为保持现有 users 表结构完整。
+        let placeholder_password = format!("ldap:{}", Uuid::new_v4());
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let user = inner.create_user(email, &placeholder_password, UserRole::User)?;
+                Ok(LdapUserResult {
+                    user,
+                    created: true,
+                })
+            }
+            SessionStoreBackend::Postgres { pool, .. } => {
+                let user = postgres_create_user(pool, email, &placeholder_password, UserRole::User)
+                    .await?;
+                Ok(LdapUserResult {
                     user,
                     created: true,
                 })
@@ -1507,9 +1591,24 @@ impl SessionStore {
                     .transpose()?
                     .unwrap_or_default();
 
+                let ldap = sqlx::query("select value from system_settings where key = $1")
+                    .bind(LDAP_SETTINGS_KEY)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?
+                    .and_then(|row| row.try_get::<String, _>("value").ok())
+                    .map(|value| {
+                        serde_json::from_str::<LdapSettings>(&value)
+                            .map_err(|_| StoreError::DatabaseFailed)
+                            .and_then(|settings| decrypt_ldap_settings(settings, cipher))
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+
                 Ok(SystemSettings {
                     max_sessions_per_user: value,
                     oidc,
+                    ldap,
                 })
             }),
         }
@@ -1528,6 +1627,7 @@ impl SessionStore {
             }
             SessionStoreBackend::Postgres { pool, cipher } => block_on_db(async {
                 let stored_oidc = encrypted_oidc_settings(&settings.oidc, cipher);
+                let stored_ldap = encrypted_ldap_settings(&settings.ldap, cipher);
                 sqlx::query(
                     r#"
                     insert into system_settings (key, value, updated_at)
@@ -1539,6 +1639,21 @@ impl SessionStore {
                 )
                 .bind(MAX_SESSIONS_PER_USER_KEY)
                 .bind(settings.max_sessions_per_user.to_string())
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                sqlx::query(
+                    r#"
+                    insert into system_settings (key, value, updated_at)
+                    values ($1, $2, now())
+                    on conflict (key) do update set
+                        value = excluded.value,
+                        updated_at = now()
+                    "#,
+                )
+                .bind(LDAP_SETTINGS_KEY)
+                .bind(serde_json::to_string(&stored_ldap).map_err(|_| StoreError::DatabaseFailed)?)
                 .execute(pool)
                 .await
                 .map_err(|_| StoreError::DatabaseFailed)?;
@@ -1657,6 +1772,19 @@ fn validate_system_settings(settings: &SystemSettings) -> Result<(), StoreError>
             return Err(StoreError::InvalidSystemSettings);
         }
     }
+    if settings.ldap.enabled {
+        let ldap = &settings.ldap;
+        if ldap.url.trim().is_empty()
+            || ldap.bind_dn.trim().is_empty()
+            || ldap.bind_password.trim().is_empty()
+            || ldap.base_dn.trim().is_empty()
+            || ldap.user_filter.trim().is_empty()
+            || !ldap.user_filter.contains("{email}")
+            || ldap.email_attribute.trim().is_empty()
+        {
+            return Err(StoreError::InvalidSystemSettings);
+        }
+    }
 
     Ok(())
 }
@@ -1675,6 +1803,25 @@ fn decrypt_oidc_settings(
 ) -> Result<OidcSettings, StoreError> {
     if looks_like_encrypted_secret(&settings.client_secret) {
         settings.client_secret = decrypt_secret(cipher, &settings.client_secret)
+            .map_err(|_| StoreError::SecretFailed)?;
+    }
+    Ok(settings)
+}
+
+fn encrypted_ldap_settings(settings: &LdapSettings, cipher: &SecretCipher) -> LdapSettings {
+    let mut stored = settings.clone();
+    if !stored.bind_password.is_empty() {
+        stored.bind_password = encrypt_secret(cipher, &stored.bind_password);
+    }
+    stored
+}
+
+fn decrypt_ldap_settings(
+    mut settings: LdapSettings,
+    cipher: &SecretCipher,
+) -> Result<LdapSettings, StoreError> {
+    if looks_like_encrypted_secret(&settings.bind_password) {
+        settings.bind_password = decrypt_secret(cipher, &settings.bind_password)
             .map_err(|_| StoreError::SecretFailed)?;
     }
     Ok(settings)

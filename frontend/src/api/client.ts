@@ -136,6 +136,7 @@ export type ModelConfigTestResult = {
 export type SystemSettings = {
   max_sessions_per_user: number;
   oidc: OidcSettings;
+  ldap: LdapSettings;
 };
 
 export type ManagedSkill = {
@@ -174,6 +175,23 @@ export type OidcSettings = {
 };
 
 export type OidcPublicConfig = {
+  enabled: boolean;
+  display_name: string;
+};
+
+export type LdapSettings = {
+  enabled: boolean;
+  display_name: string;
+  url: string;
+  bind_dn: string;
+  bind_password: string;
+  base_dn: string;
+  user_filter: string;
+  email_attribute: string;
+  auto_create_users: boolean;
+};
+
+export type LdapPublicConfig = {
   enabled: boolean;
   display_name: string;
 };
@@ -234,7 +252,9 @@ export type ApiClient = {
   me: () => Promise<User | null>;
   bootstrapStatus: () => Promise<{ bootstrap_open: boolean }>;
   oidcConfig: () => Promise<OidcPublicConfig>;
+  ldapConfig: () => Promise<LdapPublicConfig>;
   login: (email: string, password: string) => Promise<User>;
+  ldapLogin: (email: string, password: string) => Promise<User>;
   bootstrapRegister: (email: string, password: string) => Promise<User>;
   registerWithInvite: (
     inviteToken: string,
@@ -541,6 +561,33 @@ export function defaultOidcSettings(): OidcSettings {
   };
 }
 
+export function defaultLdapSettings(): LdapSettings {
+  return {
+    enabled: false,
+    display_name: "LDAP",
+    url: "",
+    bind_dn: "",
+    bind_password: "",
+    base_dn: "",
+    user_filter: "(mail={email})",
+    email_attribute: "mail",
+    auto_create_users: true,
+  };
+}
+
+type SystemSettingsPayload = Partial<Omit<SystemSettings, "oidc" | "ldap">> & {
+  oidc?: Partial<OidcSettings> | null;
+  ldap?: Partial<LdapSettings> | null;
+};
+
+function systemSettingsFromPayload(settings: SystemSettingsPayload): SystemSettings {
+  return {
+    max_sessions_per_user: positiveNumberOrDefault(settings.max_sessions_per_user, 20),
+    oidc: { ...defaultOidcSettings(), ...(settings.oidc ?? {}) },
+    ldap: { ...defaultLdapSettings(), ...(settings.ldap ?? {}) },
+  };
+}
+
 export function createApiClient(): ApiClient {
   return {
     async me() {
@@ -556,8 +603,19 @@ export function createApiClient(): ApiClient {
       const payload = await request<{ oidc: OidcPublicConfig }>("/api/auth/oidc/config");
       return payload.oidc;
     },
+    async ldapConfig() {
+      const payload = await request<{ ldap: LdapPublicConfig }>("/api/auth/ldap/config");
+      return payload.ldap;
+    },
     async login(email, password) {
       const payload = await request<{ user: User }>("/api/auth/login", {
+        method: "POST",
+        body: { email, password },
+      });
+      return payload.user;
+    },
+    async ldapLogin(email, password) {
+      const payload = await request<{ user: User }>("/api/auth/ldap/login", {
         method: "POST",
         body: { email, password },
       });
@@ -842,10 +900,10 @@ export function createApiClient(): ApiClient {
       );
     },
     async systemSettings() {
-      const payload = await request<{ settings: SystemSettings }>(
+      const payload = await request<{ settings: SystemSettingsPayload }>(
         "/api/admin/system-settings",
       );
-      return payload.settings;
+      return systemSettingsFromPayload(payload.settings);
     },
     async updateSystemSettings(settings) {
       await request<void>("/api/admin/system-settings", {
@@ -1062,6 +1120,8 @@ function stripAttachmentPreviews(attachments: HermesAttachment[]): HermesAttachm
 type MockApiClientOptions = {
   initialUser?: User | null;
   oidcPublicConfig?: OidcPublicConfig;
+  ldapPublicConfig?: LdapPublicConfig;
+  ldapLogin?: ApiClient["ldapLogin"];
   bootstrapOpen?: boolean;
   requiredModelsReady?: boolean;
   missingRequiredModelConfigKinds?: ModelConfigKind[];
@@ -1090,6 +1150,10 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     role: "admin",
     status: "active",
   };
+  const usersByEmail = new Map<string, User>();
+  if (currentUser) {
+    usersByEmail.set(currentUser.email.toLowerCase(), currentUser);
+  }
   let channels: Channel[] = [
     {
       id: "channel-1",
@@ -1165,6 +1229,7 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
   let systemSettings: SystemSettings = {
     max_sessions_per_user: 20,
     oidc: defaultOidcSettings(),
+    ldap: defaultLdapSettings(),
   };
   let managedSkills: Record<string, string> = {
     "writing/SKILL.md": "# Writing\n\nUse concise prose.\n",
@@ -1177,6 +1242,21 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     for (const listener of sessionEventListenersBySessionId[sessionId] ?? []) {
       listener(event);
     }
+  }
+
+  function authenticateUserByEmail(email: string, fallbackRole: User["role"]): User {
+    const normalizedEmail = email.trim().toLowerCase();
+    const existingUser = usersByEmail.get(normalizedEmail);
+    const user: User = existingUser ?? {
+      id: `user-${usersByEmail.size + 1}`,
+      email,
+      role: fallbackRole,
+      status: "active",
+    };
+    usersByEmail.set(normalizedEmail, user);
+    hasAnyUser = true;
+    currentUser = user;
+    return user;
   }
 
   function managedSkillTreeFromState(): ManagedSkillTreeNode {
@@ -1253,20 +1333,30 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
         display_name: systemSettings.oidc.display_name,
       };
     },
+    async ldapConfig() {
+      return options.ldapPublicConfig ?? {
+        enabled: systemSettings.ldap.enabled,
+        display_name: systemSettings.ldap.display_name,
+      };
+    },
     async login(email) {
-      hasAnyUser = true;
-      currentUser = { id: "user-1", email, role: "admin", status: "active" };
-      return currentUser;
+      return authenticateUserByEmail(email, "admin");
+    },
+    async ldapLogin(email, password) {
+      if (options.ldapLogin) {
+        const user = await options.ldapLogin(email, password);
+        usersByEmail.set(user.email.toLowerCase(), user);
+        hasAnyUser = true;
+        currentUser = user;
+        return user;
+      }
+      return authenticateUserByEmail(email, "user");
     },
     async bootstrapRegister(email) {
-      hasAnyUser = true;
-      currentUser = { id: "user-1", email, role: "admin", status: "active" };
-      return currentUser;
+      return authenticateUserByEmail(email, "admin");
     },
     async registerWithInvite(_inviteToken, email) {
-      hasAnyUser = true;
-      currentUser = { id: "user-2", email, role: "user", status: "active" };
-      return currentUser;
+      return authenticateUserByEmail(email, "user");
     },
     async logout() {
       currentUser = null;
@@ -1553,10 +1643,10 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       };
     },
     async systemSettings() {
-      return systemSettings;
+      return systemSettingsFromPayload(systemSettings);
     },
     async updateSystemSettings(settings) {
-      systemSettings = settings;
+      systemSettings = systemSettingsFromPayload(settings);
     },
     async listManagedSkills() {
       return Object.entries(managedSkills)

@@ -9,6 +9,7 @@ use hermes_hub_backend::{
     channel::service::ChannelStore,
     docker_config_from_app,
     hermes::docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
+    ldap::DefaultLdapAuthenticator,
     llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
     model_config::ModelRegistry,
     session::store::SessionStore,
@@ -34,6 +35,7 @@ fn test_state(provider: InMemoryLlmProviderClient) -> AppState {
         channel_store: ChannelStore::default(),
         model_registry: ModelRegistry::default_for_tests(),
         llm_provider: provider.shared(),
+        ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
         object_storage: InMemoryObjectStorage::default().shared(),
         session_events: Default::default(),
     }

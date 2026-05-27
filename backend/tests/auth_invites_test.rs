@@ -6,13 +6,47 @@ use axum::{
     Json, Router,
 };
 use hermes_hub_backend::{build_router, AppConfig};
+use hermes_hub_backend::{
+    build_router_with_state,
+    channel::service::ChannelStore,
+    docker_config_from_app,
+    hermes::docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
+    ldap::{DynLdapAuthenticator, InMemoryLdapAuthenticator},
+    llm_proxy::InMemoryLlmProviderClient,
+    model_config::ModelRegistry,
+    session::store::SessionStore,
+    storage::InMemoryObjectStorage,
+    AppState,
+};
 use serde_json::{json, Value};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 
 fn test_app() -> Router {
     build_router(AppConfig::for_tests())
+}
+
+fn test_app_with_ldap(ldap_authenticator: DynLdapAuthenticator) -> Router {
+    let config = AppConfig::for_tests();
+    let state = AppState {
+        docker_provisioner: DockerProvisioner::new_with_runtime(
+            docker_config_from_app(&config, &config.initial_model_config),
+            Arc::new(NoopDockerRuntime),
+        ),
+        config,
+        store: SessionStore::default(),
+        channel_store: ChannelStore::default(),
+        model_registry: ModelRegistry::default_for_tests(),
+        llm_provider: InMemoryLlmProviderClient::default().shared(),
+        ldap_authenticator,
+        object_storage: InMemoryObjectStorage::default().shared(),
+        session_events: Default::default(),
+    };
+    build_router_with_state(state)
 }
 
 fn unix_now() -> u64 {
@@ -326,6 +360,194 @@ async fn oidc_callback_exchanges_code_creates_user_and_sets_session_cookie() {
     assert_eq!(body["hermes_instances"][0]["user_id"], oidc_user_id);
     assert_eq!(body["hermes_instances"][0]["kind"], "managed_docker");
     assert_eq!(body["hermes_instances"][0]["status"], "running");
+}
+
+#[tokio::test]
+async fn ldap_login_links_existing_user_by_email() {
+    let ldap = InMemoryLdapAuthenticator::default();
+    ldap.add_user(
+        "uid=admin,ou=people,dc=example,dc=com",
+        "admin@example.com",
+        "ldap-password-123",
+    );
+    let app = test_app_with_ldap(ldap.shared());
+    bootstrap_admin(&app).await;
+    let admin_cookie = login(&app, "admin@example.com", "admin-password-123").await;
+
+    let update = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/system-settings",
+        json!({
+            "max_sessions_per_user": 20,
+            "oidc": { "enabled": false },
+            "ldap": {
+                "enabled": true,
+                "display_name": "Corporate LDAP",
+                "url": "ldaps://ldap.example.com:636",
+                "bind_dn": "cn=hub,ou=apps,dc=example,dc=com",
+                "bind_password": "ldap-bind-secret",
+                "base_dn": "ou=people,dc=example,dc=com",
+                "user_filter": "(mail={email})",
+                "email_attribute": "mail",
+                "auto_create_users": false
+            }
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/api/auth/ldap/login",
+        json!({
+            "email": "ADMIN@example.com",
+            "password": "ldap-password-123"
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = cookie_from(&response);
+    let (status, body) = response_json(response).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["user"]["email"], "admin@example.com");
+    assert_eq!(body["user"]["role"], "admin");
+
+    let me = request_empty(&app, Method::GET, "/api/auth/me", Some(&cookie)).await;
+    let (status, body) = response_json(me).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["user"]["email"], "admin@example.com");
+}
+
+#[tokio::test]
+async fn ldap_login_auto_creates_user_by_email_and_ensures_hermes() {
+    let ldap = InMemoryLdapAuthenticator::default();
+    ldap.add_user(
+        "uid=ldap-user,ou=people,dc=example,dc=com",
+        "ldap-user@example.com",
+        "ldap-password-123",
+    );
+    let app = test_app_with_ldap(ldap.shared());
+    bootstrap_admin(&app).await;
+    let admin_cookie = login(&app, "admin@example.com", "admin-password-123").await;
+    configure_required_model_configs(&app, &admin_cookie).await;
+
+    let update = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/system-settings",
+        json!({
+            "max_sessions_per_user": 20,
+            "oidc": { "enabled": false },
+            "ldap": {
+                "enabled": true,
+                "display_name": "Corporate LDAP",
+                "url": "ldaps://ldap.example.com:636",
+                "bind_dn": "cn=hub,ou=apps,dc=example,dc=com",
+                "bind_password": "ldap-bind-secret",
+                "base_dn": "ou=people,dc=example,dc=com",
+                "user_filter": "(mail={email})",
+                "email_attribute": "mail",
+                "auto_create_users": true
+            }
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/api/auth/ldap/login",
+        json!({
+            "email": "LDAP-USER@example.com",
+            "password": "ldap-password-123"
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = cookie_from(&response);
+    let (status, body) = response_json(response).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["user"]["email"], "ldap-user@example.com");
+    assert_eq!(body["user"]["role"], "user");
+    let ldap_user_id = body["user"]["id"]
+        .as_str()
+        .expect("LDAP user id exists")
+        .to_string();
+
+    let me = request_empty(&app, Method::GET, "/api/auth/me", Some(&cookie)).await;
+    let (status, body) = response_json(me).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["user"]["email"], "ldap-user@example.com");
+
+    let instances = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/hermes-instances",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(instances).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["hermes_instances"][0]["user_id"], ldap_user_id);
+    assert_eq!(body["hermes_instances"][0]["kind"], "managed_docker");
+    assert_eq!(body["hermes_instances"][0]["status"], "running");
+}
+
+#[tokio::test]
+async fn ldap_login_rejects_new_user_when_auto_create_is_disabled() {
+    let ldap = InMemoryLdapAuthenticator::default();
+    ldap.add_user(
+        "uid=ldap-user,ou=people,dc=example,dc=com",
+        "ldap-user@example.com",
+        "ldap-password-123",
+    );
+    let app = test_app_with_ldap(ldap.shared());
+    bootstrap_admin(&app).await;
+    let admin_cookie = login(&app, "admin@example.com", "admin-password-123").await;
+
+    let update = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/system-settings",
+        json!({
+            "max_sessions_per_user": 20,
+            "oidc": { "enabled": false },
+            "ldap": {
+                "enabled": true,
+                "display_name": "Corporate LDAP",
+                "url": "ldaps://ldap.example.com:636",
+                "bind_dn": "cn=hub,ou=apps,dc=example,dc=com",
+                "bind_password": "ldap-bind-secret",
+                "base_dn": "ou=people,dc=example,dc=com",
+                "user_filter": "(mail={email})",
+                "email_attribute": "mail",
+                "auto_create_users": false
+            }
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/api/auth/ldap/login",
+        json!({
+            "email": "ldap-user@example.com",
+            "password": "ldap-password-123"
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 async fn create_invite(app: &Router, admin_cookie: &str, expires_at: u64, max_uses: u32) -> Value {

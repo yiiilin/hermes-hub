@@ -13,7 +13,7 @@ import type {
   SystemSettings,
   User,
 } from "../api/client";
-import { defaultOidcSettings } from "../api/client";
+import { defaultLdapSettings, defaultOidcSettings } from "../api/client";
 import { useI18n } from "../i18n";
 import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { FileArchive, FilePlus2, FolderPlus, Upload } from "lucide-react";
@@ -257,6 +257,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
   const [systemSettings, setSystemSettings] = useState<SystemSettings>({
     max_sessions_per_user: 20,
     oidc: defaultOidcSettings(),
+    ldap: defaultLdapSettings(),
   });
   const [settingsSaved, setSettingsSaved] = useState(false);
   const [inviteHours, setInviteHours] = useState(defaultInviteHours);
@@ -537,6 +538,13 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("admin.settingsSaveFailed"));
     }
+  }
+
+  function updateLdapSettings(patch: Partial<SystemSettings["ldap"]>) {
+    setSystemSettings({
+      ...systemSettings,
+      ldap: { ...systemSettings.ldap, ...patch },
+    });
   }
 
   async function openManagedSkill(path: string) {
@@ -1397,6 +1405,79 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                 }
               />
               {t("admin.oidcAutoCreateUsers")}
+            </label>
+          </fieldset>
+          <fieldset className="form-section">
+            <legend>{t("admin.ldapSettings")}</legend>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={systemSettings.ldap.enabled}
+                onChange={(event) => updateLdapSettings({ enabled: event.target.checked })}
+              />
+              {t("admin.ldapEnabled")}
+            </label>
+            <label>
+              {t("admin.ldapDisplayName")}
+              <input
+                value={systemSettings.ldap.display_name}
+                onChange={(event) => updateLdapSettings({ display_name: event.target.value })}
+              />
+            </label>
+            <label>
+              {t("admin.ldapUrl")}
+              <input
+                value={systemSettings.ldap.url}
+                onChange={(event) => updateLdapSettings({ url: event.target.value })}
+              />
+            </label>
+            <label>
+              {t("admin.ldapBindDn")}
+              <input
+                value={systemSettings.ldap.bind_dn}
+                onChange={(event) => updateLdapSettings({ bind_dn: event.target.value })}
+              />
+            </label>
+            <label>
+              {t("admin.ldapBindPassword")}
+              <input
+                type="password"
+                value={systemSettings.ldap.bind_password}
+                onChange={(event) => updateLdapSettings({ bind_password: event.target.value })}
+              />
+            </label>
+            <label>
+              {t("admin.ldapBaseDn")}
+              <input
+                value={systemSettings.ldap.base_dn}
+                onChange={(event) => updateLdapSettings({ base_dn: event.target.value })}
+              />
+            </label>
+            <label>
+              {t("admin.ldapUserFilter")}
+              <input
+                value={systemSettings.ldap.user_filter}
+                onChange={(event) => updateLdapSettings({ user_filter: event.target.value })}
+              />
+            </label>
+            <label>
+              {t("admin.ldapEmailAttribute")}
+              <input
+                value={systemSettings.ldap.email_attribute}
+                onChange={(event) =>
+                  updateLdapSettings({ email_attribute: event.target.value })
+                }
+              />
+            </label>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={systemSettings.ldap.auto_create_users}
+                onChange={(event) =>
+                  updateLdapSettings({ auto_create_users: event.target.checked })
+                }
+              />
+              {t("admin.ldapAutoCreateUsers")}
             </label>
           </fieldset>
           <div className="button-row">

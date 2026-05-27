@@ -3,6 +3,7 @@ pub mod attachments;
 pub mod auth;
 pub mod channel_protocol;
 pub mod invites;
+pub mod ldap;
 pub mod llm_proxy;
 pub mod oidc;
 pub mod sessions;
@@ -21,6 +22,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .merge(auth::router())
         .merge(oidc::router())
+        .merge(ldap::router())
         .merge(admin::router())
         .merge(invites::router())
         .merge(attachments::router())

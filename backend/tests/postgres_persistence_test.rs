@@ -10,10 +10,11 @@ use hermes_hub_backend::{
     db::migrations::run_migrations,
     docker_config_from_app,
     hermes::docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
+    ldap::DefaultLdapAuthenticator,
     llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
     model_config::{ModelConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND},
     security::crypto::SecretCipher,
-    session::store::{OidcSettings, SessionStore, SystemSettings},
+    session::store::{LdapSettings, OidcSettings, SessionStore, SystemSettings},
     storage::InMemoryObjectStorage,
     AppConfig, AppState,
 };
@@ -90,6 +91,7 @@ async fn test_state(pool: PgPool, provider: InMemoryLlmProviderClient) -> AppSta
         channel_store: ChannelStore::postgres(pool),
         model_registry,
         llm_provider: provider.shared(),
+        ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
         object_storage: InMemoryObjectStorage::default().shared(),
         session_events: Default::default(),
     }
@@ -1107,6 +1109,17 @@ async fn postgres_system_settings_persist_session_limit() {
                 allow_password_login: true,
                 auto_create_users: true,
             },
+            ldap: LdapSettings {
+                enabled: true,
+                display_name: "Corporate LDAP".to_string(),
+                url: "ldaps://ldap.example.com:636".to_string(),
+                bind_dn: "cn=hub,ou=apps,dc=example,dc=com".to_string(),
+                bind_password: "ldap-bind-secret".to_string(),
+                base_dn: "ou=people,dc=example,dc=com".to_string(),
+                user_filter: "(&(objectClass=person)(mail={email}))".to_string(),
+                email_attribute: "mail".to_string(),
+                auto_create_users: true,
+            },
         })
         .await
         .expect("settings can be updated");
@@ -1119,6 +1132,14 @@ async fn postgres_system_settings_persist_session_limit() {
         .expect("stored oidc settings include value");
     assert!(!stored_oidc.contains("oidc-secret"));
     assert!(stored_oidc.contains(r#""client_secret":"v1."#));
+    let stored_ldap: String = sqlx::query("select value from system_settings where key = 'ldap'")
+        .fetch_one(&pool)
+        .await
+        .expect("stored ldap settings can be read")
+        .try_get("value")
+        .expect("stored ldap settings include value");
+    assert!(!stored_ldap.contains("ldap-bind-secret"));
+    assert!(stored_ldap.contains(r#""bind_password":"v1."#));
 
     let reloaded = SessionStore::postgres(pool, cipher)
         .system_settings()
@@ -1126,4 +1147,5 @@ async fn postgres_system_settings_persist_session_limit() {
         .expect("settings can be reloaded");
     assert_eq!(reloaded.max_sessions_per_user, 7);
     assert_eq!(reloaded.oidc.client_secret, "oidc-secret");
+    assert_eq!(reloaded.ldap.bind_password, "ldap-bind-secret");
 }

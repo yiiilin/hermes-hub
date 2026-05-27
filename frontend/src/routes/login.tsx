@@ -1,4 +1,4 @@
-import type { ApiClient, OidcPublicConfig, User } from "../api/client";
+import type { ApiClient, LdapPublicConfig, OidcPublicConfig, User } from "../api/client";
 import { useI18n } from "../i18n";
 import { Bot } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useState } from "react";
@@ -23,6 +23,7 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [oidc, setOidc] = useState<OidcPublicConfig | null>(null);
+  const [ldap, setLdap] = useState<LdapPublicConfig | null>(null);
   const [bootstrapOpen, setBootstrapOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -31,27 +32,27 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
   useEffect(() => {
     let alive = true;
 
-    if (inviteToken) {
-      setCheckingBootstrap(false);
-      return () => {
-        alive = false;
-      };
-    }
-
-    void Promise.all([apiClient.bootstrapStatus(), apiClient.oidcConfig()])
-      .then(([status, oidcConfig]) => {
+    void Promise.all([
+      apiClient.bootstrapStatus(),
+      apiClient.oidcConfig(),
+      apiClient.ldapConfig(),
+    ])
+      .then(([status, oidcConfig, ldapConfig]) => {
         if (alive) {
           setOidc(oidcConfig);
+          setLdap(ldapConfig);
           setBootstrapOpen(status.bootstrap_open);
         }
-        if (alive && status.bootstrap_open) {
+        if (alive && !inviteToken && status.bootstrap_open) {
           setMode("bootstrap");
         }
       })
       .catch(() => {
         if (alive) {
           setBootstrapOpen(false);
-          setMode("login");
+          if (!inviteToken) {
+            setMode("login");
+          }
         }
       })
       .finally(() => {
@@ -64,6 +65,19 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
       alive = false;
     };
   }, [apiClient, inviteToken]);
+
+  async function signInWithLdap() {
+    setBusy(true);
+    setError(null);
+
+    try {
+      onAuthenticated(await apiClient.ldapLogin(email, password));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("auth.authFailed"));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -159,6 +173,16 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
           <a className="oidc-button" href="/api/auth/oidc/start">
             {t("auth.signInWith", { provider: oidc.display_name })}
           </a>
+        ) : null}
+        {!isRegistering && ldap?.enabled ? (
+          <button
+            type="button"
+            className="oidc-button"
+            disabled={busy || checkingBootstrap}
+            onClick={() => void signInWithLdap()}
+          >
+            {t("auth.signInWith", { provider: ldap.display_name })}
+          </button>
         ) : null}
         {!inviteToken && !checkingBootstrap && (isRegistering || bootstrapOpen) ? (
           <button

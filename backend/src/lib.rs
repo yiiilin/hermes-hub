@@ -3,6 +3,7 @@ pub mod channel;
 pub mod db;
 pub mod hermes;
 pub mod http;
+pub mod ldap;
 pub mod llm_proxy;
 pub mod model_config;
 pub mod model_registry;
@@ -26,6 +27,7 @@ use channel::service::ChannelStore;
 use hermes::docker_provisioner::{
     DockerProvisioner, DockerProvisionerConfig, ManagedSkillsMountConfig, NoopDockerRuntime,
 };
+use ldap::{DefaultLdapAuthenticator, DynLdapAuthenticator};
 use llm_proxy::{DynLlmProviderClient, InMemoryLlmProviderClient, ReqwestLlmProviderClient};
 use model_config::{ModelConfig, ModelRegistry};
 use serde::Serialize;
@@ -48,6 +50,7 @@ pub struct AppState {
     pub channel_store: ChannelStore,
     pub model_registry: ModelRegistry,
     pub llm_provider: DynLlmProviderClient,
+    pub ldap_authenticator: DynLdapAuthenticator,
     pub docker_provisioner: DockerProvisioner,
     pub object_storage: DynObjectStorage,
     pub session_events: channel::events::SessionEventHub,
@@ -84,6 +87,7 @@ pub fn build_router(config: AppConfig) -> Router {
         store: SessionStore::default(),
         channel_store: ChannelStore::default(),
         llm_provider: InMemoryLlmProviderClient::default().shared(),
+        ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
         docker_provisioner,
         object_storage,
         session_events: channel::events::SessionEventHub::default(),
@@ -110,6 +114,7 @@ pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppIn
             store: SessionStore::default(),
             channel_store: ChannelStore::default(),
             llm_provider: ReqwestLlmProviderClient::default().shared(),
+            ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
             docker_provisioner,
             object_storage,
             session_events: channel::events::SessionEventHub::default(),
@@ -138,6 +143,7 @@ pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppIn
         channel_store: ChannelStore::postgres(pool),
         model_registry,
         llm_provider: ReqwestLlmProviderClient::default().shared(),
+        ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
         docker_provisioner,
         object_storage,
         session_events: channel::events::SessionEventHub::default(),

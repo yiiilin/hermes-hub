@@ -13,6 +13,7 @@ use hermes_hub_backend::{
         docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
         instance::{HermesInstance, HermesInstanceKind, HermesInstanceStatus},
     },
+    ldap::DefaultLdapAuthenticator,
     llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
     model_config::{ModelConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND},
     session::store::{HermesScheduledTaskSnapshot, HermesSchedulerSnapshotInput, SessionStore},
@@ -45,6 +46,7 @@ fn test_state_with_channel_store(store: SessionStore, channel_store: ChannelStor
             body: b"{}".to_vec(),
         })
         .shared(),
+        ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
         object_storage: InMemoryObjectStorage::default().shared(),
         session_events: Default::default(),
     }

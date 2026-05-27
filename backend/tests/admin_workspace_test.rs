@@ -9,6 +9,7 @@ use hermes_hub_backend::{
     channel::service::ChannelStore,
     docker_config_from_app,
     hermes::docker_provisioner::{DockerRuntime, DockerRuntimeOutput},
+    ldap::DefaultLdapAuthenticator,
     llm_proxy::InMemoryLlmProviderClient,
     model_config::{
         ModelConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND,
@@ -119,6 +120,7 @@ async fn app_state_with_recording_docker_runtime() -> (AppState, RecordingDocker
         channel_store: ChannelStore::default(),
         model_registry,
         llm_provider: InMemoryLlmProviderClient::default().shared(),
+        ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
         docker_provisioner,
         session_events: hermes_hub_backend::channel::events::SessionEventHub::default(),
     };
@@ -875,6 +877,8 @@ async fn admin_can_configure_per_user_session_limit() {
     assert_eq!(body["settings"]["max_sessions_per_user"], 20);
     assert_eq!(body["settings"]["oidc"]["enabled"], false);
     assert_eq!(body["settings"]["oidc"]["display_name"], "OpenID Connect");
+    assert_eq!(body["settings"]["ldap"]["enabled"], false);
+    assert_eq!(body["settings"]["ldap"]["display_name"], "LDAP");
 
     let update = request_json(
         &app,
@@ -896,6 +900,17 @@ async fn admin_can_configure_per_user_session_limit() {
                 "username_claim": "preferred_username",
                 "email_claim": "email",
                 "allow_password_login": true,
+                "auto_create_users": true
+            },
+            "ldap": {
+                "enabled": true,
+                "display_name": "Corporate LDAP",
+                "url": "ldaps://ldap.example.com:636",
+                "bind_dn": "cn=hub,ou=apps,dc=example,dc=com",
+                "bind_password": "ldap-bind-secret",
+                "base_dn": "ou=people,dc=example,dc=com",
+                "user_filter": "(&(objectClass=person)(mail={email}))",
+                "email_attribute": "mail",
                 "auto_create_users": true
             }
         }),
@@ -922,6 +937,16 @@ async fn admin_can_configure_per_user_session_limit() {
         body["settings"]["oidc"]["authorization_url"],
         "https://idp.example.com/oauth2/v1/authorize"
     );
+    assert_eq!(body["settings"]["ldap"]["enabled"], true);
+    assert_eq!(body["settings"]["ldap"]["display_name"], "Corporate LDAP");
+    assert_eq!(
+        body["settings"]["ldap"]["url"],
+        "ldaps://ldap.example.com:636"
+    );
+    assert_eq!(
+        body["settings"]["ldap"]["bind_password"],
+        "ldap-bind-secret"
+    );
 
     let public_oidc = request_empty(&app, Method::GET, "/api/auth/oidc/config", None).await;
     let (status, body) = response_json(public_oidc).await;
@@ -929,6 +954,13 @@ async fn admin_can_configure_per_user_session_limit() {
     assert_eq!(body["oidc"]["enabled"], true);
     assert_eq!(body["oidc"]["display_name"], "Acme SSO");
     assert!(body["oidc"].get("client_secret").is_none());
+
+    let public_ldap = request_empty(&app, Method::GET, "/api/auth/ldap/config", None).await;
+    let (status, body) = response_json(public_ldap).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ldap"]["enabled"], true);
+    assert_eq!(body["ldap"]["display_name"], "Corporate LDAP");
+    assert!(body["ldap"].get("bind_password").is_none());
 
     let channels = request_empty(&app, Method::GET, "/api/channels", Some(&admin_cookie)).await;
     let (status, body) = response_json(channels).await;

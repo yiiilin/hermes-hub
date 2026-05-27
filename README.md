@@ -29,12 +29,25 @@ Requirements:
 - An OpenAI-compatible model provider
 - A host where mounting `/var/run/docker.sock` is acceptable
 
-Create `.env` in the repository root:
+The production Compose file is `deploy/compose.prod.yml`. It is intentionally standalone: you can copy it and `deploy/.env.example` outside the repository and deploy from there without source code or build contexts.
+
+Create a deployment directory and edit `.env`:
+
+```bash
+sudo mkdir -p /opt/hermes-hub
+sudo cp deploy/compose.prod.yml /opt/hermes-hub/compose.yml
+sudo cp deploy/.env.example /opt/hermes-hub/.env
+cd /opt/hermes-hub
+$EDITOR .env
+```
+
+At minimum, replace these values:
 
 ```bash
 HERMES_HUB_BACKEND_IMAGE=ghcr.io/yiiilin/hermes-hub:latest
-HERMES_VERSION=latest
+HERMES_DOCKER_IMAGE=ghcr.io/yiiilin/hermes-hub-hermes:latest
 HERMES_HUB_HTTP_PORT=8080
+HERMES_DATA_ROOT=/opt/hermes-hub/data/hub/users
 
 POSTGRES_PASSWORD=change-me
 HERMES_HUB_SECRET_MASTER_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
@@ -52,22 +65,41 @@ HERMES_OBJECT_STORAGE_SECRET_KEY=change-me-rustfs-secret
 Start Hermes Hub:
 
 ```bash
-docker compose --project-directory . --env-file .env -f infra/docker/docker-compose.hub.yml --profile hermes-runtime build hermes-runtime
-docker compose --project-directory . --env-file .env -f infra/docker/docker-compose.hub.yml pull
-docker compose --project-directory . --env-file .env -f infra/docker/docker-compose.hub.yml up -d --no-build
+docker compose --env-file .env -f compose.yml pull
+docker compose --env-file .env -f compose.yml --profile hermes-runtime pull hermes-runtime
+docker compose --env-file .env -f compose.yml up -d
 ```
 
-`HERMES_VERSION` selects the official `nousresearch/hermes-agent` tag used by the thin `hermes-hub-hermes` wrapper image. Keep it aligned with the Hermes version you want to run.
-By default the wrapper image is tagged as `ghcr.io/yiiilin/hermes-hub-hermes:${HERMES_VERSION}`; set `HERMES_DOCKER_IMAGE` if you want to use a registry proxy or a local tag.
+`HERMES_DATA_ROOT` must be a host absolute path. The production Compose file bind-mounts that same path into the backend container because the backend talks to the host Docker daemon and creates sibling Hermes containers.
+
+Only the Hub Web/API port is public by default. RustFS API, RustFS Console, and skills NFS are bound to `127.0.0.1`; Postgres is not published to the host.
 
 Open `http://localhost:8080`, create the first admin account, configure models, and create invite links for users.
+
+## Development Compose
+
+The development Compose file is `deploy/compose.dev.yml`. It mounts the repository root into Rust and Node containers and keeps the existing `app-dev` profile workflow.
+
+Start only the development database:
+
+```bash
+docker compose -f deploy/compose.dev.yml up -d postgres
+```
+
+Run the full local app stack from the repository root:
+
+```bash
+docker compose -f deploy/compose.dev.yml --profile app-dev up
+```
+
+The Vite frontend listens on `http://localhost:5173`, and the backend listens on `http://localhost:8080`.
 
 ## Build From Source
 
 Requirements: Rust 1.88+, Node.js 24, npm, Docker, and Docker Compose.
 
 ```bash
-make dev-db
+docker compose -f deploy/compose.dev.yml up -d postgres
 cargo test --workspace
 
 cd frontend
@@ -90,10 +122,10 @@ Release images are published to GitHub Container Registry:
 
 ```bash
 docker pull ghcr.io/yiiilin/hermes-hub:latest
-make hermes-image
+docker pull ghcr.io/yiiilin/hermes-hub-hermes:latest
 ```
 
-The Hub image contains the Rust backend and the built React frontend. `make hermes-image` builds the thin Hermes runtime wrapper used by managed Hermes containers and tags it under GHCR by default. The service listens on port `8080`.
+The Hub image contains the Rust backend and the built React frontend. The `hermes-hub-hermes` image is the Hermes runtime wrapper used by managed per-user containers. The service listens on port `8080`.
 
 ## Release
 

@@ -1,0 +1,181 @@
+# Hermes Hub 开发部署 Compose。
+#
+# 这个文件明确用于本地开发：服务会挂载项目根目录源码，并保留 app-dev profile 工作流。
+name: hermes-hub-dev
+
+# 请从项目根目录执行 docker compose -f deploy/compose.dev.yml ...，这样 ${PWD} 会指向仓库根目录。
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: hermes_hub
+      POSTGRES_USER: hermes_hub
+      POSTGRES_PASSWORD: hermes_hub
+    ports:
+      # 开发数据库默认只监听本机，避免局域网误访问。
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - ${PWD}/data/postgres:/var/lib/postgresql/data
+    networks:
+      - hermes-hub-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hermes_hub -d hermes_hub"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rustfs-perms:
+    image: alpine:3.20
+    network_mode: "none"
+    command: ["sh", "-lc", "mkdir -p /data && chown -R 10001:10001 /data"]
+    volumes:
+      - ${PWD}/data/rustfs:/data
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    depends_on:
+      rustfs-perms:
+        condition: service_completed_successfully
+    command: ["/data"]
+    environment:
+      RUSTFS_ACCESS_KEY: ${HERMES_OBJECT_STORAGE_ACCESS_KEY:-rustfsadmin}
+      RUSTFS_SECRET_KEY: ${HERMES_OBJECT_STORAGE_SECRET_KEY:-rustfsadmin}
+      RUSTFS_CONSOLE_ENABLE: "true"
+    ports:
+      # RustFS 开发调试端口默认只绑定本机。
+      - "127.0.0.1:${RUSTFS_API_HOST_PORT:-9000}:9000"
+      - "127.0.0.1:${RUSTFS_CONSOLE_HOST_PORT:-9001}:9001"
+    volumes:
+      - ${PWD}/data/rustfs:/data
+    networks:
+      - hermes-hub-net
+
+  rustfs-init:
+    image: minio/mc:latest
+    depends_on:
+      rustfs:
+        condition: service_started
+    environment:
+      HERMES_OBJECT_STORAGE_ACCESS_KEY: ${HERMES_OBJECT_STORAGE_ACCESS_KEY:-rustfsadmin}
+      HERMES_OBJECT_STORAGE_SECRET_KEY: ${HERMES_OBJECT_STORAGE_SECRET_KEY:-rustfsadmin}
+      HERMES_OBJECT_STORAGE_BUCKET: ${HERMES_OBJECT_STORAGE_BUCKET:-hermes-hub}
+    entrypoint:
+      - /bin/sh
+      - -lc
+      - |
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+          mc alias set rustfs http://rustfs:9000 "${HERMES_OBJECT_STORAGE_ACCESS_KEY:-rustfsadmin}" "${HERMES_OBJECT_STORAGE_SECRET_KEY:-rustfsadmin}" &&
+          mc mb --ignore-existing "rustfs/${HERMES_OBJECT_STORAGE_BUCKET:-hermes-hub}" &&
+          exit 0
+          sleep 2
+        done
+        exit 1
+    networks:
+      - hermes-hub-net
+
+  hermes-runtime:
+    profiles: ["hermes-runtime"]
+    build:
+      context: ${PWD}
+      dockerfile: infra/docker/hermes/Dockerfile
+      args:
+        HERMES_VERSION: ${HERMES_VERSION:-latest}
+    image: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:${HERMES_VERSION:-latest}}
+    command: ["true"]
+    networks:
+      - hermes-hub-net
+
+  # 仅用于本地联调便利：当前服务使用源码挂载，不是生产镜像。
+  skills-fs:
+    profiles: ["app-dev"]
+    image: rust:1.88
+    working_dir: /workspace
+    command: ["bash", "-lc", "cargo run -p hermes-hub-backend --bin hermes-hub-skills-fs"]
+    environment:
+      HERMES_HUB_SKILLS_FS_BIND_ADDR: 0.0.0.0:12049
+      HERMES_HUB_SKILLS_FS_PREFIX: ${HERMES_HUB_SKILLS_FS_PREFIX:-managed-skills/current}
+      HERMES_HUB_SKILLS_FS_EXPORT_NAME: ${HERMES_HUB_SKILLS_FS_EXPORT_NAME:-skills}
+      HERMES_OBJECT_STORAGE_ENDPOINT: http://rustfs:9000
+      HERMES_OBJECT_STORAGE_BUCKET: ${HERMES_OBJECT_STORAGE_BUCKET:-hermes-hub}
+      HERMES_OBJECT_STORAGE_REGION: ${HERMES_OBJECT_STORAGE_REGION:-us-east-1}
+      HERMES_OBJECT_STORAGE_ACCESS_KEY: ${HERMES_OBJECT_STORAGE_ACCESS_KEY:-rustfsadmin}
+      HERMES_OBJECT_STORAGE_SECRET_KEY: ${HERMES_OBJECT_STORAGE_SECRET_KEY:-rustfsadmin}
+      HERMES_OBJECT_STORAGE_FORCE_PATH_STYLE: "true"
+    volumes:
+      - ${PWD}:/workspace
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    ports:
+      # NFS 只需要宿主机 Docker daemon 访问，默认不暴露到外部网络。
+      - "127.0.0.1:${HERMES_HUB_SKILLS_FS_HOST_PORT:-12049}:12049"
+    networks:
+      - hermes-hub-net
+
+  # 仅用于本地联调便利：当前服务使用源码挂载，不是生产镜像。
+  backend:
+    profiles: ["app-dev"]
+    image: rust:1.88
+    working_dir: /workspace
+    command: ["bash", "-lc", "cargo run -p hermes-hub-backend"]
+    environment:
+      HERMES_HUB_BIND_ADDR: 0.0.0.0:8080
+      DATABASE_URL: postgres://hermes_hub:hermes_hub@postgres:5432/hermes_hub
+      HERMES_HUB_SECRET_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      HERMES_HUB_COOKIE_NAME: hermes_hub_session
+      # backend 通过宿主机 Docker daemon 创建兄弟 Hermes 容器；
+      # 开发环境默认使用仓库 data 目录的绝对路径，保证 Docker bind mount 能找到真实目录。
+      HERMES_DATA_ROOT: ${PWD}/data/hub/users
+      HERMES_DOCKER_IMAGE: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:${HERMES_VERSION:-latest}}
+      HERMES_CONTAINER_NETWORK: hermes-hub-net
+      HERMES_CONTAINER_INTERNAL_PORT: 8000
+      HERMES_HUB_LLM_BASE_URL: http://hermes-hub:8080/internal/llm/v1
+      HERMES_HUB_MANAGED_SKILLS_MOUNT_ENABLED: "true"
+      HERMES_HUB_MANAGED_SKILLS_VOLUME_NAME: ${HERMES_HUB_MANAGED_SKILLS_VOLUME_NAME:-hermes-hub-managed-skills}
+      HERMES_HUB_MANAGED_SKILLS_NFS_ADDR: ${HERMES_HUB_MANAGED_SKILLS_NFS_ADDR:-127.0.0.1:12049}
+      HERMES_HUB_MANAGED_SKILLS_NFS_EXPORT: /skills
+      HERMES_HUB_MANAGED_SKILLS_CONTAINER_PATH: /hub-managed-skills
+      HERMES_OBJECT_STORAGE_ENDPOINT: http://rustfs:9000
+      HERMES_OBJECT_STORAGE_BUCKET: ${HERMES_OBJECT_STORAGE_BUCKET:-hermes-hub}
+      HERMES_OBJECT_STORAGE_REGION: ${HERMES_OBJECT_STORAGE_REGION:-us-east-1}
+      HERMES_OBJECT_STORAGE_ACCESS_KEY: ${HERMES_OBJECT_STORAGE_ACCESS_KEY:-rustfsadmin}
+      HERMES_OBJECT_STORAGE_SECRET_KEY: ${HERMES_OBJECT_STORAGE_SECRET_KEY:-rustfsadmin}
+      HERMES_OBJECT_STORAGE_FORCE_PATH_STYLE: "true"
+      HERMES_OBJECT_STORAGE_PREFIX: ${HERMES_OBJECT_STORAGE_PREFIX:-attachments}
+    volumes:
+      - ${PWD}:/workspace
+      - ${PWD}/data/hub/users:${PWD}/data/hub/users
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rustfs-init:
+        condition: service_completed_successfully
+      skills-fs:
+        condition: service_started
+    ports:
+      - "${HERMES_HUB_HTTP_HOST_BIND:-127.0.0.1}:${HERMES_HUB_HTTP_PORT:-8080}:8080"
+    networks:
+      hermes-hub-net:
+        aliases:
+          - hermes-hub
+
+  # 仅启动 Vite 开发服务器；不是生产前端镜像。
+  frontend:
+    profiles: ["app-dev"]
+    image: node:24-alpine
+    working_dir: /workspace/frontend
+    command: ["sh", "-lc", "npm install && npm run dev -- --host 0.0.0.0 --port 5173"]
+    volumes:
+      - ${PWD}:/workspace
+    depends_on:
+      - backend
+    ports:
+      - "${HERMES_HUB_FRONTEND_HOST_BIND:-127.0.0.1}:${HERMES_HUB_FRONTEND_HOST_PORT:-5173}:5173"
+    networks:
+      - hermes-hub-net
+
+networks:
+  hermes-hub-net:
+    name: hermes-hub-net

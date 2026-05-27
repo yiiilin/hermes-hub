@@ -1679,6 +1679,63 @@ describe("App", () => {
     expect(enableOidcRow?.nextElementSibling).toBe(redirectInput.closest("label"));
   });
 
+  it("shows and saves LDAP authentication settings", async () => {
+    const client = createMockApiClient();
+    const updateSystemSettings = client.updateSystemSettings.bind(client);
+    let savedSettings: unknown = null;
+    client.updateSystemSettings = vi.fn(async (settings) => {
+      savedSettings = settings;
+      await updateSystemSettings(settings);
+    });
+
+    render(<App apiClient={client} />);
+
+    await openSettingsTab("Authentication settings");
+
+    expect(await screen.findByLabelText("Enable LDAP")).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("Enable LDAP"));
+    fireEvent.change(screen.getByLabelText("LDAP display name"), {
+      target: { value: "Corporate LDAP" },
+    });
+    fireEvent.change(screen.getByLabelText("LDAP URL"), {
+      target: { value: "ldap://ldap.example.com:389" },
+    });
+    fireEvent.change(screen.getByLabelText("LDAP bind DN"), {
+      target: { value: "cn=readonly,dc=example,dc=com" },
+    });
+    fireEvent.change(screen.getByLabelText("LDAP bind password"), {
+      target: { value: "ldap-secret" },
+    });
+    fireEvent.change(screen.getByLabelText("LDAP base DN"), {
+      target: { value: "dc=example,dc=com" },
+    });
+    fireEvent.change(screen.getByLabelText("LDAP user filter"), {
+      target: { value: "(mail={email})" },
+    });
+    fireEvent.change(screen.getByLabelText("LDAP email attribute"), {
+      target: { value: "mail" },
+    });
+    expect(screen.getByLabelText("Auto-create LDAP users")).toBeChecked();
+
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+
+    expect(await screen.findByText("Settings saved")).toBeInTheDocument();
+    expect(client.updateSystemSettings).toHaveBeenCalledTimes(1);
+    expect(savedSettings).toMatchObject({
+      ldap: {
+        enabled: true,
+        display_name: "Corporate LDAP",
+        url: "ldap://ldap.example.com:389",
+        bind_dn: "cn=readonly,dc=example,dc=com",
+        bind_password: "ldap-secret",
+        base_dn: "dc=example,dc=com",
+        user_filter: "(mail={email})",
+        email_attribute: "mail",
+        auto_create_users: true,
+      },
+    });
+  });
+
   it("localizes the configured session limit message in Chinese", async () => {
     localStorage.setItem("hermes-hub-language", "zh");
     const client = createMockApiClient({
@@ -1737,6 +1794,41 @@ describe("App", () => {
 
     const oidcButton = await screen.findByRole("link", { name: "Sign in with Acme SSO" });
     expect(oidcButton).toHaveAttribute("href", "/api/auth/oidc/start");
+  });
+
+  it("shows LDAP sign-in when it is enabled and authenticates through LDAP", async () => {
+    const ldapLogin = vi.fn(async (email: string, _password: string) => ({
+      id: "ldap-user-1",
+      email,
+      role: "user" as const,
+      status: "active" as const,
+    }));
+    const client = createMockApiClient({
+      initialUser: null,
+      ldapPublicConfig: {
+        enabled: true,
+        display_name: "Corporate LDAP",
+      },
+      ldapLogin,
+    });
+
+    render(<App apiClient={client} />);
+
+    const ldapButton = await screen.findByRole("button", {
+      name: "Sign in with Corporate LDAP",
+    });
+    fireEvent.change(screen.getByLabelText("Email"), {
+      target: { value: "person@example.com" },
+    });
+    fireEvent.change(screen.getByLabelText("Password"), {
+      target: { value: "ldap-password" },
+    });
+    fireEvent.click(ldapButton);
+
+    await waitFor(() => {
+      expect(ldapLogin).toHaveBeenCalledWith("person@example.com", "ldap-password");
+    });
+    expect(await screen.findByRole("button", { name: "New chat" })).toBeInTheDocument();
   });
 
   it("hides first-admin registration entry when bootstrap is closed", async () => {
