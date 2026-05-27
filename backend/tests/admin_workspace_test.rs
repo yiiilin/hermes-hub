@@ -377,7 +377,7 @@ fn assert_managed_profile_uses_hub_fs(calls: &[Vec<String>], context: &str) {
         "{context}: managed profile startup command must link both profile files into /config"
     );
     assert!(command.contains("/hub-managed-skills"));
-    assert!(command.contains("exec gateway"));
+    assert!(command.contains("exec /opt/hermes/.venv/bin/hermes gateway"));
 }
 
 fn multipart_text(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {

@@ -25,7 +25,7 @@ use super::{
 
 /// Hub 托管 Hermes 容器规格版本。只要 env、挂载、工作目录或安全策略有变化，
 /// 就提升这个值，确保已存在的旧容器会被重建并拿到新行为。
-const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-27-managed-profile-files";
+const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-27-managed-profile-shell";
 const MANAGED_CONTAINER_SPEC_LABEL: &str = "hermes_hub_spec_version";
 const HUB_INBOX_PATH: &str = "/internal/channel/v1/inbox";
 const HUB_INBOX_TIMEOUT_SECONDS: u16 = 25;
@@ -2137,11 +2137,11 @@ fn hermes_gateway_command(managed_profile: Option<&ManagedProfileConfig>) -> Vec
          \x20\x20ln -sfn {profile_root}/$file /workspace/$file\n\
          \x20\x20ln -sfn {profile_root}/$file /config/$file\n\
          done\n\
-         exec gateway",
+         exec /opt/hermes/.venv/bin/hermes gateway",
         agents = MANAGED_PROFILE_AGENTS_FILE,
         soul = MANAGED_PROFILE_SOUL_FILE,
     );
-    vec!["sh".to_string(), "-lc".to_string(), script]
+    vec!["sh".to_string(), "-c".to_string(), script]
 }
 
 fn shell_quote(value: &str) -> String {

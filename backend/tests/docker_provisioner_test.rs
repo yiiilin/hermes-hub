@@ -840,7 +840,7 @@ async fn docker_provisioner_links_managed_profile_files_from_hub_fs() {
     );
     assert!(command.contains("/hub-managed-skills"));
     assert!(command.contains("$file"));
-    assert!(command.contains("exec gateway"));
+    assert!(command.contains("exec /opt/hermes/.venv/bin/hermes gateway"));
 
     let agents = readable_storage
         .get("managed-profile/current/AGENTS.md")
@@ -1053,7 +1053,7 @@ async fn docker_provisioner_test() {
         .iter()
         .any(|entry| entry == "HERMES_ACCEPT_HOOKS=1"));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version" && value == "2026-05-27-managed-profile-files"
+        key == "hermes_hub_spec_version" && value == "2026-05-27-managed-profile-shell"
     }));
     assert!(spec
         .mounts
@@ -1243,7 +1243,7 @@ async fn docker_provisioner_test() {
     assert!(
         create_call.windows(2).any(|args| {
             args[0] == "--label"
-                && args[1] == "hermes_hub_spec_version=2026-05-27-managed-profile-files"
+                && args[1] == "hermes_hub_spec_version=2026-05-27-managed-profile-shell"
         }),
         "managed Hermes containers must carry the current spec label"
     );
