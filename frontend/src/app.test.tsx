@@ -518,6 +518,7 @@ describe("App", () => {
     );
     expect(within(settingsTabs).getByRole("tab", { name: "Model configuration" })).toBeInTheDocument();
     expect(within(settingsTabs).getByRole("tab", { name: "Hermes management" })).toBeInTheDocument();
+    expect(within(settingsTabs).getByRole("tab", { name: "Hermes Profile" })).toBeInTheDocument();
     expect(within(settingsTabs).getByRole("tab", { name: "Managed skills" })).toBeInTheDocument();
     expect(within(settingsTabs).getByRole("tab", { name: "System parameters" })).toBeInTheDocument();
     expect(within(settingsTabs).queryByRole("tab", { name: "Session settings" })).not.toBeInTheDocument();
@@ -537,6 +538,50 @@ describe("App", () => {
     expect(enableOidcRow).toBeInTheDocument();
     expect(screen.getByLabelText("OIDC Redirect URI")).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Authentication settings" })).not.toBeInTheDocument();
+  });
+
+  it("lets admins edit and save Hermes AGENTS.md and SOUL.md", async () => {
+    const client = createMockApiClient({
+      initialHermesProfile: {
+        agents_md: "# Existing AGENTS\n\nUse the shared guardrails.\n",
+        soul_md: "# Existing SOUL\n\nKeep a calm operator tone.\n",
+      },
+    });
+    const updateHermesProfile = client.updateHermesProfile.bind(client);
+    client.updateHermesProfile = vi.fn(async (profile) => {
+      await updateHermesProfile(profile);
+    });
+
+    render(<App apiClient={client} />);
+
+    await openSettingsTab("Hermes Profile");
+
+    const agentsEditor = await screen.findByLabelText("AGENTS.md");
+    const soulEditor = screen.getByLabelText("SOUL.md");
+    expect(agentsEditor).toHaveValue("# Existing AGENTS\n\nUse the shared guardrails.\n");
+    expect(soulEditor).toHaveValue("# Existing SOUL\n\nKeep a calm operator tone.\n");
+
+    fireEvent.change(agentsEditor, {
+      target: { value: "# AGENTS\n\n- Review before running migrations.\n" },
+    });
+    fireEvent.change(soulEditor, {
+      target: { value: "# SOUL\n\nPrefer concise, direct responses.\n" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(client.updateHermesProfile).toHaveBeenCalledWith({
+        agents_md: "# AGENTS\n\n- Review before running migrations.\n",
+        soul_md: "# SOUL\n\nPrefer concise, direct responses.\n",
+      });
+    });
+    expect(await screen.findByText("Hermes Profile saved")).toBeInTheDocument();
+    expect(screen.getByLabelText("AGENTS.md")).toHaveValue(
+      "# AGENTS\n\n- Review before running migrations.\n",
+    );
+    expect(screen.getByLabelText("SOUL.md")).toHaveValue(
+      "# SOUL\n\nPrefer concise, direct responses.\n",
+    );
   });
 
   it("saves the optional image generation toggle and keeps it at the bottom of the image card", async () => {
@@ -2519,6 +2564,44 @@ describe("App", () => {
       max_output_tokens: 8192,
       temperature: 0.3,
       supports_parallel_tools: false,
+    });
+    fetchMock.mockRestore();
+  });
+
+  it("uses Hermes profile endpoints in the real API client", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (path, init) => {
+      if (path === "/api/admin/hermes-profile" && init?.method === "PUT") {
+        expect(JSON.parse(String(init.body))).toEqual({
+          agents_md: "# AGENTS\n",
+          soul_md: "# SOUL\n",
+        });
+        return {
+          ok: true,
+          status: 204,
+        } as Response;
+      }
+
+      expect(path).toBe("/api/admin/hermes-profile");
+      expect(init?.method).toBe("GET");
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          profile: {
+            agents_md: "# Stored AGENTS\n",
+            soul_md: "# Stored SOUL\n",
+          },
+        }),
+      } as Response;
+    });
+
+    await expect(createApiClient().hermesProfile()).resolves.toEqual({
+      agents_md: "# Stored AGENTS\n",
+      soul_md: "# Stored SOUL\n",
+    });
+    await createApiClient().updateHermesProfile({
+      agents_md: "# AGENTS\n",
+      soul_md: "# SOUL\n",
     });
     fetchMock.mockRestore();
   });

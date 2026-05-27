@@ -41,6 +41,8 @@ use crate::{
 
 const MAX_MANAGED_SKILL_UPLOAD_FILES: usize = 1000;
 const MANAGED_SKILL_DIRECTORY_MARKER: &str = ".hub-directory";
+const HERMES_PROFILE_AGENTS_FILE: &str = "AGENTS.md";
+const HERMES_PROFILE_SOUL_FILE: &str = "SOUL.md";
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -79,6 +81,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/admin/system-settings",
             get(get_system_settings).put(update_system_settings),
+        )
+        .route(
+            "/api/admin/hermes-profile",
+            get(get_hermes_profile).put(update_hermes_profile),
         )
         .route("/api/admin/managed-skills", get(list_managed_skills))
         .route(
@@ -167,6 +173,17 @@ struct SystemSettingsResponse {
 }
 
 type UpdateSystemSettingsRequest = SystemSettings;
+
+#[derive(Clone, Deserialize, Serialize)]
+struct HermesProfileContent {
+    agents_md: String,
+    soul_md: String,
+}
+
+#[derive(Serialize)]
+struct HermesProfileResponse {
+    profile: HermesProfileContent,
+}
 
 #[derive(Serialize)]
 struct ManagedSkillSummary {
@@ -604,6 +621,59 @@ async fn update_system_settings(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn get_hermes_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    let profile = HermesProfileContent {
+        agents_md: read_hermes_profile_file(&state, HERMES_PROFILE_AGENTS_FILE).await?,
+        soul_md: read_hermes_profile_file(&state, HERMES_PROFILE_SOUL_FILE).await?,
+    };
+
+    Ok(Json(HermesProfileResponse { profile }))
+}
+
+async fn update_hermes_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<HermesProfileContent>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    write_hermes_profile_file(
+        &state,
+        HERMES_PROFILE_AGENTS_FILE,
+        payload.agents_md.as_bytes(),
+    )
+    .await?;
+    write_hermes_profile_file(&state, HERMES_PROFILE_SOUL_FILE, payload.soul_md.as_bytes()).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn read_hermes_profile_file(state: &AppState, file_name: &str) -> Result<String, ApiError> {
+    let key = hermes_profile_object_key(state, file_name)?;
+    match state.object_storage.get(&key).await {
+        Ok(bytes) => String::from_utf8(bytes.to_vec())
+            .map_err(|_| ApiError::BadGateway("hermes profile file is not valid utf-8")),
+        Err(ObjectStorageError::NotFound) => Ok(String::new()),
+        Err(error) => Err(map_object_storage_error(error)),
+    }
+}
+
+async fn write_hermes_profile_file(
+    state: &AppState,
+    file_name: &str,
+    bytes: &[u8],
+) -> Result<(), ApiError> {
+    let key = hermes_profile_object_key(state, file_name)?;
+    state
+        .object_storage
+        .put(&key, Bytes::copy_from_slice(bytes))
+        .await
+        .map_err(map_object_storage_error)
+}
+
 async fn refresh_managed_hermes_configs(state: &AppState) -> Result<(), ApiError> {
     let instances = state
         .store
@@ -944,6 +1014,16 @@ fn managed_skills_prefix(state: &AppState) -> Result<String, ApiError> {
         return Ok(String::new());
     }
     normalize_skills_path(prefix).ok_or(ApiError::Internal)
+}
+
+fn hermes_profile_object_key(state: &AppState, file_name: &str) -> Result<String, ApiError> {
+    let prefix = state.config.managed_profile.prefix.trim_matches('/');
+    let file_name = normalize_skills_path(file_name).ok_or(ApiError::Internal)?;
+    if prefix.is_empty() {
+        return Ok(file_name);
+    }
+    let prefix = normalize_skills_path(prefix).ok_or(ApiError::Internal)?;
+    Ok(format!("{prefix}/{file_name}"))
 }
 
 fn managed_skills_list_prefix(prefix: &str) -> String {

@@ -19,6 +19,7 @@ pub struct AppConfig {
     pub hermes_docker: HermesDockerConfig,
     pub object_storage: ObjectStorageConfig,
     pub skills_fs: SkillsFsConfig,
+    pub managed_profile: ManagedProfileConfig,
     pub max_proxy_body_bytes: usize,
     pub static_dir: PathBuf,
 }
@@ -62,6 +63,14 @@ pub struct SkillsFsConfig {
     pub container_path: String,
 }
 
+/// 统一 Hermes AGENTS.md / SOUL.md 配置。
+/// 这些文件存储在对象存储中，并由同一个 hermes-hub-fs NFS 导出给 Hermes 容器。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedProfileConfig {
+    pub enabled: bool,
+    pub prefix: String,
+}
+
 impl AppConfig {
     /// 测试环境使用固定的本地配置，避免依赖真实端口和外部环境变量。
     pub fn for_tests() -> Self {
@@ -74,6 +83,7 @@ impl AppConfig {
             hermes_docker: default_hermes_docker_config(),
             object_storage: default_object_storage_config(),
             skills_fs: default_skills_fs_config(),
+            managed_profile: default_managed_profile_config(),
             max_proxy_body_bytes: 10 * 1024 * 1024,
             static_dir: PathBuf::from("frontend/dist"),
         }
@@ -96,6 +106,7 @@ impl AppConfig {
             hermes_docker: hermes_docker_config_from_env(),
             object_storage: object_storage_config_from_env(),
             skills_fs: skills_fs_config_from_env(),
+            managed_profile: managed_profile_config_from_env(),
             max_proxy_body_bytes: env_usize("HERMES_HUB_MAX_PROXY_BODY_BYTES", 10 * 1024 * 1024),
             static_dir: PathBuf::from(
                 std::env::var("HERMES_HUB_STATIC_DIR")
@@ -259,6 +270,18 @@ fn skills_fs_config_from_env() -> SkillsFsConfig {
     }
 }
 
+fn managed_profile_config_from_env() -> ManagedProfileConfig {
+    ManagedProfileConfig {
+        enabled: std::env::var("HERMES_HUB_MANAGED_PROFILE_ENABLED")
+            .ok()
+            .and_then(|value| value.parse::<bool>().ok())
+            .unwrap_or(true),
+        prefix: std::env::var("HERMES_HUB_MANAGED_PROFILE_PREFIX")
+            .or_else(|_| std::env::var("HERMES_HUB_PROFILE_FS_PREFIX"))
+            .unwrap_or_else(|_| "managed-profile/current".to_string()),
+    }
+}
+
 fn default_model_config() -> ModelConfig {
     ModelConfig {
         config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
@@ -317,6 +340,13 @@ fn default_skills_fs_config() -> SkillsFsConfig {
     }
 }
 
+fn default_managed_profile_config() -> ManagedProfileConfig {
+    ManagedProfileConfig {
+        enabled: true,
+        prefix: "managed-profile/current".to_string(),
+    }
+}
+
 fn optional_env(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -352,8 +382,8 @@ fn env_usize(name: &str, default: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        hermes_docker_config_from_env, model_config_from_env, object_storage_config_from_env,
-        skills_fs_config_from_env,
+        hermes_docker_config_from_env, managed_profile_config_from_env, model_config_from_env,
+        object_storage_config_from_env, skills_fs_config_from_env,
     };
 
     #[test]
@@ -484,6 +514,48 @@ mod tests {
         assert_eq!(config.mount_addr, "10.0.0.5:12049");
         assert_eq!(config.mount_export, "/hub-skills");
         assert_eq!(config.container_path, "/managed-skills");
+
+        for (name, value) in saved {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+    }
+
+    #[test]
+    fn managed_profile_config_reads_env() {
+        const NAMES: &[&str] = &[
+            "HERMES_HUB_MANAGED_PROFILE_ENABLED",
+            "HERMES_HUB_MANAGED_PROFILE_PREFIX",
+            "HERMES_HUB_PROFILE_FS_PREFIX",
+        ];
+        let saved = NAMES
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect::<Vec<_>>();
+        for name in NAMES {
+            std::env::remove_var(name);
+        }
+
+        std::env::set_var("HERMES_HUB_MANAGED_PROFILE_ENABLED", "false");
+        std::env::set_var(
+            "HERMES_HUB_MANAGED_PROFILE_PREFIX",
+            "managed-profile/release-a",
+        );
+
+        let config = managed_profile_config_from_env();
+        assert!(!config.enabled);
+        assert_eq!(config.prefix, "managed-profile/release-a");
+
+        std::env::remove_var("HERMES_HUB_MANAGED_PROFILE_PREFIX");
+        std::env::set_var(
+            "HERMES_HUB_PROFILE_FS_PREFIX",
+            "managed-profile/legacy-name",
+        );
+        let config = managed_profile_config_from_env();
+        assert_eq!(config.prefix, "managed-profile/legacy-name");
 
         for (name, value) in saved {
             if let Some(value) = value {

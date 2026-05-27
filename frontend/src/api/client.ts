@@ -141,6 +141,12 @@ export type SystemSettings = {
   ldap: LdapSettings;
 };
 
+// Hermes Profile 是全局 Markdown 配置，后端以 snake_case 字段直接持久化。
+export type HermesProfile = {
+  agents_md: string;
+  soul_md: string;
+};
+
 export type ManagedSkill = {
   path: string;
   size: number;
@@ -335,6 +341,8 @@ export type ApiClient = {
   testModelConfig: (config: ModelConfig) => Promise<ModelConfigTestResult>;
   systemSettings: () => Promise<SystemSettings>;
   updateSystemSettings: (settings: SystemSettings) => Promise<void>;
+  hermesProfile: () => Promise<HermesProfile>;
+  updateHermesProfile: (profile: HermesProfile) => Promise<void>;
   listManagedSkills: () => Promise<ManagedSkill[]>;
   listManagedSkillTree: () => Promise<ManagedSkillTreeNode>;
   readManagedSkill: (path: string) => Promise<ManagedSkillContent>;
@@ -931,6 +939,16 @@ export function createApiClient(): ApiClient {
         body: settings,
       });
     },
+    async hermesProfile() {
+      const payload = await request<{ profile: HermesProfile }>("/api/admin/hermes-profile");
+      return payload.profile;
+    },
+    async updateHermesProfile(profile) {
+      await request<void>("/api/admin/hermes-profile", {
+        method: "PUT",
+        body: profile,
+      });
+    },
     async listManagedSkills() {
       const payload = await request<{ skills: ManagedSkill[] }>("/api/admin/managed-skills");
       return payload.skills;
@@ -1163,6 +1181,7 @@ type MockApiClientOptions = {
   deleteManagedSkill?: ApiClient["deleteManagedSkill"];
   createManagedSkillDirectory?: ApiClient["createManagedSkillDirectory"];
   uploadManagedSkills?: ApiClient["uploadManagedSkills"];
+  initialHermesProfile?: HermesProfile;
   initialHermesSchedulerSnapshots?: HermesSchedulerSnapshot[];
 };
 
@@ -1262,6 +1281,10 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     ...(options.initialManagedSkills ?? {}),
   };
   let managedSkillDirectories = new Set(options.initialManagedSkillDirectories ?? []);
+  let hermesProfile: HermesProfile = options.initialHermesProfile ?? {
+    agents_md: "",
+    soul_md: "",
+  };
   const hermesSchedulerSnapshots = options.initialHermesSchedulerSnapshots ?? [];
 
   function emitSessionEvent(sessionId: string, event: ChannelSessionEvent) {
@@ -1678,6 +1701,15 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     },
     async updateSystemSettings(settings) {
       systemSettings = systemSettingsFromPayload(settings);
+    },
+    async hermesProfile() {
+      return { ...hermesProfile };
+    },
+    async updateHermesProfile(profile) {
+      hermesProfile = {
+        agents_md: profile.agents_md,
+        soul_md: profile.soul_md,
+      };
     },
     async listManagedSkills() {
       return Object.entries(managedSkills)

@@ -31,7 +31,7 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY --from=builder /app/target/release/hermes-hub-backend /usr/local/bin/hermes-hub-backend
-COPY --from=builder /app/target/release/hermes-hub-skills-fs /usr/local/bin/hermes-hub-skills-fs
+COPY --from=builder /app/target/release/hermes-hub-fs /usr/local/bin/hermes-hub-fs
 COPY --from=frontend-builder /app/frontend/dist /app/public
 
 ENV HERMES_HUB_BIND_ADDR=0.0.0.0:8080

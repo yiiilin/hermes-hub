@@ -1,7 +1,7 @@
 use hermes_hub_backend::hermes::{
     docker_provisioner::{
         ContainerMount, DockerProvisioner, DockerProvisionerConfig, DockerRuntime,
-        DockerRuntimeOutput, ManagedSkillsMountConfig,
+        DockerRuntimeOutput, ManagedProfileConfig, ManagedSkillsMountConfig,
     },
     instance::{HermesInstanceKind, HermesInstanceStatus},
     provisioner::HermesProvisioner,
@@ -181,6 +181,7 @@ fn test_config() -> DockerProvisionerConfig {
         cpu_limit: Some("1.0".to_string()),
         docker_binary: "docker".to_string(),
         managed_skills: None,
+        managed_profile: None,
     }
 }
 
@@ -191,6 +192,15 @@ fn test_config_with_managed_skills() -> DockerProvisionerConfig {
         addr: "127.0.0.1:12049".to_string(),
         export: "/skills".to_string(),
         container_path: "/hub-managed-skills".to_string(),
+    });
+    config
+}
+
+fn test_config_with_managed_profile() -> DockerProvisionerConfig {
+    let mut config = test_config_with_managed_skills();
+    config.managed_profile = Some(ManagedProfileConfig {
+        container_path: "/hub-managed-skills".to_string(),
+        object_prefix: "managed-profile/current".to_string(),
     });
     config
 }
@@ -775,6 +785,95 @@ async fn docker_provisioner_mounts_managed_skills_writable_for_admin_users() {
 }
 
 #[tokio::test]
+async fn docker_provisioner_links_managed_profile_files_from_hub_fs() {
+    let runtime = FakeDockerRuntime::default();
+    let object_storage = InMemoryObjectStorage::default();
+    let readable_storage = object_storage.clone();
+    let provisioner = DockerProvisioner::new_with_runtime_and_object_storage(
+        test_config_with_managed_profile(),
+        Arc::new(runtime.clone()),
+        object_storage.shared(),
+    );
+
+    let mut instance = provisioner.prepare_instance("admin-managed-profile");
+    instance.global_skills_write_enabled = true;
+
+    // 管理员可以写全局 skills；统一 profile 文件复用同一个 Hub FS，
+    // 具体写保护由 NFS 文件系统层拒绝 AGENTS.md/SOUL.md 写入。
+    let created = provisioner
+        .ensure_container(&instance, "instance-token")
+        .await
+        .expect("admin instance can be created");
+    let spec = provisioner
+        .container_spec_for(&created)
+        .expect("container spec can be rendered");
+
+    assert!(spec.mounts.iter().any(|mount| matches!(
+        mount,
+        ContainerMount::NfsVolume(volume)
+            if volume.volume_name == "hermes-managed-skills-test-rw"
+                && volume.container_path == "/hub-managed-skills"
+                && !volume.read_only
+                && volume.addr == "127.0.0.1:12049"
+                && volume.export == "/skills"
+    )));
+    assert!(
+        spec.mounts
+            .iter()
+            .all(|mount| mount.container_path() != "/hub-managed-profile"),
+        "managed profile must not create a second NFS mount"
+    );
+
+    let command = spec.command.join(" ");
+    assert!(command.contains("ln -sfn"));
+    assert!(command.contains("AGENTS.md"));
+    assert!(command.contains("SOUL.md"));
+    assert!(
+        command.contains("/workspace/$file")
+            || (command.contains("/workspace/AGENTS.md") && command.contains("/workspace/SOUL.md")),
+        "managed profile startup command must link both profile files into /workspace"
+    );
+    assert!(
+        command.contains("/config/$file")
+            || (command.contains("/config/AGENTS.md") && command.contains("/config/SOUL.md")),
+        "managed profile startup command must link both profile files into /config"
+    );
+    assert!(command.contains("/hub-managed-skills"));
+    assert!(command.contains("$file"));
+    assert!(command.contains("exec gateway"));
+
+    let agents = readable_storage
+        .get("managed-profile/current/AGENTS.md")
+        .await
+        .expect("default AGENTS.md is created for the hub fs export");
+    let soul = readable_storage
+        .get("managed-profile/current/SOUL.md")
+        .await
+        .expect("default SOUL.md is created for the hub fs export");
+    assert!(agents.is_empty());
+    assert!(soul.is_empty());
+
+    let calls = runtime.calls.lock().expect("calls lock").clone();
+    assert!(
+        calls.iter().all(|args| {
+            !args.contains(&"device=:/hermes-profile".to_string())
+                && !args.iter().any(|arg| arg.contains("12050"))
+        }),
+        "managed profile must not create its own NFS volume"
+    );
+    let create_call = calls
+        .iter()
+        .find(|args| args.first().map(String::as_str) == Some("create"))
+        .expect("container create command is issued");
+    assert!(
+        create_call
+            .windows(2)
+            .all(|args| { args[0] != "--mount" || !args[1].contains("dst=/hub-managed-profile") }),
+        "managed profile files must come from the existing hub fs mount"
+    );
+}
+
+#[tokio::test]
 async fn docker_provisioner_refreshes_status_from_docker_health() {
     let runtime = FakeDockerRuntime::default();
     let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime.clone()));
@@ -954,7 +1053,7 @@ async fn docker_provisioner_test() {
         .iter()
         .any(|entry| entry == "HERMES_ACCEPT_HOOKS=1"));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version" && value == "2026-05-27-hermes-media-attachments"
+        key == "hermes_hub_spec_version" && value == "2026-05-27-managed-profile-files"
     }));
     assert!(spec
         .mounts
@@ -1144,7 +1243,7 @@ async fn docker_provisioner_test() {
     assert!(
         create_call.windows(2).any(|args| {
             args[0] == "--label"
-                && args[1] == "hermes_hub_spec_version=2026-05-27-hermes-media-attachments"
+                && args[1] == "hermes_hub_spec_version=2026-05-27-managed-profile-files"
         }),
         "managed Hermes containers must carry the current spec label"
     );

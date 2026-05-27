@@ -99,6 +99,7 @@ fn ready_model_config(kind: &str) -> ModelConfig {
 async fn app_state_with_recording_docker_runtime() -> (AppState, RecordingDockerRuntime) {
     let mut config = AppConfig::for_tests();
     config.skills_fs.mount_enabled = true;
+    config.managed_profile.enabled = true;
     let model_registry = ModelRegistry::new(ready_model_config(LLM_MODEL_CONFIG_KIND));
     model_registry
         .replace(ready_model_config(TITLE_MODEL_CONFIG_KIND))
@@ -344,6 +345,41 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
+fn assert_managed_profile_uses_hub_fs(calls: &[Vec<String>], context: &str) {
+    let create_call = calls
+        .iter()
+        .find(|args| args.first().map(String::as_str) == Some("create"))
+        .unwrap_or_else(|| panic!("{context}: container create command is issued"));
+
+    assert!(
+        create_call
+            .windows(2)
+            .all(|pair| { pair[0] != "--mount" || !pair[1].contains("dst=/hub-managed-profile") }),
+        "{context}: managed profile must not create a second NFS mount"
+    );
+
+    // 启动命令负责把同一个 Hub FS 根目录里的 profile 文件链接到 Hermes 会读取的位置。
+    let command = create_call.join(" ");
+    assert!(
+        command.contains("ln -sfn"),
+        "{context}: profile files are linked"
+    );
+    assert!(command.contains("AGENTS.md"));
+    assert!(command.contains("SOUL.md"));
+    assert!(
+        command.contains("/workspace/$file")
+            || (command.contains("/workspace/AGENTS.md") && command.contains("/workspace/SOUL.md")),
+        "{context}: managed profile startup command must link both profile files into /workspace"
+    );
+    assert!(
+        command.contains("/config/$file")
+            || (command.contains("/config/AGENTS.md") && command.contains("/config/SOUL.md")),
+        "{context}: managed profile startup command must link both profile files into /config"
+    );
+    assert!(command.contains("/hub-managed-skills"));
+    assert!(command.contains("exec gateway"));
+}
+
 fn multipart_text(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
     body.extend_from_slice(
         format!(
@@ -437,6 +473,75 @@ async fn bootstrap_admin(app: &Router) -> String {
 }
 
 #[tokio::test]
+async fn admin_can_manage_unified_hermes_profile() {
+    let (state, _runtime) = app_state_with_recording_docker_runtime().await;
+    let app = build_router_with_state(state.clone());
+    let admin_cookie = bootstrap_admin(&app).await;
+
+    let initial = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/hermes-profile",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(initial).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["profile"]["agents_md"], "");
+    assert_eq!(body["profile"]["soul_md"], "");
+
+    let update = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/hermes-profile",
+        json!({
+            "agents_md": "# AGENTS\n\nUse Hub-managed instructions.\n",
+            "soul_md": "# SOUL\n\nBe direct and careful.\n"
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+
+    let agents = state
+        .object_storage
+        .get("managed-profile/current/AGENTS.md")
+        .await
+        .expect("AGENTS.md is written to object storage");
+    let soul = state
+        .object_storage
+        .get("managed-profile/current/SOUL.md")
+        .await
+        .expect("SOUL.md is written to object storage");
+    assert_eq!(
+        String::from_utf8(agents.to_vec()).expect("AGENTS.md is utf-8"),
+        "# AGENTS\n\nUse Hub-managed instructions.\n"
+    );
+    assert_eq!(
+        String::from_utf8(soul.to_vec()).expect("SOUL.md is utf-8"),
+        "# SOUL\n\nBe direct and careful.\n"
+    );
+
+    let saved = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/hermes-profile",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(saved).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["profile"]["agents_md"],
+        "# AGENTS\n\nUse Hub-managed instructions.\n"
+    );
+    assert_eq!(
+        body["profile"]["soul_md"],
+        "# SOUL\n\nBe direct and careful.\n"
+    );
+}
+
+#[tokio::test]
 async fn admin_hermes_gets_writable_global_skills_mount_but_regular_users_do_not() {
     let (app, runtime) = app_with_recording_docker_runtime().await;
     let admin_cookie = bootstrap_admin(&app).await;
@@ -454,6 +559,7 @@ async fn admin_hermes_gets_writable_global_skills_mount_but_regular_users_do_not
     .await;
     assert_eq!(admin_create.status(), StatusCode::OK);
     let admin_calls = runtime.calls.lock().expect("calls lock").clone();
+    assert_managed_profile_uses_hub_fs(&admin_calls, "admin create");
     assert!(
         admin_calls.iter().any(|args| {
             args.first().map(String::as_str) == Some("create")
@@ -476,6 +582,7 @@ async fn admin_hermes_gets_writable_global_skills_mount_but_regular_users_do_not
     .await;
     assert_eq!(admin_rebuild.status(), StatusCode::OK);
     let admin_rebuild_calls = runtime.calls.lock().expect("calls lock").clone();
+    assert_managed_profile_uses_hub_fs(&admin_rebuild_calls, "admin rebuild");
     assert!(
         admin_rebuild_calls.iter().any(|args| {
             args.first().map(String::as_str) == Some("create")
@@ -517,6 +624,7 @@ async fn admin_hermes_gets_writable_global_skills_mount_but_regular_users_do_not
     assert_eq!(register.status(), StatusCode::CREATED);
 
     let user_calls = runtime.calls.lock().expect("calls lock").clone();
+    assert_managed_profile_uses_hub_fs(&user_calls, "regular create");
     assert!(
         user_calls.iter().any(|args| {
             args.first().map(String::as_str) == Some("create")

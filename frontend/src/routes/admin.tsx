@@ -1,5 +1,6 @@
 import type {
   ApiClient,
+  HermesProfile,
   HermesInstance,
   HermesScheduledTaskSnapshot,
   HermesSchedulerSnapshot,
@@ -22,6 +23,7 @@ type AdminSettingsTab =
   | "users"
   | "models"
   | "hermes"
+  | "profile"
   | "scheduler"
   | "skills"
   | "system"
@@ -258,6 +260,11 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
   const [invites, setInvites] = useState<Invite[]>([]);
   const [instances, setInstances] = useState<HermesInstance[]>([]);
   const [schedulerSnapshots, setSchedulerSnapshots] = useState<HermesSchedulerSnapshot[]>([]);
+  const [hermesProfile, setHermesProfile] = useState<HermesProfile>({
+    agents_md: "",
+    soul_md: "",
+  });
+  const [hermesProfileSaved, setHermesProfileSaved] = useState(false);
   const [modelConfigs, setModelConfigs] = useState<ModelConfig[]>([]);
   const [managedSkills, setManagedSkills] = useState<ManagedSkill[]>([]);
   const [managedSkillTree, setManagedSkillTree] = useState<ManagedSkillTreeNode | null>(null);
@@ -330,6 +337,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     { key: "users", label: t("admin.userManagement") },
     { key: "models", label: t("admin.modelConfig") },
     { key: "hermes", label: t("admin.title") },
+    { key: "profile", label: t("admin.hermesProfile") },
     { key: "scheduler", label: t("admin.scheduledTasks") },
     { key: "skills", label: t("admin.skillManagement") },
     { key: "system", label: t("admin.systemParameters") },
@@ -346,6 +354,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
         nextModelStatus,
         nextSettings,
         nextSchedulerSnapshots,
+        nextHermesProfile,
       ] = await Promise.all([
         apiClient.listUsers(),
         apiClient.listInvites(),
@@ -357,6 +366,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
         activeTab === "scheduler"
           ? apiClient.listHermesSchedulerSnapshots()
           : Promise.resolve(null),
+        activeTab === "profile" ? apiClient.hermesProfile() : Promise.resolve(null),
       ]);
       setUsers(nextUsers);
       setInvites(nextInvites);
@@ -369,6 +379,9 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
       }
       if (nextSchedulerSnapshots) {
         setSchedulerSnapshots(nextSchedulerSnapshots);
+      }
+      if (nextHermesProfile) {
+        setHermesProfile(nextHermesProfile);
       }
       if (activeTab === "skills") {
         await refreshManagedSkills();
@@ -387,6 +400,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     setModelSaved(false);
     setSettingsSaved(false);
     setSkillSaved(false);
+    setHermesProfileSaved(false);
     setActiveTab(tab);
   }
 
@@ -554,6 +568,20 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
       setSettingsSaved(true);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("admin.settingsSaveFailed"));
+    }
+  }
+
+  async function saveHermesProfile(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setHermesProfileSaved(false);
+    setError(null);
+    try {
+      await apiClient.updateHermesProfile(hermesProfile);
+      // 保存后重新读取一次，确保页面展示的是后端最终落库内容。
+      setHermesProfile(await apiClient.hermesProfile());
+      setHermesProfileSaved(true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("admin.hermesProfileSaveFailed"));
     }
   }
 
@@ -1113,6 +1141,60 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
             </tbody>
           </table>
         </div>
+      </section>,
+    );
+  }
+
+  if (activeTab === "profile") {
+    return renderSystemSettingsShell(
+      <section className="admin-page" id="admin-hermes-profile">
+        <form
+          className="panel form hermes-profile-editor"
+          onSubmit={(event) => void saveHermesProfile(event)}
+        >
+          <div className="tab-actions">
+            <div className="button-row">
+              <button type="button" className="secondary" onClick={() => void refresh()}>
+                {t("admin.refresh")}
+              </button>
+              <button type="submit">{t("admin.save")}</button>
+            </div>
+          </div>
+          {error ? <p className="error">{error}</p> : null}
+          {hermesProfileSaved ? (
+            <p className="copy-line">{t("admin.hermesProfileSaved")}</p>
+          ) : null}
+          <div className="markdown-editor-grid">
+            <label>
+              {t("admin.agentsMd")}
+              <textarea
+                value={hermesProfile.agents_md}
+                onChange={(event) => {
+                  setHermesProfile((profile) => ({
+                    ...profile,
+                    agents_md: event.target.value,
+                  }));
+                  setHermesProfileSaved(false);
+                }}
+                spellCheck={false}
+              />
+            </label>
+            <label>
+              {t("admin.soulMd")}
+              <textarea
+                value={hermesProfile.soul_md}
+                onChange={(event) => {
+                  setHermesProfile((profile) => ({
+                    ...profile,
+                    soul_md: event.target.value,
+                  }));
+                  setHermesProfileSaved(false);
+                }}
+                spellCheck={false}
+              />
+            </label>
+          </div>
+        </form>
       </section>,
     );
   }

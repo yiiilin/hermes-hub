@@ -13,7 +13,10 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use tokio::process::Command;
 
-use crate::{model_config::RESPONSES_API_TYPE, storage::DynObjectStorage};
+use crate::{
+    model_config::RESPONSES_API_TYPE,
+    storage::{DynObjectStorage, ObjectStorageError},
+};
 
 use super::{
     instance::{HermesInstance, HermesInstanceKind, HermesInstanceStatus},
@@ -22,11 +25,13 @@ use super::{
 
 /// Hub 托管 Hermes 容器规格版本。只要 env、挂载、工作目录或安全策略有变化，
 /// 就提升这个值，确保已存在的旧容器会被重建并拿到新行为。
-const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-27-hermes-media-attachments";
+const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-27-managed-profile-files";
 const MANAGED_CONTAINER_SPEC_LABEL: &str = "hermes_hub_spec_version";
 const HUB_INBOX_PATH: &str = "/internal/channel/v1/inbox";
 const HUB_INBOX_TIMEOUT_SECONDS: u16 = 25;
 const HUB_INBOX_LIMIT: u16 = 4;
+const MANAGED_PROFILE_AGENTS_FILE: &str = "AGENTS.md";
+const MANAGED_PROFILE_SOUL_FILE: &str = "SOUL.md";
 const HERMES_HUB_PLUGIN_YAML: &str = r#"name: hermes-hub-platform
 label: Hermes Hub
 kind: platform
@@ -983,6 +988,7 @@ pub struct DockerProvisionerConfig {
     pub cpu_limit: Option<String>,
     pub docker_binary: String,
     pub managed_skills: Option<ManagedSkillsMountConfig>,
+    pub managed_profile: Option<ManagedProfileConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1026,6 +1032,12 @@ pub struct ManagedSkillsMountConfig {
     pub container_path: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedProfileConfig {
+    pub container_path: String,
+    pub object_prefix: String,
+}
+
 impl ContainerMount {
     pub fn bind(host_path: String, container_path: impl Into<String>, read_only: bool) -> Self {
         Self::Bind(ContainerBindMount {
@@ -1037,7 +1049,7 @@ impl ContainerMount {
 
     pub fn nfs_volume(config: &ManagedSkillsMountConfig, read_only: bool) -> Self {
         Self::NfsVolume(ContainerNfsVolumeMount {
-            volume_name: managed_skills_volume_name(&config.volume_name, read_only),
+            volume_name: managed_nfs_volume_name(&config.volume_name, read_only),
             container_path: config.container_path.clone(),
             read_only,
             addr: config.addr.clone(),
@@ -1250,7 +1262,6 @@ impl DockerProvisioner {
                 !instance.global_skills_write_enabled,
             ));
         }
-
         let mut env = vec![
             "API_SERVER_ENABLED=true".to_string(),
             // API server 仅作为容器内本地能力保留；Hub 通信全部由 adapter 主动连接。
@@ -1331,7 +1342,7 @@ impl DockerProvisioner {
                 retries: 3,
                 start_period: "20s".to_string(),
             }),
-            command: vec!["gateway".to_string()],
+            command: hermes_gateway_command(self.config.managed_profile.as_ref()),
         })
     }
 
@@ -1342,6 +1353,7 @@ impl DockerProvisioner {
     ) -> Result<HermesInstance, ProvisionerError> {
         self.ensure_managed(instance)?;
         self.ensure_network().await?;
+        self.ensure_managed_profile_files().await?;
 
         let mut next = instance.clone();
         next.llm_api_key = Some(llm_api_key.to_string());
@@ -1660,6 +1672,31 @@ impl DockerProvisioner {
                 mount.volume_name.clone(),
             ])
             .await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_managed_profile_files(&self) -> Result<(), ProvisionerError> {
+        let Some(profile) = &self.config.managed_profile else {
+            return Ok(());
+        };
+        let Some(object_storage) = &self.object_storage else {
+            return Ok(());
+        };
+
+        for file_name in [MANAGED_PROFILE_AGENTS_FILE, MANAGED_PROFILE_SOUL_FILE] {
+            let key = managed_profile_object_key(&profile.object_prefix, file_name);
+            match object_storage.get(&key).await {
+                Ok(_) => {}
+                Err(ObjectStorageError::NotFound) => {
+                    // 首次创建用户 Hermes 前先放一个空文件，保证容器内符号链接可解析。
+                    object_storage
+                        .put(&key, Bytes::new())
+                        .await
+                        .map_err(|error| ProvisionerError::ObjectStorage(error.to_string()))?;
+                }
+                Err(error) => return Err(ProvisionerError::ObjectStorage(error.to_string())),
+            }
         }
         Ok(())
     }
@@ -2042,6 +2079,7 @@ impl HermesProvisioner for DockerProvisioner {
     ) -> Result<HermesInstance, ProvisionerError> {
         self.ensure_managed(instance)?;
         self.ensure_network().await?;
+        self.ensure_managed_profile_files().await?;
 
         let mut next = instance.clone();
         next.llm_api_key = Some(llm_api_key.to_string());
@@ -2087,13 +2125,45 @@ fn render_container_mount(mount: &ContainerMount) -> String {
     value
 }
 
+fn hermes_gateway_command(managed_profile: Option<&ManagedProfileConfig>) -> Vec<String> {
+    let Some(managed_profile) = managed_profile else {
+        return vec!["gateway".to_string()];
+    };
+    let profile_root = shell_quote(&managed_profile.container_path);
+    let script = format!(
+        "set -eu\n\
+         mkdir -p /workspace /config\n\
+         for file in {agents} {soul}; do\n\
+         \x20\x20ln -sfn {profile_root}/$file /workspace/$file\n\
+         \x20\x20ln -sfn {profile_root}/$file /config/$file\n\
+         done\n\
+         exec gateway",
+        agents = MANAGED_PROFILE_AGENTS_FILE,
+        soul = MANAGED_PROFILE_SOUL_FILE,
+    );
+    vec!["sh".to_string(), "-lc".to_string(), script]
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn managed_profile_object_key(prefix: &str, file_name: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        file_name.to_string()
+    } else {
+        format!("{prefix}/{file_name}")
+    }
+}
+
 fn nfs_mount_options(addr: &str, read_only: bool) -> String {
     let (host, port) = split_nfs_addr(addr);
     let mode = if read_only { "ro" } else { "rw" };
     format!("addr={host},port={port},mountport={port},vers=3,tcp,nolock,soft,{mode}")
 }
 
-fn managed_skills_volume_name(base_name: &str, read_only: bool) -> String {
+fn managed_nfs_volume_name(base_name: &str, read_only: bool) -> String {
     if read_only {
         base_name.to_string()
     } else {

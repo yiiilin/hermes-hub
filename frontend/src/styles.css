@@ -678,6 +678,20 @@ td {
   grid-template-columns: minmax(280px, 380px) minmax(0, 1fr);
 }
 
+.markdown-editor-grid {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.hermes-profile-editor textarea {
+  font-family:
+    "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  line-height: 1.5;
+  min-height: 520px;
+  white-space: pre;
+}
+
 .skills-list-panel {
   align-self: start;
   display: grid;
@@ -1491,6 +1505,7 @@ button.composer-attachment-chip {
   .model-config-grid,
   .inline-form,
   .session-grid,
+  .markdown-editor-grid,
   .skills-layout {
     grid-template-columns: 1fr;
   }
@@ -1819,6 +1834,10 @@ button.composer-attachment-chip {
 
   .skill-editor textarea {
     min-height: 320px;
+  }
+
+  .hermes-profile-editor textarea {
+    min-height: 300px;
   }
 
   .panel {

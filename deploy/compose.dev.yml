@@ -87,15 +87,17 @@ services:
       - hermes-hub-net
 
   # 仅用于本地联调便利：当前服务使用源码挂载，不是生产镜像。
-  skills-fs:
+  hermes-hub-fs:
     profiles: ["app-dev"]
     image: rust:1.88
     working_dir: /workspace
-    command: ["bash", "-lc", "cargo run -p hermes-hub-backend --bin hermes-hub-skills-fs"]
+    command: ["bash", "-lc", "cargo run -p hermes-hub-backend --bin hermes-hub-fs"]
     environment:
       HERMES_HUB_SKILLS_FS_BIND_ADDR: 0.0.0.0:12049
       HERMES_HUB_SKILLS_FS_PREFIX: ${HERMES_HUB_SKILLS_FS_PREFIX:-managed-skills/current}
       HERMES_HUB_SKILLS_FS_EXPORT_NAME: ${HERMES_HUB_SKILLS_FS_EXPORT_NAME:-skills}
+      HERMES_HUB_MANAGED_PROFILE_ENABLED: ${HERMES_HUB_MANAGED_PROFILE_ENABLED:-true}
+      HERMES_HUB_MANAGED_PROFILE_PREFIX: ${HERMES_HUB_MANAGED_PROFILE_PREFIX:-managed-profile/current}
       HERMES_OBJECT_STORAGE_ENDPOINT: http://rustfs:9000
       HERMES_OBJECT_STORAGE_BUCKET: ${HERMES_OBJECT_STORAGE_BUCKET:-hermes-hub}
       HERMES_OBJECT_STORAGE_REGION: ${HERMES_OBJECT_STORAGE_REGION:-us-east-1}
@@ -136,6 +138,8 @@ services:
       HERMES_HUB_MANAGED_SKILLS_NFS_ADDR: ${HERMES_HUB_MANAGED_SKILLS_NFS_ADDR:-127.0.0.1:12049}
       HERMES_HUB_MANAGED_SKILLS_NFS_EXPORT: /skills
       HERMES_HUB_MANAGED_SKILLS_CONTAINER_PATH: /hub-managed-skills
+      HERMES_HUB_MANAGED_PROFILE_ENABLED: "true"
+      HERMES_HUB_MANAGED_PROFILE_PREFIX: ${HERMES_HUB_MANAGED_PROFILE_PREFIX:-managed-profile/current}
       HERMES_OBJECT_STORAGE_ENDPOINT: http://rustfs:9000
       HERMES_OBJECT_STORAGE_BUCKET: ${HERMES_OBJECT_STORAGE_BUCKET:-hermes-hub}
       HERMES_OBJECT_STORAGE_REGION: ${HERMES_OBJECT_STORAGE_REGION:-us-east-1}
@@ -152,7 +156,7 @@ services:
         condition: service_healthy
       rustfs-init:
         condition: service_completed_successfully
-      skills-fs:
+      hermes-hub-fs:
         condition: service_started
     ports:
       - "${HERMES_HUB_HTTP_HOST_BIND:-127.0.0.1}:${HERMES_HUB_HTTP_PORT:-8080}:8080"

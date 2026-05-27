@@ -165,6 +165,92 @@ async fn skills_fs_lists_and_reads_from_prefix() {
 }
 
 #[tokio::test]
+async fn skills_fs_exposes_managed_profile_files_as_readonly_root_files() {
+    let operator = test_operator().await;
+    operator
+        .write("managed-profile/current/AGENTS.md", "# Agents\n")
+        .await
+        .expect("AGENTS.md fixture can be written");
+    operator
+        .write("managed-profile/current/SOUL.md", "# Soul\n")
+        .await
+        .expect("SOUL.md fixture can be written");
+    let fs = SkillsFs::new(operator.clone(), "managed-skills/current")
+        .expect("fs can be created")
+        .with_profile_prefix("managed-profile/current")
+        .expect("profile prefix is valid");
+    let root_id = fs.root_dir();
+
+    let root_entries = fs
+        .readdir(root_id, 0, 16)
+        .await
+        .expect("root directory can be listed");
+    assert!(
+        root_entries
+            .entries
+            .iter()
+            .any(|entry| entry.name.as_ref() == b"AGENTS.md"),
+        "Hub FS root must include managed AGENTS.md"
+    );
+    assert!(
+        root_entries
+            .entries
+            .iter()
+            .any(|entry| entry.name.as_ref() == b"SOUL.md"),
+        "Hub FS root must include managed SOUL.md"
+    );
+
+    let agents_id = fs
+        .lookup(root_id, &b"AGENTS.md".as_slice().into())
+        .await
+        .expect("managed AGENTS.md can be looked up");
+    let (bytes, eof) = fs
+        .read(agents_id, 0, 1024)
+        .await
+        .expect("managed AGENTS.md can be read");
+    assert_eq!(bytes, b"# Agents\n");
+    assert!(eof);
+
+    assert!(matches!(
+        fs.write(agents_id, 0, b"changed").await,
+        Err(nfsstat3::NFS3ERR_ACCES)
+    ));
+    assert!(matches!(
+        fs.setattr(
+            agents_id,
+            nfsserve::nfs::sattr3 {
+                size: nfsserve::nfs::set_size3::size(0),
+                ..Default::default()
+            },
+        )
+        .await,
+        Err(nfsstat3::NFS3ERR_ACCES)
+    ));
+    assert!(matches!(
+        fs.remove(root_id, &b"AGENTS.md".as_slice().into()).await,
+        Err(nfsstat3::NFS3ERR_ACCES)
+    ));
+    assert!(matches!(
+        fs.rename(
+            root_id,
+            &b"SOUL.md".as_slice().into(),
+            root_id,
+            &b"SOUL.old.md".as_slice().into(),
+        )
+        .await,
+        Err(nfsstat3::NFS3ERR_ACCES)
+    ));
+    assert_eq!(
+        operator
+            .read("managed-profile/current/AGENTS.md")
+            .await
+            .expect("managed AGENTS.md remains untouched")
+            .to_vec(),
+        b"# Agents\n"
+    );
+}
+
+#[tokio::test]
 async fn skills_fs_writes_global_skills_back_to_object_storage() {
     let operator = test_operator().await;
     let fs = SkillsFs::new(operator.clone(), "managed-skills/current").expect("fs can be created");

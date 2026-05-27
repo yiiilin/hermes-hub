@@ -24,6 +24,7 @@ const FS_ID: u64 = 0x4848_534b_494c_4c53;
 const DIR_MODE: u32 = 0o755;
 const FILE_MODE: u32 = 0o644;
 const HIDDEN_SEGMENTS: [&str; 3] = [".curator_state", ".bundled_manifest", ".hub-directory"];
+const MANAGED_PROFILE_FILES: [&str; 2] = ["AGENTS.md", "SOUL.md"];
 
 #[derive(Debug, Error)]
 pub enum SkillsFsError {
@@ -89,6 +90,7 @@ impl Default for SkillsFsIndex {
 pub struct SkillsFs {
     operator: Operator,
     prefix: String,
+    profile_prefix: Option<String>,
     index: Mutex<SkillsFsIndex>,
 }
 
@@ -98,8 +100,15 @@ impl SkillsFs {
         Ok(Self {
             operator,
             prefix,
+            profile_prefix: None,
             index: Mutex::new(SkillsFsIndex::default()),
         })
+    }
+
+    pub fn with_profile_prefix(mut self, prefix: impl AsRef<str>) -> Result<Self, SkillsFsError> {
+        self.profile_prefix =
+            Some(normalize_prefix(prefix.as_ref()).ok_or(SkillsFsError::InvalidPrefix)?);
+        Ok(self)
     }
 
     pub fn from_object_storage_config(
@@ -175,6 +184,11 @@ impl SkillsFs {
                 })
                 .or_insert(node);
         }
+        if path.is_empty() {
+            for node in self.root_profile_nodes().await? {
+                nodes_by_path.insert(node.path.clone(), node);
+            }
+        }
         let mut nodes = nodes_by_path.into_values().collect::<Vec<_>>();
         nodes.sort_by(|lhs, rhs| lhs.id.cmp(&rhs.id));
         Ok(nodes)
@@ -182,6 +196,10 @@ impl SkillsFs {
 
     pub async fn read_path(&self, path: &str) -> Result<Vec<u8>, SkillsFsError> {
         let path = normalize_skills_path(path).ok_or(SkillsFsError::InvalidPrefix)?;
+        if let Some(key) = self.profile_object_key(&path) {
+            let bytes = self.operator.read(&key).await?;
+            return Ok(bytes.to_vec());
+        }
         let bytes = self.operator.read(&object_key(&self.prefix, &path)).await?;
         Ok(bytes.to_vec())
     }
@@ -390,6 +408,22 @@ impl SkillsFs {
             return Err(nfsstat3::NFS3ERR_NOENT);
         }
 
+        if let Some(key) = self.profile_object_key(&path) {
+            return match self.operator.stat(&key).await {
+                Ok(metadata) if metadata.mode().is_file() => self
+                    .node_for_path(
+                        path,
+                        false,
+                        metadata.content_length(),
+                        metadata.last_modified().map(Into::into),
+                    )
+                    .map_err(|_| nfsstat3::NFS3ERR_IO),
+                Ok(_) => Err(nfsstat3::NFS3ERR_NOENT),
+                Err(error) if error.kind() == ErrorKind::NotFound => Err(nfsstat3::NFS3ERR_NOENT),
+                Err(_) => Err(nfsstat3::NFS3ERR_IO),
+            };
+        }
+
         let file_key = object_key(&self.prefix, &path);
         match self.operator.stat(&file_key).await {
             Ok(metadata) if metadata.mode().is_file() => {
@@ -423,6 +457,9 @@ impl SkillsFs {
     }
 
     async fn directory_has_visible_entry(&self, path: &str) -> Result<bool, opendal::Error> {
+        if path.is_empty() && self.has_visible_profile_file().await? {
+            return Ok(true);
+        }
         let dir_key = object_key(&self.prefix, &dir_path(path));
         let entries = self.operator.list(&dir_key).await?;
         Ok(entries
@@ -492,6 +529,12 @@ impl SkillsFs {
     }
 
     async fn find_node_by_id(&self, id: fileid3) -> Result<Option<SkillsNode>, SkillsFsError> {
+        for node in self.root_profile_nodes().await? {
+            if node.id == id {
+                return Ok(Some(node));
+            }
+        }
+
         let mut pending_dirs = vec![String::new()];
         let mut visited_dirs = HashSet::new();
 
@@ -535,6 +578,50 @@ impl SkillsFs {
         }
 
         Ok(None)
+    }
+
+    async fn root_profile_nodes(&self) -> Result<Vec<SkillsNode>, SkillsFsError> {
+        let mut nodes = Vec::new();
+        for file_name in MANAGED_PROFILE_FILES {
+            let Some(key) = self.profile_object_key(file_name) else {
+                continue;
+            };
+            match self.operator.stat(&key).await {
+                Ok(metadata) if metadata.mode().is_file() => nodes.push(self.node_for_path(
+                    file_name.to_string(),
+                    false,
+                    metadata.content_length(),
+                    metadata.last_modified().map(Into::into),
+                )?),
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(nodes)
+    }
+
+    async fn has_visible_profile_file(&self) -> Result<bool, opendal::Error> {
+        for file_name in MANAGED_PROFILE_FILES {
+            let Some(key) = self.profile_object_key(file_name) else {
+                continue;
+            };
+            match self.operator.stat(&key).await {
+                Ok(metadata) if metadata.mode().is_file() => return Ok(true),
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
+    }
+
+    fn profile_object_key(&self, path: &str) -> Option<String> {
+        if !MANAGED_PROFILE_FILES.contains(&path) {
+            return None;
+        }
+        let prefix = self.profile_prefix.as_deref()?;
+        Some(object_key(prefix, path))
     }
 }
 
@@ -926,11 +1013,15 @@ fn has_hidden_segment(path: &str) -> bool {
 
 fn writable_skills_path(path: &str) -> Option<String> {
     let path = normalize_skills_path(path)?;
-    if path.is_empty() || has_hidden_segment(&path) {
+    if path.is_empty() || has_hidden_segment(&path) || is_managed_profile_file(&path) {
         None
     } else {
         Some(path)
     }
+}
+
+fn is_managed_profile_file(path: &str) -> bool {
+    MANAGED_PROFILE_FILES.contains(&path)
 }
 
 fn child_path_for_nfs_name(parent: &str, filename: &filename3) -> Result<String, nfsstat3> {
