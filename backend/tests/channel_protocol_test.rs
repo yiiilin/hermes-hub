@@ -16,7 +16,9 @@ use hermes_hub_backend::{
     ldap::DefaultLdapAuthenticator,
     llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
     model_config::{ModelConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND},
-    session::store::{HermesScheduledTaskSnapshot, HermesSchedulerSnapshotInput, SessionStore},
+    session::store::{
+        HermesScheduledTaskSnapshot, HermesSchedulerSnapshotInput, SessionStore, SystemSettings,
+    },
     storage::InMemoryObjectStorage,
     AppConfig, AppState,
 };
@@ -1396,7 +1398,7 @@ async fn hermes_channel_protocol_accepts_large_output_files_within_config_limit(
          Content-Type: application/vnd.openxmlformats-officedocument.presentationml.presentation\r\n\r\n"
     )
     .into_bytes();
-    // 真实 PPT 回归约 12MB；这里用超过 Axum 默认 2MB、低于业务 25MB 上限的载荷覆盖路由体限制。
+    // 真实 PPT 回归约 12MB；这里用超过 Axum 默认 2MB、低于系统参数上限的载荷覆盖路由体限制。
     let payload = vec![b'a'; 3 * 1024 * 1024];
     upload_body.extend_from_slice(&payload);
     upload_body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
@@ -1414,6 +1416,76 @@ async fn hermes_channel_protocol_accepts_large_output_files_within_config_limit(
     let (status, upload_body) = response_json(upload).await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(upload_body["attachments"][0]["size"], payload.len());
+}
+
+#[tokio::test]
+async fn hermes_channel_protocol_rejects_output_file_over_system_upload_limit() {
+    let store = SessionStore::default();
+    store
+        .update_system_settings(SystemSettings {
+            max_attachment_upload_bytes: 1024,
+            ..SystemSettings::default()
+        })
+        .await
+        .expect("system attachment limit can be updated");
+    let state = test_state(store.clone());
+    let instance_token = "instance-channel-too-large-file-token";
+    state
+        .model_registry
+        .add_instance_token_for_instance("instance-1", instance_token)
+        .await
+        .expect("instance token can be registered");
+    let app = build_router_with_state(state);
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    store
+        .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
+        .expect("instance can be bound");
+
+    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
+    let (_, channel_body) = response_json(channel).await;
+    let channel_id = channel_body["channels"][0]["id"]
+        .as_str()
+        .expect("channel id");
+    let session = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions"),
+        json!({ "kind": "agent" }),
+        Some(&cookie),
+    )
+    .await;
+    let (_, session_body) = response_json(session).await;
+    let session_id = session_body["session"]["id"].as_str().expect("session id");
+
+    let boundary = "hermes-channel-too-large-file-boundary";
+    let mut upload_body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"too-large.bin\"\r\n\
+         Content-Type: application/octet-stream\r\n\r\n"
+    )
+    .into_bytes();
+    upload_body.extend_from_slice(&vec![b'a'; 2048]);
+    upload_body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let upload = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/attachments"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload_body,
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, body) = response_json(upload).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["message"], "attachment is too large");
 }
 
 #[tokio::test]

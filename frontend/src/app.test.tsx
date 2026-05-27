@@ -462,9 +462,9 @@ describe("App", () => {
     fireEvent.click(screen.getAllByRole("button", { name: "Test" })[0]);
     expect(await screen.findByText("model test succeeded")).toBeInTheDocument();
 
-    fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Session settings" }));
+    fireEvent.click(within(settingsTabs).getByRole("tab", { name: "System parameters" }));
     const maxSessionsInput = await screen.findByLabelText("Max sessions per user");
-    expect(screen.queryByRole("heading", { name: "Session settings" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "System parameters" })).not.toBeInTheDocument();
     fireEvent.change(maxSessionsInput, { target: { value: "12" } });
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
     expect(await screen.findByText("Settings saved")).toBeInTheDocument();
@@ -519,16 +519,18 @@ describe("App", () => {
     expect(within(settingsTabs).getByRole("tab", { name: "Model configuration" })).toBeInTheDocument();
     expect(within(settingsTabs).getByRole("tab", { name: "Hermes management" })).toBeInTheDocument();
     expect(within(settingsTabs).getByRole("tab", { name: "Managed skills" })).toBeInTheDocument();
-    expect(within(settingsTabs).getByRole("tab", { name: "Session settings" })).toBeInTheDocument();
+    expect(within(settingsTabs).getByRole("tab", { name: "System parameters" })).toBeInTheDocument();
+    expect(within(settingsTabs).queryByRole("tab", { name: "Session settings" })).not.toBeInTheDocument();
     expect(within(settingsTabs).getByRole("tab", { name: "Authentication settings" })).toBeInTheDocument();
 
     fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Model configuration" }));
     expect(await screen.findByRole("heading", { name: "Large language model" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Model configuration" })).not.toBeInTheDocument();
 
-    fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Session settings" }));
+    fireEvent.click(within(settingsTabs).getByRole("tab", { name: "System parameters" }));
     expect(await screen.findByLabelText("Max sessions per user")).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "Session settings" })).not.toBeInTheDocument();
+    expect(await screen.findByLabelText("Max attachment upload size (MB)")).toBeInTheDocument();
+    expect(screen.getByLabelText("Attachment retention (days)")).toBeInTheDocument();
 
     fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Authentication settings" }));
     const enableOidcRow = await screen.findByLabelText("Enable OIDC");
@@ -625,6 +627,44 @@ describe("App", () => {
     await waitFor(() => {
       expect(screen.queryByRole("dialog", { name: "Image preview" })).not.toBeInTheDocument();
     });
+  });
+
+  it("uploads pasted composer files as attachments", async () => {
+    const hubRun = createHubRunMock({ answer: "received" });
+    render(<App apiClient={hubRun.client} />);
+
+    const composer = await screen.findByLabelText("Message");
+    const image = new File(["image"], "pasted.png", { type: "image/png" });
+
+    fireEvent.paste(composer, {
+      clipboardData: {
+        files: [image],
+        items: [],
+      },
+    });
+
+    expect(await screen.findByText("pasted.png")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Preview image pasted.png" }));
+    expect(screen.getByRole("dialog", { name: "Image preview" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Close image preview" }));
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "Image preview" })).not.toBeInTheDocument();
+    });
+
+    fireEvent.change(composer, {
+      target: { value: "看一下这张图" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(hubRun.createCalled()).toBe(true));
+    expect(
+      hubRun.getMessages().find((message) => message.role === "user")?.attachments,
+    ).toEqual([
+      expect.objectContaining({
+        name: "pasted.png",
+        kind: "image",
+      }),
+    ]);
   });
 
   it("shows each message updated time on the correct bubble edge", async () => {
@@ -1736,6 +1776,34 @@ describe("App", () => {
     });
   });
 
+  it("shows and saves system attachment parameters", async () => {
+    const client = createMockApiClient();
+    const updateSystemSettings = client.updateSystemSettings.bind(client);
+    let savedSettings: unknown = null;
+    client.updateSystemSettings = vi.fn(async (settings) => {
+      savedSettings = settings;
+      await updateSystemSettings(settings);
+    });
+
+    render(<App apiClient={client} />);
+
+    await openSettingsTab("System parameters");
+
+    fireEvent.change(await screen.findByLabelText("Max attachment upload size (MB)"), {
+      target: { value: "128" },
+    });
+    fireEvent.change(screen.getByLabelText("Attachment retention (days)"), {
+      target: { value: "14" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+
+    expect(await screen.findByText("Settings saved")).toBeInTheDocument();
+    expect(savedSettings).toMatchObject({
+      max_attachment_upload_bytes: 128 * 1024 * 1024,
+      attachment_retention_days: 14,
+    });
+  });
+
   it("localizes the configured session limit message in Chinese", async () => {
     localStorage.setItem("hermes-hub-language", "zh");
     const client = createMockApiClient({
@@ -2187,10 +2255,12 @@ describe("App", () => {
       <App
         apiClient={createMockApiClient({
           initialManagedSkills: {
+            ".DS_Store": "metadata",
             "image/SKILL.md": "# Image\n\nUse sharp visual prompts.\n",
+            "writing/.hidden.md": "hidden notes",
             "writing/references/style.md": "Use direct language.\n",
           },
-          initialManagedSkillDirectories: ["research", "writing/drafts/empty-child"],
+          initialManagedSkillDirectories: ["research", "writing/.cache", "writing/drafts/empty-child"],
           saveManagedSkill,
           deleteManagedSkill,
           createManagedSkillDirectory,
@@ -2203,9 +2273,18 @@ describe("App", () => {
     expect(await screen.findByRole("button", { name: "文件夹 writing" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "统一 Skill 管理" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "文件夹 research" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /writing\/references\/style\.md/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "文件夹 references" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "文件 style.md" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /writing\/references\/style\.md/ })).not.toBeInTheDocument();
+    expect(screen.queryByText(".DS_Store")).not.toBeInTheDocument();
+    expect(screen.queryByText(".hidden.md")).not.toBeInTheDocument();
+    expect(screen.queryByText(".cache")).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /image\/SKILL\.md/ }));
+    const imageSkillButton = screen
+      .getAllByRole("button", { name: "文件 SKILL.md" })
+      .find((button) => button.getAttribute("data-managed-skill-path") === "image/SKILL.md");
+    expect(imageSkillButton).toBeDefined();
+    fireEvent.click(imageSkillButton!);
     expect(await screen.findByLabelText("Skill 路径")).toHaveValue("image/SKILL.md");
     expect(screen.getByLabelText("Skill 内容")).toHaveValue(
       "# Image\n\nUse sharp visual prompts.\n",
@@ -2231,7 +2310,11 @@ describe("App", () => {
 
     await waitFor(() => {
       expect(deleteManagedSkill).toHaveBeenCalledWith("image/SKILL.md");
-      expect(screen.queryByRole("button", { name: /image\/SKILL\.md/ })).not.toBeInTheDocument();
+      expect(
+        screen
+          .queryAllByRole("button", { name: "文件 SKILL.md" })
+          .some((button) => button.getAttribute("data-managed-skill-path") === "image/SKILL.md"),
+      ).toBe(false);
     });
     expect(screen.getByLabelText("Skill 路径")).toHaveValue("");
     expect(screen.getByLabelText("Skill 内容")).toHaveValue("");
@@ -2246,7 +2329,7 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "创建文件夹" }));
     await waitFor(() => {
       expect(createManagedSkillDirectory).toHaveBeenCalledWith("writing/drafts");
-      expect(screen.getByRole("button", { name: "文件夹 writing/drafts" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "文件夹 drafts" })).toBeInTheDocument();
     });
 
     fireEvent.change(screen.getByLabelText("Skill 路径"), {
@@ -2257,11 +2340,11 @@ describe("App", () => {
       expect(createManagedSkillDirectory).toHaveBeenCalledWith("writing/archive");
       expect(createManagedSkillDirectory).toHaveBeenCalledWith("writing/archive/empty-child");
       expect(deleteManagedSkill).toHaveBeenCalledWith("writing/drafts");
-      expect(screen.getByRole("button", { name: "文件夹 writing/archive" })).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "文件夹 writing/archive/empty-child" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "文件夹 archive" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "文件夹 empty-child" })).toBeInTheDocument();
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "文件夹 writing/archive" }));
+    fireEvent.click(screen.getByRole("button", { name: "文件夹 archive" }));
     fireEvent.click(screen.getByRole("button", { name: "新建 Skill" }));
     expect(screen.getByLabelText("Skill 路径")).toHaveValue("writing/archive/SKILL.md");
     expect(screen.getByLabelText("Skill 内容")).toHaveValue("");
@@ -2282,12 +2365,51 @@ describe("App", () => {
 
     await openSettingsTab("统一 Skill 管理", "系统设置");
 
-    expect(await screen.findByRole("button", { name: /image\/SKILL\.md/ })).toBeInTheDocument();
+    await screen.findByRole("button", { name: "文件夹 image" });
+    expect(
+      screen
+        .getAllByRole("button", { name: "文件 SKILL.md" })
+        .some((button) => button.getAttribute("data-managed-skill-path") === "image/SKILL.md"),
+    ).toBe(true);
     expect(screen.queryByRole("heading", { name: "统一 Skill 管理" })).not.toBeInTheDocument();
     expect(screen.queryByText("managed skill not found")).not.toBeInTheDocument();
   });
 
-  it("uploads managed skill folders and zip archives from the admin tree", async () => {
+  it("allows deleting a binary managed skill even when text loading fails", async () => {
+    const deleteManagedSkill = vi.fn(async () => undefined);
+
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialManagedSkills: {
+            "mindoc-search.tgz": "binary-placeholder",
+          },
+          readManagedSkill: async (path) => {
+            if (path === "mindoc-search.tgz") {
+              throw new Error("managed skill is not valid utf-8");
+            }
+            return { path, content: "" };
+          },
+          deleteManagedSkill,
+        })}
+      />,
+    );
+
+    await openSettingsTab("Managed skills");
+
+    fireEvent.click(await screen.findByRole("button", { name: "File mindoc-search.tgz" }));
+    expect(await screen.findByText("managed skill is not valid utf-8")).toBeInTheDocument();
+    expect(screen.getByLabelText("Skill path")).toHaveValue("mindoc-search.tgz");
+    expect(screen.getByRole("button", { name: "Delete" })).not.toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+    await waitFor(() => {
+      expect(deleteManagedSkill).toHaveBeenCalledWith("mindoc-search.tgz");
+    });
+  });
+
+  it("uploads managed skill folders from the admin tree without a zip upload control", async () => {
     localStorage.setItem("hermes-hub-language", "zh");
     const uploadManagedSkills = vi.fn(async (files: File[], targetPath?: string) =>
       files.map((file) => ({
@@ -2306,6 +2428,8 @@ describe("App", () => {
 
     await openSettingsTab("统一 Skill 管理", "系统设置");
     fireEvent.click(await screen.findByRole("button", { name: "文件夹 writing" }));
+    expect(screen.queryByRole("button", { name: "上传压缩包" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("managed-skills-zip-input")).not.toBeInTheDocument();
 
     const folderFile = new File(["# Research\n"], "SKILL.md", { type: "text/markdown" });
     Object.defineProperty(folderFile, "webkitRelativePath", {
@@ -2316,15 +2440,8 @@ describe("App", () => {
     });
     await waitFor(() => {
       expect(uploadManagedSkills).toHaveBeenCalledWith([folderFile], "writing");
-      expect(screen.getByRole("button", { name: /writing\/research\/SKILL\.md/ })).toBeInTheDocument();
-    });
-
-    const zipFile = new File(["zip"], "skills.zip", { type: "application/zip" });
-    fireEvent.change(screen.getByTestId("managed-skills-zip-input"), {
-      target: { files: [zipFile] },
-    });
-    await waitFor(() => {
-      expect(uploadManagedSkills).toHaveBeenLastCalledWith([zipFile], "writing");
+      expect(screen.getByRole("button", { name: "文件夹 research" })).toBeInTheDocument();
+      expect(screen.getAllByRole("button", { name: "文件 SKILL.md" }).length).toBeGreaterThan(0);
     });
   });
 
@@ -2533,17 +2650,15 @@ describe("App", () => {
       const form = init?.body as FormData;
       expect(form.get("target_path")).toBe("writing");
       const files = form.getAll("files");
-      expect(files).toHaveLength(2);
+      expect(files).toHaveLength(1);
       expect(files[0]).toBeInstanceOf(File);
       expect((files[0] as File).name).toBe("research/SKILL.md");
-      expect((files[1] as File).name).toBe("skills.zip");
       return {
         ok: true,
         status: 201,
         json: async () => ({
           skills: [
             { path: "writing/research/SKILL.md", size: 5 },
-            { path: "writing/assistant/SKILL.md", size: 5 },
           ],
         }),
       } as Response;
@@ -2553,14 +2668,23 @@ describe("App", () => {
     Object.defineProperty(folderFile, "webkitRelativePath", {
       value: "research/SKILL.md",
     });
-    const zipFile = new File(["hello"], "skills.zip", { type: "application/zip" });
 
     await expect(
-      createApiClient().uploadManagedSkills([folderFile, zipFile], "writing"),
+      createApiClient().uploadManagedSkills([folderFile], "writing"),
     ).resolves.toEqual([
       { path: "writing/research/SKILL.md", size: 5 },
-      { path: "writing/assistant/SKILL.md", size: 5 },
     ]);
+    fetchMock.mockRestore();
+  });
+
+  it("rejects managed skill zip uploads before posting in the real API client", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    const zipFile = new File(["hello"], "skills.zip", { type: "application/zip" });
+
+    await expect(createApiClient().uploadManagedSkills([zipFile], "writing")).rejects.toThrow(
+      "managed skill zip uploads are not supported",
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
     fetchMock.mockRestore();
   });
 

@@ -33,7 +33,14 @@ import {
   X,
   FileVideo,
 } from "lucide-react";
-import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
+import {
+  ClipboardEvent as ReactClipboardEvent,
+  FormEvent,
+  ReactNode,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 
 type ChannelSessionRouteProps = {
   active?: boolean;
@@ -799,8 +806,8 @@ export function ChannelSessionRoute({
     }
   }
 
-  async function pickFiles(files: FileList | null) {
-    if (!files?.length) {
+  async function uploadAttachmentFiles(files: File[]) {
+    if (files.length === 0) {
       return;
     }
     setError(null);
@@ -809,14 +816,28 @@ export function ChannelSessionRoute({
       if (!session) {
         throw new Error(t("chat.sessionCreateFailed"));
       }
-      const selected = await apiClient.uploadSessionAttachmentsPublic(session.id, Array.from(files));
+      const selected = await apiClient.uploadSessionAttachmentsPublic(session.id, files);
       setAttachments((current) => [...current, ...selected]);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
-      }
     } catch (cause) {
       setError(userFacingErrorMessage(cause, t("chat.attachmentUploadFailed"), t));
     }
+  }
+
+  async function pickFiles(files: FileList | null) {
+    await uploadAttachmentFiles(files ? Array.from(files) : []);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }
+
+  function pasteFiles(event: ReactClipboardEvent<HTMLTextAreaElement>) {
+    const files = filesFromClipboardData(event.clipboardData);
+    if (files.length === 0) {
+      return;
+    }
+    // 只要剪贴板里有文件，就按附件处理，避免图片被浏览器插入成不可控内容。
+    event.preventDefault();
+    void uploadAttachmentFiles(files);
   }
 
   if (!active) {
@@ -898,10 +919,12 @@ export function ChannelSessionRoute({
           {attachments.length > 0 ? (
             <div className="attachment-row">
               {attachments.map((attachment) => (
-                <span key={`${attachment.id ?? attachment.name}-${attachment.size ?? 0}`}>
-                  {attachmentIcon(attachment, 15)}
-                  {attachment.name}
-                </span>
+                <ComposerAttachmentChip
+                  key={`${attachment.id ?? attachment.name}-${attachment.size ?? 0}`}
+                  attachment={attachment}
+                  onPreviewImage={setPreviewAttachment}
+                  t={t}
+                />
               ))}
             </div>
           ) : null}
@@ -910,6 +933,7 @@ export function ChannelSessionRoute({
             aria-label={t("chat.messageLabel")}
             value={prompt}
             onChange={(event) => setPrompt(event.target.value)}
+            onPaste={pasteFiles}
             placeholder={t("chat.messagePlaceholder")}
             onKeyDown={(event) => {
               // 中文/日文等输入法候选确认时也会触发 Enter，必须让组合输入先完成。
@@ -970,6 +994,21 @@ export function ChannelSessionRoute({
 
 const EXECUTION_HISTORY_MARKER = "<!-- hermes-hub:execution:v1 -->";
 const LEGACY_HERMES_EXECUTION_LINE = /^\S+\s+([A-Za-z0-9_.-]+)\((.*)\)$/u;
+
+function filesFromClipboardData(clipboardData: DataTransfer) {
+  const directFiles = Array.from(clipboardData.files ?? []);
+  if (directFiles.length > 0) {
+    return directFiles;
+  }
+
+  return Array.from(clipboardData.items ?? []).flatMap((item) => {
+    if (item.kind !== "file") {
+      return [];
+    }
+    const file = item.getAsFile();
+    return file ? [file] : [];
+  });
+}
 
 function normalizeExecutionEntry(message: HermesVerboseEvent | string): ExecutionHistoryEntry | null {
   if (typeof message === "string") {
@@ -2120,6 +2159,41 @@ function InlineAttachment({
       {attachmentIcon(attachment, 16)}
       {attachment.name}
     </a>
+  );
+}
+
+function ComposerAttachmentChip({
+  attachment,
+  onPreviewImage,
+  t,
+}: {
+  attachment: HermesAttachment;
+  onPreviewImage: (attachment: HermesAttachment) => void;
+  t: Translate;
+}) {
+  const imageSrc = attachment.data_url ?? attachment.download_url;
+  const canPreviewImage =
+    (attachment.kind === "image" || attachment.content_type.startsWith("image/")) && imageSrc;
+
+  if (canPreviewImage) {
+    return (
+      <button
+        type="button"
+        className="composer-attachment-chip composer-attachment-image"
+        aria-label={t("chat.markdownImage", { name: attachment.name })}
+        onClick={() => onPreviewImage(attachment)}
+      >
+        <img src={imageSrc} alt="" aria-hidden="true" />
+        <span>{attachment.name}</span>
+      </button>
+    );
+  }
+
+  return (
+    <span className="composer-attachment-chip">
+      {attachmentIcon(attachment, 15)}
+      <span>{attachment.name}</span>
+    </span>
   );
 }
 

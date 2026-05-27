@@ -8,7 +8,10 @@ use axum::{
 };
 use bytes::Bytes;
 use percent_encoding::percent_decode_str;
-use std::path::Path as StdPath;
+use std::{
+    path::Path as StdPath,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use uuid::Uuid;
 
 use crate::{
@@ -37,6 +40,7 @@ pub async fn upload_session_attachments(
     mut multipart: Multipart,
 ) -> Result<Vec<ChannelAttachment>, ApiError> {
     let mut attachments = Vec::new();
+    let max_upload_bytes = effective_attachment_upload_limit(state).await?;
 
     while let Some(field) = multipart
         .next_field()
@@ -53,7 +57,7 @@ pub async fn upload_session_attachments(
             .await
             .map_err(|_| ApiError::BadRequest("attachment body is invalid"))?;
 
-        if bytes.len() > state.config.object_storage.max_upload_bytes {
+        if bytes.len() > max_upload_bytes {
             return Err(ApiError::BadRequest("attachment is too large"));
         }
 
@@ -108,7 +112,7 @@ pub async fn create_session_attachment_from_bytes(
     content_type: String,
     bytes: Bytes,
 ) -> Result<ChannelAttachment, ApiError> {
-    if bytes.len() > state.config.object_storage.max_upload_bytes {
+    if bytes.len() > effective_attachment_upload_limit(state).await? {
         return Err(ApiError::BadRequest("attachment is too large"));
     }
     // 先校验 session 所有权，再写对象存储，避免非法请求在 S3/RustFS 留下孤儿对象。
@@ -186,6 +190,7 @@ async fn download_attachment(
         .get_attachment(&user.id, &attachment_id)
         .await
         .map_err(map_channel_error)?;
+    ensure_attachment_not_expired(&state, &attachment).await?;
     let bytes = state
         .object_storage
         .get(&attachment.object_key)
@@ -203,6 +208,39 @@ async fn download_attachment(
             .map_err(|_| ApiError::Internal)?,
     );
     Ok(response)
+}
+
+pub async fn effective_attachment_upload_limit(state: &AppState) -> Result<usize, ApiError> {
+    let settings = state
+        .store
+        .system_settings()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    Ok(settings.max_attachment_upload_bytes)
+}
+
+pub async fn ensure_attachment_not_expired(
+    state: &AppState,
+    attachment: &ChannelAttachment,
+) -> Result<(), ApiError> {
+    let settings = state
+        .store
+        .system_settings()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    if attachment_is_expired(attachment.created_at, settings.attachment_retention_days) {
+        return Err(ApiError::NotFound("attachment not found"));
+    }
+    Ok(())
+}
+
+fn attachment_is_expired(created_at: u64, retention_days: u32) -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let retention_seconds = u64::from(retention_days).saturating_mul(24 * 60 * 60);
+    now.saturating_sub(created_at) > retention_seconds
 }
 
 pub fn map_channel_error(error: ChannelStoreError) -> ApiError {
@@ -308,4 +346,21 @@ fn is_rfc5987_attr_char(byte: u8) -> bool {
             | b'|'
             | b'~'
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::attachment_is_expired;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn attachment_expiration_uses_retention_days() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after unix epoch")
+            .as_secs();
+
+        assert!(!attachment_is_expired(now - 6 * 24 * 60 * 60, 7));
+        assert!(attachment_is_expired(now - 8 * 24 * 60 * 60, 7));
+    }
 }

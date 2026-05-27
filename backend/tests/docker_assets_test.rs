@@ -14,6 +14,7 @@ fn hermes_wrapper_image_tracks_official_hermes_version() {
 
     assert!(dockerfile.contains("ARG HERMES_VERSION=latest"));
     assert!(dockerfile.contains("FROM nousresearch/hermes-agent:${HERMES_VERSION}"));
+    assert!(dockerfile.contains("patch_send_message_tool.py"));
     assert!(compose.contains("HERMES_VERSION: ${HERMES_VERSION:-latest}"));
     assert!(compose.contains(
         "HERMES_DOCKER_IMAGE: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:${HERMES_VERSION:-latest}}"
@@ -21,4 +22,18 @@ fn hermes_wrapper_image_tracks_official_hermes_version() {
     assert!(dev_compose.contains(
         "HERMES_DOCKER_IMAGE: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:${HERMES_VERSION:-latest}}"
     ));
+}
+
+#[test]
+fn hermes_wrapper_patches_plugin_media_delivery() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("backend crate lives under repo root");
+    let patch =
+        std::fs::read_to_string(repo_root.join("infra/docker/hermes/patch_send_message_tool.py"))
+            .expect("Hermes send_message patch is present");
+
+    assert!(patch.contains("adapter.send_document"));
+    assert!(patch.contains("adapter.send_image_file"));
+    assert!(patch.contains("is_plugin_platform"));
 }

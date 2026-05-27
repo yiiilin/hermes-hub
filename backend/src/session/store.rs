@@ -22,7 +22,13 @@ use uuid::Uuid;
 const SESSION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_MAX_SESSIONS_PER_USER: u32 = 20;
 const MAX_CONFIGURABLE_SESSIONS_PER_USER: u32 = 500;
+pub const DEFAULT_MAX_ATTACHMENT_UPLOAD_BYTES: usize = 200 * 1024 * 1024;
+pub const MAX_CONFIGURABLE_ATTACHMENT_UPLOAD_BYTES: usize = 1024 * 1024 * 1024;
+const DEFAULT_ATTACHMENT_RETENTION_DAYS: u32 = 7;
+const MAX_ATTACHMENT_RETENTION_DAYS: u32 = 3650;
 const MAX_SESSIONS_PER_USER_KEY: &str = "max_sessions_per_user";
+const MAX_ATTACHMENT_UPLOAD_BYTES_KEY: &str = "max_attachment_upload_bytes";
+const ATTACHMENT_RETENTION_DAYS_KEY: &str = "attachment_retention_days";
 const OIDC_SETTINGS_KEY: &str = "oidc";
 const LDAP_SETTINGS_KEY: &str = "ldap";
 
@@ -82,6 +88,10 @@ impl Default for StoreInner {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 pub struct SystemSettings {
     pub max_sessions_per_user: u32,
+    #[serde(default = "default_max_attachment_upload_bytes")]
+    pub max_attachment_upload_bytes: usize,
+    #[serde(default = "default_attachment_retention_days")]
+    pub attachment_retention_days: u32,
     #[serde(default)]
     pub oidc: OidcSettings,
     #[serde(default)]
@@ -144,10 +154,20 @@ impl Default for SystemSettings {
     fn default() -> Self {
         Self {
             max_sessions_per_user: DEFAULT_MAX_SESSIONS_PER_USER,
+            max_attachment_upload_bytes: DEFAULT_MAX_ATTACHMENT_UPLOAD_BYTES,
+            attachment_retention_days: DEFAULT_ATTACHMENT_RETENTION_DAYS,
             oidc: OidcSettings::default(),
             ldap: LdapSettings::default(),
         }
     }
+}
+
+fn default_max_attachment_upload_bytes() -> usize {
+    DEFAULT_MAX_ATTACHMENT_UPLOAD_BYTES
+}
+
+fn default_attachment_retention_days() -> u32 {
+    DEFAULT_ATTACHMENT_RETENTION_DAYS
 }
 
 impl Default for OidcSettings {
@@ -1577,6 +1597,26 @@ impl SessionStore {
                     .and_then(|value| value.parse::<u32>().ok())
                     .unwrap_or(DEFAULT_MAX_SESSIONS_PER_USER);
 
+                let max_attachment_upload_bytes =
+                    sqlx::query("select value from system_settings where key = $1")
+                        .bind(MAX_ATTACHMENT_UPLOAD_BYTES_KEY)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(|_| StoreError::DatabaseFailed)?
+                        .and_then(|row| row.try_get::<String, _>("value").ok())
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(DEFAULT_MAX_ATTACHMENT_UPLOAD_BYTES);
+
+                let attachment_retention_days =
+                    sqlx::query("select value from system_settings where key = $1")
+                        .bind(ATTACHMENT_RETENTION_DAYS_KEY)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(|_| StoreError::DatabaseFailed)?
+                        .and_then(|row| row.try_get::<String, _>("value").ok())
+                        .and_then(|value| value.parse::<u32>().ok())
+                        .unwrap_or(DEFAULT_ATTACHMENT_RETENTION_DAYS);
+
                 let oidc = sqlx::query("select value from system_settings where key = $1")
                     .bind(OIDC_SETTINGS_KEY)
                     .fetch_optional(pool)
@@ -1607,6 +1647,8 @@ impl SessionStore {
 
                 Ok(SystemSettings {
                     max_sessions_per_user: value,
+                    max_attachment_upload_bytes,
+                    attachment_retention_days,
                     oidc,
                     ldap,
                 })
@@ -1639,6 +1681,36 @@ impl SessionStore {
                 )
                 .bind(MAX_SESSIONS_PER_USER_KEY)
                 .bind(settings.max_sessions_per_user.to_string())
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                sqlx::query(
+                    r#"
+                    insert into system_settings (key, value, updated_at)
+                    values ($1, $2, now())
+                    on conflict (key) do update set
+                        value = excluded.value,
+                        updated_at = now()
+                    "#,
+                )
+                .bind(ATTACHMENT_RETENTION_DAYS_KEY)
+                .bind(settings.attachment_retention_days.to_string())
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                sqlx::query(
+                    r#"
+                    insert into system_settings (key, value, updated_at)
+                    values ($1, $2, now())
+                    on conflict (key) do update set
+                        value = excluded.value,
+                        updated_at = now()
+                    "#,
+                )
+                .bind(MAX_ATTACHMENT_UPLOAD_BYTES_KEY)
+                .bind(settings.max_attachment_upload_bytes.to_string())
                 .execute(pool)
                 .await
                 .map_err(|_| StoreError::DatabaseFailed)?;
@@ -1757,6 +1829,16 @@ impl SessionStore {
 fn validate_system_settings(settings: &SystemSettings) -> Result<(), StoreError> {
     if settings.max_sessions_per_user == 0
         || settings.max_sessions_per_user > MAX_CONFIGURABLE_SESSIONS_PER_USER
+    {
+        return Err(StoreError::InvalidSystemSettings);
+    }
+    if settings.max_attachment_upload_bytes == 0
+        || settings.max_attachment_upload_bytes > MAX_CONFIGURABLE_ATTACHMENT_UPLOAD_BYTES
+    {
+        return Err(StoreError::InvalidSystemSettings);
+    }
+    if settings.attachment_retention_days == 0
+        || settings.attachment_retention_days > MAX_ATTACHMENT_RETENTION_DAYS
     {
         return Err(StoreError::InvalidSystemSettings);
     }

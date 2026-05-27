@@ -954,7 +954,7 @@ async fn docker_provisioner_test() {
         .iter()
         .any(|entry| entry == "HERMES_ACCEPT_HOOKS=1"));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version" && value == "2026-05-27-managed-config-mount"
+        key == "hermes_hub_spec_version" && value == "2026-05-27-hermes-media-attachments"
     }));
     assert!(spec
         .mounts
@@ -1063,6 +1063,8 @@ async fn docker_provisioner_test() {
     assert!(plugin_adapter.contains("thread_id=session_id"));
     assert!(plugin_adapter.contains("raw_message[\"run_id\"] = run_id"));
     assert!(plugin_adapter.contains("await self.handle_message(event)"));
+    assert!(plugin_adapter.contains("def _env_enablement("));
+    assert!(plugin_adapter.contains("env_enablement_fn=_env_enablement"));
     assert!(plugin_adapter.contains("async def on_processing_start("));
     assert!(plugin_adapter.contains("async def on_processing_complete("));
     assert!(plugin_adapter.contains("ProcessingOutcome.CANCELLED"));
@@ -1142,7 +1144,7 @@ async fn docker_provisioner_test() {
     assert!(
         create_call.windows(2).any(|args| {
             args[0] == "--label"
-                && args[1] == "hermes_hub_spec_version=2026-05-27-managed-config-mount"
+                && args[1] == "hermes_hub_spec_version=2026-05-27-hermes-media-attachments"
         }),
         "managed Hermes containers must carry the current spec label"
     );

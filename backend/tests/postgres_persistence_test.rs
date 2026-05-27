@@ -1093,6 +1093,8 @@ async fn postgres_system_settings_persist_session_limit() {
     store
         .update_system_settings(SystemSettings {
             max_sessions_per_user: 7,
+            max_attachment_upload_bytes: 128 * 1024 * 1024,
+            attachment_retention_days: 14,
             oidc: OidcSettings {
                 enabled: true,
                 display_name: "Acme SSO".to_string(),
@@ -1146,6 +1148,8 @@ async fn postgres_system_settings_persist_session_limit() {
         .await
         .expect("settings can be reloaded");
     assert_eq!(reloaded.max_sessions_per_user, 7);
+    assert_eq!(reloaded.max_attachment_upload_bytes, 128 * 1024 * 1024);
+    assert_eq!(reloaded.attachment_retention_days, 14);
     assert_eq!(reloaded.oidc.client_secret, "oidc-secret");
     assert_eq!(reloaded.ldap.bind_password, "ldap-bind-secret");
 }

@@ -46,7 +46,6 @@ pub struct ObjectStorageConfig {
     pub secret_key: Option<String>,
     pub force_path_style: bool,
     pub prefix: String,
-    pub max_upload_bytes: usize,
 }
 
 /// 统一 skill 文件系统服务配置。服务进程用它启动只读 NFS；backend 用其中的
@@ -142,13 +141,6 @@ fn object_storage_config_from_env() -> ObjectStorageConfig {
             "HERMES_HUB_OBJECT_STORAGE_PREFIX",
         ])
         .unwrap_or_else(|_| "attachments".to_string()),
-        max_upload_bytes: env_usize_any(
-            &[
-                "HERMES_OBJECT_STORAGE_MAX_UPLOAD_BYTES",
-                "HERMES_HUB_OBJECT_STORAGE_MAX_UPLOAD_BYTES",
-            ],
-            25 * 1024 * 1024,
-        ),
     }
 }
 
@@ -309,7 +301,6 @@ fn default_object_storage_config() -> ObjectStorageConfig {
         secret_key: None,
         force_path_style: true,
         prefix: "attachments".to_string(),
-        max_upload_bytes: 25 * 1024 * 1024,
     }
 }
 
@@ -358,14 +349,6 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn env_usize_any(names: &[&str], default: usize) -> usize {
-    names
-        .iter()
-        .find_map(|name| std::env::var(name).ok())
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(default)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -383,7 +366,6 @@ mod tests {
             "HERMES_OBJECT_STORAGE_SECRET_KEY",
             "HERMES_OBJECT_STORAGE_FORCE_PATH_STYLE",
             "HERMES_OBJECT_STORAGE_PREFIX",
-            "HERMES_OBJECT_STORAGE_MAX_UPLOAD_BYTES",
             "HERMES_HUB_OBJECT_STORAGE_ENDPOINT",
             "HERMES_HUB_OBJECT_STORAGE_BUCKET",
             "HERMES_HUB_OBJECT_STORAGE_REGION",
@@ -391,7 +373,6 @@ mod tests {
             "HERMES_HUB_OBJECT_STORAGE_SECRET_KEY",
             "HERMES_HUB_OBJECT_STORAGE_FORCE_PATH_STYLE",
             "HERMES_HUB_OBJECT_STORAGE_PREFIX",
-            "HERMES_HUB_OBJECT_STORAGE_MAX_UPLOAD_BYTES",
         ];
 
         let saved = NAMES
@@ -414,7 +395,6 @@ mod tests {
         std::env::set_var("HERMES_HUB_OBJECT_STORAGE_SECRET_KEY", "secret");
         std::env::set_var("HERMES_HUB_OBJECT_STORAGE_FORCE_PATH_STYLE", "false");
         std::env::set_var("HERMES_HUB_OBJECT_STORAGE_PREFIX", "files");
-        std::env::set_var("HERMES_HUB_OBJECT_STORAGE_MAX_UPLOAD_BYTES", "123");
 
         let config = object_storage_config_from_env();
         assert_eq!(config.endpoint.as_deref(), Some("http://127.0.0.1:9000"));
@@ -424,7 +404,6 @@ mod tests {
         assert_eq!(config.secret_key.as_deref(), Some("secret"));
         assert!(!config.force_path_style);
         assert_eq!(config.prefix, "files");
-        assert_eq!(config.max_upload_bytes, 123);
 
         for (name, value) in saved {
             if let Some(value) = value {

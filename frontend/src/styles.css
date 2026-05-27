@@ -716,11 +716,17 @@ td {
 }
 
 .skill-upload-toolbar button,
-.panel-heading .button-row button {
+.panel-heading .button-row button,
+.skill-editor .button-row button {
   align-items: center;
   display: inline-flex;
   gap: 7px;
   justify-content: center;
+  min-height: 40px;
+}
+
+.skill-editor .button-row {
+  align-items: center;
 }
 
 .skill-tree-button {
@@ -1385,15 +1391,34 @@ td {
 }
 
 .file-chip,
-.attachment-row span {
+.composer-attachment-chip {
   align-items: center;
   background: #eef5f6;
   border: 1px solid #d7e4e7;
   border-radius: 6px;
   color: #33464f;
   display: inline-flex;
+  font: inherit;
   gap: 6px;
+  max-width: min(280px, 100%);
   padding: 6px 8px;
+}
+
+.composer-attachment-chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+button.composer-attachment-chip {
+  cursor: zoom-in;
+}
+
+.composer-attachment-image img {
+  border-radius: 4px;
+  height: 30px;
+  object-fit: cover;
+  width: 30px;
 }
 
 .composer {

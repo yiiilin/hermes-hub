@@ -135,6 +135,8 @@ export type ModelConfigTestResult = {
 
 export type SystemSettings = {
   max_sessions_per_user: number;
+  max_attachment_upload_bytes: number;
+  attachment_retention_days: number;
   oidc: OidcSettings;
   ldap: LdapSettings;
 };
@@ -542,6 +544,19 @@ function managedSkillFileName(file: File): string {
   return (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
 }
 
+function isManagedSkillZipFile(file: File): boolean {
+  const fileName = managedSkillFileName(file).split("/").pop()?.toLowerCase() ?? "";
+  return (
+    fileName.endsWith(".zip") ||
+    file.type === "application/zip" ||
+    file.type === "application/x-zip-compressed"
+  );
+}
+
+function hasHiddenManagedSkillSegment(path: string): boolean {
+  return path.split("/").filter(Boolean).some((segment) => segment.startsWith("."));
+}
+
 export function defaultOidcSettings(): OidcSettings {
   return {
     enabled: false,
@@ -583,6 +598,11 @@ type SystemSettingsPayload = Partial<Omit<SystemSettings, "oidc" | "ldap">> & {
 function systemSettingsFromPayload(settings: SystemSettingsPayload): SystemSettings {
   return {
     max_sessions_per_user: positiveNumberOrDefault(settings.max_sessions_per_user, 20),
+    max_attachment_upload_bytes: positiveNumberOrDefault(
+      settings.max_attachment_upload_bytes,
+      200 * 1024 * 1024,
+    ),
+    attachment_retention_days: positiveNumberOrDefault(settings.attachment_retention_days, 7),
     oidc: { ...defaultOidcSettings(), ...(settings.oidc ?? {}) },
     ldap: { ...defaultLdapSettings(), ...(settings.ldap ?? {}) },
   };
@@ -939,6 +959,9 @@ export function createApiClient(): ApiClient {
       await request<void>(managedSkillDirectoryUrl(path), { method: "POST" });
     },
     async uploadManagedSkills(files, targetPath) {
+      if (files.some(isManagedSkillZipFile)) {
+        throw new Error("managed skill zip uploads are not supported");
+      }
       const form = new FormData();
       if (targetPath?.trim()) {
         form.append("target_path", targetPath.trim());
@@ -1135,6 +1158,7 @@ type MockApiClientOptions = {
   createSession?: ApiClient["createSession"];
   initialManagedSkills?: Record<string, string>;
   initialManagedSkillDirectories?: string[];
+  readManagedSkill?: ApiClient["readManagedSkill"];
   saveManagedSkill?: ApiClient["saveManagedSkill"];
   deleteManagedSkill?: ApiClient["deleteManagedSkill"];
   createManagedSkillDirectory?: ApiClient["createManagedSkillDirectory"];
@@ -1228,6 +1252,8 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
   ];
   let systemSettings: SystemSettings = {
     max_sessions_per_user: 20,
+    max_attachment_upload_bytes: 200 * 1024 * 1024,
+    attachment_retention_days: 7,
     oidc: defaultOidcSettings(),
     ldap: defaultLdapSettings(),
   };
@@ -1290,9 +1316,14 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     }
 
     for (const directory of managedSkillDirectories) {
-      ensureDir(directory);
+      if (!hasHiddenManagedSkillSegment(directory)) {
+        ensureDir(directory);
+      }
     }
     for (const [path, content] of Object.entries(managedSkills)) {
+      if (hasHiddenManagedSkillSegment(path)) {
+        continue;
+      }
       const segments = path.split("/");
       const fileName = segments.pop()!;
       const parent = ensureDir(segments.join("/"));
@@ -1650,6 +1681,7 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     },
     async listManagedSkills() {
       return Object.entries(managedSkills)
+        .filter(([path]) => !hasHiddenManagedSkillSegment(path))
         .map(([path, content]) => ({ path, size: new Blob([content]).size }))
         .sort((left, right) => left.path.localeCompare(right.path));
     },
@@ -1657,6 +1689,9 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       return managedSkillTreeFromState();
     },
     async readManagedSkill(path) {
+      if (options.readManagedSkill) {
+        return options.readManagedSkill(path);
+      }
       if (!(path in managedSkills)) {
         throw new Error("managed skill not found");
       }
@@ -1693,6 +1728,9 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       managedSkillDirectories.add(path);
     },
     async uploadManagedSkills(files, targetPath) {
+      if (files.some(isManagedSkillZipFile)) {
+        throw new Error("managed skill zip uploads are not supported");
+      }
       if (options.uploadManagedSkills) {
         const uploaded = await options.uploadManagedSkills(files, targetPath);
         for (const skill of uploaded) {

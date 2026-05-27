@@ -9,13 +9,7 @@ use axum::{
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{
-    collections::BTreeMap,
-    io::{Cursor, Read},
-    path::{Component, Path as StdPath},
-    time::Instant,
-};
-use zip::ZipArchive;
+use std::{collections::BTreeMap, time::Instant};
 
 use crate::{
     domain::user::{PublicUser, UserListItem, UserRole},
@@ -222,7 +216,6 @@ struct ManagedSkillUploadResponse {
 
 struct ManagedSkillUploadPart {
     file_name: String,
-    content_type: Option<String>,
     bytes: Bytes,
 }
 
@@ -588,6 +581,16 @@ async fn update_system_settings(
     if payload.max_sessions_per_user == 0 {
         return Err(ApiError::BadRequest(
             "max sessions per user must be greater than zero",
+        ));
+    }
+    if payload.max_attachment_upload_bytes == 0 {
+        return Err(ApiError::BadRequest(
+            "max attachment upload bytes must be greater than zero",
+        ));
+    }
+    if payload.attachment_retention_days == 0 {
+        return Err(ApiError::BadRequest(
+            "attachment retention days must be greater than zero",
         ));
     }
 
@@ -1019,6 +1022,12 @@ async fn parse_managed_skill_upload(
     let mut target_path = String::new();
     let mut parts = Vec::new();
     let mut total_bytes = 0usize;
+    let max_upload_bytes = state
+        .store
+        .system_settings()
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .max_attachment_upload_bytes;
 
     while let Some(field) = multipart
         .next_field()
@@ -1039,6 +1048,12 @@ async fn parse_managed_skill_upload(
             continue;
         };
         let content_type = field.content_type().map(ToOwned::to_owned);
+        if managed_skill_upload_is_zip(&file_name, content_type.as_deref()) {
+            // 统一 Skill 管理只接收展开后的普通文件，压缩包上传统一在解析阶段拒绝。
+            return Err(ApiError::BadRequest(
+                "managed skill zip uploads are not supported",
+            ));
+        }
         let bytes = field
             .bytes()
             .await
@@ -1046,14 +1061,10 @@ async fn parse_managed_skill_upload(
         total_bytes = total_bytes
             .checked_add(bytes.len())
             .ok_or(ApiError::BadRequest("managed skill upload is too large"))?;
-        if total_bytes > state.config.object_storage.max_upload_bytes {
+        if total_bytes > max_upload_bytes {
             return Err(ApiError::BadRequest("managed skill upload is too large"));
         }
-        parts.push(ManagedSkillUploadPart {
-            file_name,
-            content_type,
-            bytes,
-        });
+        parts.push(ManagedSkillUploadPart { file_name, bytes });
         if parts.len() > MAX_MANAGED_SKILL_UPLOAD_FILES {
             return Err(ApiError::BadRequest(
                 "managed skill upload has too many files",
@@ -1063,14 +1074,8 @@ async fn parse_managed_skill_upload(
 
     let mut uploads = Vec::new();
     for part in parts {
-        let is_zip = managed_skill_upload_is_zip(&part);
-        if is_zip {
-            let files = extract_managed_skill_zip(&target_path, &part.bytes, state)?;
-            uploads.extend(files);
-        } else {
-            let path = normalize_managed_skill_upload_path(&target_path, &part.file_name)?;
-            uploads.push((path, part.bytes));
-        }
+        let path = normalize_managed_skill_upload_path(&target_path, &part.file_name)?;
+        uploads.push((path, part.bytes));
         if uploads.len() > MAX_MANAGED_SKILL_UPLOAD_FILES {
             return Err(ApiError::BadRequest(
                 "managed skill upload has too many files",
@@ -1083,95 +1088,16 @@ async fn parse_managed_skill_upload(
     Ok(uploads)
 }
 
-fn managed_skill_upload_is_zip(part: &ManagedSkillUploadPart) -> bool {
-    part.file_name
-        .rsplit('.')
-        .next()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
-        || part.content_type.as_deref().is_some_and(|content_type| {
+fn managed_skill_upload_is_zip(file_name: &str, content_type: Option<&str>) -> bool {
+    file_name
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("zip"))
+        || content_type.is_some_and(|content_type| {
             matches!(
                 content_type,
                 "application/zip" | "application/x-zip-compressed"
             )
         })
-}
-
-fn extract_managed_skill_zip(
-    target_path: &str,
-    bytes: &Bytes,
-    state: &AppState,
-) -> Result<Vec<(String, Bytes)>, ApiError> {
-    let cursor = Cursor::new(bytes.as_ref());
-    let mut archive = ZipArchive::new(cursor)
-        .map_err(|_| ApiError::BadRequest("managed skill zip archive is invalid"))?;
-    let mut files = Vec::new();
-    let mut total_bytes = 0usize;
-
-    for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .map_err(|_| ApiError::BadRequest("managed skill zip archive is invalid"))?;
-        if entry.is_dir() {
-            continue;
-        }
-        if zip_entry_is_symlink(entry.unix_mode()) {
-            return Err(ApiError::BadRequest(
-                "managed skill zip archive contains unsupported entries",
-            ));
-        }
-        let entry_path = entry
-            .enclosed_name()
-            .ok_or(ApiError::BadRequest("invalid managed skill path"))?;
-        let entry_path = path_buf_to_managed_skill_path(&entry_path)?;
-        let path = normalize_managed_skill_upload_path(target_path, &entry_path)?;
-        let entry_size = usize::try_from(entry.size())
-            .map_err(|_| ApiError::BadRequest("managed skill upload is too large"))?;
-        total_bytes = total_bytes
-            .checked_add(entry_size)
-            .ok_or(ApiError::BadRequest("managed skill upload is too large"))?;
-        if total_bytes > state.config.object_storage.max_upload_bytes {
-            return Err(ApiError::BadRequest("managed skill upload is too large"));
-        }
-
-        let mut data = Vec::with_capacity(entry_size);
-        entry
-            .read_to_end(&mut data)
-            .map_err(|_| ApiError::BadRequest("managed skill zip archive is invalid"))?;
-        files.push((path, Bytes::from(data)));
-        if files.len() > MAX_MANAGED_SKILL_UPLOAD_FILES {
-            return Err(ApiError::BadRequest(
-                "managed skill upload has too many files",
-            ));
-        }
-    }
-
-    Ok(files)
-}
-
-fn zip_entry_is_symlink(unix_mode: Option<u32>) -> bool {
-    unix_mode.is_some_and(|mode| mode & 0o170000 == 0o120000)
-}
-
-fn path_buf_to_managed_skill_path(path: &StdPath) -> Result<String, ApiError> {
-    let mut segments = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(segment) => {
-                let segment = segment
-                    .to_str()
-                    .ok_or(ApiError::BadRequest("invalid managed skill path"))?;
-                segments.push(segment.to_string());
-            }
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(ApiError::BadRequest("invalid managed skill path"));
-            }
-        }
-    }
-    if segments.is_empty() {
-        return Err(ApiError::BadRequest("invalid managed skill path"));
-    }
-    Ok(segments.join("/"))
 }
 
 fn normalize_managed_skill_optional_path(path: &str) -> Result<String, ApiError> {
@@ -1302,13 +1228,8 @@ impl ManagedSkillTreeBuilder {
 }
 
 fn has_hidden_managed_skill_segment(path: &str) -> bool {
-    // 这些路径属于 Hermes curator 的内部状态，统一管理的 Skill 不能覆盖或暴露它们。
-    path.split('/').any(|segment| {
-        matches!(
-            segment,
-            ".curator_state" | ".bundled_manifest" | MANAGED_SKILL_DIRECTORY_MARKER
-        )
-    })
+    // 统一管理的 Skill 不能写入任何隐藏文件或隐藏目录；内部目录 marker 会先 strip suffix 再进入这里。
+    path.split('/').any(|segment| segment.starts_with('.'))
 }
 
 fn map_object_storage_error(error: ObjectStorageError) -> ApiError {

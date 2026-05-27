@@ -22,7 +22,7 @@ use super::{
 
 /// Hub 托管 Hermes 容器规格版本。只要 env、挂载、工作目录或安全策略有变化，
 /// 就提升这个值，确保已存在的旧容器会被重建并拿到新行为。
-const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-27-managed-config-mount";
+const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-27-hermes-media-attachments";
 const MANAGED_CONTAINER_SPEC_LABEL: &str = "hermes_hub_spec_version";
 const HUB_INBOX_PATH: &str = "/internal/channel/v1/inbox";
 const HUB_INBOX_TIMEOUT_SECONDS: u16 = 25;
@@ -474,9 +474,9 @@ class HermesHubAdapter(BasePlatformAdapter):
         run_id = str(item.get("run_id") or inbox_id or "")
         session_id = str(item.get("session_id") or item.get("channel_session_id") or "")
         content = item.get("content") or item.get("text") or item.get("message") or ""
-        if session_id and not os.getenv("HERMES_HUB_HOME_CHANNEL"):
-            # Hub 托管场景不要求用户手动执行 /sethome；首个会话可作为 Hermes
-            # cron/跨平台通知的默认 home channel，同时避免初始化提示污染对话。
+        if session_id:
+            # send_message 工具通过 gateway config 读取 home_channel。Hub 会话的
+            # “正确默认目标”是当前正在处理的 session，不能沿用上一次会话。
             os.environ["HERMES_HUB_HOME_CHANNEL"] = session_id
         run_id = self._normalize_run_id(run_id)
         if run_id:
@@ -930,12 +930,26 @@ def _check_requirements() -> bool:
     return aiohttp is not None
 
 
+def _env_enablement() -> Optional[dict[str, Any]]:
+    seed: dict[str, Any] = {}
+    home_channel = os.getenv("HERMES_HUB_HOME_CHANNEL", "").strip()
+    if home_channel:
+        # Hermes 的 send_message 工具只读取 gateway config 里的 home_channel；
+        # adapter 在分发当前 run 前会写入这个环境变量，这里把它桥接成配置对象。
+        seed["home_channel"] = {
+            "chat_id": home_channel,
+            "name": "Hermes Hub",
+        }
+    return seed
+
+
 def register(ctx: Any) -> None:
     ctx.register_platform(
         name="hermes_hub",
         label="Hermes Hub",
         adapter_factory=lambda cfg: HermesHubAdapter(cfg),
         check_fn=_check_requirements,
+        env_enablement_fn=_env_enablement,
         required_env=["HERMES_HUB_CHANNEL_BASE_URL", "HERMES_HUB_CHANNEL_TOKEN"],
         max_message_length=8000,
         emoji="",

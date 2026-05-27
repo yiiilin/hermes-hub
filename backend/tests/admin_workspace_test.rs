@@ -21,12 +21,10 @@ use hermes_hub_backend::{
 };
 use serde_json::{json, Value};
 use std::{
-    io::{Cursor, Write},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tower::ServiceExt;
-use zip::{write::SimpleFileOptions, ZipWriter};
 
 fn test_app() -> Router {
     hermes_hub_backend::build_router(AppConfig::for_tests())
@@ -381,18 +379,23 @@ fn finish_multipart(body: &mut Vec<u8>, boundary: &str) {
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
 }
 
-fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
-    let cursor = Cursor::new(Vec::new());
-    let mut writer = ZipWriter::new(cursor);
-    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    for (path, bytes) in entries {
-        writer.start_file(path, options).expect("zip file entry");
-        writer.write_all(bytes).expect("zip entry bytes");
-    }
-    writer
-        .finish()
-        .expect("zip archive can be finished")
-        .into_inner()
+fn sample_zip_bytes() -> Vec<u8> {
+    // 这个最小合法 ZIP 样本避免测试继续依赖后端已移除的 zip crate。
+    vec![
+        80, 75, 3, 4, 20, 0, 0, 0, 0, 0, 112, 56, 187, 92, 187, 86, 240, 253, 12, 0, 0, 0, 12, 0,
+        0, 0, 18, 0, 0, 0, 97, 115, 115, 105, 115, 116, 97, 110, 116, 47, 83, 75, 73, 76, 76, 46,
+        109, 100, 35, 32, 65, 115, 115, 105, 115, 116, 97, 110, 116, 10, 80, 75, 3, 4, 20, 0, 0, 0,
+        0, 0, 112, 56, 187, 92, 134, 215, 146, 156, 11, 0, 0, 0, 11, 0, 0, 0, 28, 0, 0, 0, 97, 115,
+        115, 105, 115, 116, 97, 110, 116, 47, 114, 101, 102, 101, 114, 101, 110, 99, 101, 115, 47,
+        116, 111, 110, 101, 46, 109, 100, 66, 101, 32, 100, 105, 114, 101, 99, 116, 46, 10, 80, 75,
+        1, 2, 20, 3, 20, 0, 0, 0, 0, 0, 112, 56, 187, 92, 187, 86, 240, 253, 12, 0, 0, 0, 12, 0, 0,
+        0, 18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 1, 0, 0, 0, 0, 97, 115, 115, 105, 115, 116,
+        97, 110, 116, 47, 83, 75, 73, 76, 76, 46, 109, 100, 80, 75, 1, 2, 20, 3, 20, 0, 0, 0, 0, 0,
+        112, 56, 187, 92, 134, 215, 146, 156, 11, 0, 0, 0, 11, 0, 0, 0, 28, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 128, 1, 60, 0, 0, 0, 97, 115, 115, 105, 115, 116, 97, 110, 116, 47, 114, 101, 102,
+        101, 114, 101, 110, 99, 101, 115, 47, 116, 111, 110, 101, 46, 109, 100, 80, 75, 5, 6, 0, 0,
+        0, 0, 2, 0, 2, 0, 138, 0, 0, 0, 129, 0, 0, 0, 0, 0,
+    ]
 }
 
 fn tree_child<'a>(node: &'a Value, name: &str) -> &'a Value {
@@ -875,6 +878,11 @@ async fn admin_can_configure_per_user_session_limit() {
     let (status, body) = response_json(settings).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["settings"]["max_sessions_per_user"], 20);
+    assert_eq!(
+        body["settings"]["max_attachment_upload_bytes"],
+        200 * 1024 * 1024
+    );
+    assert_eq!(body["settings"]["attachment_retention_days"], 7);
     assert_eq!(body["settings"]["oidc"]["enabled"], false);
     assert_eq!(body["settings"]["oidc"]["display_name"], "OpenID Connect");
     assert_eq!(body["settings"]["ldap"]["enabled"], false);
@@ -886,6 +894,8 @@ async fn admin_can_configure_per_user_session_limit() {
         "/api/admin/system-settings",
         json!({
             "max_sessions_per_user": 2,
+            "max_attachment_upload_bytes": 64 * 1024 * 1024,
+            "attachment_retention_days": 30,
             "oidc": {
                 "enabled": true,
                 "display_name": "Acme SSO",
@@ -929,6 +939,11 @@ async fn admin_can_configure_per_user_session_limit() {
     let (status, body) = response_json(settings).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["settings"]["max_sessions_per_user"], 2);
+    assert_eq!(
+        body["settings"]["max_attachment_upload_bytes"],
+        64 * 1024 * 1024
+    );
+    assert_eq!(body["settings"]["attachment_retention_days"], 30);
     assert_eq!(body["settings"]["oidc"]["enabled"], true);
     assert_eq!(body["settings"]["oidc"]["display_name"], "Acme SSO");
     assert_eq!(body["settings"]["oidc"]["client_id"], "hermes-hub");
@@ -1229,6 +1244,52 @@ async fn admin_can_delete_managed_skill_directories_recursively() {
 }
 
 #[tokio::test]
+async fn admin_can_delete_binary_managed_skill_without_reading_utf8_content() {
+    let app = test_app();
+    let admin_cookie = bootstrap_admin(&app).await;
+    let boundary = "managed-skills-binary-delete-boundary";
+    let mut upload_body = Vec::new();
+    multipart_file(
+        &mut upload_body,
+        boundary,
+        "files",
+        "mindoc-search.tgz",
+        "application/gzip",
+        &[0x1f, 0x8b, 0xff, 0x00],
+    );
+    finish_multipart(&mut upload_body, boundary);
+
+    let upload = request_raw(
+        &app,
+        Method::POST,
+        "/api/admin/managed-skills/upload",
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload_body,
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(upload.status(), StatusCode::CREATED);
+
+    let read = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/managed-skills/mindoc-search.tgz",
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(read.status(), StatusCode::BAD_GATEWAY);
+
+    let delete = request_empty(
+        &app,
+        Method::DELETE,
+        "/api/admin/managed-skills/mindoc-search.tgz",
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn admin_can_upload_managed_skill_files_and_folders() {
     let app = test_app();
     let admin_cookie = bootstrap_admin(&app).await;
@@ -1279,14 +1340,11 @@ async fn admin_can_upload_managed_skill_files_and_folders() {
 }
 
 #[tokio::test]
-async fn admin_can_upload_managed_skill_zip_archives() {
+async fn managed_skill_upload_rejects_zip_archives() {
     let app = test_app();
     let admin_cookie = bootstrap_admin(&app).await;
     let boundary = "managed-skills-zip-boundary";
-    let archive = zip_bytes(&[
-        ("assistant/SKILL.md", b"# Assistant\n" as &[u8]),
-        ("assistant/references/tone.md", b"Be direct.\n" as &[u8]),
-    ]);
+    let archive = sample_zip_bytes();
     let mut upload_body = Vec::new();
     multipart_text(&mut upload_body, boundary, "target_path", "bundles");
     multipart_file(
@@ -1308,20 +1366,7 @@ async fn admin_can_upload_managed_skill_zip_archives() {
         Some(&admin_cookie),
     )
     .await;
-    let (status, body) = response_json(upload).await;
-    assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(body["skills"].as_array().expect("uploaded skills").len(), 2);
-
-    let read = request_empty(
-        &app,
-        Method::GET,
-        "/api/admin/managed-skills/bundles/assistant/SKILL.md",
-        Some(&admin_cookie),
-    )
-    .await;
-    let (status, body) = response_json(read).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["skill"]["content"], "# Assistant\n");
+    assert_eq!(upload.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1373,26 +1418,30 @@ async fn managed_skill_upload_rejects_unsafe_paths() {
     .await;
     assert_eq!(hidden.status(), StatusCode::BAD_REQUEST);
 
-    let boundary = "managed-skills-unsafe-zip-boundary";
-    let archive = zip_bytes(&[("../escape.md", b"escaped" as &[u8])]);
-    let mut unsafe_zip_body = Vec::new();
-    multipart_file(
-        &mut unsafe_zip_body,
-        boundary,
-        "file",
-        "skills.zip",
-        "application/zip",
-        &archive,
-    );
-    finish_multipart(&mut unsafe_zip_body, boundary);
-    let unsafe_zip = request_raw(
-        &app,
-        Method::POST,
-        "/api/admin/managed-skills/upload",
-        &format!("multipart/form-data; boundary={boundary}"),
-        unsafe_zip_body,
-        Some(&admin_cookie),
-    )
-    .await;
-    assert_eq!(unsafe_zip.status(), StatusCode::BAD_REQUEST);
+    for (case_name, filename, content_type) in [
+        ("nested-hidden-file", "writing/.hidden.md", "text/markdown"),
+        ("hidden-directory", ".cache/file.md", "text/markdown"),
+    ] {
+        let boundary = format!("managed-skills-dot-path-boundary-{case_name}");
+        let mut dot_path_body = Vec::new();
+        multipart_file(
+            &mut dot_path_body,
+            &boundary,
+            "files",
+            filename,
+            content_type,
+            b"hidden",
+        );
+        finish_multipart(&mut dot_path_body, &boundary);
+        let dot_path = request_raw(
+            &app,
+            Method::POST,
+            "/api/admin/managed-skills/upload",
+            &format!("multipart/form-data; boundary={boundary}"),
+            dot_path_body,
+            Some(&admin_cookie),
+        )
+        .await;
+        assert_eq!(dot_path.status(), StatusCode::BAD_REQUEST);
+    }
 }

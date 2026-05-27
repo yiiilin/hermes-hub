@@ -22,7 +22,10 @@ use crate::{
         },
     },
     http::{
-        attachments::{map_channel_error, upload_session_attachments_for_context},
+        attachments::{
+            ensure_attachment_not_expired, map_channel_error,
+            upload_session_attachments_for_context,
+        },
         ApiError,
     },
     model_config::InstanceTokenContext,
@@ -568,6 +571,7 @@ async fn download_input_attachment(
         &session_context.user_id,
         &session_context.hermes_instance_id,
     )?;
+    ensure_attachment_not_expired(&state, &attachment).await?;
     let bytes = state
         .object_storage
         .get(&attachment.object_key)

@@ -16,7 +16,7 @@ import type {
 import { defaultLdapSettings, defaultOidcSettings } from "../api/client";
 import { useI18n } from "../i18n";
 import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
-import { FileArchive, FilePlus2, FolderPlus, Upload } from "lucide-react";
+import { FilePlus2, FolderPlus, Upload } from "lucide-react";
 
 type AdminSettingsTab =
   | "users"
@@ -24,7 +24,7 @@ type AdminSettingsTab =
   | "hermes"
   | "scheduler"
   | "skills"
-  | "sessions"
+  | "system"
   | "auth";
 
 type AdminRouteProps = {
@@ -45,6 +45,7 @@ type HermesSchedulerTaskRow = {
 };
 
 const defaultInviteHours = 24;
+const bytesPerMegabyte = 1024 * 1024;
 const modelConfigOrder: ModelConfigKind[] = ["llm", "title", "image"];
 const apiTypeLabels: Record<ModelApiType, string> = {
   chat_completions: "Chat Completions",
@@ -52,6 +53,14 @@ const apiTypeLabels: Record<ModelApiType, string> = {
   images_generations: "Images",
 };
 const reasoningEfforts: Array<ReasoningEffort | ""> = ["", "minimal", "low", "medium", "high"];
+
+function megabytesFromBytes(value: number): number {
+  return Math.max(1, Math.round(value / bytesPerMegabyte));
+}
+
+function bytesFromMegabytes(value: number): number {
+  return Math.max(1, Math.round(value)) * bytesPerMegabyte;
+}
 
 function formatBytes(size: number): string {
   if (size < 1024) {
@@ -150,6 +159,10 @@ function uploadedFileName(file: File): string {
   return (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
 }
 
+function hasHiddenManagedSkillSegment(path: string): boolean {
+  return path.split("/").filter(Boolean).some((segment) => segment.startsWith("."));
+}
+
 function findManagedSkillTreeNode(
   node: ManagedSkillTreeNode,
   path: string,
@@ -205,6 +218,9 @@ function managedSkillTreeFromList(skills: ManagedSkill[]): ManagedSkillTreeNode 
   }
 
   for (const skill of skills) {
+    if (hasHiddenManagedSkillSegment(skill.path)) {
+      continue;
+    }
     const segments = skill.path.split("/").filter(Boolean);
     const name = segments.pop();
     if (!name) {
@@ -253,9 +269,10 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
   const [skillEditorMode, setSkillEditorMode] = useState<"file" | "directory">("file");
   const fileUploadInputRef = useRef<HTMLInputElement | null>(null);
   const folderUploadInputRef = useRef<HTMLInputElement | null>(null);
-  const zipUploadInputRef = useRef<HTMLInputElement | null>(null);
   const [systemSettings, setSystemSettings] = useState<SystemSettings>({
     max_sessions_per_user: 20,
+    max_attachment_upload_bytes: 200 * 1024 * 1024,
+    attachment_retention_days: 7,
     oidc: defaultOidcSettings(),
     ldap: defaultLdapSettings(),
   });
@@ -315,7 +332,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     { key: "hermes", label: t("admin.title") },
     { key: "scheduler", label: t("admin.scheduledTasks") },
     { key: "skills", label: t("admin.skillManagement") },
-    { key: "sessions", label: t("admin.sessionSettings") },
+    { key: "system", label: t("admin.systemParameters") },
     { key: "auth", label: t("admin.authSettings") },
   ];
 
@@ -334,7 +351,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
         apiClient.listInvites(),
         apiClient.listHermesInstances(),
         apiClient.modelConfigStatus(),
-        activeTab === "sessions" || activeTab === "auth"
+        activeTab === "auth" || activeTab === "system"
           ? apiClient.systemSettings()
           : Promise.resolve(null),
         activeTab === "scheduler"
@@ -558,6 +575,11 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
       setSkillContent(skill.content);
       setSkillEditorMode("file");
     } catch (cause) {
+      // 二进制或压缩包不是可编辑 Skill 文本，但仍要允许管理员选中后删除。
+      setSelectedSkillNode({ path, kind: "file" });
+      setSkillPathInput(path);
+      setSkillContent("");
+      setSkillEditorMode("file");
       setError(cause instanceof Error ? cause.message : t("admin.skillLoadFailed"));
     } finally {
       setSkillLoading(false);
@@ -719,7 +741,11 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     if (node.path === "") {
       return node.children.map(renderManagedSkillNode);
     }
+    if (hasHiddenManagedSkillSegment(node.path)) {
+      return null;
+    }
     const selected = selectedSkillNode?.path === node.path && selectedSkillNode.kind === node.kind;
+    const kindLabel = node.kind === "dir" ? t("admin.skillDirectory") : t("admin.skillFile");
     return (
       <li
         key={`${node.kind}:${node.path}`}
@@ -728,14 +754,15 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
         <button
           type="button"
           className={`skill-tree-button ${node.kind === "dir" ? "directory" : "file"}`}
-          aria-label={`${node.kind === "dir" ? t("admin.skillDirectory") : t("admin.skillFile")} ${node.path}`}
+          aria-label={`${kindLabel} ${node.name}`}
+          data-managed-skill-path={node.path}
           onClick={() =>
             node.kind === "dir"
               ? selectManagedSkillDirectory(node.path)
               : void openManagedSkill(node.path)
           }
         >
-          <strong>{node.path}</strong>
+          <strong>{node.name}</strong>
           <span>{node.kind === "dir" ? t("admin.skillDirectory") : formatBytes(node.size)}</span>
         </button>
         {node.kind === "dir" && node.children.length > 0 ? (
@@ -1176,9 +1203,9 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     );
   }
 
-  if (activeTab === "sessions") {
+  if (activeTab === "system") {
     return renderSystemSettingsShell(
-      <section className="admin-page" id="admin-session-settings">
+      <section className="admin-page" id="admin-system-parameters">
         <form className="panel form" onSubmit={(event) => void saveSystemSettings(event)}>
           <div className="tab-actions">
             <button type="button" className="secondary" onClick={() => void refresh()}>
@@ -1198,6 +1225,37 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                 setSystemSettings({
                   ...systemSettings,
                   max_sessions_per_user: Number(event.target.value),
+                })
+              }
+              required
+            />
+          </label>
+          <label>
+            {t("admin.maxAttachmentUploadMegabytes")}
+            <input
+              type="number"
+              min={1}
+              value={megabytesFromBytes(systemSettings.max_attachment_upload_bytes)}
+              onChange={(event) =>
+                setSystemSettings({
+                  ...systemSettings,
+                  max_attachment_upload_bytes: bytesFromMegabytes(Number(event.target.value)),
+                })
+              }
+              required
+            />
+          </label>
+          <label>
+            {t("admin.attachmentRetentionDays")}
+            <input
+              type="number"
+              min={1}
+              max={3650}
+              value={systemSettings.attachment_retention_days}
+              onChange={(event) =>
+                setSystemSettings({
+                  ...systemSettings,
+                  attachment_retention_days: Number(event.target.value),
                 })
               }
               required
@@ -1528,14 +1586,6 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                 {...({ webkitdirectory: "", directory: "" } as Record<string, string>)}
                 onChange={(event) => void uploadManagedSkillFiles(event)}
               />
-              <input
-                ref={zipUploadInputRef}
-                type="file"
-                accept=".zip,application/zip"
-                hidden
-                data-testid="managed-skills-zip-input"
-                onChange={(event) => void uploadManagedSkillFiles(event)}
-              />
               <button
                 type="button"
                 className="secondary"
@@ -1553,15 +1603,6 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
               >
                 <FolderPlus aria-hidden="true" size={16} />
                 {t("admin.skillUploadFolder")}
-              </button>
-              <button
-                type="button"
-                className="secondary"
-                disabled={skillLoading}
-                onClick={() => zipUploadInputRef.current?.click()}
-              >
-                <FileArchive aria-hidden="true" size={16} />
-                {t("admin.skillUploadZip")}
               </button>
             </div>
             {!managedSkillTree || managedSkillTree.children.length === 0 ? (

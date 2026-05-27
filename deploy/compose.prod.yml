@@ -156,7 +156,6 @@ services:
       HERMES_OBJECT_STORAGE_SECRET_KEY: ${HERMES_OBJECT_STORAGE_SECRET_KEY:-change-me-rustfs-secret}
       HERMES_OBJECT_STORAGE_FORCE_PATH_STYLE: ${HERMES_OBJECT_STORAGE_FORCE_PATH_STYLE:-true}
       HERMES_OBJECT_STORAGE_PREFIX: ${HERMES_OBJECT_STORAGE_PREFIX:-attachments}
-      HERMES_OBJECT_STORAGE_MAX_UPLOAD_BYTES: ${HERMES_OBJECT_STORAGE_MAX_UPLOAD_BYTES:-26214400}
     volumes:
       # Docker socket 是高权限边界；backend 需要它来创建每个用户的 Hermes 容器。
       - /var/run/docker.sock:/var/run/docker.sock
