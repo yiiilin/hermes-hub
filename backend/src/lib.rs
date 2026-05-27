@@ -110,6 +110,9 @@ pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppIn
             object_storage,
             session_events: channel::events::SessionEventHub::default(),
         };
+        tokio::spawn(hermes::lifecycle::start_hermes_lifecycle_sweeper(
+            state.clone(),
+        ));
         return Ok(build_router_with_state(state));
     };
     let secret_master_key = config
@@ -135,6 +138,9 @@ pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppIn
         object_storage,
         session_events: channel::events::SessionEventHub::default(),
     };
+    tokio::spawn(hermes::lifecycle::start_hermes_lifecycle_sweeper(
+        state.clone(),
+    ));
 
     Ok(build_router_with_state(state))
 }

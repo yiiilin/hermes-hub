@@ -5,6 +5,7 @@ import { I18nProvider, useI18n } from "./i18n";
 import { AdminRoute } from "./routes/admin";
 import { ChannelSessionRoute } from "./routes/channel-session";
 import { LoginRoute } from "./routes/login";
+import { ScheduledTasksRoute } from "./routes/scheduled-tasks";
 import { useEffect, useState } from "react";
 
 type AppProps = {
@@ -79,6 +80,10 @@ function AppContent({ apiClient }: Required<AppProps>) {
       {user.role === "admin" && activeView === "admin-settings" ? (
         <AdminRoute apiClient={apiClient} currentUser={user} />
       ) : null}
+      <ScheduledTasksRoute
+        active={activeView === "scheduled-tasks"}
+        apiClient={apiClient}
+      />
     </Layout>
   );
 }

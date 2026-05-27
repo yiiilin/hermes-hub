@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     convert::Infallible,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -172,6 +173,7 @@ async fn delete_session(
 
     // 删除会话前先停掉正在跑的 Hermese run，避免后台继续写入已经删除的 session。
     let _ = stop_active_run_for_session(&state, &user.id, &channel.id, &session_id).await?;
+    delete_managed_cron_jobs_for_session(&state, &user.id, &session_id).await?;
     let deleted = state
         .channel_store
         .delete_session(&user.id, &channel.id, &session_id)
@@ -491,6 +493,99 @@ async fn delete_session_objects(
     }
 
     Ok(())
+}
+
+pub(crate) async fn delete_managed_cron_jobs_for_session(
+    state: &AppState,
+    user_id: &str,
+    session_id: &str,
+) -> Result<(), ApiError> {
+    let instance = match state.store.hermes_instance_for_user(user_id).await {
+        Ok(instance) => instance,
+        Err(_) => return Ok(()),
+    };
+    let Some(host_config_path) = instance.host_config_path.as_deref() else {
+        return Ok(());
+    };
+    let jobs_path = PathBuf::from(host_config_path)
+        .join("cron")
+        .join("jobs.json");
+    let raw_jobs = match tokio::fs::read_to_string(&jobs_path).await {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(ApiError::Internal),
+    };
+    let mut jobs_value: Value = serde_json::from_str(&raw_jobs).map_err(|_| ApiError::Internal)?;
+    let removed_job_ids = remove_cron_jobs_for_session(&mut jobs_value, session_id);
+    if removed_job_ids.is_empty() {
+        return Ok(());
+    }
+
+    let next_jobs = serde_json::to_string_pretty(&jobs_value).map_err(|_| ApiError::Internal)?;
+    tokio::fs::write(&jobs_path, next_jobs)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    for job_id in removed_job_ids {
+        // Hermes 会把 cron 输出按 job id 放在 cron/output 下；删除 session 时一并清理这些孤儿输出。
+        let output_path = PathBuf::from(host_config_path)
+            .join("cron")
+            .join("output")
+            .join(job_id);
+        match tokio::fs::remove_dir_all(output_path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(ApiError::Internal),
+        }
+    }
+
+    Ok(())
+}
+
+fn remove_cron_jobs_for_session(jobs_value: &mut Value, session_id: &str) -> Vec<String> {
+    let Some(jobs) = cron_jobs_array_mut(jobs_value) else {
+        return Vec::new();
+    };
+    let mut removed_job_ids = Vec::new();
+    jobs.retain(|job| {
+        if cron_job_targets_session(job, session_id) {
+            removed_job_ids.push(
+                job.get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            false
+        } else {
+            true
+        }
+    });
+    removed_job_ids
+        .into_iter()
+        .filter(|job_id| !job_id.is_empty())
+        .collect()
+}
+
+fn cron_jobs_array_mut(value: &mut Value) -> Option<&mut Vec<Value>> {
+    if value.is_array() {
+        return value.as_array_mut();
+    }
+    value.get_mut("jobs").and_then(Value::as_array_mut)
+}
+
+fn cron_job_targets_session(job: &Value, session_id: &str) -> bool {
+    let origin = job.get("origin").unwrap_or(&Value::Null);
+    [
+        job.get("session_id"),
+        job.get("chat_id"),
+        job.get("thread_id"),
+        origin.get("session_id"),
+        origin.get("chat_id"),
+        origin.get("thread_id"),
+    ]
+    .iter()
+    .flatten()
+    .any(|value| value.as_str() == Some(session_id))
 }
 
 async fn model_generated_title(state: &AppState, user_id: &str, prompt: &str) -> String {

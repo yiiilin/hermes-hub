@@ -1,10 +1,20 @@
 import type { Dispatch, MouseEvent, ReactNode, SetStateAction } from "react";
 import type { User } from "../api/client";
-import { Bot, Languages, LogOut, Menu, PanelLeftClose, PanelLeftOpen, SlidersHorizontal, X } from "lucide-react";
+import {
+  Bot,
+  CalendarClock,
+  Languages,
+  LogOut,
+  Menu,
+  PanelLeftClose,
+  PanelLeftOpen,
+  SlidersHorizontal,
+  X,
+} from "lucide-react";
 import { useI18n } from "../i18n";
 import { createContext, useContext, useEffect, useState } from "react";
 
-export type AppView = "chat" | "admin-settings";
+export type AppView = "chat" | "admin-settings" | "scheduled-tasks";
 
 type ChatSidebarSetter = Dispatch<SetStateAction<ReactNode>>;
 
@@ -153,6 +163,17 @@ export function Layout({ children, user, activeView, onNavigate, onLogout }: Lay
             ) : null}
             {user ? (
               <>
+                <div className="nav-group">
+                  <button
+                    type="button"
+                    className={activeView === "scheduled-tasks" ? "nav-link active" : "nav-link"}
+                    onClick={() => navigate("scheduled-tasks")}
+                    title={t("layout.scheduledTasks")}
+                  >
+                    <CalendarClock aria-hidden="true" size={18} />
+                    <span>{t("layout.scheduledTasks")}</span>
+                  </button>
+                </div>
                 <div className="settings-area keep-sidebar-open">
                   <button
                     type="button"

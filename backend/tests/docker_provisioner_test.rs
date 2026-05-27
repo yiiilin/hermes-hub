@@ -947,6 +947,18 @@ async fn docker_provisioner_test() {
     assert!(plugin_adapter.contains("class HermesHubAdapter"));
     assert!(plugin_adapter.contains("/internal/channel/v1/inbox?timeout_seconds=25&limit=4"));
     assert!(plugin_adapter.contains("async def connect("));
+    assert!(plugin_adapter.contains("import hashlib"));
+    assert!(plugin_adapter.contains("async def _report_scheduler_snapshot("));
+    assert!(plugin_adapter.contains("def _scheduler_snapshot_payload("));
+    assert!(plugin_adapter.contains("from cron.jobs import list_jobs"));
+    assert!(plugin_adapter.contains("jobs.json"));
+    assert!(plugin_adapter.contains("\"scheduler_snapshot\""));
+    assert!(plugin_adapter.contains("\"snapshot_hash\""));
+    assert!(plugin_adapter.contains("\"next_wake_at\""));
+    assert!(plugin_adapter.contains("\"jobs\""));
+    assert!(plugin_adapter.contains("self._last_scheduler_snapshot_hash"));
+    assert!(plugin_adapter.contains("self._last_scheduler_snapshot_reported_at"));
+    assert!(plugin_adapter.contains("hashlib.sha256"));
     assert!(plugin_adapter.contains("MessageEvent("));
     assert!(plugin_adapter.contains("text=content"));
     assert!(plugin_adapter.contains("HERMES_HUB_HOME_CHANNEL"));
@@ -991,6 +1003,9 @@ async fn docker_provisioner_test() {
     assert!(plugin_adapter.contains("async def edit_message("));
     assert!(plugin_adapter.contains("async def send_document("));
     assert!(plugin_adapter.contains("async def send_image_file("));
+    assert!(plugin_adapter.contains("def _session_matches_current_loop("));
+    assert!(plugin_adapter.contains("asyncio.get_running_loop()"));
+    assert!(plugin_adapter.contains("async with self._new_client_session() as transient_session"));
     assert!(plugin_adapter.contains("async def _wait_after_empty_poll("));
     assert!(
         plugin_adapter.contains("#"),

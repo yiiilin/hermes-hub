@@ -843,11 +843,6 @@ export function ChannelSessionRoute({
             <h2 id="chat-title">{selectedSession?.title ?? t("chat.newConversation")}</h2>
             {runInProgress ? (
               <span className="header-typing" aria-live="polite">
-                <span className="typing-dots" aria-hidden="true">
-                  <i />
-                  <i />
-                  <i />
-                </span>
                 {t("chat.typing")}
               </span>
             ) : null}

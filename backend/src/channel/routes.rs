@@ -28,7 +28,8 @@ use crate::{
     },
     http::{
         attachments::upload_session_attachments, auth::current_user,
-        workspace::ensure_managed_hermes_for_user, ApiError,
+        sessions::delete_managed_cron_jobs_for_session, workspace::ensure_managed_hermes_for_user,
+        ApiError,
     },
     llm_proxy::LlmProviderRequest,
     model_config::TITLE_MODEL_CONFIG_KIND,
@@ -259,6 +260,7 @@ async fn delete_session(
 
     // 删除会话前先停止当前 Hermes run，避免容器继续写入已经被删除的会话。
     let _ = stop_active_run_for_session(&state, &user.id, &channel_id, &session_id).await?;
+    delete_managed_cron_jobs_for_session(&state, &user.id, &session_id).await?;
     let deleted = state
         .channel_store
         .delete_session(&user.id, &channel_id, &session_id)

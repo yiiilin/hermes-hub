@@ -16,6 +16,15 @@ fn schema_migrations_include_initial_tables() {
     assert!(sql.contains("status text not null default 'queued'"));
     assert!(sql.contains("channel_runs_ready_idx"));
     assert!(sql.contains("channel_runs_user_message_idx"));
+    assert!(sql.contains("create table if not exists hermes_scheduler_snapshots"));
+    assert!(sql.contains("scheduler_status text not null default 'unavailable'"));
+    assert!(sql.contains("tasks jsonb not null default '[]'::jsonb"));
+    assert!(
+        sql.contains("alter table hermes_instances add column if not exists last_user_activity_at")
+    );
+    assert!(sql.contains("alter table hermes_instances add column if not exists last_started_at"));
+    assert!(sql.contains("alter table hermes_instances add column if not exists last_stopped_at"));
+    assert!(sql.contains("alter table hermes_instances add column if not exists stopped_reason"));
     assert!(sql.contains("client_message_key text"));
     assert!(sql.contains("channel_session_messages_client_key_idx"));
     assert!(sql.contains("context_window_tokens bigint not null default 128000"));

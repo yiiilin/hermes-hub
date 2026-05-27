@@ -52,6 +52,10 @@ create table if not exists hermes_instances (
     status_message text,
     runtime_image text,
     runtime_version text,
+    last_user_activity_at timestamptz not null default now(),
+    last_started_at timestamptz,
+    last_stopped_at timestamptz,
+    stopped_reason text,
     last_health_check_at timestamptz,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
@@ -66,6 +70,23 @@ alter table hermes_instances drop column if exists base_url;
 alter table hermes_instances add column if not exists status_message text;
 alter table hermes_instances add column if not exists runtime_image text;
 alter table hermes_instances add column if not exists runtime_version text;
+alter table hermes_instances add column if not exists last_user_activity_at timestamptz not null default now();
+alter table hermes_instances add column if not exists last_started_at timestamptz;
+alter table hermes_instances add column if not exists last_stopped_at timestamptz;
+alter table hermes_instances add column if not exists stopped_reason text;
+
+create table if not exists hermes_scheduler_snapshots (
+    hermes_instance_id uuid primary key references hermes_instances(id) on delete cascade,
+    scheduler_status text not null default 'unavailable',
+    scheduler_enabled boolean not null default false,
+    running_jobs_count integer not null default 0 check (running_jobs_count >= 0),
+    source text not null default 'unknown',
+    snapshot_hash text,
+    next_wake_at timestamptz,
+    tasks jsonb not null default '[]'::jsonb,
+    reported_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
 
 create table if not exists instance_tokens (
     id uuid primary key,

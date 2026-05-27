@@ -1808,6 +1808,40 @@ impl ChannelStore {
         }
     }
 
+    pub async fn instance_has_active_runs(
+        &self,
+        instance_id: &str,
+    ) -> Result<bool, ChannelStoreError> {
+        match &self.backend {
+            ChannelStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
+                Ok(inner.runs_by_id.values().any(|run| {
+                    !run.status.is_terminal()
+                        && run_belongs_to_instance(&inner, run, Some(instance_id))
+                }))
+            }
+            ChannelStoreBackend::Postgres(pool) => block_on_db(async {
+                let count = sqlx::query(
+                    r#"
+                    select count(*)::bigint as count
+                    from channel_runs
+                    join channel_sessions on channel_sessions.id = channel_runs.session_id
+                    join channels on channels.id = channel_sessions.channel_id
+                    where channels.hermes_instance_id = $1::uuid
+                      and channel_runs.status in ('queued', 'leased', 'running')
+                    "#,
+                )
+                .bind(instance_id)
+                .fetch_one(pool)
+                .await
+                .map_err(|_| ChannelStoreError::DatabaseFailed)?
+                .try_get::<i64, _>("count")
+                .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+                Ok(count > 0)
+            }),
+        }
+    }
+
     pub async fn update_session_message(
         &self,
         user_id: &str,

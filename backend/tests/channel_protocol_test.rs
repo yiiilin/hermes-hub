@@ -15,12 +15,13 @@ use hermes_hub_backend::{
     },
     llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
     model_config::{ModelConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND},
-    session::store::SessionStore,
+    session::store::{HermesScheduledTaskSnapshot, HermesSchedulerSnapshotInput, SessionStore},
     storage::InMemoryObjectStorage,
     AppConfig, AppState,
 };
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::{fs, sync::Arc};
+use tempfile::tempdir;
 use tower::ServiceExt;
 
 fn test_state(store: SessionStore) -> AppState {
@@ -570,6 +571,100 @@ async fn deleting_channel_session_stops_active_run_and_removes_messages_and_file
     .await;
     assert_eq!(active.status(), StatusCode::NOT_FOUND);
     assert!(!attachment_id.is_empty());
+}
+
+#[tokio::test]
+async fn deleting_channel_session_removes_cron_jobs_targeting_that_session() {
+    let store = SessionStore::default();
+    let state = test_state(store.clone());
+    let app = build_router_with_state(state.clone());
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+
+    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
+    let (_, channel_body) = response_json(channel).await;
+    let channel_id = channel_body["channels"][0]["id"]
+        .as_str()
+        .expect("channel id");
+    let session = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions"),
+        json!({ "kind": "agent" }),
+        Some(&cookie),
+    )
+    .await;
+    let (_, session_body) = response_json(session).await;
+    let session_id = session_body["session"]["id"].as_str().expect("session id");
+
+    let temp = tempdir().expect("temp config dir can be created");
+    let config_path = temp.path().join("config");
+    let cron_path = config_path.join("cron");
+    fs::create_dir_all(cron_path.join("output/task-for-deleted-session"))
+        .expect("cron output dir can be created");
+    fs::write(
+        cron_path.join("jobs.json"),
+        json!({
+            "jobs": [
+                {
+                    "id": "task-for-deleted-session",
+                    "name": "Deleted session task",
+                    "origin": {
+                        "platform": "hermes_hub",
+                        "chat_id": session_id,
+                        "thread_id": session_id
+                    }
+                },
+                {
+                    "id": "task-for-other-session",
+                    "name": "Other task",
+                    "origin": {
+                        "platform": "hermes_hub",
+                        "chat_id": "other-session",
+                        "thread_id": "other-session"
+                    }
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .expect("jobs file can be written");
+
+    let mut instance = managed_instance_for(&user_id);
+    instance.host_config_path = Some(config_path.to_string_lossy().to_string());
+    store
+        .bind_hermes_instance(instance)
+        .await
+        .expect("instance can be rebound with temp config");
+
+    let deleted = request_empty(
+        &app,
+        Method::DELETE,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+
+    let jobs: Value = serde_json::from_str(
+        &fs::read_to_string(cron_path.join("jobs.json")).expect("jobs file remains readable"),
+    )
+    .expect("jobs json remains valid");
+    let job_names = jobs["jobs"]
+        .as_array()
+        .expect("jobs array")
+        .iter()
+        .map(|job| job["name"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(job_names, vec!["Other task"]);
+    assert!(
+        !cron_path.join("output/task-for-deleted-session").exists(),
+        "deleted session cron output should be removed with the cron job"
+    );
 }
 
 #[tokio::test]
@@ -1516,6 +1611,230 @@ async fn hermes_adapter_can_report_runtime_version_to_hub() {
         .await
         .expect("reported runtime version is persisted");
     assert_eq!(stored.runtime_version.as_deref(), Some("0.13.7"));
+}
+
+#[tokio::test]
+async fn hermes_adapter_can_report_scheduler_snapshot_to_admin_view() {
+    let store = SessionStore::default();
+    let state = test_state(store.clone());
+    let app = build_router_with_state(state.clone());
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    let instance_token = "instance-scheduler-snapshot-token";
+    store
+        .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
+        .expect("instance can be bound");
+    state
+        .model_registry
+        .add_instance_token_for_instance("instance-1", instance_token)
+        .await
+        .expect("instance token can be registered");
+
+    let reported = request_raw(
+        &app,
+        Method::POST,
+        "/internal/channel/v1/instance/status",
+        "application/json",
+        json!({
+            "scheduler_snapshot": {
+                "status": "ok",
+                "scheduler_enabled": true,
+                "running_jobs_count": 1,
+                "generated_at": 1_735_689_600,
+                "source": "cron.jobs",
+                "snapshot_hash": "snapshot-hash-1",
+                "next_wake_at": 1_735_722_000,
+                "jobs": [
+                    {
+                        "id": "task-daily-summary",
+                        "name": "Daily summary",
+                        "enabled": true,
+                        "schedule": "0 9 * * *",
+                        "timezone": "Asia/Shanghai",
+                        "next_run_at": 1_735_722_000,
+                        "last_run_at": 1_735_635_600,
+                        "status": "scheduled",
+                        "source": "hermes-adapter"
+                    }
+                ]
+            }
+        })
+        .to_string()
+        .into_bytes(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, body) = response_json(reported).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["hermes_instance"]["id"], "instance-1");
+
+    let snapshots = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/hermes-scheduler-snapshots",
+        Some(&cookie),
+    )
+    .await;
+    let (status, body) = response_json(snapshots).await;
+    assert_eq!(status, StatusCode::OK);
+    let snapshot = &body["hermes_scheduler_snapshots"][0];
+    assert_eq!(snapshot["user_id"], user_id);
+    assert_eq!(snapshot["user_email"], "admin@example.com");
+    assert_eq!(snapshot["hermes_instance_id"], "instance-1");
+    assert_eq!(snapshot["scheduler_enabled"], true);
+    assert_eq!(snapshot["running_jobs_count"], 1);
+    assert_eq!(snapshot["reported_at"], 1_735_689_600);
+    assert_eq!(snapshot["tasks"][0]["id"], "task-daily-summary");
+    assert_eq!(snapshot["tasks"][0]["name"], "Daily summary");
+    assert_eq!(snapshot["tasks"][0]["schedule"], "0 9 * * *");
+}
+
+#[tokio::test]
+async fn user_can_read_only_their_own_scheduler_snapshot() {
+    let store = SessionStore::default();
+    let state = test_state(store.clone());
+    let app = build_router_with_state(state.clone());
+    let admin_cookie = bootstrap_and_login(&app).await;
+    let admin_id = store
+        .user_by_session_cookie(&admin_cookie, "hermes_hub_session")
+        .await
+        .expect("admin can be read from session")
+        .id;
+
+    let invite = request_json(
+        &app,
+        Method::POST,
+        "/api/invites",
+        json!({
+            "expires_at": 4_102_444_800u64,
+            "max_uses": 1
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, invite_body) = response_json(invite).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = invite_body["token"].as_str().expect("invite token");
+    let registered = request_json(
+        &app,
+        Method::POST,
+        "/api/auth/register",
+        json!({
+            "invite_token": token,
+            "email": "user@example.com",
+            "password": "user-password-123"
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(registered.status(), StatusCode::CREATED);
+    let login = request_json(
+        &app,
+        Method::POST,
+        "/api/auth/login",
+        json!({
+            "email": "user@example.com",
+            "password": "user-password-123"
+        }),
+        None,
+    )
+    .await;
+    let user_cookie = cookie_from(&login);
+    let user_id = store
+        .user_by_session_cookie(&user_cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+
+    let mut admin_instance = managed_instance_for(&admin_id);
+    admin_instance.id = "instance-admin".to_string();
+    let mut user_instance = managed_instance_for(&user_id);
+    user_instance.id = "instance-user".to_string();
+    user_instance.name = "hermes-user-regular".to_string();
+    store
+        .bind_hermes_instance(admin_instance)
+        .await
+        .expect("admin instance can be bound");
+    store
+        .bind_hermes_instance(user_instance)
+        .await
+        .expect("user instance can be bound");
+
+    store
+        .record_hermes_scheduler_snapshot(
+            "instance-admin",
+            HermesSchedulerSnapshotInput {
+                scheduler_status: "ok".to_string(),
+                scheduler_enabled: true,
+                running_jobs_count: 0,
+                reported_at: 1_735_689_600,
+                source: "admin-scheduler".to_string(),
+                snapshot_hash: Some("admin-hash".to_string()),
+                next_wake_at: None,
+                tasks: vec![HermesScheduledTaskSnapshot {
+                    id: "task-admin".to_string(),
+                    name: "Admin task".to_string(),
+                    enabled: true,
+                    schedule: "0 8 * * *".to_string(),
+                    timezone: "Asia/Shanghai".to_string(),
+                    next_run_at: None,
+                    last_run_at: None,
+                    status: "scheduled".to_string(),
+                    source: "hermes-adapter".to_string(),
+                }],
+            },
+        )
+        .await
+        .expect("admin snapshot can be stored");
+    store
+        .record_hermes_scheduler_snapshot(
+            "instance-user",
+            HermesSchedulerSnapshotInput {
+                scheduler_status: "ok".to_string(),
+                scheduler_enabled: true,
+                running_jobs_count: 1,
+                reported_at: 1_735_689_700,
+                source: "user-scheduler".to_string(),
+                snapshot_hash: Some("user-hash".to_string()),
+                next_wake_at: Some(1_735_722_000),
+                tasks: vec![HermesScheduledTaskSnapshot {
+                    id: "task-user-daily".to_string(),
+                    name: "User daily task".to_string(),
+                    enabled: true,
+                    schedule: "0 9 * * *".to_string(),
+                    timezone: "Asia/Shanghai".to_string(),
+                    next_run_at: Some(1_735_722_000),
+                    last_run_at: Some(1_735_635_600),
+                    status: "scheduled".to_string(),
+                    source: "hermes-adapter".to_string(),
+                }],
+            },
+        )
+        .await
+        .expect("user snapshot can be stored");
+
+    let response = request_empty(
+        &app,
+        Method::GET,
+        "/api/workspace/hermes-scheduler-snapshot",
+        Some(&user_cookie),
+    )
+    .await;
+    let (status, body) = response_json(response).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let snapshot = &body["hermes_scheduler_snapshot"];
+    assert_eq!(snapshot["user_id"], user_id);
+    assert_eq!(snapshot["hermes_instance_id"], "instance-user");
+    assert_eq!(snapshot["tasks"][0]["name"], "User daily task");
+    assert_eq!(snapshot["tasks"][0]["schedule"], "0 9 * * *");
+    assert_ne!(snapshot["tasks"][0]["name"], "Admin task");
 }
 
 #[tokio::test]

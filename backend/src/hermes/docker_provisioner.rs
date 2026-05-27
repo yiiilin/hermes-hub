@@ -53,12 +53,14 @@ const HERMES_HUB_ADAPTER_PY: &str = r#"
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.metadata
 import json
 import logging
 import mimetypes
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import unquote, urlencode
@@ -120,6 +122,8 @@ class HermesHubAdapter(BasePlatformAdapter):
         # 处理开始/结束钩子用这个表把当前 session 映射到真实 Hub run。
         self._active_run_ids_by_session: dict[str, str] = {}
         self._runtime_status_reported = False
+        self._last_scheduler_snapshot_hash = ""
+        self._last_scheduler_snapshot_reported_at = 0.0
 
     @property
     def name(self) -> str:
@@ -136,16 +140,12 @@ class HermesHubAdapter(BasePlatformAdapter):
                 retryable=False,
             )
             return False
-        if self._session is None:
-            timeout = aiohttp.ClientTimeout(total=self.timeout_seconds + 15)
-            self._session = aiohttp.ClientSession(
-                timeout=timeout,
-                headers=self._headers(),
-                trust_env=True,
-            )
+        if self._session is None or self._session.closed:
+            self._session = self._new_client_session()
         if self._poll_task is None or self._poll_task.done():
             self._closed.clear()
             await self._report_runtime_status_once()
+            await self._report_scheduler_snapshot(force=True)
             self._poll_task = asyncio.create_task(self._poll_loop())
         self._mark_connected()
         return True
@@ -282,6 +282,7 @@ class HermesHubAdapter(BasePlatformAdapter):
 
     async def _wait_after_empty_poll(self) -> None:
         # Hub 后端也会等待；这里保留退避，防止代理或配置异常时空队列忙轮询。
+        await self._report_scheduler_snapshot()
         await asyncio.sleep(self._last_empty_poll_delay)
         self._last_empty_poll_delay = min(self._last_empty_poll_delay * 2, 5.0)
 
@@ -339,6 +340,129 @@ class HermesHubAdapter(BasePlatformAdapter):
 
     def _usable_runtime_version(self, value: str) -> bool:
         return bool(value and value.strip() and value.strip() != "latest")
+
+    async def _report_scheduler_snapshot(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_scheduler_snapshot_reported_at < 60:
+            return
+        payload = self._scheduler_snapshot_payload()
+        snapshot = payload.get("scheduler_snapshot") or {}
+        snapshot_hash = str(snapshot.get("snapshot_hash") or "")
+        if (
+            not force
+            and snapshot_hash
+            and snapshot_hash == self._last_scheduler_snapshot_hash
+        ):
+            self._last_scheduler_snapshot_reported_at = now
+            return
+        try:
+            await self._request_json("POST", "/instance/status", json=payload)
+            self._last_scheduler_snapshot_hash = snapshot_hash
+            self._last_scheduler_snapshot_reported_at = now
+        except Exception as error:
+            # 定时任务快照只影响 Hub 生命周期调度，不能中断用户消息通道。
+            logger.warning("Hermes Hub scheduler snapshot report failed: %s", error)
+
+    def _scheduler_snapshot_payload(self) -> dict[str, Any]:
+        jobs, source, load_error = self._load_cron_jobs()
+        tasks = [self._scheduler_job_payload(job, index, source) for index, job in enumerate(jobs)]
+        enabled_next_runs = [
+            task["next_run_at"]
+            for task in tasks
+            if task.get("enabled") and task.get("next_run_at") is not None
+        ]
+        status = "ok" if load_error is None else "unavailable"
+        stable_snapshot = {
+            "status": status,
+            "source": source,
+            "jobs": tasks,
+        }
+        stable = json.dumps(stable_snapshot, sort_keys=True, default=str).encode("utf-8")
+        snapshot = {
+            **stable_snapshot,
+            "scheduler_enabled": status == "ok",
+            "running_jobs_count": sum(1 for task in tasks if task.get("status") == "running"),
+            "generated_at": int(time.time()),
+            "next_wake_at": min(enabled_next_runs) if enabled_next_runs else None,
+            "snapshot_hash": hashlib.sha256(stable).hexdigest(),
+        }
+        if load_error:
+            snapshot["error"] = str(load_error)[:512]
+        return {"scheduler_snapshot": snapshot}
+
+    def _load_cron_jobs(self) -> tuple[list[Any], str, Optional[Exception]]:
+        try:
+            from cron.jobs import list_jobs
+
+            jobs = list_jobs(include_disabled=True)
+            return self._jobs_list(jobs), "cron.jobs", None
+        except Exception as error:
+            file_jobs, file_error = self._load_cron_jobs_json()
+            if file_error is None:
+                return file_jobs, "jobs.json", None
+            return [], "unavailable", error
+
+    def _load_cron_jobs_json(self) -> tuple[list[Any], Optional[Exception]]:
+        try:
+            jobs_path = Path(os.getenv("HERMES_HOME", "/config")) / "cron" / "jobs.json"
+            with jobs_path.open("r", encoding="utf-8") as file:
+                return self._jobs_list(json.load(file)), None
+        except Exception as error:
+            return [], error
+
+    def _jobs_list(self, value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            jobs = value.get("jobs") or value.get("items") or value.get("tasks")
+            if isinstance(jobs, list):
+                return jobs
+            return list(value.values())
+        return []
+
+    def _scheduler_job_payload(self, job: Any, index: int, source: str) -> dict[str, Any]:
+        enabled = bool(self._job_value(job, "enabled", default=True))
+        name = str(self._job_value(job, "name", "title", default="") or "")
+        task_id = str(self._job_value(job, "id", "job_id", "name", default=f"task-{index}") or f"task-{index}")
+        status = str(
+            self._job_value(job, "status", "state", "last_status", default="")
+            or ("scheduled" if enabled else "disabled")
+        )
+        return {
+            "id": task_id,
+            "name": name,
+            "enabled": enabled,
+            "schedule": str(self._job_value(job, "schedule", "cron", "cron_expr", "expression", default="") or ""),
+            "timezone": str(self._job_value(job, "timezone", "tz", default="UTC") or "UTC"),
+            "next_run_at": self._epoch_value(self._job_value(job, "next_run_at", "next_run", "next_at")),
+            "last_run_at": self._epoch_value(self._job_value(job, "last_run_at", "last_run", "last_at")),
+            "status": status,
+            "source": source,
+        }
+
+    def _job_value(self, job: Any, *names: str, default: Any = None) -> Any:
+        for name in names:
+            if isinstance(job, dict) and name in job:
+                return job.get(name)
+            if hasattr(job, name):
+                return getattr(job, name)
+        return default
+
+    def _epoch_value(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return int(value)
+        if hasattr(value, "timestamp"):
+            try:
+                return int(value.timestamp())
+            except Exception:
+                return None
+        try:
+            text = str(value).strip()
+            return int(float(text)) if text else None
+        except Exception:
+            return None
 
     async def _dispatch_inbox_item(self, item: dict[str, Any]) -> None:
         inbox_id = str(item.get("id") or item.get("message_id") or "")
@@ -414,6 +538,7 @@ class HermesHubAdapter(BasePlatformAdapter):
                 logger.warning("Hermes Hub run completion callback failed: %s", error)
         finally:
             self._forget_active_run(event, run_id)
+            await self._report_scheduler_snapshot(force=True)
 
     async def _upload_and_send(
         self,
@@ -602,6 +727,16 @@ class HermesHubAdapter(BasePlatformAdapter):
 
     async def _download_attachment(self, attachment_id: str) -> tuple[bytes, str]:
         session = await self._ensure_session()
+        if not self._session_matches_current_loop(session):
+            async with self._new_client_session() as transient_session:
+                return await self._download_attachment_with_session(transient_session, attachment_id)
+        return await self._download_attachment_with_session(session, attachment_id)
+
+    async def _download_attachment_with_session(
+        self,
+        session: aiohttp.ClientSession,
+        attachment_id: str,
+    ) -> tuple[bytes, str]:
         url = self._url(f"/attachments/{attachment_id}/download")
         async with session.get(url) as response:
             payload = await response.read()
@@ -611,6 +746,19 @@ class HermesHubAdapter(BasePlatformAdapter):
 
     async def _request_json(self, method: str, path: str, **kwargs: Any) -> Any:
         session = await self._ensure_session()
+        if not self._session_matches_current_loop(session):
+            # Hermes cron 可能在独立 event loop 里回调 platform.send；aiohttp session 不能跨 loop 复用。
+            async with self._new_client_session() as transient_session:
+                return await self._request_json_with_session(transient_session, method, path, **kwargs)
+        return await self._request_json_with_session(session, method, path, **kwargs)
+
+    async def _request_json_with_session(
+        self,
+        session: aiohttp.ClientSession,
+        method: str,
+        path: str,
+        **kwargs: Any,
+    ) -> Any:
         url = self._url(path)
         async with session.request(method, url, **kwargs) as response:
             text = await response.text()
@@ -624,11 +772,26 @@ class HermesHubAdapter(BasePlatformAdapter):
                 return {"text": text}
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
-        if self._session is None:
+        if self._session is None or self._session.closed:
             connected = await self.connect()
             if not connected:
                 raise RuntimeError("Hermes Hub platform is not connected")
         return self._session
+
+    def _new_client_session(self) -> aiohttp.ClientSession:
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds + 15)
+        return aiohttp.ClientSession(
+            timeout=timeout,
+            headers=self._headers(),
+            trust_env=True,
+        )
+
+    def _session_matches_current_loop(self, session: aiohttp.ClientSession) -> bool:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        return getattr(session, "_loop", None) is loop and asyncio.current_task(loop=loop) is not None
 
     def _url(self, path: str) -> str:
         if path.startswith("http://") or path.startswith("https://"):

@@ -1913,6 +1913,121 @@ describe("App", () => {
     expect(screen.queryByText("error / unhealthy")).not.toBeInTheDocument();
   });
 
+  it("loads and displays Hermes scheduled tasks in system settings", async () => {
+    const listHermesSchedulerSnapshots = vi.fn(async () => [
+      {
+        user_id: "user-1",
+        user_email: "admin@example.com",
+        hermes_instance_id: "instance-1",
+        instance_status: "running",
+        scheduler_enabled: true,
+        running_jobs_count: 1,
+        reported_at: 1_735_689_600,
+        tasks: [
+          {
+            id: "task-daily-summary",
+            name: "Daily summary",
+            enabled: true,
+            schedule: "0 9 * * *",
+            timezone: "Asia/Shanghai",
+            next_run_at: 1_735_722_000,
+            last_run_at: 1_735_635_600,
+            status: "scheduled",
+            source: "hermes-adapter",
+          },
+        ],
+      },
+    ]);
+    const client = Object.assign(createMockApiClient(), {
+      listHermesSchedulerSnapshots,
+    });
+
+    render(<App apiClient={client} />);
+
+    await openSettingsTab("Scheduled tasks");
+
+    expect(listHermesSchedulerSnapshots).toHaveBeenCalled();
+    const schedulerTable = await screen.findByRole("table", { name: "Scheduled tasks" });
+    expect(within(schedulerTable).getByText("admin@example.com")).toBeInTheDocument();
+    expect(within(schedulerTable).getByText("Daily summary")).toBeInTheDocument();
+    expect(within(schedulerTable).getByText("0 9 * * *")).toBeInTheDocument();
+    expect(within(schedulerTable).getByText("scheduled")).toBeInTheDocument();
+  });
+
+  it("shows the current user's scheduled tasks above personalization", async () => {
+    const workspaceHermesSchedulerSnapshot = vi.fn(async () => ({
+      user_id: "user-2",
+      user_email: "user@example.com",
+      hermes_instance_id: "instance-user",
+      instance_status: "running",
+      scheduler_enabled: true,
+      running_jobs_count: 1,
+      reported_at: 1_735_689_600,
+      tasks: [
+        {
+          id: "task-user-daily",
+          name: "User daily task",
+          enabled: true,
+          schedule: "0 9 * * *",
+          timezone: "Asia/Shanghai",
+          next_run_at: 1_735_722_000,
+          last_run_at: 1_735_635_600,
+          status: "scheduled",
+          source: "hermes-adapter",
+        },
+      ],
+    }));
+    const client = Object.assign(
+      createMockApiClient({
+        initialUser: {
+          id: "user-2",
+          email: "user@example.com",
+          role: "user",
+          status: "active",
+        },
+      }),
+      { workspaceHermesSchedulerSnapshot },
+    );
+
+    render(<App apiClient={client} />);
+
+    const scheduledTasksNav = await screen.findByRole("button", { name: "Scheduled tasks" });
+    const personalizationNav = screen.getByRole("button", { name: "Personalization" });
+    expect(
+      scheduledTasksNav.compareDocumentPosition(personalizationNav) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    fireEvent.click(scheduledTasksNav);
+
+    expect(workspaceHermesSchedulerSnapshot).toHaveBeenCalled();
+    const schedulerTable = await screen.findByRole("table", { name: "Scheduled tasks" });
+    expect(within(schedulerTable).getByText("User daily task")).toBeInTheDocument();
+    expect(within(schedulerTable).getByText("0 9 * * *")).toBeInTheDocument();
+    expect(within(schedulerTable).getByText("scheduled")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "System settings" })).not.toBeInTheDocument();
+  });
+
+  it("shows header typing status without the animated dots", async () => {
+    render(
+      <App
+        apiClient={createMockApiClient({
+          activeRunsBySessionId: {
+            "session-1": {
+              run_id: "hub-run-header-typing",
+              status: "running",
+              created_at: Date.now(),
+              updated_at: Date.now(),
+            },
+          },
+        })}
+      />,
+    );
+
+    const headerTyping = await screen.findByText("Hermes is typing");
+    expect(headerTyping.closest(".header-typing")?.querySelector(".typing-dots")).toBeNull();
+  });
+
   it("shows pending feedback while creating a managed Hermes instance", async () => {
     const deferred = createDeferred<void>();
     const client = createMockApiClient({ initialInstance: null });

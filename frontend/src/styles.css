@@ -602,6 +602,28 @@ table {
   width: 100%;
 }
 
+.table-scroll {
+  overflow-x: auto;
+  width: 100%;
+}
+
+.scheduler-panel {
+  overflow: hidden;
+}
+
+.empty-state {
+  align-items: center;
+  background: #f5f8f9;
+  border: 1px dashed #c8d6dc;
+  border-radius: 8px;
+  color: #52656d;
+  display: flex;
+  justify-content: center;
+  min-height: 120px;
+  padding: 20px;
+  text-align: center;
+}
+
 th,
 td {
   border-bottom: 1px solid #e6ecef;

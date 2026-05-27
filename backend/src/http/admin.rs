@@ -39,7 +39,7 @@ use crate::{
         CHAT_COMPLETIONS_API_TYPE, DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS,
         DEFAULT_TEMPERATURE, IMAGE_MODEL_CONFIG_KIND, LLM_MODEL_CONFIG_KIND, RESPONSES_API_TYPE,
     },
-    session::store::SystemSettings,
+    session::store::{HermesSchedulerSnapshot, SystemSettings},
     skills_fs::normalize_skills_path,
     storage::ObjectStorageError,
     AppState,
@@ -54,6 +54,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/admin/users/{user_id}/disable", post(disable_user))
         .route("/api/admin/users/{user_id}/enable", post(enable_user))
         .route("/api/admin/hermes-instances", get(list_hermes_instances))
+        .route(
+            "/api/admin/hermes-scheduler-snapshots",
+            get(list_hermes_scheduler_snapshots),
+        )
         .route(
             "/api/admin/users/{user_id}/hermes-instance/create-managed",
             post(create_managed_hermes_instance),
@@ -121,6 +125,11 @@ struct HermesInstancesResponse {
 #[derive(Serialize)]
 struct HermesInstanceResponse {
     hermes_instance: HermesInstance,
+}
+
+#[derive(Serialize)]
+struct HermesSchedulerSnapshotsResponse {
+    hermes_scheduler_snapshots: Vec<HermesSchedulerSnapshot>,
 }
 
 #[derive(Serialize)]
@@ -292,6 +301,22 @@ async fn list_hermes_instances(
     }
     Ok(Json(HermesInstancesResponse {
         hermes_instances: refreshed_instances,
+    }))
+}
+
+async fn list_hermes_scheduler_snapshots(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    let snapshots = state
+        .store
+        .list_hermes_scheduler_snapshots()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    Ok(Json(HermesSchedulerSnapshotsResponse {
+        hermes_scheduler_snapshots: snapshots,
     }))
 }
 

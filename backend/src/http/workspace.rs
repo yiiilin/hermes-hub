@@ -15,6 +15,7 @@ use crate::{
     },
     http::{auth::current_user, map_provisioner_error, ApiError},
     model_config::IMAGE_MODEL_CONFIG_KIND,
+    session::store::HermesSchedulerSnapshot,
     AppState,
 };
 
@@ -26,6 +27,10 @@ pub fn router() -> Router<AppState> {
             "/api/workspace/hermes-instance",
             get(current_hermes_instance),
         )
+        .route(
+            "/api/workspace/hermes-scheduler-snapshot",
+            get(current_scheduler_snapshot),
+        )
 }
 
 #[derive(Serialize)]
@@ -36,6 +41,11 @@ struct WorkspaceStatusResponse {
 #[derive(Serialize)]
 struct HermesInstanceResponse {
     hermes_instance: HermesInstance,
+}
+
+#[derive(Serialize)]
+struct WorkspaceSchedulerSnapshotResponse {
+    hermes_scheduler_snapshot: Option<HermesSchedulerSnapshot>,
 }
 
 async fn status(
@@ -80,6 +90,19 @@ pub async fn ensure_required_model_configs(state: &AppState) -> Result<(), ApiEr
 }
 
 pub async fn ensure_managed_hermes_for_user(
+    state: &AppState,
+    user_id: &str,
+) -> Result<HermesInstance, ApiError> {
+    let instance = ensure_managed_hermes_for_user_without_activity(state, user_id).await?;
+    state
+        .store
+        .record_hermes_user_activity(user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    Ok(instance)
+}
+
+pub async fn ensure_managed_hermes_for_user_without_activity(
     state: &AppState,
     user_id: &str,
 ) -> Result<HermesInstance, ApiError> {
@@ -260,4 +283,24 @@ async fn current_hermes_instance(
     let hermes_instance = refresh_managed_hermes_status(&state, hermes_instance).await?;
 
     Ok(Json(HermesInstanceResponse { hermes_instance }))
+}
+
+async fn current_scheduler_snapshot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = current_user(&state, &headers).await?;
+    let snapshot = match state.store.hermes_instance_for_user(&user.id).await {
+        Ok(instance) => state
+            .store
+            .hermes_scheduler_snapshot_for_instance(&instance.id)
+            .await
+            .map_err(|_| ApiError::Internal)?,
+        // 新用户的 Hermes 可能还没上报过调度快照；个人页应展示空状态而不是报错。
+        Err(_) => None,
+    };
+
+    Ok(Json(WorkspaceSchedulerSnapshotResponse {
+        hermes_scheduler_snapshot: snapshot,
+    }))
 }

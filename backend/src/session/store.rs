@@ -8,7 +8,7 @@ use crate::{
     security::crypto::{decrypt_secret, encrypt_secret, SecretCipher},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Executor, PgPool, Postgres, Row};
 use std::{
@@ -51,6 +51,8 @@ struct StoreInner {
     invites_by_id: HashMap<String, Invite>,
     invite_ids_by_hash: HashMap<String, String>,
     hermes_instances_by_user_id: HashMap<String, HermesInstance>,
+    hermes_scheduler_snapshots_by_instance_id: HashMap<String, HermesSchedulerSnapshot>,
+    hermes_lifecycle_by_instance_id: HashMap<String, HermesLifecycleState>,
     proxy_audit_logs: Vec<ProxyAuditEvent>,
     llm_usage_events: Vec<LlmUsageEvent>,
     system_settings: SystemSettings,
@@ -65,6 +67,8 @@ impl Default for StoreInner {
             invites_by_id: HashMap::new(),
             invite_ids_by_hash: HashMap::new(),
             hermes_instances_by_user_id: HashMap::new(),
+            hermes_scheduler_snapshots_by_instance_id: HashMap::new(),
+            hermes_lifecycle_by_instance_id: HashMap::new(),
             proxy_audit_logs: Vec::new(),
             llm_usage_events: Vec::new(),
             system_settings: SystemSettings::default(),
@@ -173,6 +177,64 @@ pub struct LlmUsageEvent {
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
     pub total_tokens: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HermesScheduledTaskSnapshot {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub schedule: String,
+    pub timezone: String,
+    pub next_run_at: Option<u64>,
+    pub last_run_at: Option<u64>,
+    pub status: String,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HermesSchedulerSnapshot {
+    pub user_id: String,
+    pub user_email: Option<String>,
+    pub hermes_instance_id: String,
+    pub instance_status: String,
+    pub scheduler_status: String,
+    pub scheduler_enabled: bool,
+    pub running_jobs_count: u32,
+    pub reported_at: u64,
+    pub source: String,
+    pub snapshot_hash: Option<String>,
+    pub next_wake_at: Option<u64>,
+    pub tasks: Vec<HermesScheduledTaskSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HermesSchedulerSnapshotInput {
+    pub scheduler_status: String,
+    pub scheduler_enabled: bool,
+    pub running_jobs_count: u32,
+    pub reported_at: u64,
+    pub source: String,
+    pub snapshot_hash: Option<String>,
+    pub next_wake_at: Option<u64>,
+    pub tasks: Vec<HermesScheduledTaskSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HermesLifecycleState {
+    pub instance_id: String,
+    pub user_id: String,
+    pub last_user_activity_at: Option<u64>,
+    pub last_started_at: Option<u64>,
+    pub last_stopped_at: Option<u64>,
+    pub stopped_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HermesLifecycleCandidate {
+    pub instance: HermesInstance,
+    pub lifecycle: HermesLifecycleState,
+    pub scheduler_snapshot: Option<HermesSchedulerSnapshot>,
 }
 
 #[derive(Debug, Error)]
@@ -716,6 +778,7 @@ impl SessionStore {
         match &self.backend {
             SessionStoreBackend::Memory(inner) => {
                 let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                update_memory_lifecycle_from_instance(&mut inner, &instance, None);
                 inner
                     .hermes_instances_by_user_id
                     .insert(instance.user_id.clone(), instance);
@@ -731,11 +794,16 @@ impl SessionStore {
                     insert into hermes_instances (
                         id, user_id, kind, status, name, api_token_secret_ref,
                         container_id, host_workspace_path, host_sandbox_path, host_config_path,
-                        health_status, status_message, runtime_image, runtime_version, updated_at
+                        health_status, status_message, runtime_image, runtime_version,
+                        last_started_at, last_stopped_at, stopped_reason, updated_at
                     )
                     values (
                         $1::uuid, $2::uuid, $3, $4, $5, $6,
-                        $7, $8, $9, $10, $11, $12, $13, $14, now()
+                        $7, $8, $9, $10, $11, $12, $13, $14,
+                        case when $4 = 'running' then now() else null end,
+                        case when $4 = 'stopped' then now() else null end,
+                        case when $4 = 'stopped' then 'manual' else null end,
+                        now()
                     )
                     on conflict (user_id) do update
                     set id = excluded.id,
@@ -751,6 +819,19 @@ impl SessionStore {
                         status_message = excluded.status_message,
                         runtime_image = excluded.runtime_image,
                         runtime_version = excluded.runtime_version,
+                        last_started_at = case
+                            when excluded.status = 'running' and hermes_instances.status <> 'running' then now()
+                            else coalesce(hermes_instances.last_started_at, excluded.last_started_at)
+                        end,
+                        last_stopped_at = case
+                            when excluded.status = 'stopped' and hermes_instances.status <> 'stopped' then now()
+                            else hermes_instances.last_stopped_at
+                        end,
+                        stopped_reason = case
+                            when excluded.status = 'running' then null
+                            when excluded.status = 'stopped' and hermes_instances.status <> 'stopped' then coalesce(hermes_instances.stopped_reason, 'manual')
+                            else hermes_instances.stopped_reason
+                        end,
                         updated_at = now()
                     "#,
                 )
@@ -940,6 +1021,288 @@ impl SessionStore {
                 .ok_or(StoreError::InviteNotFound)?;
 
                 row_to_hermes_instance(&row, cipher)
+            }),
+        }
+    }
+
+    pub async fn record_hermes_scheduler_snapshot(
+        &self,
+        instance_id: &str,
+        input: HermesSchedulerSnapshotInput,
+    ) -> Result<HermesSchedulerSnapshot, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let instance = inner
+                    .hermes_instances_by_user_id
+                    .values()
+                    .find(|instance| instance.id == instance_id)
+                    .cloned()
+                    .ok_or(StoreError::InviteNotFound)?;
+                let user_email = inner
+                    .users_by_id
+                    .get(&instance.user_id)
+                    .map(|user| user.email.clone());
+                let snapshot = HermesSchedulerSnapshot {
+                    user_id: instance.user_id.clone(),
+                    user_email,
+                    hermes_instance_id: instance.id.clone(),
+                    instance_status: hermes_status_as_str(&instance.status).to_string(),
+                    scheduler_status: input.scheduler_status,
+                    scheduler_enabled: input.scheduler_enabled,
+                    running_jobs_count: input.running_jobs_count,
+                    reported_at: input.reported_at,
+                    source: input.source,
+                    snapshot_hash: input.snapshot_hash,
+                    next_wake_at: input.next_wake_at,
+                    tasks: input.tasks,
+                };
+                inner
+                    .hermes_scheduler_snapshots_by_instance_id
+                    .insert(instance.id.clone(), snapshot.clone());
+                Ok(snapshot)
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let tasks =
+                    serde_json::to_value(&input.tasks).map_err(|_| StoreError::DatabaseFailed)?;
+                sqlx::query(
+                    r#"
+                    insert into hermes_scheduler_snapshots (
+                        hermes_instance_id, scheduler_status, scheduler_enabled,
+                        running_jobs_count, source, snapshot_hash, next_wake_at,
+                        tasks, reported_at, updated_at
+                    )
+                    values (
+                        $1::uuid, $2, $3, $4, $5, $6, to_timestamp($7),
+                        $8, to_timestamp($9), now()
+                    )
+                    on conflict (hermes_instance_id) do update
+                    set scheduler_status = excluded.scheduler_status,
+                        scheduler_enabled = excluded.scheduler_enabled,
+                        running_jobs_count = excluded.running_jobs_count,
+                        source = excluded.source,
+                        snapshot_hash = excluded.snapshot_hash,
+                        next_wake_at = excluded.next_wake_at,
+                        tasks = excluded.tasks,
+                        reported_at = excluded.reported_at,
+                        updated_at = now()
+                    "#,
+                )
+                .bind(instance_id)
+                .bind(&input.scheduler_status)
+                .bind(input.scheduler_enabled)
+                .bind(input.running_jobs_count as i32)
+                .bind(&input.source)
+                .bind(&input.snapshot_hash)
+                .bind(input.next_wake_at.map(|value| value as f64))
+                .bind(tasks)
+                .bind(input.reported_at as f64)
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                let row = sqlx::query(hermes_scheduler_snapshot_select(
+                    "where hermes_scheduler_snapshots.hermes_instance_id = $1::uuid",
+                    "",
+                ))
+                .bind(instance_id)
+                .fetch_one(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+                row_to_scheduler_snapshot(&row)
+            }),
+        }
+    }
+
+    pub async fn list_hermes_scheduler_snapshots(
+        &self,
+    ) -> Result<Vec<HermesSchedulerSnapshot>, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let mut snapshots = inner
+                    .hermes_scheduler_snapshots_by_instance_id
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                snapshots.sort_by(|left, right| {
+                    left.user_email
+                        .as_deref()
+                        .unwrap_or(&left.user_id)
+                        .cmp(right.user_email.as_deref().unwrap_or(&right.user_id))
+                });
+                Ok(snapshots)
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let rows = sqlx::query(hermes_scheduler_snapshot_select(
+                    "",
+                    "order by users.email asc",
+                ))
+                .fetch_all(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                rows.iter().map(row_to_scheduler_snapshot).collect()
+            }),
+        }
+    }
+
+    pub async fn hermes_scheduler_snapshot_for_instance(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<HermesSchedulerSnapshot>, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                Ok(inner
+                    .hermes_scheduler_snapshots_by_instance_id
+                    .get(instance_id)
+                    .cloned())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let rows = sqlx::query(hermes_scheduler_snapshot_select(
+                    "where hermes_scheduler_snapshots.hermes_instance_id = $1::uuid",
+                    "",
+                ))
+                .bind(instance_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                rows.as_ref().map(row_to_scheduler_snapshot).transpose()
+            }),
+        }
+    }
+
+    pub async fn record_hermes_user_activity(&self, user_id: &str) -> Result<(), StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let instance = inner
+                    .hermes_instances_by_user_id
+                    .get(user_id)
+                    .ok_or(StoreError::InviteNotFound)?
+                    .clone();
+                let state = inner
+                    .hermes_lifecycle_by_instance_id
+                    .entry(instance.id.clone())
+                    .or_insert_with(|| default_lifecycle_state(&instance));
+                state.last_user_activity_at = Some(unix_now());
+                Ok(())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                sqlx::query(
+                    r#"
+                    update hermes_instances
+                    set last_user_activity_at = now(),
+                        updated_at = now()
+                    where user_id = $1::uuid
+                    "#,
+                )
+                .bind(user_id)
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+                Ok(())
+            }),
+        }
+    }
+
+    pub async fn set_hermes_instance_stopped_reason(
+        &self,
+        instance_id: &str,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let instance = inner
+                    .hermes_instances_by_user_id
+                    .values()
+                    .find(|instance| instance.id == instance_id)
+                    .cloned()
+                    .ok_or(StoreError::InviteNotFound)?;
+                let state = inner
+                    .hermes_lifecycle_by_instance_id
+                    .entry(instance.id.clone())
+                    .or_insert_with(|| default_lifecycle_state(&instance));
+                state.last_stopped_at = Some(unix_now());
+                state.stopped_reason = Some(reason.to_string());
+                Ok(())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                sqlx::query(
+                    r#"
+                    update hermes_instances
+                    set stopped_reason = $2,
+                        last_stopped_at = now(),
+                        updated_at = now()
+                    where id = $1::uuid
+                    "#,
+                )
+                .bind(instance_id)
+                .bind(reason)
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+                Ok(())
+            }),
+        }
+    }
+
+    pub async fn list_hermes_lifecycle_candidates(
+        &self,
+    ) -> Result<Vec<HermesLifecycleCandidate>, StoreError> {
+        let instances = self.list_hermes_instances().await?;
+        let mut candidates = Vec::with_capacity(instances.len());
+        for instance in instances {
+            let lifecycle = self
+                .hermes_lifecycle_state_for_instance(&instance)
+                .await?
+                .unwrap_or_else(|| default_lifecycle_state(&instance));
+            let scheduler_snapshot = self
+                .hermes_scheduler_snapshot_for_instance(&instance.id)
+                .await?;
+            candidates.push(HermesLifecycleCandidate {
+                instance,
+                lifecycle,
+                scheduler_snapshot,
+            });
+        }
+        Ok(candidates)
+    }
+
+    async fn hermes_lifecycle_state_for_instance(
+        &self,
+        instance: &HermesInstance,
+    ) -> Result<Option<HermesLifecycleState>, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                Ok(inner
+                    .hermes_lifecycle_by_instance_id
+                    .get(&instance.id)
+                    .cloned())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let row = sqlx::query(
+                    r#"
+                    select id::text as instance_id,
+                           user_id::text as user_id,
+                           extract(epoch from last_user_activity_at)::bigint as last_user_activity_at,
+                           extract(epoch from last_started_at)::bigint as last_started_at,
+                           extract(epoch from last_stopped_at)::bigint as last_stopped_at,
+                           stopped_reason
+                    from hermes_instances
+                    where id = $1::uuid
+                    "#,
+                )
+                .bind(&instance.id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                row.as_ref().map(row_to_lifecycle_state).transpose()
             }),
         }
     }
@@ -1592,6 +1955,53 @@ fn hermes_instance_select(prefix: &str, filter: &str, suffix: &str) -> String {
     )
 }
 
+fn hermes_scheduler_snapshot_select(filter: &str, suffix: &str) -> &'static str {
+    // 当前只需要两个固定查询形态，返回 &'static str 可以避免动态 SQL 生命周期噪音。
+    match (filter.is_empty(), suffix.is_empty()) {
+        (true, false) => {
+            r#"
+            select users.id::text as user_id,
+                   users.email as user_email,
+                   hermes_instances.id::text as hermes_instance_id,
+                   hermes_instances.status as instance_status,
+                   hermes_scheduler_snapshots.scheduler_status,
+                   hermes_scheduler_snapshots.scheduler_enabled,
+                   hermes_scheduler_snapshots.running_jobs_count,
+                   hermes_scheduler_snapshots.source,
+                   hermes_scheduler_snapshots.snapshot_hash,
+                   extract(epoch from hermes_scheduler_snapshots.next_wake_at)::bigint as next_wake_at,
+                   hermes_scheduler_snapshots.tasks,
+                   extract(epoch from hermes_scheduler_snapshots.reported_at)::bigint as reported_at
+            from hermes_scheduler_snapshots
+            join hermes_instances on hermes_instances.id = hermes_scheduler_snapshots.hermes_instance_id
+            join users on users.id = hermes_instances.user_id
+            order by users.email asc
+            "#
+        }
+        (false, true) => {
+            r#"
+            select users.id::text as user_id,
+                   users.email as user_email,
+                   hermes_instances.id::text as hermes_instance_id,
+                   hermes_instances.status as instance_status,
+                   hermes_scheduler_snapshots.scheduler_status,
+                   hermes_scheduler_snapshots.scheduler_enabled,
+                   hermes_scheduler_snapshots.running_jobs_count,
+                   hermes_scheduler_snapshots.source,
+                   hermes_scheduler_snapshots.snapshot_hash,
+                   extract(epoch from hermes_scheduler_snapshots.next_wake_at)::bigint as next_wake_at,
+                   hermes_scheduler_snapshots.tasks,
+                   extract(epoch from hermes_scheduler_snapshots.reported_at)::bigint as reported_at
+            from hermes_scheduler_snapshots
+            join hermes_instances on hermes_instances.id = hermes_scheduler_snapshots.hermes_instance_id
+            join users on users.id = hermes_instances.user_id
+            where hermes_scheduler_snapshots.hermes_instance_id = $1::uuid
+            "#
+        }
+        _ => unreachable!("unsupported scheduler snapshot query shape"),
+    }
+}
+
 fn row_to_user(row: &sqlx::postgres::PgRow) -> Result<User, StoreError> {
     let role = row
         .try_get::<String, _>("role")
@@ -1707,6 +2117,123 @@ fn row_to_hermes_instance(
             .map_err(|_| StoreError::DatabaseFailed)?,
         global_skills_write_enabled: false,
     })
+}
+
+fn row_to_scheduler_snapshot(
+    row: &sqlx::postgres::PgRow,
+) -> Result<HermesSchedulerSnapshot, StoreError> {
+    let tasks_value = row
+        .try_get::<serde_json::Value, _>("tasks")
+        .map_err(|_| StoreError::DatabaseFailed)?;
+    let tasks = serde_json::from_value::<Vec<HermesScheduledTaskSnapshot>>(tasks_value)
+        .map_err(|_| StoreError::DatabaseFailed)?;
+
+    Ok(HermesSchedulerSnapshot {
+        user_id: row
+            .try_get("user_id")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        user_email: row
+            .try_get("user_email")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        hermes_instance_id: row
+            .try_get("hermes_instance_id")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        instance_status: row
+            .try_get("instance_status")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        scheduler_status: row
+            .try_get("scheduler_status")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        scheduler_enabled: row
+            .try_get("scheduler_enabled")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        running_jobs_count: row
+            .try_get::<i32, _>("running_jobs_count")
+            .map_err(|_| StoreError::DatabaseFailed)? as u32,
+        reported_at: row
+            .try_get::<i64, _>("reported_at")
+            .map_err(|_| StoreError::DatabaseFailed)? as u64,
+        source: row
+            .try_get("source")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        snapshot_hash: row
+            .try_get("snapshot_hash")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        next_wake_at: row
+            .try_get::<Option<i64>, _>("next_wake_at")
+            .map_err(|_| StoreError::DatabaseFailed)?
+            .map(|value| value as u64),
+        tasks,
+    })
+}
+
+fn row_to_lifecycle_state(row: &sqlx::postgres::PgRow) -> Result<HermesLifecycleState, StoreError> {
+    Ok(HermesLifecycleState {
+        instance_id: row
+            .try_get("instance_id")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        user_id: row
+            .try_get("user_id")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        last_user_activity_at: row
+            .try_get::<Option<i64>, _>("last_user_activity_at")
+            .map_err(|_| StoreError::DatabaseFailed)?
+            .map(|value| value as u64),
+        last_started_at: row
+            .try_get::<Option<i64>, _>("last_started_at")
+            .map_err(|_| StoreError::DatabaseFailed)?
+            .map(|value| value as u64),
+        last_stopped_at: row
+            .try_get::<Option<i64>, _>("last_stopped_at")
+            .map_err(|_| StoreError::DatabaseFailed)?
+            .map(|value| value as u64),
+        stopped_reason: row
+            .try_get("stopped_reason")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+    })
+}
+
+fn default_lifecycle_state(instance: &HermesInstance) -> HermesLifecycleState {
+    let now = unix_now();
+    HermesLifecycleState {
+        instance_id: instance.id.clone(),
+        user_id: instance.user_id.clone(),
+        last_user_activity_at: Some(now),
+        last_started_at: matches!(&instance.status, HermesInstanceStatus::Running).then_some(now),
+        last_stopped_at: matches!(&instance.status, HermesInstanceStatus::Stopped).then_some(now),
+        stopped_reason: None,
+    }
+}
+
+fn update_memory_lifecycle_from_instance(
+    inner: &mut StoreInner,
+    instance: &HermesInstance,
+    stopped_reason: Option<&str>,
+) {
+    let now = unix_now();
+    let previous_status = inner
+        .hermes_instances_by_user_id
+        .get(&instance.user_id)
+        .map(|previous| previous.status.clone());
+    let state = inner
+        .hermes_lifecycle_by_instance_id
+        .entry(instance.id.clone())
+        .or_insert_with(|| default_lifecycle_state(instance));
+    match &instance.status {
+        HermesInstanceStatus::Running => {
+            if previous_status.as_ref() != Some(&HermesInstanceStatus::Running) {
+                state.last_started_at = Some(now);
+            }
+            state.stopped_reason = None;
+        }
+        HermesInstanceStatus::Stopped => {
+            if previous_status.as_ref() != Some(&HermesInstanceStatus::Stopped) {
+                state.last_stopped_at = Some(now);
+                state.stopped_reason = Some(stopped_reason.unwrap_or("manual").to_string());
+            }
+        }
+        HermesInstanceStatus::Provisioning | HermesInstanceStatus::Error => {}
+    }
 }
 
 fn optional_uuid(value: Option<&str>) -> Result<Option<Uuid>, StoreError> {

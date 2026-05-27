@@ -74,6 +74,29 @@ export type HermesInstance = {
   runtime_version?: string | null;
 };
 
+export type HermesScheduledTaskSnapshot = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  schedule: string;
+  timezone: string;
+  next_run_at?: number | string | null;
+  last_run_at?: number | string | null;
+  status: string;
+  source: string;
+};
+
+export type HermesSchedulerSnapshot = {
+  user_id: string;
+  user_email?: string | null;
+  hermes_instance_id: string;
+  instance_status: string;
+  scheduler_enabled: boolean;
+  running_jobs_count: number;
+  reported_at: number | string;
+  tasks: HermesScheduledTaskSnapshot[];
+};
+
 export type ModelConfigKind = "llm" | "image" | "title";
 export type ModelApiType = "chat_completions" | "responses" | "images_generations";
 export type ReasoningEffort = "minimal" | "low" | "medium" | "high";
@@ -230,6 +253,8 @@ export type ApiClient = {
   startHermesInstance: (userId: string) => Promise<HermesInstance>;
   stopHermesInstance: (userId: string) => Promise<HermesInstance>;
   rebuildHermesInstance: (userId: string) => Promise<HermesInstance>;
+  listHermesSchedulerSnapshots: () => Promise<HermesSchedulerSnapshot[]>;
+  workspaceHermesSchedulerSnapshot: () => Promise<HermesSchedulerSnapshot | null>;
   listChannels: () => Promise<Channel[]>;
   createChannel: (name: string, description?: string) => Promise<Channel>;
   listSessions: (channelId: string) => Promise<ChannelSession[]>;
@@ -623,6 +648,34 @@ export function createApiClient(): ApiClient {
         { method: "POST" },
       );
       return payload.hermes_instance;
+    },
+    async listHermesSchedulerSnapshots() {
+      const payload = await request<
+        | HermesSchedulerSnapshot[]
+        | {
+            hermes_scheduler_snapshots?: HermesSchedulerSnapshot[];
+            scheduler_snapshots?: HermesSchedulerSnapshot[];
+            snapshots?: HermesSchedulerSnapshot[];
+          }
+      >("/api/admin/hermes-scheduler-snapshots");
+      if (Array.isArray(payload)) {
+        return payload;
+      }
+      // 兼容后端字段名小幅调整，避免只读页因为包裹 key 不一致而整体空白。
+      return (
+        payload.hermes_scheduler_snapshots ??
+        payload.scheduler_snapshots ??
+        payload.snapshots ??
+        []
+      );
+    },
+    async workspaceHermesSchedulerSnapshot() {
+      const payload = await request<{
+        hermes_scheduler_snapshot?: HermesSchedulerSnapshot | null;
+        scheduler_snapshot?: HermesSchedulerSnapshot | null;
+      }>("/api/workspace/hermes-scheduler-snapshot");
+      // 个人页只需要当前用户自己的快照；字段名保持和管理员接口的主字段一致。
+      return payload.hermes_scheduler_snapshot ?? payload.scheduler_snapshot ?? null;
     },
     async listChannels() {
       const payload = await request<{ channels: Channel[] }>("/api/channels");
@@ -1026,6 +1079,7 @@ type MockApiClientOptions = {
   deleteManagedSkill?: ApiClient["deleteManagedSkill"];
   createManagedSkillDirectory?: ApiClient["createManagedSkillDirectory"];
   uploadManagedSkills?: ApiClient["uploadManagedSkills"];
+  initialHermesSchedulerSnapshots?: HermesSchedulerSnapshot[];
 };
 
 export function createMockApiClient(options: MockApiClientOptions = {}): ApiClient {
@@ -1117,6 +1171,7 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     ...(options.initialManagedSkills ?? {}),
   };
   let managedSkillDirectories = new Set(options.initialManagedSkillDirectories ?? []);
+  const hermesSchedulerSnapshots = options.initialHermesSchedulerSnapshots ?? [];
 
   function emitSessionEvent(sessionId: string, event: ChannelSessionEvent) {
     for (const listener of sessionEventListenersBySessionId[sessionId] ?? []) {
@@ -1272,6 +1327,19 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     async rebuildHermesInstance() {
       instance = { ...(instance as HermesInstance), status: "running" };
       return instance;
+    },
+    async listHermesSchedulerSnapshots() {
+      return hermesSchedulerSnapshots;
+    },
+    async workspaceHermesSchedulerSnapshot() {
+      const currentUserId = currentUser?.id;
+      if (!currentUserId) {
+        return null;
+      }
+      return (
+        hermesSchedulerSnapshots.find((snapshot) => snapshot.user_id === currentUserId) ??
+        null
+      );
     },
     async listChannels() {
       return channels;

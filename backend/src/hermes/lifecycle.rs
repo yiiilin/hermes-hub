@@ -1,0 +1,231 @@
+use std::time::Duration;
+
+use crate::{
+    hermes::{
+        instance::{HermesInstance, HermesInstanceStatus},
+        provisioner::HermesProvisioner,
+    },
+    http::{map_provisioner_error, workspace::ensure_managed_hermes_for_user_without_activity},
+    session::store::{
+        HermesLifecycleCandidate, HermesScheduledTaskSnapshot, HermesSchedulerSnapshot,
+    },
+    AppState,
+};
+
+pub const DEFAULT_IDLE_STOP_AFTER_SECONDS: u64 = 30 * 60;
+pub const DEFAULT_WAKE_MARGIN_SECONDS: u64 = 5 * 60;
+pub const DEFAULT_SWEEP_INTERVAL_SECONDS: u64 = 60;
+const IDLE_STOP_REASON: &str = "idle";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HermesLifecycleDecisionSettings {
+    pub idle_stop_after_seconds: u64,
+    pub wake_margin_seconds: u64,
+}
+
+impl Default for HermesLifecycleDecisionSettings {
+    fn default() -> Self {
+        Self {
+            idle_stop_after_seconds: DEFAULT_IDLE_STOP_AFTER_SECONDS,
+            wake_margin_seconds: DEFAULT_WAKE_MARGIN_SECONDS,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HermesLifecycleScheduledTask {
+    pub enabled: bool,
+    pub next_run_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HermesLifecycleDecisionInput {
+    pub status: HermesInstanceStatus,
+    pub last_user_activity_at: Option<u64>,
+    pub has_active_runs: bool,
+    pub scheduler_enabled: bool,
+    pub tasks: Vec<HermesLifecycleScheduledTask>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HermesLifecycleAction {
+    KeepRunning,
+    StopIdle,
+    WakeForScheduledTask,
+}
+
+pub fn decide_hermes_lifecycle_action(
+    input: &HermesLifecycleDecisionInput,
+    now: u64,
+    settings: HermesLifecycleDecisionSettings,
+) -> HermesLifecycleAction {
+    if input.has_active_runs {
+        return HermesLifecycleAction::KeepRunning;
+    }
+
+    if matches!(input.status, HermesInstanceStatus::Stopped)
+        && input.scheduler_enabled
+        && has_task_due_within(&input.tasks, now, settings.wake_margin_seconds)
+    {
+        return HermesLifecycleAction::WakeForScheduledTask;
+    }
+
+    if !matches!(input.status, HermesInstanceStatus::Running) {
+        return HermesLifecycleAction::KeepRunning;
+    }
+
+    if input.scheduler_enabled
+        && has_task_due_within(&input.tasks, now, settings.wake_margin_seconds)
+    {
+        return HermesLifecycleAction::KeepRunning;
+    }
+
+    let Some(last_user_activity_at) = input.last_user_activity_at else {
+        return HermesLifecycleAction::KeepRunning;
+    };
+    if now.saturating_sub(last_user_activity_at) >= settings.idle_stop_after_seconds {
+        HermesLifecycleAction::StopIdle
+    } else {
+        HermesLifecycleAction::KeepRunning
+    }
+}
+
+pub async fn start_hermes_lifecycle_sweeper(state: AppState) {
+    let mut interval = tokio::time::interval(Duration::from_secs(DEFAULT_SWEEP_INTERVAL_SECONDS));
+    loop {
+        interval.tick().await;
+        if let Err(error) = sweep_hermes_lifecycle_once(&state, unix_now()).await {
+            tracing::warn!(?error, "Hermes lifecycle sweep failed");
+        }
+    }
+}
+
+pub async fn sweep_hermes_lifecycle_once(
+    state: &AppState,
+    now: u64,
+) -> Result<(), crate::http::ApiError> {
+    let settings = HermesLifecycleDecisionSettings::default();
+    let candidates = state
+        .store
+        .list_hermes_lifecycle_candidates()
+        .await
+        .map_err(|_| crate::http::ApiError::Internal)?;
+
+    for candidate in candidates {
+        let has_active_runs = state
+            .channel_store
+            .instance_has_active_runs(&candidate.instance.id)
+            .await
+            .map_err(|_| crate::http::ApiError::Internal)?;
+        let decision = decide_hermes_lifecycle_action(
+            &decision_input(&candidate, has_active_runs),
+            now,
+            settings.clone(),
+        );
+        match decision {
+            HermesLifecycleAction::KeepRunning => {}
+            HermesLifecycleAction::StopIdle => {
+                if let Err(error) = stop_idle_instance(state, &candidate.instance).await {
+                    tracing::warn!(
+                        ?error,
+                        instance_id = %candidate.instance.id,
+                        "failed to stop idle Hermes instance"
+                    );
+                }
+            }
+            HermesLifecycleAction::WakeForScheduledTask => {
+                if let Err(error) = ensure_managed_hermes_for_user_without_activity(
+                    state,
+                    &candidate.instance.user_id,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        ?error,
+                        instance_id = %candidate.instance.id,
+                        "failed to wake Hermes instance for scheduled task"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn decision_input(
+    candidate: &HermesLifecycleCandidate,
+    has_active_runs: bool,
+) -> HermesLifecycleDecisionInput {
+    let snapshot = candidate.scheduler_snapshot.as_ref();
+    HermesLifecycleDecisionInput {
+        status: candidate.instance.status.clone(),
+        last_user_activity_at: candidate.lifecycle.last_user_activity_at,
+        has_active_runs,
+        scheduler_enabled: snapshot
+            .map(|snapshot| snapshot.scheduler_enabled && snapshot.scheduler_status == "ok")
+            .unwrap_or(false),
+        tasks: snapshot_tasks(snapshot),
+    }
+}
+
+fn snapshot_tasks(snapshot: Option<&HermesSchedulerSnapshot>) -> Vec<HermesLifecycleScheduledTask> {
+    snapshot
+        .map(|snapshot| {
+            snapshot
+                .tasks
+                .iter()
+                .map(task_from_snapshot)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn task_from_snapshot(task: &HermesScheduledTaskSnapshot) -> HermesLifecycleScheduledTask {
+    HermesLifecycleScheduledTask {
+        enabled: task.enabled,
+        next_run_at: task.next_run_at,
+    }
+}
+
+fn has_task_due_within(
+    tasks: &[HermesLifecycleScheduledTask],
+    now: u64,
+    margin_seconds: u64,
+) -> bool {
+    tasks.iter().any(|task| {
+        task.enabled
+            && task
+                .next_run_at
+                .is_some_and(|next_run_at| next_run_at <= now.saturating_add(margin_seconds))
+    })
+}
+
+async fn stop_idle_instance(
+    state: &AppState,
+    instance: &HermesInstance,
+) -> Result<(), crate::http::ApiError> {
+    let stopped = state
+        .docker_provisioner
+        .stop_instance(instance)
+        .await
+        .map_err(map_provisioner_error)?;
+    state
+        .store
+        .bind_hermes_instance(stopped.clone())
+        .await
+        .map_err(|_| crate::http::ApiError::Internal)?;
+    state
+        .store
+        .set_hermes_instance_stopped_reason(&stopped.id, IDLE_STOP_REASON)
+        .await
+        .map_err(|_| crate::http::ApiError::Internal)?;
+    Ok(())
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after unix epoch")
+        .as_secs()
+}

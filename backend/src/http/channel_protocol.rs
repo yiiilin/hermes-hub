@@ -26,6 +26,7 @@ use crate::{
         ApiError,
     },
     model_config::InstanceTokenContext,
+    session::store::{HermesScheduledTaskSnapshot, HermesSchedulerSnapshotInput},
     AppState,
 };
 
@@ -94,6 +95,37 @@ struct AckRunRequest {
 struct InstanceStatusReportRequest {
     runtime_image: Option<String>,
     runtime_version: Option<String>,
+    scheduler_snapshot: Option<SchedulerSnapshotReportRequest>,
+}
+
+#[derive(Deserialize, Default)]
+struct SchedulerSnapshotReportRequest {
+    status: Option<String>,
+    scheduler_enabled: Option<bool>,
+    running_jobs_count: Option<u32>,
+    generated_at: Option<Value>,
+    reported_at: Option<Value>,
+    source: Option<String>,
+    snapshot_hash: Option<String>,
+    next_wake_at: Option<Value>,
+    jobs: Option<Vec<SchedulerJobReportRequest>>,
+    tasks: Option<Vec<SchedulerJobReportRequest>>,
+}
+
+#[derive(Deserialize, Default)]
+struct SchedulerJobReportRequest {
+    id: Option<Value>,
+    name: Option<Value>,
+    enabled: Option<bool>,
+    schedule: Option<Value>,
+    cron: Option<Value>,
+    timezone: Option<Value>,
+    next_run_at: Option<Value>,
+    last_run_at: Option<Value>,
+    status: Option<Value>,
+    state: Option<Value>,
+    last_status: Option<Value>,
+    source: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -461,7 +493,11 @@ async fn report_instance_status(
         .ok_or(ApiError::Unauthorized)?;
     let runtime_image = clean_runtime_report_value(payload.runtime_image, 512);
     let runtime_version = clean_runtime_version_report_value(payload.runtime_version, 128);
-    if runtime_image.is_none() && runtime_version.is_none() {
+    let scheduler_snapshot = payload
+        .scheduler_snapshot
+        .map(scheduler_snapshot_input)
+        .transpose()?;
+    if runtime_image.is_none() && runtime_version.is_none() && scheduler_snapshot.is_none() {
         return Err(ApiError::BadRequest("runtime status report is empty"));
     }
 
@@ -471,6 +507,13 @@ async fn report_instance_status(
         .update_hermes_instance_runtime(instance_id, runtime_image, runtime_version)
         .await
         .map_err(|_| ApiError::Internal)?;
+    if let Some(snapshot) = scheduler_snapshot {
+        state
+            .store
+            .record_hermes_scheduler_snapshot(instance_id, snapshot)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+    }
     Ok(Json(HermesInstanceResponse { hermes_instance }))
 }
 
@@ -520,6 +563,154 @@ fn clean_runtime_report_value(value: Option<String>, max_len: usize) -> Option<S
 fn clean_runtime_version_report_value(value: Option<String>, max_len: usize) -> Option<String> {
     // latest 只是镜像滚动标签，不是可追溯的 Hermes 发布版本。
     clean_runtime_report_value(value, max_len).filter(|value| value != "latest")
+}
+
+fn scheduler_snapshot_input(
+    payload: SchedulerSnapshotReportRequest,
+) -> Result<HermesSchedulerSnapshotInput, ApiError> {
+    let source = clean_runtime_report_value(payload.source, 128)
+        .unwrap_or_else(|| "hermes-adapter".to_string());
+    let scheduler_status =
+        clean_runtime_report_value(payload.status, 64).unwrap_or_else(|| "unavailable".to_string());
+    let raw_tasks = payload.tasks.or(payload.jobs).unwrap_or_default();
+    let tasks = raw_tasks
+        .into_iter()
+        .enumerate()
+        .map(|(index, task)| scheduler_task_snapshot(task, index, &source))
+        .collect::<Vec<_>>();
+    let running_jobs_count = payload.running_jobs_count.unwrap_or_else(|| {
+        tasks
+            .iter()
+            .filter(|task| task.status == "running" || task.status == "leased")
+            .count() as u32
+    });
+    let reported_at = payload
+        .reported_at
+        .as_ref()
+        .and_then(timestamp_from_report_value)
+        .or_else(|| {
+            payload
+                .generated_at
+                .as_ref()
+                .and_then(timestamp_from_report_value)
+        })
+        .unwrap_or_else(unix_now);
+
+    Ok(HermesSchedulerSnapshotInput {
+        scheduler_status: scheduler_status.clone(),
+        scheduler_enabled: payload
+            .scheduler_enabled
+            .unwrap_or_else(|| scheduler_status == "ok"),
+        running_jobs_count,
+        reported_at,
+        source,
+        snapshot_hash: payload
+            .snapshot_hash
+            .and_then(|value| clean_runtime_report_value(Some(value), 256)),
+        next_wake_at: payload
+            .next_wake_at
+            .as_ref()
+            .and_then(timestamp_from_report_value),
+        tasks,
+    })
+}
+
+fn scheduler_task_snapshot(
+    payload: SchedulerJobReportRequest,
+    index: usize,
+    snapshot_source: &str,
+) -> HermesScheduledTaskSnapshot {
+    let name = payload
+        .name
+        .as_ref()
+        .and_then(string_from_report_value)
+        .unwrap_or_default();
+    let id = payload
+        .id
+        .as_ref()
+        .and_then(string_from_report_value)
+        .or_else(|| (!name.is_empty()).then(|| name.clone()))
+        .unwrap_or_else(|| format!("task-{index}"));
+    let enabled = payload.enabled.unwrap_or(true);
+    let status = payload
+        .status
+        .as_ref()
+        .and_then(string_from_report_value)
+        .or_else(|| payload.state.as_ref().and_then(string_from_report_value))
+        .or_else(|| {
+            payload
+                .last_status
+                .as_ref()
+                .and_then(string_from_report_value)
+        })
+        .unwrap_or_else(|| {
+            if enabled {
+                "scheduled".to_string()
+            } else {
+                "disabled".to_string()
+            }
+        });
+
+    HermesScheduledTaskSnapshot {
+        id,
+        name,
+        enabled,
+        schedule: payload
+            .schedule
+            .as_ref()
+            .or(payload.cron.as_ref())
+            .and_then(string_from_report_value)
+            .unwrap_or_default(),
+        timezone: payload
+            .timezone
+            .as_ref()
+            .and_then(string_from_report_value)
+            .unwrap_or_else(|| "UTC".to_string()),
+        next_run_at: payload
+            .next_run_at
+            .as_ref()
+            .and_then(timestamp_from_report_value),
+        last_run_at: payload
+            .last_run_at
+            .as_ref()
+            .and_then(timestamp_from_report_value),
+        status,
+        source: payload
+            .source
+            .as_ref()
+            .and_then(string_from_report_value)
+            .unwrap_or_else(|| snapshot_source.to_string()),
+    }
+}
+
+fn string_from_report_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.trim().chars().take(512).collect::<String>()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+    .filter(|value| !value.is_empty())
+}
+
+fn timestamp_from_report_value(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number
+            .as_u64()
+            .or_else(|| number.as_f64().map(|value| value as u64)),
+        Value::String(value) => {
+            let value = value.trim();
+            value.parse::<u64>().ok()
+        }
+        _ => None,
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after unix epoch")
+        .as_secs()
 }
 
 async fn verify_instance_token(

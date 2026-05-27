@@ -1,6 +1,8 @@
 import type {
   ApiClient,
   HermesInstance,
+  HermesScheduledTaskSnapshot,
+  HermesSchedulerSnapshot,
   Invite,
   ManagedSkill,
   ManagedSkillTreeNode,
@@ -16,7 +18,14 @@ import { useI18n } from "../i18n";
 import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { FileArchive, FilePlus2, FolderPlus, Upload } from "lucide-react";
 
-type AdminSettingsTab = "users" | "models" | "hermes" | "skills" | "sessions" | "auth";
+type AdminSettingsTab =
+  | "users"
+  | "models"
+  | "hermes"
+  | "scheduler"
+  | "skills"
+  | "sessions"
+  | "auth";
 
 type AdminRouteProps = {
   apiClient: ApiClient;
@@ -29,6 +38,11 @@ type SelectedSkillNode = {
 } | null;
 
 type HermesAction = "create" | "start" | "stop" | "rebuild";
+
+type HermesSchedulerTaskRow = {
+  snapshot: HermesSchedulerSnapshot;
+  task: HermesScheduledTaskSnapshot;
+};
 
 const defaultInviteHours = 24;
 const modelConfigOrder: ModelConfigKind[] = ["llm", "title", "image"];
@@ -96,6 +110,28 @@ function hermesImageVersion(image?: string | null): string | undefined {
   const lastSegment = imageWithoutDigest?.split("/").at(-1);
   const tag = lastSegment?.includes(":") ? lastSegment.split(":").at(-1)?.trim() : undefined;
   return tag && tag !== "latest" ? tag : undefined;
+}
+
+function formatSchedulerSnapshotTime(
+  value: number | string | null | undefined,
+  language: string,
+): string {
+  if (value === null || value === undefined || value === "") {
+    return "-";
+  }
+  // Hermes adapter 可能上送秒级 Unix 时间，也可能上送 ISO 字符串；展示层统一容错格式化。
+  const timestamp =
+    typeof value === "number" && value < 10_000_000_000 ? value * 1000 : value;
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) {
+    return String(value);
+  }
+  return new Intl.DateTimeFormat(language === "zh" ? "zh-CN" : "en-US", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
 }
 
 function parentPath(path: string): string {
@@ -205,6 +241,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
   const [users, setUsers] = useState<User[]>([]);
   const [invites, setInvites] = useState<Invite[]>([]);
   const [instances, setInstances] = useState<HermesInstance[]>([]);
+  const [schedulerSnapshots, setSchedulerSnapshots] = useState<HermesSchedulerSnapshot[]>([]);
   const [modelConfigs, setModelConfigs] = useState<ModelConfig[]>([]);
   const [managedSkills, setManagedSkills] = useState<ManagedSkill[]>([]);
   const [managedSkillTree, setManagedSkillTree] = useState<ManagedSkillTreeNode | null>(null);
@@ -242,6 +279,17 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     () => new Map(instances.map((instance) => [instance.user_id, instance])),
     [instances],
   );
+  const usersById = useMemo(
+    () => new Map(users.map((user) => [user.id, user])),
+    [users],
+  );
+  const schedulerTaskRows = useMemo<HermesSchedulerTaskRow[]>(
+    () =>
+      schedulerSnapshots.flatMap((snapshot) =>
+        (snapshot.tasks ?? []).map((task) => ({ snapshot, task })),
+      ),
+    [schedulerSnapshots],
+  );
   const modelLabels: Record<ModelConfigKind, string> = {
     llm: t("admin.llm"),
     image: t("admin.imageModel"),
@@ -264,6 +312,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     { key: "users", label: t("admin.userManagement") },
     { key: "models", label: t("admin.modelConfig") },
     { key: "hermes", label: t("admin.title") },
+    { key: "scheduler", label: t("admin.scheduledTasks") },
     { key: "skills", label: t("admin.skillManagement") },
     { key: "sessions", label: t("admin.sessionSettings") },
     { key: "auth", label: t("admin.authSettings") },
@@ -272,13 +321,23 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
   async function refresh() {
     setError(null);
     try {
-      const [nextUsers, nextInvites, nextInstances, nextModelStatus, nextSettings] = await Promise.all([
+      const [
+        nextUsers,
+        nextInvites,
+        nextInstances,
+        nextModelStatus,
+        nextSettings,
+        nextSchedulerSnapshots,
+      ] = await Promise.all([
         apiClient.listUsers(),
         apiClient.listInvites(),
         apiClient.listHermesInstances(),
         apiClient.modelConfigStatus(),
         activeTab === "sessions" || activeTab === "auth"
           ? apiClient.systemSettings()
+          : Promise.resolve(null),
+        activeTab === "scheduler"
+          ? apiClient.listHermesSchedulerSnapshots()
           : Promise.resolve(null),
       ]);
       setUsers(nextUsers);
@@ -289,6 +348,9 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
       setMissingRequiredModels(nextModelStatus.missing_required_model_config_kinds);
       if (nextSettings) {
         setSystemSettings(nextSettings);
+      }
+      if (nextSchedulerSnapshots) {
+        setSchedulerSnapshots(nextSchedulerSnapshots);
       }
       if (activeTab === "skills") {
         await refreshManagedSkills();
@@ -1015,6 +1077,92 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
               })}
             </tbody>
           </table>
+        </div>
+      </section>,
+    );
+  }
+
+  if (activeTab === "scheduler") {
+    return renderSystemSettingsShell(
+      <section className="admin-page" id="admin-scheduler">
+        <div className="tab-actions">
+          <button type="button" className="secondary" onClick={() => void refresh()}>
+            {t("admin.refresh")}
+          </button>
+        </div>
+        {error ? <p className="error">{error}</p> : null}
+        <div className="panel scheduler-panel">
+          {schedulerTaskRows.length === 0 ? (
+            <div className="empty-state">
+              <strong>{t("admin.noScheduledTasks")}</strong>
+            </div>
+          ) : (
+            <div className="table-scroll">
+              <table aria-label={t("admin.scheduledTasks")}>
+                <thead>
+                  <tr>
+                    <th>{t("admin.owner")}</th>
+                    <th>{t("admin.schedulerTask")}</th>
+                    <th>{t("admin.schedule")}</th>
+                    <th>{t("admin.nextRunAt")}</th>
+                    <th>{t("admin.lastRunAt")}</th>
+                    <th>{t("admin.status")}</th>
+                    <th>{t("admin.source")}</th>
+                    <th>{t("admin.instanceStatus")}</th>
+                    <th>{t("admin.reportedAt")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {schedulerTaskRows.map(({ snapshot, task }) => (
+                    <tr key={`${snapshot.hermes_instance_id}:${task.id}`}>
+                      <td>
+                        <span className="status-cell">
+                          <span>
+                            {snapshot.user_email?.trim() ||
+                              usersById.get(snapshot.user_id)?.email ||
+                              snapshot.user_id}
+                          </span>
+                          <span className="status-detail">{snapshot.user_id}</span>
+                        </span>
+                      </td>
+                      <td>
+                        <span className="status-cell">
+                          <span>{task.name || task.id}</span>
+                          <span className="status-detail">
+                            {task.enabled ? t("admin.enabled") : t("admin.disabled")} / {task.id}
+                          </span>
+                        </span>
+                      </td>
+                      <td>
+                        <span className="status-cell">
+                          <span>{task.schedule || "-"}</span>
+                          <span className="status-detail">{task.timezone || "-"}</span>
+                        </span>
+                      </td>
+                      <td>{formatSchedulerSnapshotTime(task.next_run_at, language)}</td>
+                      <td>{formatSchedulerSnapshotTime(task.last_run_at, language)}</td>
+                      <td>{task.status || "-"}</td>
+                      <td>{task.source || "-"}</td>
+                      <td>
+                        <span className="status-cell">
+                          <span>{snapshot.instance_status || "-"}</span>
+                          <span className="status-detail">
+                            {snapshot.scheduler_enabled
+                              ? t("admin.schedulerEnabled")
+                              : t("admin.schedulerDisabled")}
+                            {" / "}
+                            {t("admin.runningJobs")}: {snapshot.running_jobs_count}
+                          </span>
+                          <span className="status-detail">{snapshot.hermes_instance_id}</span>
+                        </span>
+                      </td>
+                      <td>{formatSchedulerSnapshotTime(snapshot.reported_at, language)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       </section>,
     );
