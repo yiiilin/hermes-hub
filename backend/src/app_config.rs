@@ -266,7 +266,7 @@ fn skills_fs_config_from_env() -> SkillsFsConfig {
         mount_export: std::env::var("HERMES_HUB_MANAGED_SKILLS_NFS_EXPORT")
             .unwrap_or_else(|_| "/skills".to_string()),
         container_path: std::env::var("HERMES_HUB_MANAGED_SKILLS_CONTAINER_PATH")
-            .unwrap_or_else(|_| "/workspace/hub-managed-skills".to_string()),
+            .unwrap_or_else(|_| "/nfs".to_string()),
     }
 }
 
@@ -336,7 +336,7 @@ fn default_skills_fs_config() -> SkillsFsConfig {
         mount_volume_name: "hermes-hub-managed-skills-test".to_string(),
         mount_addr: "127.0.0.1:12049".to_string(),
         mount_export: "/skills".to_string(),
-        container_path: "/workspace/hub-managed-skills".to_string(),
+        container_path: "/nfs".to_string(),
     }
 }
 

@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -25,11 +25,12 @@ use super::{
 
 /// Hub 托管 Hermes 容器规格版本。只要 env、挂载、工作目录或安全策略有变化，
 /// 就提升这个值，确保已存在的旧容器会被重建并拿到新行为。
-const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-27-managed-profile-workspace";
+const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-27-managed-nfs-root-v2";
 const MANAGED_CONTAINER_SPEC_LABEL: &str = "hermes_hub_spec_version";
 const HUB_INBOX_PATH: &str = "/internal/channel/v1/inbox";
 const HUB_INBOX_TIMEOUT_SECONDS: u16 = 25;
 const HUB_INBOX_LIMIT: u16 = 4;
+const MANAGED_SKILLS_EXTERNAL_DIR: &str = "/nfs/skills";
 const MANAGED_PROFILE_AGENTS_FILE: &str = "AGENTS.md";
 const MANAGED_PROFILE_SOUL_FILE: &str = "SOUL.md";
 const HERMES_HUB_PLUGIN_YAML: &str = r#"name: hermes-hub-platform
@@ -1289,6 +1290,7 @@ impl DockerProvisioner {
             ),
             format!("HERMES_HUB_INSTANCE_ID={}", instance.id),
             format!("HERMES_HUB_USER_ID={}", instance.user_id),
+            "HERMES_HUB_NFS_DIR=/nfs".to_string(),
             format!("HERMES_HUB_INBOX_PATH={HUB_INBOX_PATH}"),
             format!("HERMES_HUB_INBOX_TIMEOUT_SECONDS={HUB_INBOX_TIMEOUT_SECONDS}"),
             format!("HERMES_HUB_INBOX_LIMIT={HUB_INBOX_LIMIT}"),
@@ -1359,7 +1361,6 @@ impl DockerProvisioner {
         next.llm_api_key = Some(llm_api_key.to_string());
         next.api_token_secret_ref = Some(llm_api_key.to_string());
         self.create_host_directories(&next)?;
-        self.prepare_managed_profile_links(&next)?;
         let config_changed = self.write_managed_config(&next).await?;
 
         if let Some(inspection) = self.inspect_container(&next.name).await? {
@@ -1434,7 +1435,6 @@ impl DockerProvisioner {
         next.llm_api_key = Some(llm_api_key.to_string());
         next.api_token_secret_ref = Some(llm_api_key.to_string());
         provisioner.create_host_directories(&next)?;
-        provisioner.prepare_managed_profile_links(&next)?;
         // 只刷新 Hub 管理的配置文件，不重建 Docker 容器；gateway 由 adapter 控制项重启。
         provisioner.write_managed_config(&next).await
     }
@@ -1525,42 +1525,6 @@ impl DockerProvisioner {
         .flatten()
         {
             set_directory_mode_for_container_tools(path)?;
-        }
-
-        Ok(())
-    }
-
-    fn prepare_managed_profile_links(
-        &self,
-        instance: &HermesInstance,
-    ) -> Result<(), ProvisionerError> {
-        let Some(profile) = &self.config.managed_profile else {
-            return Ok(());
-        };
-        let workspace_path = instance
-            .host_workspace_path
-            .as_ref()
-            .ok_or(ProvisionerError::InvalidManagedInstance)?;
-        let config_path = instance
-            .host_config_path
-            .as_ref()
-            .ok_or(ProvisionerError::InvalidManagedInstance)?;
-        let workspace_path = PathBuf::from(workspace_path);
-        let config_path = PathBuf::from(config_path);
-        let profile_root = profile.container_path.trim_end_matches('/');
-
-        for file_name in [MANAGED_PROFILE_AGENTS_FILE, MANAGED_PROFILE_SOUL_FILE] {
-            // 官方 Hermes entrypoint 会先检查 HERMES_HOME/SOUL.md，再执行 Hub 下发的
-            // command。这里提前在宿主挂载目录中放好容器内绝对软链，避免旧路径软链在
-            // entrypoint 阶段变成 dangling symlink。
-            replace_symlink(
-                &workspace_path.join(file_name),
-                Path::new(&format!("{profile_root}/{file_name}")),
-            )?;
-            replace_symlink(
-                &config_path.join(file_name),
-                Path::new(&format!("/workspace/{file_name}")),
-            )?;
         }
 
         Ok(())
@@ -1817,10 +1781,10 @@ impl DockerProvisioner {
             .config
             .managed_skills
             .as_ref()
-            .map(|managed_skills| {
+            .map(|_| {
                 Ok(format!(
                     "skills:\n  external_dirs:\n    - {}\n",
-                    yaml_string(&managed_skills.container_path)?
+                    yaml_string(MANAGED_SKILLS_EXTERNAL_DIR)?
                 ))
             })
             .transpose()?
@@ -2123,7 +2087,6 @@ impl HermesProvisioner for DockerProvisioner {
         next.llm_api_key = Some(llm_api_key.to_string());
         next.api_token_secret_ref = Some(llm_api_key.to_string());
         self.create_host_directories(&next)?;
-        self.prepare_managed_profile_links(&next)?;
         self.write_managed_config(&next).await?;
         self.remove_container_if_exists(&next.name).await?;
         let container_id = self.create_container(&next).await?;
@@ -2141,35 +2104,6 @@ impl HermesProvisioner for DockerProvisioner {
 
 fn path_to_string(path: PathBuf) -> String {
     path.to_string_lossy().into_owned()
-}
-
-fn replace_symlink(link_path: &Path, target: &Path) -> Result<(), ProvisionerError> {
-    match std::fs::symlink_metadata(link_path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-                return Err(ProvisionerError::Filesystem(format!(
-                    "{} is a directory and cannot be replaced by a managed profile link",
-                    link_path.display()
-                )));
-            }
-            std::fs::remove_file(link_path)
-                .map_err(|error| ProvisionerError::Filesystem(error.to_string()))?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(ProvisionerError::Filesystem(error.to_string())),
-    }
-
-    #[cfg(unix)]
-    {
-        symlink(target, link_path).map_err(|error| ProvisionerError::Filesystem(error.to_string()))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = target;
-        Err(ProvisionerError::Filesystem(
-            "managed profile links require a Unix-like filesystem".to_string(),
-        ))
-    }
 }
 
 fn render_container_mount(mount: &ContainerMount) -> String {
@@ -2194,26 +2128,15 @@ fn render_container_mount(mount: &ContainerMount) -> String {
 }
 
 fn hermes_gateway_command(managed_profile: Option<&ManagedProfileConfig>) -> Vec<String> {
-    let Some(managed_profile) = managed_profile else {
-        return vec!["gateway".to_string()];
-    };
-    let profile_root = shell_quote(&managed_profile.container_path);
-    let script = format!(
-        "set -eu\n\
-         mkdir -p /workspace /config\n\
-         for file in {agents} {soul}; do\n\
-         \x20\x20ln -sfn {profile_root}/$file /workspace/$file\n\
-         \x20\x20ln -sfn /workspace/$file /config/$file\n\
-         done\n\
-         exec /opt/hermes/.venv/bin/hermes gateway",
-        agents = MANAGED_PROFILE_AGENTS_FILE,
-        soul = MANAGED_PROFILE_SOUL_FILE,
-    );
-    vec!["sh".to_string(), "-c".to_string(), script]
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+    if managed_profile.is_some() {
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "exec /opt/hermes/.venv/bin/hermes gateway".to_string(),
+        ]
+    } else {
+        vec!["gateway".to_string()]
+    }
 }
 
 fn managed_profile_object_key(prefix: &str, file_name: &str) -> String {

@@ -24,6 +24,7 @@ const FS_ID: u64 = 0x4848_534b_494c_4c53;
 const DIR_MODE: u32 = 0o755;
 const FILE_MODE: u32 = 0o644;
 const HIDDEN_SEGMENTS: [&str; 3] = [".curator_state", ".bundled_manifest", ".hub-directory"];
+const MANAGED_SKILLS_DIR: &str = "skills";
 const MANAGED_PROFILE_FILES: [&str; 2] = ["AGENTS.md", "SOUL.md"];
 
 #[derive(Debug, Error)]
@@ -148,7 +149,22 @@ impl SkillsFs {
         // 避免把用户传入的空路径误当作合法文件名。
         let path = normalize_skills_path(if path.is_empty() { "/" } else { path })
             .ok_or(SkillsFsError::InvalidPrefix)?;
-        let list_prefix = list_object_prefix(&self.prefix, &path);
+        if path.is_empty() {
+            let mut nodes_by_path = HashMap::new();
+            let skills_node = self.node_for_path(MANAGED_SKILLS_DIR.to_string(), true, 0, None)?;
+            nodes_by_path.insert(skills_node.path.clone(), skills_node);
+            for node in self.root_profile_nodes().await? {
+                nodes_by_path.insert(node.path.clone(), node);
+            }
+            let mut nodes = nodes_by_path.into_values().collect::<Vec<_>>();
+            nodes.sort_by(|lhs, rhs| lhs.id.cmp(&rhs.id));
+            return Ok(nodes);
+        }
+
+        let Some(storage_dir) = nfs_skills_storage_path(&path) else {
+            return Ok(Vec::new());
+        };
+        let list_prefix = list_object_prefix(&self.prefix, &storage_dir);
         let mut entries = self.operator.list(&list_prefix).await?;
         entries.sort_by(|lhs, rhs| lhs.path().cmp(rhs.path()));
 
@@ -157,13 +173,16 @@ impl SkillsFs {
             let Some(relative) = relative_entry_path(&self.prefix, entry.path()) else {
                 continue;
             };
-            if relative == path || relative.is_empty() || has_hidden_segment(&relative) {
+            if relative == storage_dir || relative.is_empty() || has_hidden_segment(&relative) {
                 continue;
             }
-            let Some((child_path, is_virtual_dir)) = direct_child_path(&path, &relative) else {
+            let Some((child_storage_path, is_virtual_dir)) =
+                direct_child_path(&storage_dir, &relative)
+            else {
                 continue;
             };
             let is_dir = is_virtual_dir || entry.metadata().mode().is_dir();
+            let child_path = skills_nfs_path(&child_storage_path);
             if is_dir && !self.directory_has_visible_entry(&child_path).await? {
                 continue;
             }
@@ -184,11 +203,6 @@ impl SkillsFs {
                 })
                 .or_insert(node);
         }
-        if path.is_empty() {
-            for node in self.root_profile_nodes().await? {
-                nodes_by_path.insert(node.path.clone(), node);
-            }
-        }
         let mut nodes = nodes_by_path.into_values().collect::<Vec<_>>();
         nodes.sort_by(|lhs, rhs| lhs.id.cmp(&rhs.id));
         Ok(nodes)
@@ -200,7 +214,11 @@ impl SkillsFs {
             let bytes = self.operator.read(&key).await?;
             return Ok(bytes.to_vec());
         }
-        let bytes = self.operator.read(&object_key(&self.prefix, &path)).await?;
+        let storage_path = nfs_skills_storage_file_path(&path).ok_or(SkillsFsError::NotFound)?;
+        let bytes = self
+            .operator
+            .read(&object_key(&self.prefix, &storage_path))
+            .await?;
         Ok(bytes.to_vec())
     }
 
@@ -210,7 +228,8 @@ impl SkillsFs {
         offset: u64,
         data: &[u8],
     ) -> Result<SkillsNode, SkillsFsError> {
-        let path = writable_skills_path(path).ok_or(SkillsFsError::InvalidPrefix)?;
+        let (path, storage_path) =
+            writable_skills_storage_path(path).ok_or(SkillsFsError::InvalidPrefix)?;
         let mut bytes = match self.read_path(&path).await {
             Ok(bytes) => bytes,
             Err(SkillsFsError::Opendal(error)) if error.kind() == ErrorKind::NotFound => Vec::new(),
@@ -225,7 +244,7 @@ impl SkillsFs {
             bytes.resize(end, 0);
         }
         bytes[start..end].copy_from_slice(data);
-        let key = object_key(&self.prefix, &path);
+        let key = object_key(&self.prefix, &storage_path);
         let metadata = self.operator.write(&key, bytes).await?;
         self.node_for_path(
             path,
@@ -236,7 +255,8 @@ impl SkillsFs {
     }
 
     async fn truncate_path(&self, path: &str, size: u64) -> Result<SkillsNode, SkillsFsError> {
-        let path = writable_skills_path(path).ok_or(SkillsFsError::InvalidPrefix)?;
+        let (path, storage_path) =
+            writable_skills_storage_path(path).ok_or(SkillsFsError::InvalidPrefix)?;
         let mut bytes = match self.read_path(&path).await {
             Ok(bytes) => bytes,
             Err(SkillsFsError::Opendal(error)) if error.kind() == ErrorKind::NotFound => Vec::new(),
@@ -246,7 +266,7 @@ impl SkillsFs {
         bytes.resize(size, 0);
         let metadata = self
             .operator
-            .write(&object_key(&self.prefix, &path), bytes)
+            .write(&object_key(&self.prefix, &storage_path), bytes)
             .await?;
         self.node_for_path(
             path,
@@ -261,14 +281,15 @@ impl SkillsFs {
     }
 
     async fn create_directory(&self, path: &str) -> Result<SkillsNode, SkillsFsError> {
-        let path = writable_skills_path(path).ok_or(SkillsFsError::InvalidPrefix)?;
+        let (path, storage_path) =
+            writable_skills_storage_path(path).ok_or(SkillsFsError::InvalidPrefix)?;
         // NFS 新建的空目录需要跨进程重启可见；对象存储没有真实目录时，用目录对象持久化。
         self.operator
-            .create_dir(&object_key(&self.prefix, &dir_path(&path)))
+            .create_dir(&object_key(&self.prefix, &dir_path(&storage_path)))
             .await?;
         self.operator
             .write(
-                &object_key(&self.prefix, &format!("{path}/.hub-directory")),
+                &object_key(&self.prefix, &format!("{storage_path}/.hub-directory")),
                 "",
             )
             .await?;
@@ -276,7 +297,8 @@ impl SkillsFs {
     }
 
     async fn delete_path(&self, path: &str) -> Result<(), SkillsFsError> {
-        let path = writable_skills_path(path).ok_or(SkillsFsError::InvalidPrefix)?;
+        let (path, storage_path) =
+            writable_skills_storage_path(path).ok_or(SkillsFsError::InvalidPrefix)?;
         let node = match self.lookup_path(&path).await {
             Ok(node) => node,
             Err(nfsstat3::NFS3ERR_NOENT) => self
@@ -288,12 +310,13 @@ impl SkillsFs {
             if !self.list_dir(&path).await?.is_empty() {
                 return Err(SkillsFsError::DirectoryNotEmpty);
             }
-            self.delete_object_if_exists(&format!("{path}/.hub-directory"))
+            self.delete_object_if_exists(&format!("{storage_path}/.hub-directory"))
                 .await?;
-            self.delete_object_if_exists(&dir_path(&path)).await?;
+            self.delete_object_if_exists(&dir_path(&storage_path))
+                .await?;
         } else {
             self.operator
-                .delete(&object_key(&self.prefix, &path))
+                .delete(&object_key(&self.prefix, &storage_path))
                 .await?;
         }
         self.remove_index_prefix(&path)?;
@@ -301,8 +324,10 @@ impl SkillsFs {
     }
 
     async fn rename_path(&self, from: &str, to: &str) -> Result<(), SkillsFsError> {
-        let from = writable_skills_path(from).ok_or(SkillsFsError::InvalidPrefix)?;
-        let to = writable_skills_path(to).ok_or(SkillsFsError::InvalidPrefix)?;
+        let (from, from_storage) =
+            writable_skills_storage_path(from).ok_or(SkillsFsError::InvalidPrefix)?;
+        let (_to, to_storage) =
+            writable_skills_storage_path(to).ok_or(SkillsFsError::InvalidPrefix)?;
         let node = match self.lookup_path(&from).await {
             Ok(node) => node,
             Err(nfsstat3::NFS3ERR_NOENT) => self
@@ -313,22 +338,26 @@ impl SkillsFs {
         if node.is_dir {
             let entries = self
                 .operator
-                .list(&object_key(&self.prefix, &dir_path(&from)))
+                .list(&object_key(&self.prefix, &dir_path(&from_storage)))
                 .await?;
             for entry in entries {
                 let Some(relative) = relative_entry_path(&self.prefix, entry.path()) else {
                     continue;
                 };
-                if relative == from || !relative.starts_with(&format!("{from}/")) {
+                if relative == from_storage || !relative.starts_with(&format!("{from_storage}/")) {
                     continue;
                 }
-                let target_relative = format!("{to}{}", &relative[from.len()..]);
+                let target_relative = format!("{to_storage}{}", &relative[from_storage.len()..]);
                 if entry.metadata().mode().is_dir() {
                     self.operator
                         .create_dir(&object_key(&self.prefix, &dir_path(&target_relative)))
                         .await?;
                 } else {
-                    let bytes = self.read_path(&relative).await?;
+                    let bytes = self
+                        .operator
+                        .read(&object_key(&self.prefix, &relative))
+                        .await?
+                        .to_vec();
                     self.operator
                         .write(&object_key(&self.prefix, &target_relative), bytes)
                         .await?;
@@ -338,15 +367,15 @@ impl SkillsFs {
                 }
             }
             self.operator
-                .delete(&object_key(&self.prefix, &dir_path(&from)))
+                .delete(&object_key(&self.prefix, &dir_path(&from_storage)))
                 .await?;
         } else {
             let bytes = self.read_path(&from).await?;
             self.operator
-                .write(&object_key(&self.prefix, &to), bytes)
+                .write(&object_key(&self.prefix, &to_storage), bytes)
                 .await?;
             self.operator
-                .delete(&object_key(&self.prefix, &from))
+                .delete(&object_key(&self.prefix, &from_storage))
                 .await?;
         }
         self.remove_index_prefix(&from)?;
@@ -404,6 +433,11 @@ impl SkillsFs {
         if path.is_empty() {
             return Ok(self.root_node());
         }
+        if path == MANAGED_SKILLS_DIR {
+            return self
+                .node_for_path(MANAGED_SKILLS_DIR.to_string(), true, 0, None)
+                .map_err(|_| nfsstat3::NFS3ERR_IO);
+        }
         if has_hidden_segment(&path) {
             return Err(nfsstat3::NFS3ERR_NOENT);
         }
@@ -424,7 +458,10 @@ impl SkillsFs {
             };
         }
 
-        let file_key = object_key(&self.prefix, &path);
+        let Some(storage_path) = nfs_skills_storage_path(&path) else {
+            return Err(nfsstat3::NFS3ERR_NOENT);
+        };
+        let file_key = object_key(&self.prefix, &storage_path);
         match self.operator.stat(&file_key).await {
             Ok(metadata) if metadata.mode().is_file() => {
                 return self
@@ -457,15 +494,20 @@ impl SkillsFs {
     }
 
     async fn directory_has_visible_entry(&self, path: &str) -> Result<bool, opendal::Error> {
-        if path.is_empty() && self.has_visible_profile_file().await? {
+        if path.is_empty() || path == MANAGED_SKILLS_DIR {
             return Ok(true);
         }
-        let dir_key = object_key(&self.prefix, &dir_path(path));
+        let Some(storage_path) = nfs_skills_storage_path(path) else {
+            return Ok(false);
+        };
+        let dir_key = object_key(&self.prefix, &dir_path(&storage_path));
         let entries = self.operator.list(&dir_key).await?;
         Ok(entries
             .iter()
             .filter_map(|entry| visible_relative_entry(&self.prefix, entry))
-            .any(|relative| relative == path || relative.starts_with(&format!("{path}/"))))
+            .any(|relative| {
+                relative == storage_path || relative.starts_with(&format!("{storage_path}/"))
+            }))
     }
 
     fn node_for_entry_path(
@@ -475,8 +517,9 @@ impl SkillsFs {
     ) -> Result<SkillsNode, SkillsFsError> {
         let relative =
             relative_entry_path(&self.prefix, &entry_path).ok_or(SkillsFsError::InvalidPrefix)?;
+        let path = skills_nfs_path(&relative);
         self.node_for_path(
-            relative,
+            path,
             metadata.mode().is_dir(),
             metadata.content_length(),
             metadata.last_modified().map(Into::into),
@@ -529,6 +572,11 @@ impl SkillsFs {
     }
 
     async fn find_node_by_id(&self, id: fileid3) -> Result<Option<SkillsNode>, SkillsFsError> {
+        if stable_fileid_for_path(MANAGED_SKILLS_DIR) == id {
+            return self
+                .node_for_path(MANAGED_SKILLS_DIR.to_string(), true, 0, None)
+                .map(Some);
+        }
         for node in self.root_profile_nodes().await? {
             if node.id == id {
                 return Ok(Some(node));
@@ -555,10 +603,12 @@ impl SkillsFs {
                 if relative.is_empty() || has_hidden_segment(&relative) {
                     continue;
                 }
-                let Some((child_path, is_virtual_dir)) = direct_child_path(&dir, &relative) else {
+                let Some((child_storage_path, is_virtual_dir)) = direct_child_path(&dir, &relative)
+                else {
                     continue;
                 };
                 let is_dir = is_virtual_dir || entry.metadata().mode().is_dir();
+                let child_path = skills_nfs_path(&child_storage_path);
                 if is_dir && !self.directory_has_visible_entry(&child_path).await? {
                     continue;
                 }
@@ -572,7 +622,7 @@ impl SkillsFs {
                 }
 
                 if is_dir {
-                    pending_dirs.push(child_path);
+                    pending_dirs.push(child_storage_path);
                 }
             }
         }
@@ -599,21 +649,6 @@ impl SkillsFs {
             }
         }
         Ok(nodes)
-    }
-
-    async fn has_visible_profile_file(&self) -> Result<bool, opendal::Error> {
-        for file_name in MANAGED_PROFILE_FILES {
-            let Some(key) = self.profile_object_key(file_name) else {
-                continue;
-            };
-            match self.operator.stat(&key).await {
-                Ok(metadata) if metadata.mode().is_file() => return Ok(true),
-                Ok(_) => {}
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(false)
     }
 
     fn profile_object_key(&self, path: &str) -> Option<String> {
@@ -1011,9 +1046,33 @@ fn has_hidden_segment(path: &str) -> bool {
         .any(|segment| HIDDEN_SEGMENTS.contains(&segment))
 }
 
+fn nfs_skills_storage_path(path: &str) -> Option<String> {
+    let path = normalize_skills_path(path)?;
+    if path == MANAGED_SKILLS_DIR || path.starts_with(&format!("{MANAGED_SKILLS_DIR}/")) {
+        path.strip_prefix(MANAGED_SKILLS_DIR)
+            .map(|value| value.trim_start_matches('/').to_string())
+    } else {
+        None
+    }
+}
+
+fn nfs_skills_storage_file_path(path: &str) -> Option<String> {
+    let storage_path = nfs_skills_storage_path(path)?;
+    (storage_path != MANAGED_SKILLS_DIR).then_some(storage_path)
+}
+
+fn writable_skills_storage_path(path: &str) -> Option<(String, String)> {
+    let path = writable_skills_path(path)?;
+    let storage_path = nfs_skills_storage_file_path(&path)?;
+    Some((path, storage_path))
+}
+
 fn writable_skills_path(path: &str) -> Option<String> {
     let path = normalize_skills_path(path)?;
-    if path.is_empty() || has_hidden_segment(&path) || is_managed_profile_file(&path) {
+    if !path.starts_with(&format!("{MANAGED_SKILLS_DIR}/"))
+        || has_hidden_segment(&path)
+        || is_managed_profile_file(&path)
+    {
         None
     } else {
         Some(path)
@@ -1022,6 +1081,14 @@ fn writable_skills_path(path: &str) -> Option<String> {
 
 fn is_managed_profile_file(path: &str) -> bool {
     MANAGED_PROFILE_FILES.contains(&path)
+}
+
+fn skills_nfs_path(storage_path: &str) -> String {
+    if storage_path.is_empty() {
+        MANAGED_SKILLS_DIR.to_string()
+    } else {
+        format!("{MANAGED_SKILLS_DIR}/{storage_path}")
+    }
 }
 
 fn child_path_for_nfs_name(parent: &str, filename: &filename3) -> Result<String, nfsstat3> {

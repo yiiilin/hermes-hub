@@ -81,8 +81,8 @@ async fn skills_fs_lists_and_reads_from_prefix() {
         root_entries
             .entries
             .iter()
-            .any(|entry| entry.name.as_ref() == b"writing"),
-        "NFS clients must be able to discover top-level skill directories"
+            .any(|entry| entry.name.as_ref() == b"skills"),
+        "NFS root must expose the managed skills directory"
     );
     assert!(
         root_entries.entries.iter().all(|entry| {
@@ -100,22 +100,54 @@ async fn skills_fs_lists_and_reads_from_prefix() {
             .all(|entry| entry.name.as_ref() != b"hidden-only"),
         "directories backed only by hidden curator metadata must not leak through NFS"
     );
+    let skills_id = fs
+        .lookup(root_id, &b"skills".as_slice().into())
+        .await
+        .expect("skills dir can be looked up");
+    let skills_entries = fs
+        .readdir(skills_id, 0, 16)
+        .await
+        .expect("skills directory can be listed");
+    assert!(
+        skills_entries
+            .entries
+            .iter()
+            .any(|entry| entry.name.as_ref() == b"writing"),
+        "NFS clients must be able to discover skill directories under /skills"
+    );
+    assert!(
+        skills_entries.entries.iter().all(|entry| {
+            !matches!(
+                entry.name.as_ref(),
+                b".curator_state" | b".bundled_manifest"
+            )
+        }),
+        "Hub curator metadata must not be visible through the managed skills directory"
+    );
+    assert!(
+        skills_entries
+            .entries
+            .iter()
+            .all(|entry| entry.name.as_ref() != b"hidden-only"),
+        "directories backed only by hidden curator metadata must not leak through NFS"
+    );
     assert!(matches!(
-        fs.lookup(root_id, &b".curator_state".as_slice().into())
+        fs.lookup(skills_id, &b".curator_state".as_slice().into())
             .await,
         Err(nfsstat3::NFS3ERR_NOENT)
     ));
     assert!(matches!(
-        fs.lookup(root_id, &b"hidden-only".as_slice().into()).await,
+        fs.lookup(skills_id, &b"hidden-only".as_slice().into())
+            .await,
         Err(nfsstat3::NFS3ERR_NOENT)
     ));
     assert!(matches!(
-        fs.lookup(root_id, &b"hub-empty".as_slice().into()).await,
+        fs.lookup(skills_id, &b"hub-empty".as_slice().into()).await,
         Err(nfsstat3::NFS3ERR_NOENT)
     ));
 
     let empty_id = fs
-        .lookup(root_id, &b"empty-dir".as_slice().into())
+        .lookup(skills_id, &b"empty-dir".as_slice().into())
         .await
         .expect("explicit empty directory marker can be looked up");
     let empty_entries = fs
@@ -128,7 +160,7 @@ async fn skills_fs_lists_and_reads_from_prefix() {
     );
 
     let writing_id = fs
-        .lookup(root_id, &b"writing".as_slice().into())
+        .lookup(skills_id, &b"writing".as_slice().into())
         .await
         .expect("writing dir can be looked up");
     let skill_id = fs
@@ -165,7 +197,7 @@ async fn skills_fs_lists_and_reads_from_prefix() {
 }
 
 #[tokio::test]
-async fn skills_fs_exposes_managed_profile_files_as_readonly_root_files() {
+async fn skills_fs_exposes_managed_profile_files_and_skills_directory_at_root() {
     let operator = test_operator().await;
     operator
         .write("managed-profile/current/AGENTS.md", "# Agents\n")
@@ -185,6 +217,13 @@ async fn skills_fs_exposes_managed_profile_files_as_readonly_root_files() {
         .readdir(root_id, 0, 16)
         .await
         .expect("root directory can be listed");
+    assert!(
+        root_entries
+            .entries
+            .iter()
+            .any(|entry| entry.name.as_ref() == b"skills"),
+        "Hub FS root must include the managed skills directory"
+    );
     assert!(
         root_entries
             .entries
@@ -255,10 +294,18 @@ async fn skills_fs_writes_global_skills_back_to_object_storage() {
     let operator = test_operator().await;
     let fs = SkillsFs::new(operator.clone(), "managed-skills/current").expect("fs can be created");
     let root_id = fs.root_dir();
+    let skills_id = fs
+        .lookup(root_id, &b"skills".as_slice().into())
+        .await
+        .expect("skills dir can be looked up");
 
     assert!(matches!(fs.capabilities(), VFSCapabilities::ReadWrite));
     let (draft_id, draft_attr) = fs
-        .create(root_id, &b"draft.md".as_slice().into(), Default::default())
+        .create(
+            skills_id,
+            &b"draft.md".as_slice().into(),
+            Default::default(),
+        )
         .await
         .expect("admin Hermes can create a global skill file");
     assert_eq!(draft_attr.size, 0);
@@ -277,7 +324,7 @@ async fn skills_fs_writes_global_skills_back_to_object_storage() {
     );
 
     let docs_id = fs
-        .mkdir(root_id, &b"docs".as_slice().into())
+        .mkdir(skills_id, &b"docs".as_slice().into())
         .await
         .expect("admin Hermes can create a global skill directory")
         .0;
@@ -309,7 +356,7 @@ async fn skills_fs_writes_global_skills_back_to_object_storage() {
         Err(error) if error.kind() == opendal::ErrorKind::NotFound
     ));
 
-    fs.remove(root_id, &b"draft.md".as_slice().into())
+    fs.remove(skills_id, &b"draft.md".as_slice().into())
         .await
         .expect("admin Hermes can remove a global skill file");
     assert!(matches!(
@@ -319,7 +366,7 @@ async fn skills_fs_writes_global_skills_back_to_object_storage() {
 
     assert!(matches!(
         fs.create(
-            root_id,
+            skills_id,
             &b".curator_state".as_slice().into(),
             Default::default()
         )
@@ -337,8 +384,12 @@ async fn skills_fs_write_from_offset_zero_preserves_existing_tail() {
         .expect("fixture can be written");
     let fs = SkillsFs::new(operator.clone(), "managed-skills/current").expect("fs can be created");
     let root_id = fs.root_dir();
+    let skills_id = fs
+        .lookup(root_id, &b"skills".as_slice().into())
+        .await
+        .expect("skills dir can be looked up");
     let notes_id = fs
-        .lookup(root_id, &b"notes.md".as_slice().into())
+        .lookup(skills_id, &b"notes.md".as_slice().into())
         .await
         .expect("notes file can be looked up");
 
@@ -361,9 +412,13 @@ async fn skills_fs_create_exclusive_rejects_existing_file() {
     let operator = test_operator().await;
     let fs = SkillsFs::new(operator.clone(), "managed-skills/current").expect("fs can be created");
     let root_id = fs.root_dir();
+    let skills_id = fs
+        .lookup(root_id, &b"skills".as_slice().into())
+        .await
+        .expect("skills dir can be looked up");
 
     assert!(matches!(
-        fs.create_exclusive(root_id, &b"writing".as_slice().into())
+        fs.create_exclusive(skills_id, &b"writing".as_slice().into())
             .await,
         Err(nfsstat3::NFS3ERR_EXIST)
     ));
@@ -382,24 +437,28 @@ async fn skills_fs_rejects_removing_non_empty_directory() {
     let operator = test_operator().await;
     let fs = SkillsFs::new(operator.clone(), "managed-skills/current").expect("fs can be created");
     let root_id = fs.root_dir();
+    let skills_id = fs
+        .lookup(root_id, &b"skills".as_slice().into())
+        .await
+        .expect("skills dir can be looked up");
     let writing_id = fs
-        .lookup(root_id, &b"writing".as_slice().into())
+        .lookup(skills_id, &b"writing".as_slice().into())
         .await
         .expect("writing dir can be looked up");
 
     assert!(matches!(
-        fs.remove(root_id, &b"writing".as_slice().into()).await,
+        fs.remove(skills_id, &b"writing".as_slice().into()).await,
         Err(nfsstat3::NFS3ERR_NOTEMPTY)
     ));
     assert!(matches!(
         fs.remove(writing_id, &b"SKILL.md".as_slice().into()).await,
         Ok(())
     ));
-    fs.remove(root_id, &b"writing".as_slice().into())
+    fs.remove(skills_id, &b"writing".as_slice().into())
         .await
         .expect("empty directory can be removed");
     assert!(matches!(
-        fs.lookup(root_id, &b"writing".as_slice().into()).await,
+        fs.lookup(skills_id, &b"writing".as_slice().into()).await,
         Err(nfsstat3::NFS3ERR_NOENT)
     ));
 }
@@ -409,26 +468,30 @@ async fn skills_fs_renames_directories_with_children() {
     let operator = test_operator().await;
     let fs = SkillsFs::new(operator.clone(), "managed-skills/current").expect("fs can be created");
     let root_id = fs.root_dir();
+    let skills_id = fs
+        .lookup(root_id, &b"skills".as_slice().into())
+        .await
+        .expect("skills dir can be looked up");
     let writing_id = fs
-        .lookup(root_id, &b"writing".as_slice().into())
+        .lookup(skills_id, &b"writing".as_slice().into())
         .await
         .expect("writing dir can be looked up");
 
     fs.rename(
-        root_id,
+        skills_id,
         &b"writing".as_slice().into(),
-        root_id,
+        skills_id,
         &b"writing-renamed".as_slice().into(),
     )
     .await
     .expect("directory rename should succeed");
 
     assert!(matches!(
-        fs.lookup(root_id, &b"writing".as_slice().into()).await,
+        fs.lookup(skills_id, &b"writing".as_slice().into()).await,
         Err(nfsstat3::NFS3ERR_NOENT)
     ));
     let renamed_id = fs
-        .lookup(root_id, &b"writing-renamed".as_slice().into())
+        .lookup(skills_id, &b"writing-renamed".as_slice().into())
         .await
         .expect("renamed dir can be looked up");
     let renamed_skill_id = fs
@@ -452,8 +515,12 @@ async fn skills_fs_file_handles_survive_server_restart() {
     let operator = test_operator().await;
     let fs = SkillsFs::new(operator.clone(), "managed-skills/current").expect("fs can be created");
     let root_id = fs.root_dir();
+    let skills_id = fs
+        .lookup(root_id, &b"skills".as_slice().into())
+        .await
+        .expect("skills dir can be looked up");
     let writing_id = fs
-        .lookup(root_id, &b"writing".as_slice().into())
+        .lookup(skills_id, &b"writing".as_slice().into())
         .await
         .expect("writing dir can be looked up");
     let skill_id = fs
@@ -464,6 +531,10 @@ async fn skills_fs_file_handles_survive_server_restart() {
 
     let restarted =
         SkillsFs::new(operator, "managed-skills/current").expect("restarted fs can be created");
+    let _skills_id = restarted
+        .lookup(root_id, &b"skills".as_slice().into())
+        .await
+        .expect("skills dir can be looked up after restart");
     let restored_id = restarted
         .fh_to_id(&skill_handle)
         .expect("stable handle can be decoded after restart");

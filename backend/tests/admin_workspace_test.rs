@@ -358,29 +358,13 @@ fn assert_managed_profile_uses_hub_fs(calls: &[Vec<String>], context: &str) {
         "{context}: managed profile must not create a second NFS mount"
     );
 
-    // 启动命令负责把同一个 Hub FS 根目录里的 profile 文件链接到 Hermes 会读取的位置。
+    // wrapper entrypoint 负责把同一个 Hub FS 根目录里的 profile 文件链接到 Hermes 会读取的位置；
+    // Hub 后端只负责挂载 /nfs 并启动 gateway。
     let command = create_call.join(" ");
     assert!(
-        command.contains("ln -sfn"),
-        "{context}: profile files are linked"
+        !command.contains("ln -sfn"),
+        "{context}: profile files must be linked by the wrapper entrypoint, not Hub backend"
     );
-    assert!(command.contains("AGENTS.md"));
-    assert!(command.contains("SOUL.md"));
-    assert!(
-        command.contains("/workspace/$file")
-            || (command.contains("/workspace/AGENTS.md") && command.contains("/workspace/SOUL.md")),
-        "{context}: managed profile startup command must link both profile files into /workspace"
-    );
-    assert!(
-        command.contains("/config/$file")
-            || (command.contains("/config/AGENTS.md") && command.contains("/config/SOUL.md")),
-        "{context}: managed profile startup command must link both profile files into /config"
-    );
-    assert!(
-        command.contains("ln -sfn /workspace/$file /config/$file"),
-        "{context}: config compatibility links must point back to the workspace profile entry"
-    );
-    assert!(command.contains("/workspace/hub-managed-skills"));
     assert!(command.contains("exec /opt/hermes/.venv/bin/hermes gateway"));
 }
 
@@ -569,7 +553,7 @@ async fn admin_hermes_gets_writable_global_skills_mount_but_regular_users_do_not
             args.first().map(String::as_str) == Some("create")
                 && args.windows(2).any(|pair| {
                     pair[0] == "--mount"
-                        && pair[1].contains("dst=/workspace/hub-managed-skills")
+                        && pair[1].contains("dst=/nfs")
                         && !pair[1].contains("readonly")
                 })
         }),
@@ -592,7 +576,7 @@ async fn admin_hermes_gets_writable_global_skills_mount_but_regular_users_do_not
             args.first().map(String::as_str) == Some("create")
                 && args.windows(2).any(|pair| {
                     pair[0] == "--mount"
-                        && pair[1].contains("dst=/workspace/hub-managed-skills")
+                        && pair[1].contains("dst=/nfs")
                         && !pair[1].contains("readonly")
                 })
         }),
@@ -635,7 +619,7 @@ async fn admin_hermes_gets_writable_global_skills_mount_but_regular_users_do_not
                 && args.windows(2).any(|pair| {
                     pair[0] == "--mount"
                         && pair[1]
-                            == "type=volume,src=hermes-hub-managed-skills-test,dst=/workspace/hub-managed-skills,volume-driver=local,readonly"
+                            == "type=volume,src=hermes-hub-managed-skills-test,dst=/nfs,volume-driver=local,readonly"
                 })
         }),
         "regular Hermes must keep global skills readonly"
@@ -691,7 +675,7 @@ async fn admin_rebuild_managed_hermes_keeps_global_skills_writable() {
                 && args.windows(2).any(|pair| {
                     pair[0] == "--mount"
                         && pair[1]
-                            == "type=volume,src=hermes-hub-managed-skills-test-rw,dst=/workspace/hub-managed-skills,volume-driver=local"
+                            == "type=volume,src=hermes-hub-managed-skills-test-rw,dst=/nfs,volume-driver=local"
                 })
         }),
         "admin rebuild must preserve writable global skills mount"
@@ -757,7 +741,7 @@ async fn regular_user_rebuild_managed_hermes_keeps_global_skills_readonly() {
                 && args.windows(2).any(|pair| {
                     pair[0] == "--mount"
                         && pair[1]
-                            == "type=volume,src=hermes-hub-managed-skills-test,dst=/workspace/hub-managed-skills,volume-driver=local,readonly"
+                            == "type=volume,src=hermes-hub-managed-skills-test,dst=/nfs,volume-driver=local,readonly"
                 })
         }),
         "regular user rebuild must keep global skills readonly"
