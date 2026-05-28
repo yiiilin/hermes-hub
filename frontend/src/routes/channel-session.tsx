@@ -847,45 +847,17 @@ export function ChannelSessionRoute({
           </button>
         </header>
 
-        <div
-          className={renderedMessages.length === 0 ? "message-list empty" : "message-list"}
-          ref={messageListRef}
-        >
-          {renderedMessages.length === 0 ? (
-            <div className="empty-chat">
-              <Bot aria-hidden="true" size={30} />
-              <strong>{t("chat.empty")}</strong>
-            </div>
-          ) : (
-            renderedMessages.map((message) => {
-              const isPendingMessage = message.id === pendingAssistantMessageId;
-              if (
-                liveExecutionVisible &&
-                activeExecutionMessage?.id === message.id &&
-                !isPendingMessage
-              ) {
-                return null;
-              }
-              if (!shouldRenderMessageBubble(message, isPendingMessage)) {
-                return null;
-              }
-
-              return (
-                <MessageBubble
-                  key={message.id}
-                  message={message}
-                  pending={isPendingMessage}
-                  executionEvents={
-                    isPendingMessage && verboseEvents.length > 0 ? verboseEvents : undefined
-                  }
-                  onPreviewImage={setPreviewAttachment}
-                  t={t}
-                  language={language}
-                />
-              );
-            })
-          )}
-        </div>
+        <MessageList
+          activeExecutionMessageId={activeExecutionMessage?.id ?? null}
+          language={language}
+          liveExecutionVisible={liveExecutionVisible}
+          messageListRef={messageListRef}
+          messages={renderedMessages}
+          onPreviewImage={setPreviewAttachment}
+          pendingAssistantMessageId={pendingAssistantMessageId}
+          t={t}
+          verboseEvents={verboseEvents}
+        />
 
         <ChatComposer
           busy={busy}
@@ -914,6 +886,7 @@ const LEGACY_HERMES_EXECUTION_LINE = /^\S+\s+([A-Za-z0-9_.-]+)\((.*)\)$/u;
 const LEGACY_HERMES_EXECUTION_HINT = /(^|\n)\S+\s+[A-Za-z0-9_.-]+\(/u;
 const EXECUTION_HISTORY_EVENTS_CACHE_LIMIT = 500;
 const executionHistoryEventsCache = new Map<string, ExecutionHistoryEntry[] | null>();
+const messageTimeFormatters = new Map<Language, Intl.DateTimeFormat>();
 
 function filesFromClipboardData(clipboardData: DataTransfer) {
   const directFiles = Array.from(clipboardData.files ?? []);
@@ -1104,6 +1077,61 @@ export function createClientMessageId(source: BrowserCrypto | undefined = global
 
   return `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
+
+const MessageList = memo(function MessageList({
+  activeExecutionMessageId,
+  language,
+  liveExecutionVisible,
+  messageListRef,
+  messages,
+  onPreviewImage,
+  pendingAssistantMessageId,
+  t,
+  verboseEvents,
+}: {
+  activeExecutionMessageId: string | null;
+  language: Language;
+  liveExecutionVisible: boolean;
+  messageListRef: { current: HTMLDivElement | null };
+  messages: ChannelMessage[];
+  onPreviewImage: (attachment: HermesAttachment) => void;
+  pendingAssistantMessageId: string | null;
+  t: Translate;
+  verboseEvents: ExecutionHistoryEntry[];
+}) {
+  return (
+    <div className={messages.length === 0 ? "message-list empty" : "message-list"} ref={messageListRef}>
+      {messages.length === 0 ? (
+        <div className="empty-chat">
+          <Bot aria-hidden="true" size={30} />
+          <strong>{t("chat.empty")}</strong>
+        </div>
+      ) : (
+        messages.map((message) => {
+          const isPendingMessage = message.id === pendingAssistantMessageId;
+          if (liveExecutionVisible && activeExecutionMessageId === message.id && !isPendingMessage) {
+            return null;
+          }
+          if (!shouldRenderMessageBubble(message, isPendingMessage)) {
+            return null;
+          }
+
+          return (
+            <MessageBubble
+              key={message.id}
+              message={message}
+              pending={isPendingMessage}
+              executionEvents={isPendingMessage && verboseEvents.length > 0 ? verboseEvents : undefined}
+              onPreviewImage={onPreviewImage}
+              t={t}
+              language={language}
+            />
+          );
+        })
+      )}
+    </div>
+  );
+});
 
 const ChatComposer = memo(function ChatComposer({
   busy,
@@ -1611,10 +1639,15 @@ const MessageBubble = memo(function MessageBubble({
 });
 
 function formatMessageUpdatedTime(date: Date, language: Language) {
-  return new Intl.DateTimeFormat(language, {
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(date);
+  let formatter = messageTimeFormatters.get(language);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat(language, {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    messageTimeFormatters.set(language, formatter);
+  }
+  return formatter.format(date);
 }
 
 function messageUpdatedAtDate(message: ChannelMessage) {
