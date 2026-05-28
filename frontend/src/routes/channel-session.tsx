@@ -1575,12 +1575,7 @@ function sortMessagesForDisplay(messages: ChannelMessage[]) {
         return leftCreatedAt - rightCreatedAt;
       }
 
-      const leftExecution = isExecutionHistoryContent(left.message.content) ? 0 : 1;
-      const rightExecution = isExecutionHistoryContent(right.message.content) ? 0 : 1;
-      if (leftExecution !== rightExecution) {
-        return leftExecution - rightExecution;
-      }
-
+      // 同一时间戳内保留 Hub/SSE 传来的追加顺序；执行步骤也是消息，不能被特殊排序挪动。
       return left.index - right.index;
     })
     .map(({ message }) => message);

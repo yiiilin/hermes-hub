@@ -25,7 +25,7 @@ use super::{
 
 /// Hub 托管 Hermes 容器规格版本。只要 env、挂载、工作目录或安全策略有变化，
 /// 就提升这个值，确保已存在的旧容器会被重建并拿到新行为。
-const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-27-managed-nfs-root-v2";
+const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-28-managed-nfs-live-profile";
 const MANAGED_CONTAINER_SPEC_LABEL: &str = "hermes_hub_spec_version";
 const HUB_INBOX_PATH: &str = "/internal/channel/v1/inbox";
 const HUB_INBOX_TIMEOUT_SECONDS: u16 = 25;
@@ -2151,16 +2151,18 @@ fn managed_profile_object_key(prefix: &str, file_name: &str) -> String {
 fn nfs_mount_options(addr: &str, read_only: bool) -> String {
     let (host, port) = split_nfs_addr(addr);
     let mode = if read_only { "ro" } else { "rw" };
-    format!("addr={host},port={port},mountport={port},vers=3,tcp,nolock,soft,{mode}")
+    format!(
+        "addr={host},port={port},mountport={port},vers=3,tcp,nolock,soft,actimeo=0,lookupcache=none,{mode}"
+    )
 }
 
 fn managed_nfs_volume_name(base_name: &str, read_only: bool) -> String {
     if read_only {
-        base_name.to_string()
+        // Docker 不会更新已有 volume 的 NFS options；换名确保新容器使用禁缓存挂载。
+        format!("{base_name}-live")
     } else {
-        // Docker volume create 不会更新已有同名 volume 的 NFS mount options；
-        // rw 挂载必须使用独立名称，避免复用普通用户的 ro volume。
-        format!("{base_name}-rw")
+        // rw 挂载也要独立名称，避免复用普通用户 ro volume 以及旧缓存参数。
+        format!("{base_name}-rw-live")
     }
 }
 

@@ -555,14 +555,20 @@ impl SkillsFs {
         if id == ROOT_ID {
             return Ok(self.root_node());
         }
-        if let Some(node) = self
-            .index
-            .lock()
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?
-            .id_to_node
-            .get(&id)
-            .cloned()
-        {
+        let cached_node = {
+            self.index
+                .lock()
+                .map_err(|_| nfsstat3::NFS3ERR_IO)?
+                .id_to_node
+                .get(&id)
+                .cloned()
+        };
+        if let Some(node) = cached_node {
+            if is_managed_profile_file(&node.path) {
+                // AGENTS.md / SOUL.md 由 Hub 管理界面直接写对象存储；容器里的 NFS
+                // 旧 file handle 必须重新 stat 对象，避免继续返回缓存的 size/mtime。
+                return self.lookup_path(&node.path).await;
+            }
             return Ok(node);
         }
         self.find_node_by_id(id)

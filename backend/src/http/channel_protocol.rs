@@ -339,18 +339,33 @@ async fn update_message(
         &session_context.hermes_instance_id,
     )?;
     reject_late_terminal_output(&state, &token_context, payload.run_id.as_deref(), None).await?;
-    let message = state
-        .channel_store
-        .update_session_message(
+    let attachments = payload.attachments.unwrap_or_else(|| json!([]));
+    let (status, message, created) = if is_execution_protocol_message(&payload.content) {
+        upsert_latest_execution_message(
+            &state,
             &session_context.user_id,
             &session_context.channel_id,
             &session_id,
             &message_id,
             payload.content,
-            payload.attachments.unwrap_or_else(|| json!([])),
+            attachments,
         )
-        .await
-        .map_err(map_channel_error)?;
+        .await?
+    } else {
+        let message = state
+            .channel_store
+            .update_session_message(
+                &session_context.user_id,
+                &session_context.channel_id,
+                &session_id,
+                &message_id,
+                payload.content,
+                attachments,
+            )
+            .await
+            .map_err(map_channel_error)?;
+        (StatusCode::OK, message, false)
+    };
     if let Some(run_id) = payload
         .run_id
         .as_deref()
@@ -363,11 +378,110 @@ async fn update_message(
             .await
             .map_err(map_channel_error)?;
     }
-    state.session_events.publish(SessionEvent::MessageUpdated {
-        message: message.clone(),
+    if created {
+        state.session_events.publish(SessionEvent::MessageCreated {
+            message: message.clone(),
+        });
+    } else {
+        state.session_events.publish(SessionEvent::MessageUpdated {
+            message: message.clone(),
+        });
+    }
+
+    Ok((status, Json(MessageResponse { message })))
+}
+
+async fn upsert_latest_execution_message(
+    state: &AppState,
+    user_id: &str,
+    channel_id: &str,
+    session_id: &str,
+    message_id: &str,
+    content: String,
+    attachments: serde_json::Value,
+) -> Result<(StatusCode, crate::channel::service::ChannelMessage, bool), ApiError> {
+    let messages = state
+        .channel_store
+        .list_session_messages(user_id, channel_id, session_id)
+        .await
+        .map_err(map_channel_error)?;
+    let target_exists = messages.iter().any(|message| message.id == message_id);
+    if !target_exists {
+        return Err(map_channel_error(
+            crate::channel::service::ChannelStoreError::ChannelNotFound,
+        ));
+    }
+
+    let latest = messages.last();
+    let update_message_id = latest.and_then(|message| {
+        if message.id == message_id
+            || (message.role == ChannelMessageRole::Assistant
+                && is_execution_protocol_message(&message.content))
+        {
+            Some(message.id.as_str())
+        } else {
+            None
+        }
     });
 
-    Ok(Json(MessageResponse { message }))
+    if let Some(update_message_id) = update_message_id {
+        let message = state
+            .channel_store
+            .update_session_message(
+                user_id,
+                channel_id,
+                session_id,
+                update_message_id,
+                content,
+                attachments,
+            )
+            .await
+            .map_err(map_channel_error)?;
+        return Ok((StatusCode::OK, message, false));
+    }
+
+    // Hermes 对旧执行步骤消息的 edit 可能在用户新消息或正式回复之后才到达。
+    // 这时不能继续改旧气泡，否则执行步骤会“漂”回历史位置；应在 session 末尾新开执行气泡。
+    let message = state
+        .channel_store
+        .append_session_message(
+            user_id,
+            channel_id,
+            session_id,
+            ChannelMessageRole::Assistant,
+            None,
+            content,
+            attachments,
+        )
+        .await
+        .map_err(map_channel_error)?;
+    Ok((StatusCode::CREATED, message, true))
+}
+
+fn is_execution_protocol_message(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with("<!-- hermes-hub:execution:v1 -->")
+        || trimmed.starts_with("执行步骤\n")
+        || trimmed.lines().any(is_legacy_hermes_tool_line)
+}
+
+fn is_legacy_hermes_tool_line(line: &str) -> bool {
+    let line = line.trim();
+    let Some((split_at, _)) = line.char_indices().find(|(_, ch)| ch.is_whitespace()) else {
+        return false;
+    };
+    let rest = line[split_at..].trim_start();
+    let Some(open_paren) = rest.find('(') else {
+        return false;
+    };
+    if !rest.ends_with(')') {
+        return false;
+    }
+    let tool_name = &rest[..open_paren];
+    !tool_name.is_empty()
+        && tool_name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
 }
 
 async fn poll_inbox(

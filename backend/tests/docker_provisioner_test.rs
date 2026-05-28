@@ -682,7 +682,7 @@ async fn docker_provisioner_mounts_managed_skills_readonly_for_regular_users() {
     assert!(spec.mounts.iter().any(|mount| matches!(
         mount,
         ContainerMount::NfsVolume(volume)
-            if volume.volume_name == "hermes-managed-skills-test"
+            if volume.volume_name == "hermes-managed-skills-test-live"
                 && volume.container_path == "/nfs"
                 && volume.read_only
                 && volume.addr == "127.0.0.1:12049"
@@ -710,11 +710,11 @@ async fn docker_provisioner_mounts_managed_skills_readonly_for_regular_users() {
                 && args.get(1).map(String::as_str) == Some("create")
                 && args.contains(&"type=nfs".to_string())
                 && args.contains(
-                    &"o=addr=127.0.0.1,port=12049,mountport=12049,vers=3,tcp,nolock,soft,ro"
+                    &"o=addr=127.0.0.1,port=12049,mountport=12049,vers=3,tcp,nolock,soft,actimeo=0,lookupcache=none,ro"
                         .to_string(),
                 )
                 && args.contains(&"device=:/skills".to_string())
-                && args.last().map(String::as_str) == Some("hermes-managed-skills-test")
+                && args.last().map(String::as_str) == Some("hermes-managed-skills-test-live")
         }),
         "managed skills NFS volume must be created before container create"
     );
@@ -726,7 +726,7 @@ async fn docker_provisioner_mounts_managed_skills_readonly_for_regular_users() {
         create_call.windows(2).any(|args| {
             args[0] == "--mount"
                 && args[1]
-                    == "type=volume,src=hermes-managed-skills-test,dst=/nfs,volume-driver=local,readonly"
+                    == "type=volume,src=hermes-managed-skills-test-live,dst=/nfs,volume-driver=local,readonly"
         }),
         "managed skills must be mounted readonly into Hermes containers"
     );
@@ -749,7 +749,7 @@ async fn docker_provisioner_mounts_managed_skills_writable_for_admin_users() {
     assert!(spec.mounts.iter().any(|mount| matches!(
         mount,
         ContainerMount::NfsVolume(volume)
-            if volume.volume_name == "hermes-managed-skills-test-rw"
+            if volume.volume_name == "hermes-managed-skills-test-rw-live"
                 && volume.container_path == "/nfs"
                 && !volume.read_only
     )));
@@ -764,7 +764,7 @@ async fn docker_provisioner_mounts_managed_skills_writable_for_admin_users() {
             args.first().map(String::as_str) == Some("volume")
                 && args.get(1).map(String::as_str) == Some("create")
                 && args.contains(
-                    &"o=addr=127.0.0.1,port=12049,mountport=12049,vers=3,tcp,nolock,soft,rw"
+                    &"o=addr=127.0.0.1,port=12049,mountport=12049,vers=3,tcp,nolock,soft,actimeo=0,lookupcache=none,rw"
                         .to_string(),
                 )
         }),
@@ -778,7 +778,7 @@ async fn docker_provisioner_mounts_managed_skills_writable_for_admin_users() {
         create_call.windows(2).any(|args| {
             args[0] == "--mount"
                 && args[1]
-                    == "type=volume,src=hermes-managed-skills-test-rw,dst=/nfs,volume-driver=local"
+                    == "type=volume,src=hermes-managed-skills-test-rw-live,dst=/nfs,volume-driver=local"
         }),
         "admin managed skills mount must not include Docker readonly flag"
     );
@@ -812,7 +812,7 @@ async fn docker_provisioner_links_managed_profile_files_from_hub_fs() {
     assert!(spec.mounts.iter().any(|mount| matches!(
         mount,
         ContainerMount::NfsVolume(volume)
-            if volume.volume_name == "hermes-managed-skills-test-rw"
+            if volume.volume_name == "hermes-managed-skills-test-rw-live"
                 && volume.container_path == "/nfs"
                 && !volume.read_only
                 && volume.addr == "127.0.0.1:12049"
@@ -1043,7 +1043,7 @@ async fn docker_provisioner_test() {
         .iter()
         .any(|entry| entry == "HERMES_ACCEPT_HOOKS=1"));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version" && value == "2026-05-27-managed-nfs-root-v2"
+        key == "hermes_hub_spec_version" && value == "2026-05-28-managed-nfs-live-profile"
     }));
     assert!(spec
         .mounts
@@ -1233,7 +1233,7 @@ async fn docker_provisioner_test() {
     assert!(
         create_call.windows(2).any(|args| {
             args[0] == "--label"
-                && args[1] == "hermes_hub_spec_version=2026-05-27-managed-nfs-root-v2"
+                && args[1] == "hermes_hub_spec_version=2026-05-28-managed-nfs-live-profile"
         }),
         "managed Hermes containers must carry the current spec label"
     );

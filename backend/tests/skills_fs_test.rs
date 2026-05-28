@@ -290,6 +290,49 @@ async fn skills_fs_exposes_managed_profile_files_and_skills_directory_at_root() 
 }
 
 #[tokio::test]
+async fn skills_fs_refreshes_managed_profile_file_attributes_after_object_update() {
+    let operator = test_operator().await;
+    operator
+        .write("managed-profile/current/AGENTS.md", "old")
+        .await
+        .expect("AGENTS.md fixture can be written");
+    let fs = SkillsFs::new(operator.clone(), "managed-skills/current")
+        .expect("fs can be created")
+        .with_profile_prefix("managed-profile/current")
+        .expect("profile prefix is valid");
+    let root_id = fs.root_dir();
+
+    let agents_id = fs
+        .lookup(root_id, &b"AGENTS.md".as_slice().into())
+        .await
+        .expect("managed AGENTS.md can be looked up");
+    assert_eq!(
+        fs.getattr(agents_id)
+            .await
+            .expect("initial attr can be read")
+            .size,
+        3
+    );
+
+    operator
+        .write("managed-profile/current/AGENTS.md", "new managed profile")
+        .await
+        .expect("AGENTS.md can be updated outside NFS");
+
+    let refreshed_attr = fs
+        .getattr(agents_id)
+        .await
+        .expect("updated attr can be read through the old file handle");
+    assert_eq!(refreshed_attr.size, "new managed profile".len() as u64);
+    let (bytes, eof) = fs
+        .read(agents_id, 0, 1024)
+        .await
+        .expect("updated AGENTS.md can be read through the old file handle");
+    assert_eq!(bytes, b"new managed profile");
+    assert!(eof);
+}
+
+#[tokio::test]
 async fn skills_fs_writes_global_skills_back_to_object_storage() {
     let operator = test_operator().await;
     let fs = SkillsFs::new(operator.clone(), "managed-skills/current").expect("fs can be created");

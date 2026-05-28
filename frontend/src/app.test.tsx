@@ -1144,6 +1144,46 @@ describe("App", () => {
     expect(screen.queryByText("📚 skill_view(['name'])")).not.toBeInTheDocument();
   });
 
+  it("keeps execution bubbles in the session append order", async () => {
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialMessagesBySessionId: {
+            "session-1": [
+              {
+                id: "message-user-order",
+                session_id: "session-1",
+                role: "user",
+                content: "开始",
+                attachments: [],
+                created_at: 1,
+              },
+              {
+                id: "message-final-order",
+                session_id: "session-1",
+                role: "assistant",
+                content: "先到的正式回复",
+                attachments: [],
+                created_at: 1,
+              },
+              legacyExecutionMessage(
+                `💻 terminal(['command'])\n{"command":"late tool"}`,
+                "message-execution-order",
+                1,
+              ),
+            ],
+          },
+        })}
+      />,
+    );
+
+    await screen.findByText("先到的正式回复");
+    const messageListText = document.querySelector(".message-list")?.textContent ?? "";
+    expect(messageListText.indexOf("先到的正式回复")).toBeLessThan(
+      messageListText.indexOf('call terminal：{"command":"late tool"}'),
+    );
+  });
+
   it("keeps earlier execution blocks visible while a later run is pending", async () => {
     render(
       <App

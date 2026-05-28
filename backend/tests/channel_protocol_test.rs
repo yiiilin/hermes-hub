@@ -2324,6 +2324,117 @@ async fn channel_run_enqueue_can_be_polled_and_completed_by_hermes_hub_adapter()
 }
 
 #[tokio::test]
+async fn adapter_execution_edit_after_newer_message_appends_to_latest_execution_slot() {
+    let store = SessionStore::default();
+    let state = test_state(store.clone());
+    let instance_token = "instance-adapter-execution-order-token";
+    state
+        .model_registry
+        .add_instance_token_for_instance("instance-1", instance_token)
+        .await
+        .expect("instance token can be registered");
+    let app = build_router_with_state(state.clone());
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    store
+        .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
+        .expect("instance can be bound");
+
+    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
+    let (_, channel_body) = response_json(channel).await;
+    let channel_id = channel_body["channels"][0]["id"]
+        .as_str()
+        .expect("channel id");
+    let session = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions"),
+        json!({ "kind": "agent" }),
+        Some(&cookie),
+    )
+    .await;
+    let (_, session_body) = response_json(session).await;
+    let session_id = session_body["session"]["id"].as_str().expect("session id");
+
+    let progress = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/messages"),
+        "application/json",
+        json!({
+            "role": "assistant",
+            "content": "💻 terminal(['command'])\n{\"command\":\"first\"}",
+            "attachments": []
+        })
+        .to_string()
+        .into_bytes(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    assert_eq!(progress.status(), StatusCode::CREATED);
+    let (_, progress_body) = response_json(progress).await;
+    let progress_message_id = progress_body["message"]["id"]
+        .as_str()
+        .expect("progress message id");
+
+    let user_followup = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        json!({
+            "role": "user",
+            "content": "继续",
+            "attachments": []
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(user_followup.status(), StatusCode::CREATED);
+
+    let moved_progress = request_raw(
+        &app,
+        Method::PUT,
+        &format!("/internal/channel/v1/sessions/{session_id}/messages/{progress_message_id}"),
+        "application/json",
+        json!({
+            "content": "💻 terminal(['command'])\n{\"command\":\"first\"}\n✅ terminal completed",
+            "attachments": []
+        })
+        .to_string()
+        .into_bytes(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    assert_eq!(moved_progress.status(), StatusCode::CREATED);
+    let (_, moved_progress_body) = response_json(moved_progress).await;
+    assert_ne!(moved_progress_body["message"]["id"], progress_message_id);
+
+    let messages = request_empty(
+        &app,
+        Method::GET,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        Some(&cookie),
+    )
+    .await;
+    let (_, messages_body) = response_json(messages).await;
+    let messages = messages_body["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["id"], progress_message_id);
+    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(
+        messages[2]["content"],
+        "💻 terminal(['command'])\n{\"command\":\"first\"}\n✅ terminal completed"
+    );
+}
+
+#[tokio::test]
 async fn assistant_message_with_hermes_run_key_does_not_clear_active_run() {
     let store = SessionStore::default();
     let state = test_state(store.clone());
