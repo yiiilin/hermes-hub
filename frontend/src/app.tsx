@@ -2,11 +2,14 @@ import type { ApiClient, User } from "./api/client";
 import { createApiClient } from "./api/client";
 import { Layout, type AppView } from "./components/layout";
 import { I18nProvider, useI18n } from "./i18n";
-import { AdminRoute } from "./routes/admin";
 import { ChannelSessionRoute } from "./routes/channel-session";
 import { LoginRoute } from "./routes/login";
 import { ScheduledTasksRoute } from "./routes/scheduled-tasks";
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
+
+const AdminRoute = lazy(() =>
+  import("./routes/admin").then((module) => ({ default: module.AdminRoute })),
+);
 
 type AppProps = {
   apiClient?: ApiClient;
@@ -78,7 +81,9 @@ function AppContent({ apiClient }: Required<AppProps>) {
         onOpenChat={() => setActiveView("chat")}
       />
       {user.role === "admin" && activeView === "admin-settings" ? (
-        <AdminRoute apiClient={apiClient} currentUser={user} />
+        <Suspense fallback={<main className="auth-shell">{t("common.loading")}</main>}>
+          <AdminRoute apiClient={apiClient} currentUser={user} />
+        </Suspense>
       ) : null}
       <ScheduledTasksRoute
         active={activeView === "scheduled-tasks"}

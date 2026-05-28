@@ -39,6 +39,7 @@ export type ChannelMessage = {
   id: string;
   session_id: string;
   role: "user" | "assistant";
+  message_kind?: "text" | "execution";
   client_message_key?: string | null;
   content: string;
   attachments: HermesAttachment[];
@@ -1190,6 +1191,60 @@ type MockApiClientOptions = {
   initialHermesSchedulerSnapshots?: HermesSchedulerSnapshot[];
 };
 
+function withMockMessageKind(message: ChannelMessage): ChannelMessage {
+  if (message.message_kind) {
+    return message;
+  }
+  return {
+    ...message,
+    message_kind: inferMockMessageKind(
+      message.role,
+      message.client_message_key,
+      message.content,
+    ),
+  };
+}
+
+function inferMockMessageKind(
+  role: ChannelMessage["role"],
+  clientMessageKey: string | null | undefined,
+  content: string,
+): ChannelMessage["message_kind"] {
+  if (
+    role === "assistant" &&
+    (clientMessageKey?.startsWith("hermes-execution:") ||
+      isMockExecutionProtocolMessage(content))
+  ) {
+    return "execution";
+  }
+  return "text";
+}
+
+function isMockExecutionProtocolMessage(content: string) {
+  const trimmed = content.trimStart();
+  return (
+    trimmed.startsWith("<!-- hermes-hub:execution:v1 -->") ||
+    trimmed.startsWith("执行步骤\n") ||
+    trimmed.split("\n").some(isMockLegacyExecutionLine)
+  );
+}
+
+function isMockLegacyExecutionLine(line: string) {
+  const trimmed = line.trim();
+  const firstWhitespace = trimmed.search(/\s/);
+  if (firstWhitespace < 0) {
+    return false;
+  }
+  const rest = trimmed.slice(firstWhitespace).trimStart();
+  const openParen = rest.indexOf("(");
+  if (openParen <= 0 || !rest.endsWith(")")) {
+    return false;
+  }
+
+  // 测试 mock 和后端保持同一类执行行判定，避免前端测试误用旧内容猜测。
+  return /^[A-Za-z0-9_.-]+$/.test(rest.slice(0, openParen));
+}
+
 export function createMockApiClient(options: MockApiClientOptions = {}): ApiClient {
   let hasAnyUser = options.bootstrapOpen === true ? false : true;
   let currentUser: User | null = "initialUser" in options ? options.initialUser! : {
@@ -1219,10 +1274,14 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       updated_at: Date.now(),
     },
   ];
-  let messagesBySessionId: Record<string, ChannelMessage[]> = {
+  const initialMessagesBySessionId: Record<string, ChannelMessage[]> = {
     "session-1": [],
     ...(options.initialMessagesBySessionId ?? {}),
   };
+  let messagesBySessionId: Record<string, ChannelMessage[]> = {};
+  for (const [sessionId, sessionMessages] of Object.entries(initialMessagesBySessionId)) {
+    messagesBySessionId[sessionId] = sessionMessages.map(withMockMessageKind);
+  }
   let activeRunsBySessionId = { ...(options.activeRunsBySessionId ?? {}) };
   const sessionEventListenersBySessionId: Record<
     string,
@@ -1547,6 +1606,7 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
         id: `message-${(messagesBySessionId[sessionId] ?? []).length + 1}`,
         session_id: sessionId,
         role: input.role,
+        message_kind: inferMockMessageKind(input.role, input.clientMessageKey, input.content),
         client_message_key: input.clientMessageKey,
         content: input.content,
         attachments: input.attachments ?? [],
@@ -1568,6 +1628,11 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       }
       const nextMessage = {
         ...existing,
+        message_kind: inferMockMessageKind(
+          existing.role,
+          existing.client_message_key,
+          input.content,
+        ),
         content: input.content,
         attachments: input.attachments ?? [],
         updated_at: Date.now(),

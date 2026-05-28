@@ -41,6 +41,7 @@ import {
   FormEvent,
   ReactNode,
   memo,
+  useCallback,
   useEffect,
   isValidElement,
   useMemo,
@@ -62,6 +63,17 @@ type BrowserCrypto = {
 type Translate = ReturnType<typeof useI18n>["t"];
 type Language = ReturnType<typeof useI18n>["language"];
 type ExecutionHistoryEntry = HermesVerboseEvent;
+type RenderableMessage = {
+  message: ChannelMessage;
+  pending: boolean;
+};
+
+const MESSAGE_VIRTUALIZATION_THRESHOLD = 80;
+const MESSAGE_VIRTUALIZATION_OVERSCAN_PX = 900;
+const MESSAGE_VIRTUALIZATION_DEFAULT_VIEWPORT_PX = 720;
+const MESSAGE_VIRTUALIZATION_DEFAULT_ROW_HEIGHT_PX = 112;
+const MESSAGE_VIRTUALIZATION_MIN_ROW_HEIGHT_PX = 44;
+const MESSAGE_VIRTUALIZATION_DEFAULT_GAP_PX = 16;
 
 export function ChannelSessionRoute({
   active = true,
@@ -379,7 +391,7 @@ export function ChannelSessionRoute({
             pendingAssistantSessionIdRef.current === message.session_id,
         );
         if ((activeRunId && runStillActive) || hasPendingMessageInSession) {
-          if (isExecutionHistoryContent(message.content)) {
+          if (isExecutionHistoryMessage(message)) {
             // 执行日志本身就是当前可见的 loading 气泡，避免再保留一个空回复气泡。
             if (activeRunId) {
               pendingAssistantIdsByRunRef.current[activeRunId] = message.id;
@@ -855,6 +867,7 @@ export function ChannelSessionRoute({
           messages={renderedMessages}
           onPreviewImage={setPreviewAttachment}
           pendingAssistantMessageId={pendingAssistantMessageId}
+          stickToBottomRef={stickToBottomRef}
           t={t}
           verboseEvents={verboseEvents}
         />
@@ -1062,6 +1075,8 @@ function scrollMessageListToBottom(node: HTMLElement | null) {
   });
   schedule(() => {
     node.scrollTop = node.scrollHeight;
+    // 程序滚动到底部时同步触发滚动监听，让虚拟列表和贴底状态立刻读到新位置。
+    node.dispatchEvent(new Event("scroll"));
   });
 }
 
@@ -1086,6 +1101,7 @@ const MessageList = memo(function MessageList({
   messages,
   onPreviewImage,
   pendingAssistantMessageId,
+  stickToBottomRef,
   t,
   verboseEvents,
 }: {
@@ -1096,42 +1112,380 @@ const MessageList = memo(function MessageList({
   messages: ChannelMessage[];
   onPreviewImage: (attachment: HermesAttachment) => void;
   pendingAssistantMessageId: string | null;
+  stickToBottomRef: { current: boolean };
   t: Translate;
   verboseEvents: ExecutionHistoryEntry[];
 }) {
+  const renderableMessages = useMemo(
+    () =>
+      messages.reduce<RenderableMessage[]>((current, message) => {
+        const pending = message.id === pendingAssistantMessageId;
+        if (liveExecutionVisible && activeExecutionMessageId === message.id && !pending) {
+          return current;
+        }
+        if (!shouldRenderMessageBubble(message, pending)) {
+          return current;
+        }
+        current.push({ message, pending });
+        return current;
+      }, []),
+    [activeExecutionMessageId, liveExecutionVisible, messages, pendingAssistantMessageId],
+  );
+  const virtualized = renderableMessages.length > MESSAGE_VIRTUALIZATION_THRESHOLD;
+  const virtualWindow = useVirtualMessageWindow(
+    renderableMessages,
+    virtualized,
+    messageListRef,
+    stickToBottomRef,
+  );
+
+  function renderMessage(entry: RenderableMessage) {
+    return (
+      <MessageBubble
+        message={entry.message}
+        pending={entry.pending}
+        executionEvents={
+          entry.pending && verboseEvents.length > 0 ? verboseEvents : undefined
+        }
+        onPreviewImage={onPreviewImage}
+        t={t}
+        language={language}
+      />
+    );
+  }
+
   return (
-    <div className={messages.length === 0 ? "message-list empty" : "message-list"} ref={messageListRef}>
+    <div
+      className={[
+        messages.length === 0 ? "message-list empty" : "message-list",
+        virtualized ? "virtualized" : "",
+      ]
+        .filter(Boolean)
+        .join(" ")}
+      ref={messageListRef}
+    >
       {messages.length === 0 ? (
         <div className="empty-chat">
           <Bot aria-hidden="true" size={30} />
           <strong>{t("chat.empty")}</strong>
         </div>
+      ) : virtualized ? (
+        <div
+          className="message-virtual-spacer"
+          style={{ height: `${virtualWindow.totalHeight}px` }}
+        >
+          {virtualWindow.items.map((entry, offset) => {
+            const index = virtualWindow.startIndex + offset;
+            return (
+              <VirtualMessageRow
+                key={entry.message.id}
+                messageId={entry.message.id}
+                measureKey={virtualMessageMeasureKey(entry, verboseEvents)}
+                top={virtualWindow.offsets[index] ?? 0}
+                onMeasure={virtualWindow.measureRow}
+              >
+                {renderMessage(entry)}
+              </VirtualMessageRow>
+            );
+          })}
+        </div>
       ) : (
-        messages.map((message) => {
-          const isPendingMessage = message.id === pendingAssistantMessageId;
-          if (liveExecutionVisible && activeExecutionMessageId === message.id && !isPendingMessage) {
-            return null;
-          }
-          if (!shouldRenderMessageBubble(message, isPendingMessage)) {
-            return null;
-          }
-
-          return (
-            <MessageBubble
-              key={message.id}
-              message={message}
-              pending={isPendingMessage}
-              executionEvents={isPendingMessage && verboseEvents.length > 0 ? verboseEvents : undefined}
-              onPreviewImage={onPreviewImage}
-              t={t}
-              language={language}
-            />
-          );
-        })
+        renderableMessages.map((entry) => (
+          <MessageBubble
+            key={entry.message.id}
+            message={entry.message}
+            pending={entry.pending}
+            executionEvents={
+              entry.pending && verboseEvents.length > 0 ? verboseEvents : undefined
+            }
+            onPreviewImage={onPreviewImage}
+            t={t}
+            language={language}
+          />
+        ))
       )}
     </div>
   );
 });
+
+function useVirtualMessageWindow(
+  entries: RenderableMessage[],
+  enabled: boolean,
+  messageListRef: { current: HTMLDivElement | null },
+  stickToBottomRef: { current: boolean },
+) {
+  const measuredHeightsRef = useRef<Record<string, number>>({});
+  const [heightVersion, setHeightVersion] = useState(0);
+  const [rowGap, setRowGap] = useState(MESSAGE_VIRTUALIZATION_DEFAULT_GAP_PX);
+  const [viewport, setViewport] = useState({ scrollTop: 0, height: 0 });
+
+  useEffect(() => {
+    if (!enabled) {
+      return;
+    }
+
+    const liveIds = new Set(entries.map((entry) => entry.message.id));
+    let changed = false;
+    for (const id of Object.keys(measuredHeightsRef.current)) {
+      if (!liveIds.has(id)) {
+        delete measuredHeightsRef.current[id];
+        changed = true;
+      }
+    }
+    if (changed) {
+      setHeightVersion((version) => version + 1);
+    }
+  }, [enabled, entries]);
+
+  useEffect(() => {
+    if (!enabled) {
+      return;
+    }
+
+    const node = messageListRef.current;
+    if (!node) {
+      return;
+    }
+
+    let animationFrame = 0;
+    function updateViewport() {
+      window.cancelAnimationFrame(animationFrame);
+      animationFrame = window.requestAnimationFrame(() => {
+        const current = messageListRef.current;
+        if (!current) {
+          return;
+        }
+        const nextGap = readMessageListGap(current);
+        setRowGap((previous) => (Math.abs(previous - nextGap) < 0.5 ? previous : nextGap));
+        setViewport((previous) => {
+          const next = {
+            scrollTop: current.scrollTop,
+            height: current.clientHeight,
+          };
+          return previous.scrollTop === next.scrollTop && previous.height === next.height
+            ? previous
+            : next;
+        });
+      });
+    }
+
+    updateViewport();
+    node.addEventListener("scroll", updateViewport, { passive: true });
+    window.addEventListener("resize", updateViewport);
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(updateViewport);
+    observer?.observe(node);
+
+    return () => {
+      window.cancelAnimationFrame(animationFrame);
+      node.removeEventListener("scroll", updateViewport);
+      window.removeEventListener("resize", updateViewport);
+      observer?.disconnect();
+    };
+  }, [enabled, entries.length, messageListRef]);
+
+  const virtualMetrics = useMemo(() => {
+    const heights = entries.map((entry) =>
+      measuredHeightsRef.current[entry.message.id] ??
+      estimateMessageRowHeight(entry.message),
+    );
+    const offsets: number[] = [];
+    let totalHeight = 0;
+    for (let index = 0; index < heights.length; index += 1) {
+      offsets[index] = totalHeight;
+      totalHeight += heights[index] + (index === heights.length - 1 ? 0 : rowGap);
+    }
+
+    return { heights, offsets, totalHeight };
+  }, [entries, heightVersion, rowGap]);
+
+  const layout = useMemo(() => {
+    const { heights, offsets, totalHeight } = virtualMetrics;
+    if (!enabled || entries.length === 0) {
+      return {
+        offsets,
+        totalHeight,
+        startIndex: 0,
+        endIndex: entries.length,
+        items: entries,
+      };
+    }
+
+    const viewportHeight =
+      viewport.height > 0 ? viewport.height : MESSAGE_VIRTUALIZATION_DEFAULT_VIEWPORT_PX;
+    const preferredBottom =
+      stickToBottomRef.current && viewport.scrollTop <= 0 && totalHeight > viewportHeight;
+    const scrollTop = preferredBottom
+      ? Math.max(0, totalHeight - viewportHeight)
+      : viewport.scrollTop;
+    const visibleStart = Math.max(0, scrollTop - MESSAGE_VIRTUALIZATION_OVERSCAN_PX);
+    const visibleEnd = scrollTop + viewportHeight + MESSAGE_VIRTUALIZATION_OVERSCAN_PX;
+    const startIndex = findFirstVisibleMessageIndex(offsets, heights, rowGap, visibleStart);
+    const endIndex = findLastVisibleMessageIndex(offsets, visibleEnd, entries.length);
+
+    return {
+      offsets,
+      totalHeight,
+      startIndex,
+      endIndex,
+      items: entries.slice(startIndex, endIndex),
+    };
+  }, [enabled, entries, stickToBottomRef, viewport.height, viewport.scrollTop, virtualMetrics]);
+
+  const measureRow = useCallback(
+    (messageId: string, height: number) => {
+      if (!Number.isFinite(height) || height <= 0) {
+        return;
+      }
+
+      const normalizedHeight = Math.max(
+        MESSAGE_VIRTUALIZATION_MIN_ROW_HEIGHT_PX,
+        Math.ceil(height),
+      );
+      const previous = measuredHeightsRef.current[messageId];
+      if (previous !== undefined && Math.abs(previous - normalizedHeight) < 1) {
+        return;
+      }
+
+      const node = messageListRef.current;
+      const shouldKeepBottom = Boolean(
+        node && stickToBottomRef.current && isMessageListNearBottom(node),
+      );
+      measuredHeightsRef.current[messageId] = normalizedHeight;
+      setHeightVersion((version) => version + 1);
+      if (shouldKeepBottom) {
+        scrollMessageListToBottom(node);
+      }
+    },
+    [messageListRef, stickToBottomRef],
+  );
+
+  return { ...layout, measureRow };
+}
+
+function VirtualMessageRow({
+  children,
+  measureKey,
+  messageId,
+  onMeasure,
+  top,
+}: {
+  children: ReactNode;
+  measureKey: string;
+  messageId: string;
+  onMeasure: (messageId: string, height: number) => void;
+  top: number;
+}) {
+  const rowRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const node = rowRef.current;
+    if (!node) {
+      return;
+    }
+
+    function measure() {
+      const current = rowRef.current;
+      if (!current) {
+        return;
+      }
+      const height = current.getBoundingClientRect().height || current.offsetHeight;
+      onMeasure(messageId, height);
+    }
+
+    measure();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    observer?.observe(node);
+    return () => observer?.disconnect();
+  }, [measureKey, messageId, onMeasure]);
+
+  return (
+    <div
+      className="message-virtual-row"
+      ref={rowRef}
+      style={{ transform: `translateY(${top}px)` }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function virtualMessageMeasureKey(entry: RenderableMessage, verboseEvents: ExecutionHistoryEntry[]) {
+  return [
+    entry.message.id,
+    entry.message.updated_at ?? entry.message.created_at,
+    entry.message.content.length,
+    entry.message.attachments?.length ?? 0,
+    entry.pending ? "pending" : "ready",
+    entry.pending ? verboseEvents.length : 0,
+  ].join(":");
+}
+
+function estimateMessageRowHeight(message: ChannelMessage) {
+  const lineCount = Math.max(1, message.content.split("\n").length);
+  const contentBlocks = Math.ceil(message.content.length / 96);
+  const attachmentHeight = (message.attachments?.length ?? 0) * 56;
+  const executionHeight = message.message_kind === "execution" ? 48 : 0;
+  return Math.max(
+    MESSAGE_VIRTUALIZATION_MIN_ROW_HEIGHT_PX,
+    Math.min(
+      360,
+      MESSAGE_VIRTUALIZATION_DEFAULT_ROW_HEIGHT_PX +
+        contentBlocks * 18 +
+        (lineCount - 1) * 12 +
+        attachmentHeight +
+        executionHeight,
+    ),
+  );
+}
+
+function readMessageListGap(node: HTMLElement) {
+  const styles = window.getComputedStyle(node);
+  const rawGap =
+    styles.getPropertyValue("--message-list-gap").trim() || styles.rowGap || styles.gap;
+  const parsed = Number.parseFloat(rawGap);
+  return Number.isFinite(parsed) && parsed > 0
+    ? parsed
+    : MESSAGE_VIRTUALIZATION_DEFAULT_GAP_PX;
+}
+
+function findFirstVisibleMessageIndex(
+  offsets: number[],
+  heights: number[],
+  rowGap: number,
+  visibleStart: number,
+) {
+  let low = 0;
+  let high = offsets.length;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    const rowBottom = offsets[mid] + heights[mid] + rowGap;
+    if (rowBottom < visibleStart) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  return Math.max(0, Math.min(low, offsets.length - 1));
+}
+
+function findLastVisibleMessageIndex(
+  offsets: number[],
+  visibleEnd: number,
+  itemCount: number,
+) {
+  let low = 0;
+  let high = offsets.length;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    if (offsets[mid] <= visibleEnd) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  return Math.min(itemCount, Math.max(1, low + 1));
+}
 
 const ChatComposer = memo(function ChatComposer({
   busy,
@@ -1423,7 +1777,7 @@ function activeExecutionMessageForRun(
   const executionKey = hermesExecutionMessageKey(run.run_id);
   const keyedMessage = messages.find(
     (message) =>
-      message.client_message_key === executionKey && isExecutionHistoryContent(message.content),
+      message.client_message_key === executionKey && isExecutionHistoryMessage(message),
   );
   if (keyedMessage) {
     return keyedMessage;
@@ -1435,7 +1789,7 @@ function activeExecutionMessageForRun(
       .reverse()
       .find(
         (message) =>
-          isExecutionHistoryContent(message.content) &&
+          isExecutionHistoryMessage(message) &&
           (message.created_at ?? 0) >= runCreatedAt,
       ) ?? null
   );
@@ -1464,7 +1818,7 @@ function hasRenderableMessageBody(message: ChannelMessage) {
   return Boolean(
     message.content.trim() ||
       (message.attachments ?? []).length > 0 ||
-      isExecutionHistoryContent(message.content),
+      isExecutionHistoryMessage(message),
   );
 }
 
@@ -1566,7 +1920,9 @@ const MessageBubble = memo(function MessageBubble({
   t: Translate;
   language: Language;
 }) {
-  const executionEvents = executionEventsOverride ?? executionHistoryEvents(message.content);
+  const executionEvents =
+    executionEventsOverride ??
+    (isExecutionHistoryMessage(message) ? executionHistoryEvents(message.content) : undefined);
   const hasExecutionEvents = Array.isArray(executionEvents) && executionEvents.length > 0;
   const hasVisibleBody = Boolean(
     message.content || message.attachments?.length || hasExecutionEvents || pending,
@@ -1682,6 +2038,15 @@ function mergeExecutionHistoryMessages(messages: ChannelMessage[]) {
   return messages;
 }
 
+function isExecutionHistoryMessage(message: ChannelMessage) {
+  if (message.message_kind) {
+    return message.message_kind === "execution";
+  }
+
+  // 旧后端或测试数据没有 message_kind 时，继续按内容兜底识别历史执行步骤。
+  return isExecutionHistoryContent(message.content);
+}
+
 function isExecutionHistoryContent(content: string) {
   if (content.startsWith(`${EXECUTION_HISTORY_MARKER}\n`) || content.startsWith("执行步骤\n")) {
     return true;
@@ -1708,8 +2073,8 @@ function isRepeatedAssistantMessage(left: ChannelMessage, right: ChannelMessage)
   return (
     left.role === "assistant" &&
     right.role === "assistant" &&
-    !isExecutionHistoryContent(left.content) &&
-    !isExecutionHistoryContent(right.content) &&
+    !isExecutionHistoryMessage(left) &&
+    !isExecutionHistoryMessage(right) &&
     left.content.trim() !== "" &&
     left.content.trim() === right.content.trim()
   );

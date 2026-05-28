@@ -2382,6 +2382,7 @@ async fn adapter_execution_edit_after_newer_message_appends_to_latest_execution_
     let progress_message_id = progress_body["message"]["id"]
         .as_str()
         .expect("progress message id");
+    assert_eq!(progress_body["message"]["message_kind"], "execution");
 
     let user_followup = request_json(
         &app,
@@ -2415,6 +2416,7 @@ async fn adapter_execution_edit_after_newer_message_appends_to_latest_execution_
     assert_eq!(moved_progress.status(), StatusCode::CREATED);
     let (_, moved_progress_body) = response_json(moved_progress).await;
     assert_ne!(moved_progress_body["message"]["id"], progress_message_id);
+    assert_eq!(moved_progress_body["message"]["message_kind"], "execution");
 
     let messages = request_empty(
         &app,
@@ -2427,7 +2429,10 @@ async fn adapter_execution_edit_after_newer_message_appends_to_latest_execution_
     let messages = messages_body["messages"].as_array().expect("messages");
     assert_eq!(messages.len(), 3);
     assert_eq!(messages[0]["id"], progress_message_id);
+    assert_eq!(messages[0]["message_kind"], "execution");
     assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages[1]["message_kind"], "text");
+    assert_eq!(messages[2]["message_kind"], "execution");
     assert_eq!(
         messages[2]["content"],
         "💻 terminal(['command'])\n{\"command\":\"first\"}\n✅ terminal completed"

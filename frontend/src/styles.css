@@ -1072,9 +1072,10 @@ td {
 
 .message-list {
   align-content: start;
+  --message-list-gap: 16px;
   display: grid;
   flex: 1 1 auto;
-  gap: 16px;
+  gap: var(--message-list-gap);
   grid-auto-rows: max-content;
   min-height: 0;
   overflow-x: hidden;
@@ -1082,8 +1083,28 @@ td {
   padding: 26px 28px;
 }
 
+.message-list.virtualized {
+  display: block;
+}
+
 .message-list.empty {
   place-content: center;
+}
+
+.message-virtual-spacer {
+  min-height: 100%;
+  position: relative;
+  width: 100%;
+}
+
+.message-virtual-row {
+  display: grid;
+  left: 0;
+  position: absolute;
+  right: 0;
+  top: 0;
+  width: 100%;
+  will-change: transform;
 }
 
 .empty-chat {
@@ -1836,7 +1857,7 @@ button.composer-attachment-chip {
   }
 
   .message-list {
-    gap: 10px;
+    --message-list-gap: 10px;
     padding: 14px 12px;
   }
 

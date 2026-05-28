@@ -82,6 +82,7 @@ describe("App", () => {
       id,
       session_id: "session-1",
       role: "assistant",
+      message_kind: "execution",
       content: `<!-- hermes-hub:execution:v1 -->\n${JSON.stringify(content)}`,
       attachments: [],
       created_at: Date.now(),
@@ -97,6 +98,7 @@ describe("App", () => {
       id,
       session_id: "session-1",
       role: "assistant",
+      message_kind: "execution",
       content,
       attachments: [],
       created_at: createdAt,
@@ -1234,6 +1236,92 @@ describe("App", () => {
       screen.getByText('call image generation：{"aspect_ratio":"portrait","prompt":"cat"}'),
     ).toBeInTheDocument();
     expect(screen.queryByText("📚 skill_view(['name'])")).not.toBeInTheDocument();
+  });
+
+  it("uses backend message kind to render execution history without content guessing", async () => {
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialMessagesBySessionId: {
+            "session-1": [
+              {
+                id: "message-kind-execution",
+                session_id: "session-1",
+                role: "assistant",
+                message_kind: "execution",
+                content:
+                  `<!-- hermes-hub:execution:v1 -->\n${JSON.stringify([
+                    { kind: "tool.call", tool: "terminal", detail: "from kind" },
+                  ])}`,
+                attachments: [],
+                created_at: 1,
+              },
+            ],
+          },
+        })}
+      />,
+    );
+
+    expect(await screen.findByText("Execution steps")).toBeInTheDocument();
+    expect(screen.getByText("call terminal：from kind")).toBeInTheDocument();
+  });
+
+  it("does not parse execution-looking content when backend marks it as text", async () => {
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialMessagesBySessionId: {
+            "session-1": [
+              {
+                id: "message-kind-text",
+                session_id: "session-1",
+                role: "assistant",
+                message_kind: "text",
+                content: `💻 terminal(['command'])\n{"command":"show raw text"}`,
+                attachments: [],
+                created_at: 1,
+              },
+            ],
+          },
+        })}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(document.querySelector(".message-list")?.textContent).toContain("show raw text");
+    });
+    expect(screen.queryByText("Execution steps")).not.toBeInTheDocument();
+    expect(document.querySelector(".message-list")?.textContent).toContain("💻 terminal");
+  });
+
+  it("virtualizes long chat histories while keeping recent messages rendered", async () => {
+    const messages = Array.from({ length: 140 }, (_, index): ChannelMessage => ({
+      id: `message-long-${index}`,
+      session_id: "session-1",
+      role: index % 2 === 0 ? "user" : "assistant",
+      message_kind: "text",
+      content: `message ${index}`,
+      attachments: [],
+      created_at: index + 1,
+    }));
+
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialMessagesBySessionId: {
+            "session-1": messages,
+          },
+        })}
+      />,
+    );
+
+    expect(await screen.findByText("message 139")).toBeInTheDocument();
+    await waitFor(() => {
+      const bubbles = document.querySelectorAll(".message-bubble");
+      expect(bubbles.length).toBeGreaterThan(0);
+      expect(bubbles.length).toBeLessThan(80);
+    });
+    expect(screen.queryByText("message 0")).not.toBeInTheDocument();
   });
 
   it("keeps execution bubbles in the session append order", async () => {

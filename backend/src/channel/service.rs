@@ -63,6 +63,58 @@ impl ChannelMessageRole {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelMessageKind {
+    Text,
+    Execution,
+}
+
+impl ChannelMessageKind {
+    fn classify(
+        role: &ChannelMessageRole,
+        client_message_key: Option<&str>,
+        content: &str,
+    ) -> Self {
+        if role == &ChannelMessageRole::Assistant
+            && (client_message_key.is_some_and(|key| key.starts_with("hermes-execution:"))
+                || is_execution_protocol_message(content))
+        {
+            Self::Execution
+        } else {
+            Self::Text
+        }
+    }
+}
+
+fn is_execution_protocol_message(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with("<!-- hermes-hub:execution:v1 -->")
+        || trimmed.starts_with("执行步骤\n")
+        || trimmed.lines().any(is_legacy_hermes_tool_line)
+}
+
+fn is_legacy_hermes_tool_line(line: &str) -> bool {
+    let line = line.trim();
+    let Some((split_at, _)) = line.char_indices().find(|(_, ch)| ch.is_whitespace()) else {
+        return false;
+    };
+    let rest = line[split_at..].trim_start();
+    let Some(open_paren) = rest.find('(') else {
+        return false;
+    };
+    if !rest.ends_with(')') {
+        return false;
+    }
+
+    // 兼容 Hermes 早期直接输出的 “图标 工具名(args)” 执行行，用于旧消息补齐 message_kind。
+    let tool_name = &rest[..open_paren];
+    !tool_name.is_empty()
+        && tool_name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChannelAttachmentDirection {
@@ -139,6 +191,7 @@ pub struct ChannelMessage {
     pub id: String,
     pub session_id: String,
     pub role: ChannelMessageRole,
+    pub message_kind: ChannelMessageKind,
     pub client_message_key: Option<String>,
     pub content: String,
     pub attachments: Value,
@@ -1091,10 +1144,13 @@ impl ChannelStore {
                 }
 
                 let now = unix_now();
+                let message_kind =
+                    ChannelMessageKind::classify(&role, client_message_key.as_deref(), &content);
                 let message = ChannelMessage {
                     id: message_id,
                     session_id: session_id.to_string(),
                     role,
+                    message_kind,
                     client_message_key,
                     content,
                     attachments,
@@ -1884,6 +1940,11 @@ impl ChannelStore {
                 let now = unix_now();
                 message.content = content;
                 message.attachments = attachments;
+                message.message_kind = ChannelMessageKind::classify(
+                    &message.role,
+                    message.client_message_key.as_deref(),
+                    &message.content,
+                );
                 message.updated_at = now;
                 let message = message.clone();
                 if let Some(session) = inner.sessions_by_id.get_mut(session_id) {
@@ -2380,6 +2441,14 @@ fn row_to_message(row: &sqlx::postgres::PgRow) -> Result<ChannelMessage, Channel
     let role = row
         .try_get::<String, _>("role")
         .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+    let role = ChannelMessageRole::parse(&role)?;
+    let client_message_key: Option<String> = row
+        .try_get("client_message_key")
+        .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+    let content: String = row
+        .try_get("content")
+        .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+    let message_kind = ChannelMessageKind::classify(&role, client_message_key.as_deref(), &content);
 
     Ok(ChannelMessage {
         id: row
@@ -2388,13 +2457,10 @@ fn row_to_message(row: &sqlx::postgres::PgRow) -> Result<ChannelMessage, Channel
         session_id: row
             .try_get("session_id")
             .map_err(|_| ChannelStoreError::DatabaseFailed)?,
-        role: ChannelMessageRole::parse(&role)?,
-        client_message_key: row
-            .try_get("client_message_key")
-            .map_err(|_| ChannelStoreError::DatabaseFailed)?,
-        content: row
-            .try_get("content")
-            .map_err(|_| ChannelStoreError::DatabaseFailed)?,
+        role,
+        message_kind,
+        client_message_key,
+        content,
         attachments: row
             .try_get("attachments")
             .map_err(|_| ChannelStoreError::DatabaseFailed)?,
