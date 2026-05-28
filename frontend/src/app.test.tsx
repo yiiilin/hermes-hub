@@ -1,5 +1,49 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+const vditorMock = vi.hoisted(() => {
+  const instances: Array<{
+    destroy: ReturnType<typeof vi.fn>;
+    element: HTMLElement;
+    getValue: ReturnType<typeof vi.fn>;
+    options: Record<string, unknown>;
+    setValue: ReturnType<typeof vi.fn>;
+    value: string;
+  }> = [];
+
+  const Vditor = vi.fn(function (
+    this: {
+      destroy: ReturnType<typeof vi.fn>;
+      element: HTMLElement;
+      getValue: ReturnType<typeof vi.fn>;
+      options: Record<string, unknown>;
+      setValue: ReturnType<typeof vi.fn>;
+      value: string;
+    },
+    element: HTMLElement,
+    options: Record<string, unknown> = {},
+  ) {
+    this.element = element;
+    this.options = options;
+    this.value = String(options.value ?? "");
+    this.destroy = vi.fn();
+    this.getValue = vi.fn(() => this.value);
+    this.setValue = vi.fn((nextValue: string) => {
+      this.value = nextValue;
+      this.element.textContent = nextValue;
+    });
+    element.classList.add("vditor");
+    element.textContent = this.value;
+    instances.push(this);
+    queueMicrotask(() => (options.after as (() => void) | undefined)?.());
+  });
+
+  return { instances, Vditor };
+});
+
+vi.mock("vditor", () => ({
+  default: vditorMock.Vditor,
+}));
 
 import { App } from "./app";
 import {
@@ -17,6 +61,8 @@ import { createClientMessageId } from "./routes/channel-session";
 
 describe("App", () => {
   afterEach(() => {
+    vditorMock.instances.splice(0);
+    vditorMock.Vditor.mockClear();
     window.history.pushState({}, "", "/");
     localStorage.clear();
   });
@@ -66,6 +112,20 @@ describe("App", () => {
 
   function expectNoPendingLoader() {
     expect(document.querySelector(".typing-dots")).not.toBeInTheDocument();
+  }
+
+  function managedSkillTreeButton(path: string): HTMLButtonElement {
+    const button = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-managed-skill-path]"))
+      .find((candidate) => candidate.getAttribute("data-managed-skill-path") === path);
+    expect(button).toBeDefined();
+    return button!;
+  }
+
+  function vditorInstanceForLabel(label: string) {
+    const editor = screen.getByRole("textbox", { name: label });
+    const instance = vditorMock.instances.find((candidate) => candidate.element === editor);
+    expect(instance).toBeDefined();
+    return instance!;
   }
 
   function expectedMessageTime(timestampSeconds: number) {
@@ -540,7 +600,7 @@ describe("App", () => {
     expect(screen.queryByRole("heading", { name: "Authentication settings" })).not.toBeInTheDocument();
   });
 
-  it("lets admins edit and save only SOUL.md with a Markdown WYSIWYG editor", async () => {
+  it("lets admins edit and save only SOUL.md with Vditor's Markdown WYSIWYG editor", async () => {
     const client = createMockApiClient({
       initialHermesProfile: {
         agents_md: "# Existing AGENTS\n\nUse the shared guardrails.\n",
@@ -560,28 +620,44 @@ describe("App", () => {
     expect(screen.queryByText("AGENTS.md")).not.toBeInTheDocument();
 
     const soulEditor = await screen.findByRole("textbox", { name: "SOUL.md" });
-    expect(soulEditor).toHaveAttribute("contenteditable", "true");
-    expect(within(soulEditor).getByText("Existing SOUL")).toBeInTheDocument();
-    expect(within(soulEditor).getByText("Keep a calm operator tone.")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Bold" })).toHaveAttribute("title", "Bold");
-    expect(screen.getByRole("button", { name: "Bulleted list" })).toHaveAttribute(
-      "title",
-      "Bulleted list",
+    expect(soulEditor).toHaveClass("soul-vditor-editor");
+    expect(vditorMock.Vditor).toHaveBeenCalledTimes(1);
+    expect(vditorMock.Vditor).toHaveBeenCalledWith(
+      soulEditor,
+      expect.objectContaining({
+        cache: { enable: false },
+        cdn: "/vditor",
+        height: 520,
+        mode: "wysiwyg",
+        value: "",
+      }),
+    );
+    await waitFor(() => {
+      expect(vditorMock.instances[0].setValue).toHaveBeenCalledWith(
+        "# Existing SOUL\n\nKeep a calm operator tone.\n",
+        true,
+      );
+    });
+    expect(vditorMock.instances[0].options).toEqual(
+      expect.objectContaining({
+        toolbar: expect.arrayContaining(["headings", "bold", "italic", "table", "code"]),
+      }),
     );
 
-    soulEditor.innerHTML =
-      "<h1>SOUL</h1><p>Prefer <strong>concise</strong>, direct responses.</p>";
-    fireEvent.input(soulEditor);
+    const nextSoul =
+      "# SOUL\n\nPrefer **concise**, direct responses.\n\n| 场景 | 命令 |\n|------|------|\n| 启动 | `./start_ntp.sh` |\n\n```bash\n./start_ntp.sh\n```\n";
+    await act(async () => {
+      (vditorMock.instances[0].options.input as (value: string) => void)(nextSoul);
+    });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => {
       expect(client.updateHermesProfile).toHaveBeenCalledWith({
-        soul_md: "# SOUL\n\nPrefer **concise**, direct responses.\n",
+        soul_md: nextSoul,
       });
     });
     expect(await screen.findByText("Hermes Profile saved")).toBeInTheDocument();
     expect(screen.queryByLabelText("AGENTS.md")).not.toBeInTheDocument();
-    expect(within(screen.getByRole("textbox", { name: "SOUL.md" })).getByText("SOUL")).toBeInTheDocument();
   });
 
   it("saves the optional image generation toggle and keeps it at the bottom of the image card", async () => {
@@ -2371,28 +2447,38 @@ describe("App", () => {
 
     await openSettingsTab("统一 Skill 管理", "系统设置");
 
-    expect(await screen.findByRole("button", { name: "文件夹 writing" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "writing" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "统一 Skill 管理" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "文件夹 research" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "文件夹 references" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "文件 style.md" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "research" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "references" })).toBeInTheDocument();
+    const styleButton = managedSkillTreeButton("writing/references/style.md");
+    expect(styleButton).toHaveTextContent("style.md");
+    expect(styleButton).toHaveTextContent(/\d+ B/);
     expect(screen.queryByRole("button", { name: /writing\/references\/style\.md/ })).not.toBeInTheDocument();
     expect(screen.queryByText(".DS_Store")).not.toBeInTheDocument();
     expect(screen.queryByText(".hidden.md")).not.toBeInTheDocument();
     expect(screen.queryByText(".cache")).not.toBeInTheDocument();
+    const skillList = document.querySelector(".skill-list");
+    expect(skillList).toBeInTheDocument();
+    expect(within(skillList as HTMLElement).queryByText("文件夹")).not.toBeInTheDocument();
+    expect(within(skillList as HTMLElement).queryByText("文件")).not.toBeInTheDocument();
 
-    const imageSkillButton = screen
-      .getAllByRole("button", { name: "文件 SKILL.md" })
-      .find((button) => button.getAttribute("data-managed-skill-path") === "image/SKILL.md");
-    expect(imageSkillButton).toBeDefined();
-    fireEvent.click(imageSkillButton!);
+    const imageSkillButton = managedSkillTreeButton("image/SKILL.md");
+    expect(imageSkillButton).toHaveTextContent("SKILL.md");
+    expect(imageSkillButton).toHaveTextContent(/\d+ B/);
+    fireEvent.click(imageSkillButton);
     expect(await screen.findByLabelText("Skill 路径")).toHaveValue("image/SKILL.md");
-    expect(screen.getByLabelText("Skill 内容")).toHaveValue(
-      "# Image\n\nUse sharp visual prompts.\n",
-    );
+    const skillEditor = await screen.findByRole("textbox", { name: "Skill 内容" });
+    expect(skillEditor).toHaveClass("skill-vditor-editor");
+    const skillVditor = vditorInstanceForLabel("Skill 内容");
+    await waitFor(() => {
+      expect(skillVditor.setValue).toHaveBeenCalledWith("# Image\n\nUse sharp visual prompts.\n", true);
+    });
 
-    fireEvent.change(screen.getByLabelText("Skill 内容"), {
-      target: { value: "# Image\n\nUse cinematic visual prompts.\n" },
+    await act(async () => {
+      (skillVditor.options.input as (value: string) => void)(
+        "# Image\n\nUse cinematic visual prompts.\n",
+      );
     });
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
 
@@ -2412,16 +2498,21 @@ describe("App", () => {
     await waitFor(() => {
       expect(deleteManagedSkill).toHaveBeenCalledWith("image/SKILL.md");
       expect(
-        screen
-          .queryAllByRole("button", { name: "文件 SKILL.md" })
+        Array.from(
+          document.querySelectorAll<HTMLButtonElement>(
+            "[data-managed-skill-path='image/SKILL.md']",
+          ),
+        )
           .some((button) => button.getAttribute("data-managed-skill-path") === "image/SKILL.md"),
       ).toBe(false);
     });
     expect(screen.getByLabelText("Skill 路径")).toHaveValue("");
-    expect(screen.getByLabelText("Skill 内容")).toHaveValue("");
+    await waitFor(() => {
+      expect(vditorInstanceForLabel("Skill 内容").setValue).toHaveBeenLastCalledWith("", true);
+    });
     expect(screen.getByRole("button", { name: "删除" })).toBeDisabled();
 
-    fireEvent.click(screen.getByRole("button", { name: "文件夹 writing" }));
+    fireEvent.click(screen.getByRole("button", { name: "writing" }));
     fireEvent.click(screen.getByRole("button", { name: "新建文件夹" }));
     expect(screen.getByLabelText("Skill 路径")).toHaveValue("writing/new-folder");
     fireEvent.change(screen.getByLabelText("Skill 路径"), {
@@ -2430,7 +2521,7 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "创建文件夹" }));
     await waitFor(() => {
       expect(createManagedSkillDirectory).toHaveBeenCalledWith("writing/drafts");
-      expect(screen.getByRole("button", { name: "文件夹 drafts" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "drafts" })).toBeInTheDocument();
     });
 
     fireEvent.change(screen.getByLabelText("Skill 路径"), {
@@ -2441,14 +2532,14 @@ describe("App", () => {
       expect(createManagedSkillDirectory).toHaveBeenCalledWith("writing/archive");
       expect(createManagedSkillDirectory).toHaveBeenCalledWith("writing/archive/empty-child");
       expect(deleteManagedSkill).toHaveBeenCalledWith("writing/drafts");
-      expect(screen.getByRole("button", { name: "文件夹 archive" })).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "文件夹 empty-child" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "archive" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "empty-child" })).toBeInTheDocument();
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "文件夹 archive" }));
+    fireEvent.click(screen.getByRole("button", { name: "archive" }));
     fireEvent.click(screen.getByRole("button", { name: "新建 Skill" }));
     expect(screen.getByLabelText("Skill 路径")).toHaveValue("writing/archive/SKILL.md");
-    expect(screen.getByLabelText("Skill 内容")).toHaveValue("");
+    expect(vditorInstanceForLabel("Skill 内容").value).toBe("");
   });
 
   it("opens managed skill management when the tree endpoint is not available yet", async () => {
@@ -2466,11 +2557,12 @@ describe("App", () => {
 
     await openSettingsTab("统一 Skill 管理", "系统设置");
 
-    await screen.findByRole("button", { name: "文件夹 image" });
+    await screen.findByRole("button", { name: "image" });
     expect(
-      screen
-        .getAllByRole("button", { name: "文件 SKILL.md" })
-        .some((button) => button.getAttribute("data-managed-skill-path") === "image/SKILL.md"),
+      Boolean(
+        Array.from(document.querySelectorAll<HTMLButtonElement>("[data-managed-skill-path]"))
+          .find((button) => button.getAttribute("data-managed-skill-path") === "image/SKILL.md"),
+      ),
     ).toBe(true);
     expect(screen.queryByRole("heading", { name: "统一 Skill 管理" })).not.toBeInTheDocument();
     expect(screen.queryByText("managed skill not found")).not.toBeInTheDocument();
@@ -2498,7 +2590,7 @@ describe("App", () => {
 
     await openSettingsTab("Managed skills");
 
-    fireEvent.click(await screen.findByRole("button", { name: "File mindoc-search.tgz" }));
+    fireEvent.click(await screen.findByRole("button", { name: /mindoc-search\.tgz/ }));
     expect(await screen.findByText("managed skill is not valid utf-8")).toBeInTheDocument();
     expect(screen.getByLabelText("Skill path")).toHaveValue("mindoc-search.tgz");
     expect(screen.getByRole("button", { name: "Delete" })).not.toBeDisabled();
@@ -2528,7 +2620,7 @@ describe("App", () => {
     );
 
     await openSettingsTab("统一 Skill 管理", "系统设置");
-    fireEvent.click(await screen.findByRole("button", { name: "文件夹 writing" }));
+    fireEvent.click(await screen.findByRole("button", { name: "writing" }));
     expect(screen.queryByRole("button", { name: "上传压缩包" })).not.toBeInTheDocument();
     expect(screen.queryByTestId("managed-skills-zip-input")).not.toBeInTheDocument();
 
@@ -2541,8 +2633,8 @@ describe("App", () => {
     });
     await waitFor(() => {
       expect(uploadManagedSkills).toHaveBeenCalledWith([folderFile], "writing");
-      expect(screen.getByRole("button", { name: "文件夹 research" })).toBeInTheDocument();
-      expect(screen.getAllByRole("button", { name: "文件 SKILL.md" }).length).toBeGreaterThan(0);
+      expect(screen.getByRole("button", { name: "research" })).toBeInTheDocument();
+      expect(managedSkillTreeButton("writing/research/SKILL.md")).toBeInTheDocument();
     });
   });
 

@@ -21,12 +21,13 @@ import {
   FormEvent,
   ReactNode,
   useEffect,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
-import { Bold, Heading1, Italic, List, Quote, FilePlus2, FolderPlus, Upload } from "lucide-react";
+import { FilePlus2, FileText, Folder, FolderPlus, Upload } from "lucide-react";
+import Vditor from "vditor";
+import "vditor/dist/index.css";
 
 type AdminSettingsTab =
   | "users"
@@ -65,267 +66,118 @@ const apiTypeLabels: Record<ModelApiType, string> = {
 };
 const reasoningEfforts: Array<ReasoningEffort | ""> = ["", "minimal", "low", "medium", "high"];
 
-type MarkdownInlineContext = {
-  bold?: boolean;
-  italic?: boolean;
-};
-
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-function inlineMarkdownToHtml(value: string): string {
-  return escapeHtml(value)
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*([^*]+)\*/g, "<em>$1</em>");
-}
-
-function markdownToEditableHtml(markdown: string): string {
-  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
-  const blocks: string[] = [];
-
-  for (let index = 0; index < lines.length; ) {
-    const line = lines[index];
-    if (!line.trim()) {
-      index += 1;
-      continue;
-    }
-
-    const heading = line.match(/^(#{1,6})\s+(.+)$/);
-    if (heading) {
-      const level = Math.min(6, heading[1].length);
-      blocks.push(`<h${level}>${inlineMarkdownToHtml(heading[2].trim())}</h${level}>`);
-      index += 1;
-      continue;
-    }
-
-    if (/^\s*[-*]\s+/.test(line)) {
-      const items: string[] = [];
-      while (index < lines.length && /^\s*[-*]\s+/.test(lines[index])) {
-        items.push(`<li>${inlineMarkdownToHtml(lines[index].replace(/^\s*[-*]\s+/, "").trim())}</li>`);
-        index += 1;
-      }
-      blocks.push(`<ul>${items.join("")}</ul>`);
-      continue;
-    }
-
-    if (/^\s*>\s?/.test(line)) {
-      const quoteLines: string[] = [];
-      while (index < lines.length && /^\s*>\s?/.test(lines[index])) {
-        quoteLines.push(lines[index].replace(/^\s*>\s?/, ""));
-        index += 1;
-      }
-      blocks.push(`<blockquote>${inlineMarkdownToHtml(quoteLines.join("\n"))}</blockquote>`);
-      continue;
-    }
-
-    const paragraphLines = [line];
-    index += 1;
-    while (
-      index < lines.length &&
-      lines[index].trim() &&
-      !/^(#{1,6})\s+/.test(lines[index]) &&
-      !/^\s*[-*]\s+/.test(lines[index]) &&
-      !/^\s*>\s?/.test(lines[index])
-    ) {
-      paragraphLines.push(lines[index]);
-      index += 1;
-    }
-    blocks.push(`<p>${inlineMarkdownToHtml(paragraphLines.join("\n"))}</p>`);
-  }
-
-  return blocks.join("") || "<p><br></p>";
-}
-
-function markdownFromEditableElement(element: HTMLElement): string {
-  const blocks = Array.from(element.childNodes)
-    .map((node) => markdownBlockFromNode(node))
-    .filter(Boolean);
-  return blocks.join("\n\n").replace(/\n{3,}/g, "\n\n").trimEnd() + (blocks.length ? "\n" : "");
-}
-
-function markdownBlockFromNode(node: ChildNode): string {
-  if (node.nodeType === Node.TEXT_NODE) {
-    return markdownInlineFromNode(node).trim();
-  }
-  if (!(node instanceof HTMLElement)) {
-    return "";
-  }
-  const tagName = node.tagName.toLowerCase();
-  if (/^h[1-6]$/.test(tagName)) {
-    return `${"#".repeat(Number(tagName[1]))} ${markdownInlineFromChildren(node).trim()}`;
-  }
-  if (tagName === "ul") {
-    return Array.from(node.children)
-      .filter((child) => child.tagName.toLowerCase() === "li")
-      .map((child) => `- ${markdownInlineFromChildren(child as HTMLElement).trim()}`)
-      .join("\n");
-  }
-  if (tagName === "ol") {
-    return Array.from(node.children)
-      .filter((child) => child.tagName.toLowerCase() === "li")
-      .map((child, index) => `${index + 1}. ${markdownInlineFromChildren(child as HTMLElement).trim()}`)
-      .join("\n");
-  }
-  if (tagName === "blockquote") {
-    return markdownInlineFromChildren(node)
-      .split("\n")
-      .map((line) => `> ${line}`)
-      .join("\n");
-  }
-  if (tagName === "br") {
-    return "";
-  }
-  return markdownInlineFromChildren(node).trim();
-}
-
-function markdownInlineFromChildren(element: HTMLElement): string {
-  return Array.from(element.childNodes)
-    .map((node) => markdownInlineFromNode(node))
-    .join("")
-    .replace(/\u00a0/g, " ");
-}
-
-function markdownInlineFromNode(node: ChildNode, context: MarkdownInlineContext = {}): string {
-  if (node.nodeType === Node.TEXT_NODE) {
-    const text = node.textContent ?? "";
-    if (!text) {
-      return "";
-    }
-    if (context.bold) {
-      return `**${text}**`;
-    }
-    if (context.italic) {
-      return `*${text}*`;
-    }
-    return text;
-  }
-  if (!(node instanceof HTMLElement)) {
-    return "";
-  }
-  const tagName = node.tagName.toLowerCase();
-  if (tagName === "br") {
-    return "\n";
-  }
-  const nextContext = {
-    bold: context.bold || tagName === "strong" || tagName === "b",
-    italic: context.italic || tagName === "em" || tagName === "i",
-  };
-  return Array.from(node.childNodes)
-    .map((child) => markdownInlineFromNode(child, nextContext))
-    .join("");
-}
-
-function SoulMarkdownEditor({
+function MarkdownVditorEditor({
   value,
   label,
   onChange,
+  className,
+  height = 520,
 }: {
+  className?: string;
+  height?: number;
   value: string;
   label: string;
   onChange: (value: string) => void;
 }) {
-  const editorRef = useRef<HTMLDivElement | null>(null);
+  const { language } = useI18n();
+  const editorHostRef = useRef<HTMLDivElement | null>(null);
+  const editorInstanceRef = useRef<Vditor | null>(null);
+  const latestOnChangeRef = useRef(onChange);
+  const latestValueRef = useRef(value);
   const lastEmittedMarkdownRef = useRef<string | null>(null);
-  const lastSyncedMarkdownRef = useRef<string | null>(null);
+  const editorReadyRef = useRef(false);
 
-  useLayoutEffect(() => {
-    const editor = editorRef.current;
+  useEffect(() => {
+    latestOnChangeRef.current = onChange;
+  }, [onChange]);
+
+  useEffect(() => {
+    latestValueRef.current = value;
+    const editor = editorInstanceRef.current;
     if (!editor) {
       return;
     }
-    if (value === lastEmittedMarkdownRef.current && editor.innerHTML) {
+    if (!editorReadyRef.current || value === lastEmittedMarkdownRef.current) {
       return;
     }
-    if (value === lastSyncedMarkdownRef.current) {
-      return;
+    if (editor.getValue() !== value) {
+      editor.setValue(value, true);
     }
-    editor.innerHTML = markdownToEditableHtml(value);
-    lastSyncedMarkdownRef.current = value;
-    lastEmittedMarkdownRef.current = value;
   }, [value]);
 
-  function emitMarkdown() {
-    const editor = editorRef.current;
-    if (!editor) {
+  useEffect(() => {
+    const editorHost = editorHostRef.current;
+    if (!editorHost) {
       return;
     }
-    const nextValue = markdownFromEditableElement(editor);
-    lastEmittedMarkdownRef.current = nextValue;
-    onChange(nextValue);
-  }
+    let destroyed = false;
+    const emitMarkdown = (nextValue: string) => {
+      lastEmittedMarkdownRef.current = nextValue;
+      latestValueRef.current = nextValue;
+      latestOnChangeRef.current(nextValue);
+    };
+    const editor = new Vditor(editorHost, {
+      cache: { enable: false },
+      cdn: "/vditor",
+      height,
+      lang: language === "zh" ? "zh_CN" : "en_US",
+      minHeight: height,
+      mode: "wysiwyg",
+      value,
+      toolbar: [
+        "headings",
+        "bold",
+        "italic",
+        "strike",
+        "|",
+        "list",
+        "ordered-list",
+        "check",
+        "|",
+        "quote",
+        "code",
+        "inline-code",
+        "table",
+        "link",
+        "|",
+        "undo",
+        "redo",
+        "fullscreen",
+        "edit-mode",
+      ],
+      toolbarConfig: { pin: false },
+      input: emitMarkdown,
+      blur: emitMarkdown,
+      after: () => {
+        if (destroyed) {
+          return;
+        }
+        editorReadyRef.current = true;
+        const latestValue = latestValueRef.current;
+        // Vditor 初始化依赖异步 Lute 资源；初始化期间如果后端刷新了内容，这里补一次同步。
+        if (editor.getValue() !== latestValue) {
+          editor.setValue(latestValue, true);
+        }
+      },
+    });
+    editorInstanceRef.current = editor;
 
-  function runEditorCommand(command: string, value?: string) {
-    editorRef.current?.focus();
-    // 浏览器原生编辑命令足够覆盖 SOUL.md 的轻量富文本编辑场景，避免引入大型编辑器依赖。
-    document.execCommand(command, false, value);
-    emitMarkdown();
-  }
+    return () => {
+      destroyed = true;
+      editorReadyRef.current = false;
+      editorInstanceRef.current = null;
+      editor.destroy();
+    };
+  }, [height, language]);
 
   return (
     <div className="soul-markdown-editor">
       <div className="markdown-editor-label">{label}</div>
-      <div className="markdown-editor-toolbar" role="toolbar" aria-label={label}>
-        <button
-          type="button"
-          className="secondary icon-button"
-          aria-label="Heading"
-          title="Heading"
-          onClick={() => runEditorCommand("formatBlock", "h1")}
-        >
-          <Heading1 size={17} aria-hidden="true" />
-        </button>
-        <button
-          type="button"
-          className="secondary icon-button"
-          aria-label="Bold"
-          title="Bold"
-          onClick={() => runEditorCommand("bold")}
-        >
-          <Bold size={17} aria-hidden="true" />
-        </button>
-        <button
-          type="button"
-          className="secondary icon-button"
-          aria-label="Italic"
-          title="Italic"
-          onClick={() => runEditorCommand("italic")}
-        >
-          <Italic size={17} aria-hidden="true" />
-        </button>
-        <button
-          type="button"
-          className="secondary icon-button"
-          aria-label="Bulleted list"
-          title="Bulleted list"
-          onClick={() => runEditorCommand("insertUnorderedList")}
-        >
-          <List size={17} aria-hidden="true" />
-        </button>
-        <button
-          type="button"
-          className="secondary icon-button"
-          aria-label="Quote"
-          title="Quote"
-          onClick={() => runEditorCommand("formatBlock", "blockquote")}
-        >
-          <Quote size={17} aria-hidden="true" />
-        </button>
-      </div>
       <div
-        ref={editorRef}
-        className="markdown-wysiwyg-surface"
+        ref={editorHostRef}
+        className={`markdown-vditor-editor ${className ?? ""}`.trim()}
         role="textbox"
         aria-label={label}
-        contentEditable
-        suppressContentEditableWarning
-        spellCheck={false}
-        onInput={emitMarkdown}
-        onBlur={emitMarkdown}
       />
     </div>
   );
@@ -1047,7 +899,6 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
       return null;
     }
     const selected = selectedSkillNode?.path === node.path && selectedSkillNode.kind === node.kind;
-    const kindLabel = node.kind === "dir" ? t("admin.skillDirectory") : t("admin.skillFile");
     return (
       <li
         key={`${node.kind}:${node.path}`}
@@ -1056,16 +907,24 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
         <button
           type="button"
           className={`skill-tree-button ${node.kind === "dir" ? "directory" : "file"}`}
-          aria-label={`${kindLabel} ${node.name}`}
+          aria-label={node.name}
           data-managed-skill-path={node.path}
+          title={node.path}
           onClick={() =>
             node.kind === "dir"
               ? selectManagedSkillDirectory(node.path)
               : void openManagedSkill(node.path)
           }
         >
-          <strong>{node.name}</strong>
-          <span>{node.kind === "dir" ? t("admin.skillDirectory") : formatBytes(node.size)}</span>
+          {node.kind === "dir" ? (
+            <Folder className="skill-tree-icon" size={15} aria-hidden="true" />
+          ) : (
+            <FileText className="skill-tree-icon" size={15} aria-hidden="true" />
+          )}
+          <span className="skill-tree-name">{node.name}</span>
+          {node.kind === "file" ? (
+            <span className="skill-tree-size">{formatBytes(node.size)}</span>
+          ) : null}
         </button>
         {node.kind === "dir" && node.children.length > 0 ? (
           <ul className="skill-tree">{node.children.map(renderManagedSkillNode)}</ul>
@@ -1438,7 +1297,8 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
           {hermesProfileSaved ? (
             <p className="copy-line">{t("admin.hermesProfileSaved")}</p>
           ) : null}
-          <SoulMarkdownEditor
+          <MarkdownVditorEditor
+            className="soul-vditor-editor"
             label={t("admin.soulMd")}
             value={hermesProfile.soul_md}
             onChange={(soulMd) => {
@@ -1960,17 +1820,16 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
               />
             </label>
             {skillEditorMode === "file" ? (
-              <label>
-                {t("admin.skillContent")}
-                <textarea
-                  value={skillContent}
-                  onChange={(event) => {
-                    setSkillContent(event.target.value);
-                    setSkillSaved(false);
-                  }}
-                  spellCheck={false}
-                />
-              </label>
+              <MarkdownVditorEditor
+                className="skill-vditor-editor"
+                height={440}
+                label={t("admin.skillContent")}
+                value={skillContent}
+                onChange={(nextContent) => {
+                  setSkillContent(nextContent);
+                  setSkillSaved(false);
+                }}
+              />
             ) : (
               <p className="notice">{t("admin.skillDirectorySelected")}</p>
             )}

@@ -689,52 +689,31 @@ td {
   font-weight: 700;
 }
 
-.markdown-editor-toolbar {
-  align-items: center;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.markdown-wysiwyg-surface {
-  background: #ffffff;
+.markdown-vditor-editor {
   border: 1px solid #cdd9de;
   border-radius: 8px;
-  color: #172f38;
-  line-height: 1.6;
-  min-height: 520px;
-  outline: none;
-  overflow: auto;
-  padding: 18px;
+  min-height: 360px;
+  overflow: hidden;
 }
 
-.markdown-wysiwyg-surface:focus {
+.markdown-vditor-editor:focus-within {
   border-color: #1d6f8f;
   box-shadow: 0 0 0 3px rgba(29, 111, 143, 0.12);
 }
 
-.markdown-wysiwyg-surface h1,
-.markdown-wysiwyg-surface h2,
-.markdown-wysiwyg-surface h3 {
-  margin: 0 0 12px;
+.markdown-vditor-editor.vditor {
+  --panel-background-color: #ffffff;
+  border-color: #cdd9de;
+  color: #172f38;
 }
 
-.markdown-wysiwyg-surface p,
-.markdown-wysiwyg-surface ul,
-.markdown-wysiwyg-surface ol,
-.markdown-wysiwyg-surface blockquote {
-  margin: 0 0 12px;
+.markdown-vditor-editor .vditor-toolbar {
+  border-bottom-color: #d8e2e6;
 }
 
-.markdown-wysiwyg-surface ul,
-.markdown-wysiwyg-surface ol {
-  padding-left: 22px;
-}
-
-.markdown-wysiwyg-surface blockquote {
-  border-left: 3px solid #9bb2bc;
-  color: #41545b;
-  padding-left: 12px;
+.markdown-vditor-editor .vditor-reset {
+  font-family: inherit;
+  line-height: 1.6;
 }
 
 .skills-list-panel {
@@ -793,13 +772,13 @@ td {
   background: transparent;
   border-color: transparent;
   color: inherit;
-  display: grid;
-  gap: 3px;
-  justify-items: start;
-  min-height: 42px;
+  display: flex;
+  gap: 7px;
+  min-height: 30px;
   overflow: hidden;
-  padding: 7px 9px;
+  padding: 4px 7px;
   text-align: left;
+  width: 100%;
 }
 
 .skill-tree-button:hover,
@@ -808,31 +787,40 @@ td {
   border-color: #c9dfe6;
 }
 
-.skill-tree-button strong {
+.skill-tree-icon {
+  color: #6c8088;
+  flex: 0 0 auto;
+}
+
+.skill-tree-button.directory .skill-tree-icon {
+  color: #b47a22;
+}
+
+.skill-tree-button.file .skill-tree-icon {
+  color: #3e6875;
+}
+
+.skill-tree-name {
+  color: #172f38;
+  flex: 1 1 auto;
   font-size: 13px;
   line-height: 1.25;
+  min-width: 0;
   overflow-wrap: anywhere;
 }
 
-.skill-tree-button.directory strong {
+.skill-tree-button.directory .skill-tree-name {
   color: #132026;
 }
 
-.skill-tree-button.file strong {
+.skill-tree-button.file .skill-tree-name {
   color: #23444f;
 }
 
-.skill-tree-button span {
+.skill-tree-size {
   color: #66777f;
+  flex: 0 0 auto;
   font-size: 12px;
-}
-
-.skill-editor textarea {
-  font-family:
-    "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  line-height: 1.5;
-  min-height: 440px;
-  white-space: pre;
 }
 
 .chat-workspace {
@@ -1920,11 +1908,7 @@ button.composer-attachment-chip {
     max-height: 220px;
   }
 
-  .skill-editor textarea {
-    min-height: 320px;
-  }
-
-  .markdown-wysiwyg-surface {
+  .markdown-vditor-editor {
     min-height: 300px;
   }
 
