@@ -776,7 +776,7 @@ describe("App", () => {
                 session_id: "session-1",
                 role: "assistant",
                 content:
-                  `## 结果\n\n**加粗文本** 和 \`code\`\n\n文件：[练习.pptx](${absolutePptUrl})\n\n![cat](/api/attachments/cat/download)\n\n[open](/download)`,
+                  `## 结果\n\n**加粗文本** 和 \`code\`\n\n\`\`\`bash\n./start_ntp.sh\n\`\`\`\n\n| 场景 | 命令 |\n|------|------|\n| 将本机作为时钟源 | ./start_ntp.sh |\n| 同步指定时钟源 | ./start_ntp.sh <时钟源IP> |\n\n文件：[练习.pptx](${absolutePptUrl})\n\n![cat](/api/attachments/cat/download)\n\n[open](/download)`,
                 attachments: [
                   {
                     id: "attachment-ppt",
@@ -786,6 +786,14 @@ describe("App", () => {
                     kind: "file",
                     size: 12,
                     download_url: "/api/attachments/attachment-ppt/download",
+                  },
+                  {
+                    id: "cat",
+                    name: "cat",
+                    content_type: "image/png",
+                    kind: "image",
+                    size: 99,
+                    download_url: "/api/attachments/cat/download",
                   },
                 ],
                 created_at: 1,
@@ -799,6 +807,14 @@ describe("App", () => {
     expect(await screen.findByRole("heading", { name: "结果" })).toBeInTheDocument();
     expect(screen.getByText("加粗文本")).toBeInTheDocument();
     expect(screen.getByText("code")).toBeInTheDocument();
+    expect(screen.getByText("bash")).toHaveClass("markdown-code-language");
+    const codeBlock = document.querySelector(".markdown-code-block");
+    expect(codeBlock).toHaveTextContent("./start_ntp.sh");
+    const table = screen.getByRole("table");
+    expect(within(table).getByRole("columnheader", { name: "场景" })).toBeInTheDocument();
+    expect(within(table).getByRole("columnheader", { name: "命令" })).toBeInTheDocument();
+    expect(within(table).getByText("将本机作为时钟源")).toBeInTheDocument();
+    expect(within(table).getByText("./start_ntp.sh <时钟源IP>")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "open" })).toHaveAttribute("href", "/download");
     expect(screen.getByRole("button", { name: "Preview image cat" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Download file 练习.pptx" })).toBeInTheDocument();

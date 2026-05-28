@@ -11,6 +11,8 @@ import type {
 import { ApiRequestError } from "../api/client";
 import { useChatSidebar, useSidebarCollapsed } from "../components/layout";
 import { useI18n } from "../i18n";
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   File,
   FileArchive,
@@ -34,10 +36,12 @@ import {
   FileVideo,
 } from "lucide-react";
 import {
+  Children,
   ClipboardEvent as ReactClipboardEvent,
   FormEvent,
   ReactNode,
   useEffect,
+  isValidElement,
   useRef,
   useState,
 } from "react";
@@ -1723,9 +1727,12 @@ function MarkdownContent({
 
   return (
     <div className="markdown-content">
-      {parseMarkdownBlocks(content).map((block, index) =>
-        renderMarkdownBlock(block, index, attachments, referencedAttachmentIds, onPreviewImage, t),
-      )}
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={markdownComponents(attachments, referencedAttachmentIds, onPreviewImage, t)}
+      >
+        {content}
+      </ReactMarkdown>
       <InlineAttachments
         attachments={attachments}
         referencedAttachmentIds={referencedAttachmentIds}
@@ -1736,244 +1743,46 @@ function MarkdownContent({
   );
 }
 
-type MarkdownBlock =
-  | { type: "code"; text: string; language?: string }
-  | { type: "heading"; level: number; text: string }
-  | { type: "paragraph"; text: string }
-  | { type: "ul"; items: string[] }
-  | { type: "ol"; items: string[] }
-  | { type: "quote"; text: string };
-
-function parseMarkdownBlocks(content: string): MarkdownBlock[] {
-  const blocks: MarkdownBlock[] = [];
-  const lines = content.replace(/\r\n/g, "\n").split("\n");
-
-  for (let index = 0; index < lines.length; ) {
-    const line = lines[index];
-    if (!line.trim()) {
-      index += 1;
-      continue;
-    }
-
-    const fence = line.match(/^```(\S*)\s*$/);
-    if (fence) {
-      const codeLines: string[] = [];
-      index += 1;
-      while (index < lines.length && !/^```\s*$/.test(lines[index])) {
-        codeLines.push(lines[index]);
-        index += 1;
-      }
-      blocks.push({ type: "code", language: fence[1] || undefined, text: codeLines.join("\n") });
-      index += index < lines.length ? 1 : 0;
-      continue;
-    }
-
-    const heading = line.match(/^(#{1,6})\s+(.+)$/);
-    if (heading) {
-      blocks.push({ type: "heading", level: heading[1].length, text: heading[2].trim() });
-      index += 1;
-      continue;
-    }
-
-    if (/^\s*[-*]\s+/.test(line)) {
-      const items: string[] = [];
-      while (index < lines.length && /^\s*[-*]\s+/.test(lines[index])) {
-        items.push(lines[index].replace(/^\s*[-*]\s+/, "").trim());
-        index += 1;
-      }
-      blocks.push({ type: "ul", items });
-      continue;
-    }
-
-    if (/^\s*\d+[.)]\s+/.test(line)) {
-      const items: string[] = [];
-      while (index < lines.length && /^\s*\d+[.)]\s+/.test(lines[index])) {
-        items.push(lines[index].replace(/^\s*\d+[.)]\s+/, "").trim());
-        index += 1;
-      }
-      blocks.push({ type: "ol", items });
-      continue;
-    }
-
-    if (/^\s*>\s?/.test(line)) {
-      const quoteLines: string[] = [];
-      while (index < lines.length && /^\s*>\s?/.test(lines[index])) {
-        quoteLines.push(lines[index].replace(/^\s*>\s?/, ""));
-        index += 1;
-      }
-      blocks.push({ type: "quote", text: quoteLines.join("\n") });
-      continue;
-    }
-
-    const paragraphLines = [line];
-    index += 1;
-    while (
-      index < lines.length &&
-      lines[index].trim() &&
-      !/^```/.test(lines[index]) &&
-      !/^(#{1,6})\s+/.test(lines[index]) &&
-      !/^\s*[-*]\s+/.test(lines[index]) &&
-      !/^\s*\d+[.)]\s+/.test(lines[index]) &&
-      !/^\s*>\s?/.test(lines[index])
-    ) {
-      paragraphLines.push(lines[index]);
-      index += 1;
-    }
-    blocks.push({ type: "paragraph", text: paragraphLines.join("\n") });
-  }
-
-  return blocks.length > 0 ? blocks : [{ type: "paragraph", text: content }];
-}
-
-function renderMarkdownBlock(
-  block: MarkdownBlock,
-  index: number,
+function markdownComponents(
   attachments: HermesAttachment[],
   referencedAttachmentIds: Set<string>,
   onPreviewImage: (attachment: HermesAttachment) => void,
   t: Translate,
-) {
-  if (block.type === "code") {
-    return (
-      <pre className="markdown-code" key={`code-${index}`}>
-        <code>{block.text}</code>
-      </pre>
-    );
-  }
-
-  if (block.type === "heading") {
-    const children = renderInlineMarkdown(
-      block.text,
-      `heading-${index}`,
-      attachments,
-      referencedAttachmentIds,
-      onPreviewImage,
-      t,
-    );
-    if (block.level <= 1) {
-      return <h3 key={`heading-${index}`}>{children}</h3>;
-    }
-    if (block.level === 2) {
-      return <h4 key={`heading-${index}`}>{children}</h4>;
-    }
-    if (block.level === 3) {
-      return <h5 key={`heading-${index}`}>{children}</h5>;
-    }
-    return <h6 key={`heading-${index}`}>{children}</h6>;
-  }
-
-  if (block.type === "ul" || block.type === "ol") {
-    const Tag = block.type;
-    return (
-      <Tag key={`${block.type}-${index}`}>
-        {block.items.map((item, itemIndex) => (
-          <li key={`${block.type}-${index}-${itemIndex}`}>
-            {renderInlineMarkdown(
-              item,
-              `${block.type}-${index}-${itemIndex}`,
-              attachments,
-              referencedAttachmentIds,
-              onPreviewImage,
-              t,
-            )}
-          </li>
-        ))}
-      </Tag>
-    );
-  }
-
-  if (block.type === "quote") {
-    return (
-      <blockquote key={`quote-${index}`}>
-        {renderInlineMarkdownWithBreaks(
-          block.text,
-          `quote-${index}`,
-          attachments,
-          referencedAttachmentIds,
-          onPreviewImage,
-          t,
-        )}
-      </blockquote>
-    );
-  }
-
-  return (
-    <p key={`paragraph-${index}`}>
-      {renderInlineMarkdownWithBreaks(
-        block.text,
-        `paragraph-${index}`,
-        attachments,
-        referencedAttachmentIds,
-        onPreviewImage,
-        t,
-      )}
-    </p>
-  );
-}
-
-function renderInlineMarkdownWithBreaks(
-  text: string,
-  keyPrefix: string,
-  attachments: HermesAttachment[],
-  referencedAttachmentIds: Set<string>,
-  onPreviewImage: (attachment: HermesAttachment) => void,
-  t: Translate,
-) {
-  return text.split("\n").flatMap((line, index) => {
-    const nodes = renderInlineMarkdown(
-      line,
-      `${keyPrefix}-${index}`,
-      attachments,
-      referencedAttachmentIds,
-      onPreviewImage,
-      t,
-    );
-    return index === 0 ? nodes : [<br key={`${keyPrefix}-br-${index}`} />, ...nodes];
-  });
-}
-
-function renderInlineMarkdown(
-  text: string,
-  keyPrefix: string,
-  attachments: HermesAttachment[],
-  referencedAttachmentIds: Set<string>,
-  onPreviewImage: (attachment: HermesAttachment) => void,
-  t: Translate,
-): ReactNode[] {
-  const nodes: ReactNode[] = [];
-  const tokenPattern = /(!\[[^\]]*]\([^)]+\)|\[[^\]]+]\([^)]+\)|https?:\/\/\S+|\/api\/attachments\/\S+\/download|`[^`]+`|\*\*[^*]+\*\*)/g;
-  let cursor = 0;
-  let match: RegExpExecArray | null;
-
-  while ((match = tokenPattern.exec(text))) {
-    if (match.index > cursor) {
-      nodes.push(text.slice(cursor, match.index));
-    }
-
-    const token = match[0];
-    const image = token.match(/^!\[([^\]]*)]\(([^)]+)\)$/);
-    const link = token.match(/^\[([^\]]+)]\(([^)]+)\)$/);
-    if (image) {
-      const [, alt, url] = image;
+): Components {
+  return {
+    a({ href, children }) {
+      const url = href ?? "";
       const attachment = attachmentForUrl(attachments, url);
       if (attachment) {
         referencedAttachmentIds.add(attachment.id ?? attachment.download_url ?? attachment.name);
-        nodes.push(
+        return <InlineAttachment attachment={attachment} onPreviewImage={onPreviewImage} t={t} />;
+      }
+      const safeHref = safeMarkdownUrl(url, false);
+      return safeHref ? (
+        <a href={safeHref} rel="noreferrer" target="_blank">
+          {children}
+        </a>
+      ) : (
+        <>{children}</>
+      );
+    },
+    img({ src, alt }) {
+      const url = src ?? "";
+      const attachment = attachmentForUrl(attachments, url);
+      if (attachment) {
+        referencedAttachmentIds.add(attachment.id ?? attachment.download_url ?? attachment.name);
+        return (
           <InlineAttachment
-            key={`${keyPrefix}-attachment-image-${match.index}`}
             attachment={{ ...attachment, name: alt || attachment.name }}
             onPreviewImage={onPreviewImage}
             t={t}
-          />,
+          />
         );
-        cursor = match.index + token.length;
-        continue;
       }
       const imageUrl = safeMarkdownUrl(url, true);
       if (imageUrl) {
-        nodes.push(
+        return (
           <button
-            key={`${keyPrefix}-image-${match.index}`}
             type="button"
             className="image-preview-trigger markdown-image-trigger"
             aria-label={t("chat.markdownImage", { name: alt || imageUrl })}
@@ -1988,95 +1797,32 @@ function renderInlineMarkdown(
             }
           >
             <img src={imageUrl} alt={alt || imageUrl} />
-          </button>,
-        );
-      } else {
-        nodes.push(alt);
-      }
-    } else if (link) {
-      const [, label, url] = link;
-      const href = safeMarkdownUrl(url, false);
-      const attachment = attachmentForUrl(attachments, url);
-      if (attachment) {
-        referencedAttachmentIds.add(attachment.id ?? attachment.download_url ?? attachment.name);
-        nodes.push(
-          <InlineAttachment
-            key={`${keyPrefix}-attachment-link-${match.index}`}
-            attachment={{ ...attachment, name: label || attachment.name }}
-            onPreviewImage={onPreviewImage}
-            t={t}
-          />,
-        );
-      } else {
-        nodes.push(
-          href ? (
-            <a key={`${keyPrefix}-link-${match.index}`} href={href} rel="noreferrer" target="_blank">
-              {label}
-            </a>
-          ) : (
-            label
-          ),
+          </button>
         );
       }
-    } else if (/^https?:\/\//i.test(token)) {
-      const { url, trailing } = splitTrailingUrlPunctuation(token);
-      const href = safeMarkdownUrl(url, false);
-      nodes.push(
-        href ? (
-          <a
-            key={`${keyPrefix}-plain-link-${match.index}`}
-            href={href}
-            rel="noreferrer"
-            target="_blank"
-          >
-            {url}
-          </a>
-        ) : (
-          token
-        ),
+      return <>{alt}</>;
+    },
+    pre({ children }) {
+      const language = markdownCodeLanguage(children);
+      return (
+        <div className="markdown-code-block">
+          {language ? <span className="markdown-code-language">{language}</span> : null}
+          <pre className="markdown-code">{children}</pre>
+        </div>
       );
-      if (href && trailing) {
-        nodes.push(trailing);
-      }
-    } else if (isPlainAttachmentUrl(token)) {
-      const attachment = attachmentForUrl(attachments, token);
-      if (attachment) {
-        referencedAttachmentIds.add(attachment.id ?? attachment.download_url ?? attachment.name);
-        nodes.push(
-          <InlineAttachment
-            key={`${keyPrefix}-attachment-url-${match.index}`}
-            attachment={attachment}
-            onPreviewImage={onPreviewImage}
-            t={t}
-          />,
-        );
-      } else {
-        nodes.push(token);
-      }
-    } else if (token.startsWith("`")) {
-      nodes.push(<code key={`${keyPrefix}-code-${match.index}`}>{token.slice(1, -1)}</code>);
-    } else if (token.startsWith("**")) {
-      nodes.push(
-        <strong key={`${keyPrefix}-strong-${match.index}`}>{token.slice(2, -2)}</strong>,
-      );
-    }
-    cursor = match.index + token.length;
-  }
-
-  if (cursor < text.length) {
-    nodes.push(text.slice(cursor));
-  }
-
-  return nodes;
+    },
+    code({ className, children }) {
+      return <code className={className}>{children}</code>;
+    },
+  };
 }
 
-function splitTrailingUrlPunctuation(token: string) {
-  // 裸链接通常会跟着句末标点；标点不能进入 href，否则用户复制或点击时会打开错误地址。
-  const match = /^(.*?)([),.;，。；、]*)$/u.exec(token);
-  return {
-    url: match?.[1] ?? token,
-    trailing: match?.[2] ?? "",
-  };
+function markdownCodeLanguage(children: ReactNode): string | null {
+  const child = Children.toArray(children).find((item) => isValidElement(item));
+  if (!child || !isValidElement<{ className?: string }>(child)) {
+    return null;
+  }
+  return /(?:^|\s)language-(\S+)/.exec(child.props.className ?? "")?.[1] ?? null;
 }
 
 function InlineAttachments({
@@ -2226,11 +1972,6 @@ function normalizeAttachmentUrl(url: string | undefined) {
 
 function attachmentIdFromUrl(url: string) {
   return /\/api\/attachments\/([^/]+)\/download/.exec(url)?.[1] ?? null;
-}
-
-function isPlainAttachmentUrl(token: string) {
-  // 只有真实附件下载地址才进入附件渲染分支；普通文本不能被相对 URL 解析误判。
-  return Boolean(attachmentIdFromUrl(normalizeAttachmentUrl(token)));
 }
 
 function safeMarkdownUrl(url: string, imageOnly: boolean) {

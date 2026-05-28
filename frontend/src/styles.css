@@ -1182,6 +1182,7 @@ td {
 .markdown-content pre,
 .markdown-content ul,
 .markdown-content ol,
+.markdown-content table,
 .markdown-content h3,
 .markdown-content h4,
 .markdown-content h5,
@@ -1220,6 +1221,27 @@ td {
   padding-left: 10px;
 }
 
+.markdown-content table {
+  border-collapse: collapse;
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.markdown-content th,
+.markdown-content td {
+  border: 1px solid #d8e3e7;
+  padding: 7px 9px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.markdown-content th {
+  background: #f4f8f9;
+  color: #132026;
+  font-weight: 700;
+}
+
 .markdown-content code {
   background: #eef5f6;
   border: 1px solid #d7e4e7;
@@ -1230,6 +1252,24 @@ td {
   padding: 1px 5px;
 }
 
+.markdown-code-block {
+  display: grid;
+  max-width: min(680px, 100%);
+  overflow: hidden;
+}
+
+.markdown-code-language {
+  background: #223842;
+  border: 1px solid #263b44;
+  border-bottom: 0;
+  border-radius: 7px 7px 0 0;
+  color: #b9d2da;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  padding: 5px 10px;
+  text-transform: lowercase;
+}
+
 .markdown-code {
   background: #101d22;
   border: 1px solid #263b44;
@@ -1238,6 +1278,10 @@ td {
   max-width: min(680px, 100%);
   overflow: auto;
   padding: 10px 12px;
+}
+
+.markdown-code-language + .markdown-code {
+  border-radius: 0 0 7px 7px;
 }
 
 .markdown-code code {
