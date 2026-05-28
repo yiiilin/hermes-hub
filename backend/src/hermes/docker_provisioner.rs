@@ -25,7 +25,7 @@ use super::{
 
 /// Hub 托管 Hermes 容器规格版本。只要 env、挂载、工作目录或安全策略有变化，
 /// 就提升这个值，确保已存在的旧容器会被重建并拿到新行为。
-const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-28-managed-nfs-soul-only";
+const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-28-managed-nfs-dir-env";
 const MANAGED_CONTAINER_SPEC_LABEL: &str = "hermes_hub_spec_version";
 const HUB_INBOX_PATH: &str = "/internal/channel/v1/inbox";
 const HUB_INBOX_TIMEOUT_SECONDS: u16 = 25;
@@ -1262,6 +1262,18 @@ impl DockerProvisioner {
                 !instance.global_skills_write_enabled,
             ));
         }
+        let hub_nfs_dir = self
+            .config
+            .managed_profile
+            .as_ref()
+            .map(|profile| profile.container_path.as_str())
+            .or_else(|| {
+                self.config
+                    .managed_skills
+                    .as_ref()
+                    .map(|skills| skills.container_path.as_str())
+            })
+            .unwrap_or("/nfs");
         let mut env = vec![
             "API_SERVER_ENABLED=true".to_string(),
             // API server 仅作为容器内本地能力保留；Hub 通信全部由 adapter 主动连接。
@@ -1289,7 +1301,7 @@ impl DockerProvisioner {
             ),
             format!("HERMES_HUB_INSTANCE_ID={}", instance.id),
             format!("HERMES_HUB_USER_ID={}", instance.user_id),
-            "HERMES_HUB_NFS_DIR=/nfs".to_string(),
+            format!("HERMES_HUB_NFS_DIR={hub_nfs_dir}"),
             format!("HERMES_HUB_INBOX_PATH={HUB_INBOX_PATH}"),
             format!("HERMES_HUB_INBOX_TIMEOUT_SECONDS={HUB_INBOX_TIMEOUT_SECONDS}"),
             format!("HERMES_HUB_INBOX_LIMIT={HUB_INBOX_LIMIT}"),

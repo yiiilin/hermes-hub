@@ -206,6 +206,39 @@ fn test_config_with_managed_profile() -> DockerProvisionerConfig {
 }
 
 #[tokio::test]
+async fn docker_provisioner_passes_actual_nfs_path_to_wrapper_entrypoint() {
+    let runtime = FakeDockerRuntime::default();
+    let mut config = test_config_with_managed_profile();
+    config
+        .managed_skills
+        .as_mut()
+        .expect("managed skills config")
+        .container_path = "/hub-managed-skills".to_string();
+    config
+        .managed_profile
+        .as_mut()
+        .expect("managed profile config")
+        .container_path = "/hub-managed-skills".to_string();
+    let provisioner = DockerProvisioner::new_with_runtime(config, Arc::new(runtime));
+    let instance = provisioner.prepare_instance("custom-nfs-path");
+
+    let spec = provisioner
+        .container_spec_for(&instance)
+        .expect("container spec can be rendered");
+
+    assert!(spec.mounts.iter().any(|mount| matches!(
+        mount,
+        ContainerMount::NfsVolume(volume) if volume.container_path == "/hub-managed-skills"
+    )));
+    assert!(
+        spec.env
+            .iter()
+            .any(|item| item == "HERMES_HUB_NFS_DIR=/hub-managed-skills"),
+        "wrapper entrypoint must read SOUL.md from the actual NFS mount path"
+    );
+}
+
+#[tokio::test]
 async fn docker_provisioner_reports_runtime_image_and_version_from_container() {
     let runtime = FakeDockerRuntime::default();
     *runtime.container_exists.lock().expect("exists lock") = true;
@@ -1045,7 +1078,7 @@ async fn docker_provisioner_test() {
         .iter()
         .any(|entry| entry == "HERMES_ACCEPT_HOOKS=1"));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version" && value == "2026-05-28-managed-nfs-soul-only"
+        key == "hermes_hub_spec_version" && value == "2026-05-28-managed-nfs-dir-env"
     }));
     assert!(spec
         .mounts
@@ -1235,7 +1268,7 @@ async fn docker_provisioner_test() {
     assert!(
         create_call.windows(2).any(|args| {
             args[0] == "--label"
-                && args[1] == "hermes_hub_spec_version=2026-05-28-managed-nfs-soul-only"
+                && args[1] == "hermes_hub_spec_version=2026-05-28-managed-nfs-dir-env"
         }),
         "managed Hermes containers must carry the current spec label"
     );
