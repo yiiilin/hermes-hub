@@ -40,8 +40,10 @@ import {
   ClipboardEvent as ReactClipboardEvent,
   FormEvent,
   ReactNode,
+  memo,
   useEffect,
   isValidElement,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -74,8 +76,6 @@ export function ChannelSessionRoute({
   const [seenSessionUpdates, setSeenSessionUpdates] = useState<Record<string, number>>({});
   const [unreadSessionIds, setUnreadSessionIds] = useState<Set<string>>(() => new Set());
   const [messages, setMessages] = useState<ChannelMessage[]>([]);
-  const [prompt, setPrompt] = useState("");
-  const [attachments, setAttachments] = useState<HermesAttachment[]>([]);
   const [previewAttachment, setPreviewAttachment] = useState<HermesAttachment | null>(null);
   const [pendingAssistantMessageId, setPendingAssistantMessageId] = useState<string | null>(null);
   const [pendingAssistantSessionId, setPendingAssistantSessionId] = useState<string | null>(null);
@@ -83,8 +83,6 @@ export function ChannelSessionRoute({
   const [verboseEvents, setVerboseEvents] = useState<ExecutionHistoryEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
   const pendingAssistantIdsByRunRef = useRef<Record<string, string>>({});
@@ -122,14 +120,6 @@ export function ChannelSessionRoute({
     pendingAssistantSessionIdRef.current = null;
     setPendingAssistantMessageId(null);
     setPendingAssistantSessionId(null);
-  }
-
-  function focusComposerInputSoon() {
-    const schedule = globalThis.requestAnimationFrame ?? ((callback: FrameRequestCallback) => {
-      globalThis.setTimeout(callback, 0);
-      return 0;
-    });
-    schedule(() => composerInputRef.current?.focus());
   }
 
   async function refreshSessions() {
@@ -516,27 +506,16 @@ export function ChannelSessionRoute({
     );
   }
 
-  async function sendPrompt(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    await submitPrompt();
-  }
-
-  async function submitPrompt() {
-    if (!selectedSession && (!prompt.trim() && attachments.length === 0)) {
+  async function submitPrompt(text: string, nextAttachments: HermesAttachment[]) {
+    if (!selectedSession && (!text && nextAttachments.length === 0)) {
       return;
     }
 
     setBusy(true);
     setError(null);
 
-    const text = prompt.trim();
-    const nextAttachments = attachments;
-    setPrompt("");
-    setAttachments([]);
     resetVerboseEvents();
     stickToBottomRef.current = true;
-    // 发送后立即把焦点还给输入框，Hermes 回复时用户也可以继续写下一条草稿。
-    focusComposerInputSoon();
     let sessionForRequest: SessionSummary | null = null;
     let assistantMessageId: string | null = null;
     const userMessageKey = createClientMessageId();
@@ -812,7 +791,7 @@ export function ChannelSessionRoute({
 
   async function uploadAttachmentFiles(files: File[]) {
     if (files.length === 0) {
-      return;
+      return [];
     }
     setError(null);
     try {
@@ -820,45 +799,35 @@ export function ChannelSessionRoute({
       if (!session) {
         throw new Error(t("chat.sessionCreateFailed"));
       }
-      const selected = await apiClient.uploadSessionAttachmentsPublic(session.id, files);
-      setAttachments((current) => [...current, ...selected]);
+      return await apiClient.uploadSessionAttachmentsPublic(session.id, files);
     } catch (cause) {
       setError(userFacingErrorMessage(cause, t("chat.attachmentUploadFailed"), t));
+      return [];
     }
-  }
-
-  async function pickFiles(files: FileList | null) {
-    await uploadAttachmentFiles(files ? Array.from(files) : []);
-    if (fileInputRef.current) {
-      fileInputRef.current.value = "";
-    }
-  }
-
-  function pasteFiles(event: ReactClipboardEvent<HTMLTextAreaElement>) {
-    const files = filesFromClipboardData(event.clipboardData);
-    if (files.length === 0) {
-      return;
-    }
-    // 只要剪贴板里有文件，就按附件处理，避免图片被浏览器插入成不可控内容。
-    event.preventDefault();
-    void uploadAttachmentFiles(files);
-  }
-
-  if (!active) {
-    return null;
   }
 
   // 会话切换和 SSE snapshot 都是异步状态更新；渲染层再按当前会话兜底过滤，
   // 避免旧会话消息在新会话页面短暂或异常残留。
   const selectedSessionId = selectedSession?.id ?? null;
-  const renderedMessages = sortMessagesForDisplay(
-    messages.filter((message) => !selectedSessionId || message.session_id === selectedSessionId),
+  const renderedMessages = useMemo(
+    () =>
+      sortMessagesForDisplay(
+        messages.filter((message) => !selectedSessionId || message.session_id === selectedSessionId),
+      ),
+    [messages, selectedSessionId],
   );
   const runInProgress = Boolean(activeRun && !isTerminalHermesRun(activeRun));
   const liveExecutionVisible = Boolean(
     pendingAssistantSessionId === selectedSession?.id && verboseEvents.length > 0,
   );
-  const activeExecutionMessage = activeExecutionMessageForRun(renderedMessages, activeRun);
+  const activeExecutionMessage = useMemo(
+    () => activeExecutionMessageForRun(renderedMessages, activeRun),
+    [activeRun, renderedMessages],
+  );
+
+  if (!active) {
+    return null;
+  }
 
   return (
     <section className="chat-workspace">
@@ -918,72 +887,16 @@ export function ChannelSessionRoute({
           )}
         </div>
 
-        <form className="composer" onSubmit={sendPrompt}>
-          {error ? <p className="error">{error}</p> : null}
-          {attachments.length > 0 ? (
-            <div className="attachment-row">
-              {attachments.map((attachment) => (
-                <ComposerAttachmentChip
-                  key={`${attachment.id ?? attachment.name}-${attachment.size ?? 0}`}
-                  attachment={attachment}
-                  onPreviewImage={setPreviewAttachment}
-                  t={t}
-                />
-              ))}
-            </div>
-          ) : null}
-          <textarea
-            ref={composerInputRef}
-            aria-label={t("chat.messageLabel")}
-            value={prompt}
-            onChange={(event) => setPrompt(event.target.value)}
-            onPaste={pasteFiles}
-            placeholder={t("chat.messagePlaceholder")}
-            onKeyDown={(event) => {
-              // 中文/日文等输入法候选确认时也会触发 Enter，必须让组合输入先完成。
-              if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) {
-                return;
-              }
-              if (!busy) {
-                event.preventDefault();
-                void submitPrompt();
-              }
-            }}
-          />
-          <div className="composer-actions">
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              hidden
-              onChange={(event) => void pickFiles(event.target.files)}
-            />
-            <button
-              type="button"
-              className="secondary icon-text attach-button"
-              onClick={() => fileInputRef.current?.click()}
-            >
-              <Paperclip aria-hidden="true" size={17} />
-              {t("chat.attach")}
-            </button>
-            <button
-              type="button"
-              className="secondary icon-text"
-              disabled={!runInProgress}
-              onClick={() => void stopCurrentRun()}
-            >
-              <CircleStop aria-hidden="true" size={17} />
-              {t("chat.stop")}
-            </button>
-            <button
-              type="submit"
-              disabled={busy || (!prompt.trim() && attachments.length === 0)}
-            >
-              <Send aria-hidden="true" size={17} />
-              {t("chat.send")}
-            </button>
-          </div>
-        </form>
+        <ChatComposer
+          busy={busy}
+          error={error}
+          runInProgress={runInProgress}
+          onPreviewImage={setPreviewAttachment}
+          onStop={() => void stopCurrentRun()}
+          onSubmit={submitPrompt}
+          onUploadAttachments={uploadAttachmentFiles}
+          t={t}
+        />
       </main>
       {previewAttachment ? (
         <ImagePreviewDialog
@@ -998,6 +911,9 @@ export function ChannelSessionRoute({
 
 const EXECUTION_HISTORY_MARKER = "<!-- hermes-hub:execution:v1 -->";
 const LEGACY_HERMES_EXECUTION_LINE = /^\S+\s+([A-Za-z0-9_.-]+)\((.*)\)$/u;
+const LEGACY_HERMES_EXECUTION_HINT = /(^|\n)\S+\s+[A-Za-z0-9_.-]+\(/u;
+const EXECUTION_HISTORY_EVENTS_CACHE_LIMIT = 500;
+const executionHistoryEventsCache = new Map<string, ExecutionHistoryEntry[] | null>();
 
 function filesFromClipboardData(clipboardData: DataTransfer) {
   const directFiles = Array.from(clipboardData.files ?? []);
@@ -1188,6 +1104,148 @@ export function createClientMessageId(source: BrowserCrypto | undefined = global
 
   return `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
+
+const ChatComposer = memo(function ChatComposer({
+  busy,
+  error,
+  runInProgress,
+  onPreviewImage,
+  onStop,
+  onSubmit,
+  onUploadAttachments,
+  t,
+}: {
+  busy: boolean;
+  error: string | null;
+  runInProgress: boolean;
+  onPreviewImage: (attachment: HermesAttachment) => void;
+  onStop: () => void;
+  onSubmit: (text: string, attachments: HermesAttachment[]) => Promise<void>;
+  onUploadAttachments: (files: File[]) => Promise<HermesAttachment[]>;
+  t: Translate;
+}) {
+  const [prompt, setPrompt] = useState("");
+  const [attachments, setAttachments] = useState<HermesAttachment[]>([]);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
+
+  function focusComposerInputSoon() {
+    const schedule = globalThis.requestAnimationFrame ?? ((callback: FrameRequestCallback) => {
+      globalThis.setTimeout(callback, 0);
+      return 0;
+    });
+    schedule(() => composerInputRef.current?.focus());
+  }
+
+  async function submitComposer() {
+    const text = prompt.trim();
+    if (!text && attachments.length === 0) {
+      return;
+    }
+
+    const nextAttachments = attachments;
+    // 输入态只属于 Composer；先清空本地草稿，避免父级消息流变化牵动每次键入。
+    setPrompt("");
+    setAttachments([]);
+    focusComposerInputSoon();
+    await onSubmit(text, nextAttachments);
+  }
+
+  async function sendPrompt(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await submitComposer();
+  }
+
+  async function uploadAttachmentFiles(files: File[]) {
+    const selected = await onUploadAttachments(files);
+    if (selected.length > 0) {
+      setAttachments((current) => [...current, ...selected]);
+    }
+  }
+
+  async function pickFiles(files: FileList | null) {
+    await uploadAttachmentFiles(files ? Array.from(files) : []);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }
+
+  function pasteFiles(event: ReactClipboardEvent<HTMLTextAreaElement>) {
+    const files = filesFromClipboardData(event.clipboardData);
+    if (files.length === 0) {
+      return;
+    }
+    // 只要剪贴板里有文件，就按附件处理，避免图片被浏览器插入成不可控内容。
+    event.preventDefault();
+    void uploadAttachmentFiles(files);
+  }
+
+  return (
+    <form className="composer" onSubmit={sendPrompt}>
+      {error ? <p className="error">{error}</p> : null}
+      {attachments.length > 0 ? (
+        <div className="attachment-row">
+          {attachments.map((attachment) => (
+            <ComposerAttachmentChip
+              key={`${attachment.id ?? attachment.name}-${attachment.size ?? 0}`}
+              attachment={attachment}
+              onPreviewImage={onPreviewImage}
+              t={t}
+            />
+          ))}
+        </div>
+      ) : null}
+      <textarea
+        ref={composerInputRef}
+        aria-label={t("chat.messageLabel")}
+        value={prompt}
+        onChange={(event) => setPrompt(event.target.value)}
+        onPaste={pasteFiles}
+        placeholder={t("chat.messagePlaceholder")}
+        onKeyDown={(event) => {
+          // 中文/日文等输入法候选确认时也会触发 Enter，必须让组合输入先完成。
+          if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) {
+            return;
+          }
+          if (!busy) {
+            event.preventDefault();
+            void submitComposer();
+          }
+        }}
+      />
+      <div className="composer-actions">
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          hidden
+          onChange={(event) => void pickFiles(event.target.files)}
+        />
+        <button
+          type="button"
+          className="secondary icon-text attach-button"
+          onClick={() => fileInputRef.current?.click()}
+        >
+          <Paperclip aria-hidden="true" size={17} />
+          {t("chat.attach")}
+        </button>
+        <button
+          type="button"
+          className="secondary icon-text"
+          disabled={!runInProgress}
+          onClick={onStop}
+        >
+          <CircleStop aria-hidden="true" size={17} />
+          {t("chat.stop")}
+        </button>
+        <button type="submit" disabled={busy || (!prompt.trim() && attachments.length === 0)}>
+          <Send aria-hidden="true" size={17} />
+          {t("chat.send")}
+        </button>
+      </div>
+    </form>
+  );
+});
 
 function ChatSidebar({
   sessions,
@@ -1465,7 +1523,7 @@ function withoutSession(source: Set<string>, sessionId: string) {
   return next;
 }
 
-function MessageBubble({
+const MessageBubble = memo(function MessageBubble({
   message,
   pending = false,
   executionEvents: executionEventsOverride,
@@ -1550,7 +1608,7 @@ function MessageBubble({
       ) : null}
     </article>
   );
-}
+});
 
 function formatMessageUpdatedTime(date: Date, language: Language) {
   return new Intl.DateTimeFormat(language, {
@@ -1592,11 +1650,11 @@ function mergeExecutionHistoryMessages(messages: ChannelMessage[]) {
 }
 
 function isExecutionHistoryContent(content: string) {
-  return (
-    content.startsWith(`${EXECUTION_HISTORY_MARKER}\n`) ||
-    content.startsWith("执行步骤\n") ||
-    Boolean(parseLegacyHermesExecutionEvents(content))
-  );
+  if (content.startsWith(`${EXECUTION_HISTORY_MARKER}\n`) || content.startsWith("执行步骤\n")) {
+    return true;
+  }
+
+  return mayContainLegacyHermesExecution(content) && Boolean(executionHistoryEvents(content));
 }
 
 function dedupeRepeatedAssistantMessages(messages: ChannelMessage[]) {
@@ -1796,7 +1854,7 @@ function markdownComponents(
               })
             }
           >
-            <img src={imageUrl} alt={alt || imageUrl} />
+            <img src={imageUrl} alt={alt || imageUrl} loading="lazy" decoding="async" />
           </button>
         );
       }
@@ -1877,7 +1935,7 @@ function InlineAttachment({
         aria-label={t("chat.markdownImage", { name: attachment.name })}
         onClick={() => onPreviewImage(attachment)}
       >
-        <img src={imageSrc} alt={attachment.name} />
+        <img src={imageSrc} alt={attachment.name} loading="lazy" decoding="async" />
       </button>
     );
   }
@@ -1924,7 +1982,7 @@ function ComposerAttachmentChip({
         aria-label={t("chat.markdownImage", { name: attachment.name })}
         onClick={() => onPreviewImage(attachment)}
       >
-        <img src={imageSrc} alt="" aria-hidden="true" />
+        <img src={imageSrc} alt="" aria-hidden="true" loading="lazy" decoding="async" />
         <span>{attachment.name}</span>
       </button>
     );
@@ -2041,6 +2099,16 @@ function attachmentIcon(attachment: HermesAttachment, size = 16) {
 }
 
 function executionHistoryEvents(content: string): ExecutionHistoryEntry[] | null {
+  if (executionHistoryEventsCache.has(content)) {
+    return executionHistoryEventsCache.get(content) ?? null;
+  }
+
+  const events = parseExecutionHistoryEventsUncached(content);
+  rememberExecutionHistoryEvents(content, events);
+  return events;
+}
+
+function parseExecutionHistoryEventsUncached(content: string): ExecutionHistoryEntry[] | null {
   if (content.startsWith(`${EXECUTION_HISTORY_MARKER}\n`)) {
     try {
       const parsed = JSON.parse(content.slice(EXECUTION_HISTORY_MARKER.length).trim());
@@ -2057,6 +2125,9 @@ function executionHistoryEvents(content: string): ExecutionHistoryEntry[] | null
   }
 
   if (!content.startsWith("执行步骤\n")) {
+    if (!mayContainLegacyHermesExecution(content)) {
+      return null;
+    }
     const legacyEvents = parseLegacyHermesExecutionEvents(content);
     return legacyEvents;
   }
@@ -2066,6 +2137,21 @@ function executionHistoryEvents(content: string): ExecutionHistoryEntry[] | null
     .map((line) => normalizeExecutionEntry(line.trim().replace(/^- /, "")))
     .filter((event): event is ExecutionHistoryEntry => Boolean(event));
   return events.length > 0 ? events : null;
+}
+
+function rememberExecutionHistoryEvents(content: string, events: ExecutionHistoryEntry[] | null) {
+  // 消息渲染会多次判断同一段 Markdown 是否是执行步骤；缓存正负结果，避免长文本反复 split/regex。
+  if (executionHistoryEventsCache.size >= EXECUTION_HISTORY_EVENTS_CACHE_LIMIT) {
+    const oldestKey = executionHistoryEventsCache.keys().next().value;
+    if (oldestKey !== undefined) {
+      executionHistoryEventsCache.delete(oldestKey);
+    }
+  }
+  executionHistoryEventsCache.set(content, events);
+}
+
+function mayContainLegacyHermesExecution(content: string) {
+  return content.includes("(") && LEGACY_HERMES_EXECUTION_HINT.test(content);
 }
 
 function parseLegacyHermesExecutionEvents(content: string): ExecutionHistoryEntry[] | null {

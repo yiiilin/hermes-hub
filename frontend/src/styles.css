@@ -1104,6 +1104,8 @@ td {
   align-self: start;
   border: 1px solid transparent;
   border-radius: 8px;
+  contain-intrinsic-size: 160px;
+  content-visibility: auto;
   display: grid;
   gap: 8px;
   height: fit-content;
