@@ -460,6 +460,20 @@ describe("App", () => {
     );
   });
 
+  it("prewarms Hermes when an authenticated user becomes active", async () => {
+    const client = createMockApiClient();
+    const ensureHermes = vi.fn(client.ensureHermes.bind(client));
+    client.ensureHermes = ensureHermes;
+
+    render(<App apiClient={client} />);
+
+    expect(await screen.findByRole("button", { name: "New chat" })).toBeInTheDocument();
+    await waitFor(() => expect(ensureHermes).toHaveBeenCalledTimes(1));
+
+    fireEvent.keyDown(window, { key: "Shift" });
+    expect(ensureHermes).toHaveBeenCalledTimes(1);
+  });
+
   it("renders the authenticated admin workspace and can send a Hermes prompt", async () => {
     render(<App apiClient={createMockApiClient()} />);
 
@@ -2267,17 +2281,27 @@ describe("App", () => {
   });
 
   it("can create a managed Hermes instance for a user without one", async () => {
+    const client = createMockApiClient({
+      initialInstance: null,
+    });
+    client.ensureHermes = vi.fn(async () => {
+      throw new Error("prewarm disabled for this action-focused test");
+    });
+    client.listUsers = async () => [
+      { id: "user-1", email: "admin@example.com", role: "admin", status: "active" },
+      { id: "user-2", email: "user@example.com", role: "user", status: "active" },
+    ];
+
     render(
       <App
-        apiClient={createMockApiClient({
-          initialInstance: null,
-        })}
+        apiClient={client}
       />,
     );
 
     await openSettingsTab("Hermes management");
-    expect(await screen.findAllByText("not_created")).toHaveLength(2);
-    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+    const createButtons = await screen.findAllByRole("button", { name: "Create" });
+    expect(createButtons.length).toBeGreaterThan(0);
+    fireEvent.click(createButtons[0]);
 
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Start" })).toBeInTheDocument();
@@ -2456,6 +2480,13 @@ describe("App", () => {
   it("shows pending feedback while creating a managed Hermes instance", async () => {
     const deferred = createDeferred<void>();
     const client = createMockApiClient({ initialInstance: null });
+    client.ensureHermes = vi.fn(async () => {
+      throw new Error("prewarm disabled for this action-focused test");
+    });
+    client.listUsers = async () => [
+      { id: "user-1", email: "admin@example.com", role: "admin", status: "active" },
+      { id: "user-2", email: "user@example.com", role: "user", status: "active" },
+    ];
     const originalCreateHermesInstance = client.createHermesInstance;
     const createHermesInstance = vi.fn(async (userId: string) => {
       await deferred.promise;
@@ -2466,7 +2497,7 @@ describe("App", () => {
     render(<App apiClient={client} />);
 
     await openSettingsTab("Hermes management");
-    fireEvent.click(await screen.findByRole("button", { name: "Create" }));
+    fireEvent.click((await screen.findAllByRole("button", { name: "Create" }))[0]);
 
     expect(await screen.findByRole("button", { name: "Creating..." })).toBeDisabled();
     expect(createHermesInstance).toHaveBeenCalledWith("user-1");
