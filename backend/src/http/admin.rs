@@ -41,7 +41,6 @@ use crate::{
 
 const MAX_MANAGED_SKILL_UPLOAD_FILES: usize = 1000;
 const MANAGED_SKILL_DIRECTORY_MARKER: &str = ".hub-directory";
-const HERMES_PROFILE_AGENTS_FILE: &str = "AGENTS.md";
 const HERMES_PROFILE_SOUL_FILE: &str = "SOUL.md";
 
 pub fn router() -> Router<AppState> {
@@ -176,7 +175,6 @@ type UpdateSystemSettingsRequest = SystemSettings;
 
 #[derive(Clone, Deserialize, Serialize)]
 struct HermesProfileContent {
-    agents_md: String,
     soul_md: String,
 }
 
@@ -627,7 +625,6 @@ async fn get_hermes_profile(
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
     let profile = HermesProfileContent {
-        agents_md: read_hermes_profile_file(&state, HERMES_PROFILE_AGENTS_FILE).await?,
         soul_md: read_hermes_profile_file(&state, HERMES_PROFILE_SOUL_FILE).await?,
     };
 
@@ -640,12 +637,6 @@ async fn update_hermes_profile(
     Json(payload): Json<HermesProfileContent>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
-    write_hermes_profile_file(
-        &state,
-        HERMES_PROFILE_AGENTS_FILE,
-        payload.agents_md.as_bytes(),
-    )
-    .await?;
     write_hermes_profile_file(&state, HERMES_PROFILE_SOUL_FILE, payload.soul_md.as_bytes()).await?;
 
     Ok(StatusCode::NO_CONTENT)

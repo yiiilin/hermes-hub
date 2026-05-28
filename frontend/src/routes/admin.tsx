@@ -16,8 +16,17 @@ import type {
 } from "../api/client";
 import { defaultLdapSettings, defaultOidcSettings } from "../api/client";
 import { useI18n } from "../i18n";
-import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
-import { FilePlus2, FolderPlus, Upload } from "lucide-react";
+import {
+  ChangeEvent,
+  FormEvent,
+  ReactNode,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { Bold, Heading1, Italic, List, Quote, FilePlus2, FolderPlus, Upload } from "lucide-react";
 
 type AdminSettingsTab =
   | "users"
@@ -55,6 +64,272 @@ const apiTypeLabels: Record<ModelApiType, string> = {
   images_generations: "Images",
 };
 const reasoningEfforts: Array<ReasoningEffort | ""> = ["", "minimal", "low", "medium", "high"];
+
+type MarkdownInlineContext = {
+  bold?: boolean;
+  italic?: boolean;
+};
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function inlineMarkdownToHtml(value: string): string {
+  return escapeHtml(value)
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g, "<em>$1</em>");
+}
+
+function markdownToEditableHtml(markdown: string): string {
+  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+  const blocks: string[] = [];
+
+  for (let index = 0; index < lines.length; ) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) {
+      const level = Math.min(6, heading[1].length);
+      blocks.push(`<h${level}>${inlineMarkdownToHtml(heading[2].trim())}</h${level}>`);
+      index += 1;
+      continue;
+    }
+
+    if (/^\s*[-*]\s+/.test(line)) {
+      const items: string[] = [];
+      while (index < lines.length && /^\s*[-*]\s+/.test(lines[index])) {
+        items.push(`<li>${inlineMarkdownToHtml(lines[index].replace(/^\s*[-*]\s+/, "").trim())}</li>`);
+        index += 1;
+      }
+      blocks.push(`<ul>${items.join("")}</ul>`);
+      continue;
+    }
+
+    if (/^\s*>\s?/.test(line)) {
+      const quoteLines: string[] = [];
+      while (index < lines.length && /^\s*>\s?/.test(lines[index])) {
+        quoteLines.push(lines[index].replace(/^\s*>\s?/, ""));
+        index += 1;
+      }
+      blocks.push(`<blockquote>${inlineMarkdownToHtml(quoteLines.join("\n"))}</blockquote>`);
+      continue;
+    }
+
+    const paragraphLines = [line];
+    index += 1;
+    while (
+      index < lines.length &&
+      lines[index].trim() &&
+      !/^(#{1,6})\s+/.test(lines[index]) &&
+      !/^\s*[-*]\s+/.test(lines[index]) &&
+      !/^\s*>\s?/.test(lines[index])
+    ) {
+      paragraphLines.push(lines[index]);
+      index += 1;
+    }
+    blocks.push(`<p>${inlineMarkdownToHtml(paragraphLines.join("\n"))}</p>`);
+  }
+
+  return blocks.join("") || "<p><br></p>";
+}
+
+function markdownFromEditableElement(element: HTMLElement): string {
+  const blocks = Array.from(element.childNodes)
+    .map((node) => markdownBlockFromNode(node))
+    .filter(Boolean);
+  return blocks.join("\n\n").replace(/\n{3,}/g, "\n\n").trimEnd() + (blocks.length ? "\n" : "");
+}
+
+function markdownBlockFromNode(node: ChildNode): string {
+  if (node.nodeType === Node.TEXT_NODE) {
+    return markdownInlineFromNode(node).trim();
+  }
+  if (!(node instanceof HTMLElement)) {
+    return "";
+  }
+  const tagName = node.tagName.toLowerCase();
+  if (/^h[1-6]$/.test(tagName)) {
+    return `${"#".repeat(Number(tagName[1]))} ${markdownInlineFromChildren(node).trim()}`;
+  }
+  if (tagName === "ul") {
+    return Array.from(node.children)
+      .filter((child) => child.tagName.toLowerCase() === "li")
+      .map((child) => `- ${markdownInlineFromChildren(child as HTMLElement).trim()}`)
+      .join("\n");
+  }
+  if (tagName === "ol") {
+    return Array.from(node.children)
+      .filter((child) => child.tagName.toLowerCase() === "li")
+      .map((child, index) => `${index + 1}. ${markdownInlineFromChildren(child as HTMLElement).trim()}`)
+      .join("\n");
+  }
+  if (tagName === "blockquote") {
+    return markdownInlineFromChildren(node)
+      .split("\n")
+      .map((line) => `> ${line}`)
+      .join("\n");
+  }
+  if (tagName === "br") {
+    return "";
+  }
+  return markdownInlineFromChildren(node).trim();
+}
+
+function markdownInlineFromChildren(element: HTMLElement): string {
+  return Array.from(element.childNodes)
+    .map((node) => markdownInlineFromNode(node))
+    .join("")
+    .replace(/\u00a0/g, " ");
+}
+
+function markdownInlineFromNode(node: ChildNode, context: MarkdownInlineContext = {}): string {
+  if (node.nodeType === Node.TEXT_NODE) {
+    const text = node.textContent ?? "";
+    if (!text) {
+      return "";
+    }
+    if (context.bold) {
+      return `**${text}**`;
+    }
+    if (context.italic) {
+      return `*${text}*`;
+    }
+    return text;
+  }
+  if (!(node instanceof HTMLElement)) {
+    return "";
+  }
+  const tagName = node.tagName.toLowerCase();
+  if (tagName === "br") {
+    return "\n";
+  }
+  const nextContext = {
+    bold: context.bold || tagName === "strong" || tagName === "b",
+    italic: context.italic || tagName === "em" || tagName === "i",
+  };
+  return Array.from(node.childNodes)
+    .map((child) => markdownInlineFromNode(child, nextContext))
+    .join("");
+}
+
+function SoulMarkdownEditor({
+  value,
+  label,
+  onChange,
+}: {
+  value: string;
+  label: string;
+  onChange: (value: string) => void;
+}) {
+  const editorRef = useRef<HTMLDivElement | null>(null);
+  const lastEmittedMarkdownRef = useRef<string | null>(null);
+  const lastSyncedMarkdownRef = useRef<string | null>(null);
+
+  useLayoutEffect(() => {
+    const editor = editorRef.current;
+    if (!editor) {
+      return;
+    }
+    if (value === lastEmittedMarkdownRef.current && editor.innerHTML) {
+      return;
+    }
+    if (value === lastSyncedMarkdownRef.current) {
+      return;
+    }
+    editor.innerHTML = markdownToEditableHtml(value);
+    lastSyncedMarkdownRef.current = value;
+    lastEmittedMarkdownRef.current = value;
+  }, [value]);
+
+  function emitMarkdown() {
+    const editor = editorRef.current;
+    if (!editor) {
+      return;
+    }
+    const nextValue = markdownFromEditableElement(editor);
+    lastEmittedMarkdownRef.current = nextValue;
+    onChange(nextValue);
+  }
+
+  function runEditorCommand(command: string, value?: string) {
+    editorRef.current?.focus();
+    // 浏览器原生编辑命令足够覆盖 SOUL.md 的轻量富文本编辑场景，避免引入大型编辑器依赖。
+    document.execCommand(command, false, value);
+    emitMarkdown();
+  }
+
+  return (
+    <div className="soul-markdown-editor">
+      <div className="markdown-editor-label">{label}</div>
+      <div className="markdown-editor-toolbar" role="toolbar" aria-label={label}>
+        <button
+          type="button"
+          className="secondary icon-button"
+          aria-label="Heading"
+          title="Heading"
+          onClick={() => runEditorCommand("formatBlock", "h1")}
+        >
+          <Heading1 size={17} aria-hidden="true" />
+        </button>
+        <button
+          type="button"
+          className="secondary icon-button"
+          aria-label="Bold"
+          title="Bold"
+          onClick={() => runEditorCommand("bold")}
+        >
+          <Bold size={17} aria-hidden="true" />
+        </button>
+        <button
+          type="button"
+          className="secondary icon-button"
+          aria-label="Italic"
+          title="Italic"
+          onClick={() => runEditorCommand("italic")}
+        >
+          <Italic size={17} aria-hidden="true" />
+        </button>
+        <button
+          type="button"
+          className="secondary icon-button"
+          aria-label="Bulleted list"
+          title="Bulleted list"
+          onClick={() => runEditorCommand("insertUnorderedList")}
+        >
+          <List size={17} aria-hidden="true" />
+        </button>
+        <button
+          type="button"
+          className="secondary icon-button"
+          aria-label="Quote"
+          title="Quote"
+          onClick={() => runEditorCommand("formatBlock", "blockquote")}
+        >
+          <Quote size={17} aria-hidden="true" />
+        </button>
+      </div>
+      <div
+        ref={editorRef}
+        className="markdown-wysiwyg-surface"
+        role="textbox"
+        aria-label={label}
+        contentEditable
+        suppressContentEditableWarning
+        spellCheck={false}
+        onInput={emitMarkdown}
+        onBlur={emitMarkdown}
+      />
+    </div>
+  );
+}
 
 function megabytesFromBytes(value: number): number {
   return Math.max(1, Math.round(value / bytesPerMegabyte));
@@ -261,7 +536,6 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
   const [instances, setInstances] = useState<HermesInstance[]>([]);
   const [schedulerSnapshots, setSchedulerSnapshots] = useState<HermesSchedulerSnapshot[]>([]);
   const [hermesProfile, setHermesProfile] = useState<HermesProfile>({
-    agents_md: "",
     soul_md: "",
   });
   const [hermesProfileSaved, setHermesProfileSaved] = useState(false);
@@ -1164,36 +1438,14 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
           {hermesProfileSaved ? (
             <p className="copy-line">{t("admin.hermesProfileSaved")}</p>
           ) : null}
-          <div className="markdown-editor-grid">
-            <label>
-              {t("admin.agentsMd")}
-              <textarea
-                value={hermesProfile.agents_md}
-                onChange={(event) => {
-                  setHermesProfile((profile) => ({
-                    ...profile,
-                    agents_md: event.target.value,
-                  }));
-                  setHermesProfileSaved(false);
-                }}
-                spellCheck={false}
-              />
-            </label>
-            <label>
-              {t("admin.soulMd")}
-              <textarea
-                value={hermesProfile.soul_md}
-                onChange={(event) => {
-                  setHermesProfile((profile) => ({
-                    ...profile,
-                    soul_md: event.target.value,
-                  }));
-                  setHermesProfileSaved(false);
-                }}
-                spellCheck={false}
-              />
-            </label>
-          </div>
+          <SoulMarkdownEditor
+            label={t("admin.soulMd")}
+            value={hermesProfile.soul_md}
+            onChange={(soulMd) => {
+              setHermesProfile({ soul_md: soulMd });
+              setHermesProfileSaved(false);
+            }}
+          />
         </form>
       </section>,
     );

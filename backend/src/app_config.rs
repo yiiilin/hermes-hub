@@ -63,8 +63,8 @@ pub struct SkillsFsConfig {
     pub container_path: String,
 }
 
-/// 统一 Hermes AGENTS.md / SOUL.md 配置。
-/// 这些文件存储在对象存储中，并由同一个 hermes-hub-fs NFS 导出给 Hermes 容器。
+/// 统一 Hermes SOUL.md 配置。
+/// 文件存储在对象存储中，并由同一个 hermes-hub-fs NFS 导出给 Hermes 容器。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManagedProfileConfig {
     pub enabled: bool,

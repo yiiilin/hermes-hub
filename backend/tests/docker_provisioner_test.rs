@@ -799,8 +799,8 @@ async fn docker_provisioner_links_managed_profile_files_from_hub_fs() {
     let mut instance = provisioner.prepare_instance(&user_id);
     instance.global_skills_write_enabled = true;
 
-    // 管理员可以写全局 skills；统一 profile 文件复用同一个 Hub FS，
-    // 具体写保护由 NFS 文件系统层拒绝 AGENTS.md/SOUL.md 写入，profile 软链由 wrapper entrypoint 负责。
+    // 管理员可以写全局 skills；SOUL.md 复用同一个 Hub FS，
+    // 具体写保护由 NFS 文件系统层拒绝 SOUL.md 写入，profile 软链由 wrapper entrypoint 负责。
     let created = provisioner
         .ensure_container(&instance, "instance-token")
         .await
@@ -834,13 +834,15 @@ async fn docker_provisioner_links_managed_profile_files_from_hub_fs() {
 
     let agents = readable_storage
         .get("managed-profile/current/AGENTS.md")
-        .await
-        .expect("default AGENTS.md is created for the hub fs export");
+        .await;
+    assert!(
+        agents.is_err(),
+        "default AGENTS.md must not be created for the hub fs export anymore"
+    );
     let soul = readable_storage
         .get("managed-profile/current/SOUL.md")
         .await
         .expect("default SOUL.md is created for the hub fs export");
-    assert!(agents.is_empty());
     assert!(soul.is_empty());
 
     let calls = runtime.calls.lock().expect("calls lock").clone();
@@ -1043,7 +1045,7 @@ async fn docker_provisioner_test() {
         .iter()
         .any(|entry| entry == "HERMES_ACCEPT_HOOKS=1"));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version" && value == "2026-05-28-managed-nfs-live-profile"
+        key == "hermes_hub_spec_version" && value == "2026-05-28-managed-nfs-soul-only"
     }));
     assert!(spec
         .mounts
@@ -1233,7 +1235,7 @@ async fn docker_provisioner_test() {
     assert!(
         create_call.windows(2).any(|args| {
             args[0] == "--label"
-                && args[1] == "hermes_hub_spec_version=2026-05-28-managed-nfs-live-profile"
+                && args[1] == "hermes_hub_spec_version=2026-05-28-managed-nfs-soul-only"
         }),
         "managed Hermes containers must carry the current spec label"
     );

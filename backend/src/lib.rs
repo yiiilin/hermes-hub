@@ -218,8 +218,8 @@ pub fn docker_config_from_app(
             }),
         managed_profile: (config.managed_profile.enabled && config.skills_fs.mount_enabled).then(
             || ManagedProfileConfig {
-                // 统一 profile 文件通过同一个 Hub FS 挂载进入容器；wrapper entrypoint
-                // 会从该目录把 AGENTS.md / SOUL.md 链接到 Hermes 会读取的位置。
+                // 统一 SOUL.md 通过同一个 Hub FS 挂载进入容器；wrapper entrypoint
+                // 会从该目录把文件链接到 Hermes 会读取的位置。
                 container_path: config.skills_fs.container_path.clone(),
                 object_prefix: config.managed_profile.prefix.clone(),
             },

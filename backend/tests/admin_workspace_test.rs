@@ -475,15 +475,18 @@ async fn admin_can_manage_unified_hermes_profile() {
     .await;
     let (status, body) = response_json(initial).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["profile"]["agents_md"], "");
     assert_eq!(body["profile"]["soul_md"], "");
+    assert!(
+        body["profile"].get("agents_md").is_none(),
+        "AGENTS.md must not be exposed through the Hermes profile API"
+    );
 
     let update = request_json(
         &app,
         Method::PUT,
         "/api/admin/hermes-profile",
         json!({
-            "agents_md": "# AGENTS\n\nUse Hub-managed instructions.\n",
+            "agents_md": "# AGENTS\n\nLegacy clients may still send this.\n",
             "soul_md": "# SOUL\n\nBe direct and careful.\n"
         }),
         Some(&admin_cookie),
@@ -494,17 +497,16 @@ async fn admin_can_manage_unified_hermes_profile() {
     let agents = state
         .object_storage
         .get("managed-profile/current/AGENTS.md")
-        .await
-        .expect("AGENTS.md is written to object storage");
+        .await;
+    assert!(
+        agents.is_err(),
+        "Hermes profile API must ignore AGENTS.md instead of writing it"
+    );
     let soul = state
         .object_storage
         .get("managed-profile/current/SOUL.md")
         .await
         .expect("SOUL.md is written to object storage");
-    assert_eq!(
-        String::from_utf8(agents.to_vec()).expect("AGENTS.md is utf-8"),
-        "# AGENTS\n\nUse Hub-managed instructions.\n"
-    );
     assert_eq!(
         String::from_utf8(soul.to_vec()).expect("SOUL.md is utf-8"),
         "# SOUL\n\nBe direct and careful.\n"
@@ -520,12 +522,12 @@ async fn admin_can_manage_unified_hermes_profile() {
     let (status, body) = response_json(saved).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        body["profile"]["agents_md"],
-        "# AGENTS\n\nUse Hub-managed instructions.\n"
-    );
-    assert_eq!(
         body["profile"]["soul_md"],
         "# SOUL\n\nBe direct and careful.\n"
+    );
+    assert!(
+        body["profile"].get("agents_md").is_none(),
+        "saved Hermes profile response must stay SOUL-only"
     );
 }
 

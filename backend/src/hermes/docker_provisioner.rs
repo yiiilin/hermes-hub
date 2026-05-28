@@ -25,13 +25,12 @@ use super::{
 
 /// Hub 托管 Hermes 容器规格版本。只要 env、挂载、工作目录或安全策略有变化，
 /// 就提升这个值，确保已存在的旧容器会被重建并拿到新行为。
-const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-28-managed-nfs-live-profile";
+const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-28-managed-nfs-soul-only";
 const MANAGED_CONTAINER_SPEC_LABEL: &str = "hermes_hub_spec_version";
 const HUB_INBOX_PATH: &str = "/internal/channel/v1/inbox";
 const HUB_INBOX_TIMEOUT_SECONDS: u16 = 25;
 const HUB_INBOX_LIMIT: u16 = 4;
 const MANAGED_SKILLS_EXTERNAL_DIR: &str = "/nfs/skills";
-const MANAGED_PROFILE_AGENTS_FILE: &str = "AGENTS.md";
 const MANAGED_PROFILE_SOUL_FILE: &str = "SOUL.md";
 const HERMES_HUB_PLUGIN_YAML: &str = r#"name: hermes-hub-platform
 label: Hermes Hub
@@ -1686,7 +1685,7 @@ impl DockerProvisioner {
             return Ok(());
         };
 
-        for file_name in [MANAGED_PROFILE_AGENTS_FILE, MANAGED_PROFILE_SOUL_FILE] {
+        for file_name in [MANAGED_PROFILE_SOUL_FILE] {
             let key = managed_profile_object_key(&profile.object_prefix, file_name);
             match object_storage.get(&key).await {
                 Ok(_) => {}

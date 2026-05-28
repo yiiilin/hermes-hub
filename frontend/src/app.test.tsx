@@ -540,7 +540,7 @@ describe("App", () => {
     expect(screen.queryByRole("heading", { name: "Authentication settings" })).not.toBeInTheDocument();
   });
 
-  it("lets admins edit and save Hermes AGENTS.md and SOUL.md", async () => {
+  it("lets admins edit and save only SOUL.md with a Markdown WYSIWYG editor", async () => {
     const client = createMockApiClient({
       initialHermesProfile: {
         agents_md: "# Existing AGENTS\n\nUse the shared guardrails.\n",
@@ -556,32 +556,32 @@ describe("App", () => {
 
     await openSettingsTab("Hermes Profile");
 
-    const agentsEditor = await screen.findByLabelText("AGENTS.md");
-    const soulEditor = screen.getByLabelText("SOUL.md");
-    expect(agentsEditor).toHaveValue("# Existing AGENTS\n\nUse the shared guardrails.\n");
-    expect(soulEditor).toHaveValue("# Existing SOUL\n\nKeep a calm operator tone.\n");
+    expect(screen.queryByLabelText("AGENTS.md")).not.toBeInTheDocument();
+    expect(screen.queryByText("AGENTS.md")).not.toBeInTheDocument();
 
-    fireEvent.change(agentsEditor, {
-      target: { value: "# AGENTS\n\n- Review before running migrations.\n" },
-    });
-    fireEvent.change(soulEditor, {
-      target: { value: "# SOUL\n\nPrefer concise, direct responses.\n" },
-    });
+    const soulEditor = await screen.findByRole("textbox", { name: "SOUL.md" });
+    expect(soulEditor).toHaveAttribute("contenteditable", "true");
+    expect(within(soulEditor).getByText("Existing SOUL")).toBeInTheDocument();
+    expect(within(soulEditor).getByText("Keep a calm operator tone.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Bold" })).toHaveAttribute("title", "Bold");
+    expect(screen.getByRole("button", { name: "Bulleted list" })).toHaveAttribute(
+      "title",
+      "Bulleted list",
+    );
+
+    soulEditor.innerHTML =
+      "<h1>SOUL</h1><p>Prefer <strong>concise</strong>, direct responses.</p>";
+    fireEvent.input(soulEditor);
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => {
       expect(client.updateHermesProfile).toHaveBeenCalledWith({
-        agents_md: "# AGENTS\n\n- Review before running migrations.\n",
-        soul_md: "# SOUL\n\nPrefer concise, direct responses.\n",
+        soul_md: "# SOUL\n\nPrefer **concise**, direct responses.\n",
       });
     });
     expect(await screen.findByText("Hermes Profile saved")).toBeInTheDocument();
-    expect(screen.getByLabelText("AGENTS.md")).toHaveValue(
-      "# AGENTS\n\n- Review before running migrations.\n",
-    );
-    expect(screen.getByLabelText("SOUL.md")).toHaveValue(
-      "# SOUL\n\nPrefer concise, direct responses.\n",
-    );
+    expect(screen.queryByLabelText("AGENTS.md")).not.toBeInTheDocument();
+    expect(within(screen.getByRole("textbox", { name: "SOUL.md" })).getByText("SOUL")).toBeInTheDocument();
   });
 
   it("saves the optional image generation toggle and keeps it at the bottom of the image card", async () => {
@@ -2612,7 +2612,6 @@ describe("App", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (path, init) => {
       if (path === "/api/admin/hermes-profile" && init?.method === "PUT") {
         expect(JSON.parse(String(init.body))).toEqual({
-          agents_md: "# AGENTS\n",
           soul_md: "# SOUL\n",
         });
         return {
@@ -2636,11 +2635,9 @@ describe("App", () => {
     });
 
     await expect(createApiClient().hermesProfile()).resolves.toEqual({
-      agents_md: "# Stored AGENTS\n",
       soul_md: "# Stored SOUL\n",
     });
     await createApiClient().updateHermesProfile({
-      agents_md: "# AGENTS\n",
       soul_md: "# SOUL\n",
     });
     fetchMock.mockRestore();

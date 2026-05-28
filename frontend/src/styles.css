@@ -678,18 +678,63 @@ td {
   grid-template-columns: minmax(280px, 380px) minmax(0, 1fr);
 }
 
-.markdown-editor-grid {
+.soul-markdown-editor {
   display: grid;
-  gap: 18px;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
 }
 
-.hermes-profile-editor textarea {
-  font-family:
-    "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  line-height: 1.5;
+.markdown-editor-label {
+  color: #1d3540;
+  font-size: 0.88rem;
+  font-weight: 700;
+}
+
+.markdown-editor-toolbar {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.markdown-wysiwyg-surface {
+  background: #ffffff;
+  border: 1px solid #cdd9de;
+  border-radius: 8px;
+  color: #172f38;
+  line-height: 1.6;
   min-height: 520px;
-  white-space: pre;
+  outline: none;
+  overflow: auto;
+  padding: 18px;
+}
+
+.markdown-wysiwyg-surface:focus {
+  border-color: #1d6f8f;
+  box-shadow: 0 0 0 3px rgba(29, 111, 143, 0.12);
+}
+
+.markdown-wysiwyg-surface h1,
+.markdown-wysiwyg-surface h2,
+.markdown-wysiwyg-surface h3 {
+  margin: 0 0 12px;
+}
+
+.markdown-wysiwyg-surface p,
+.markdown-wysiwyg-surface ul,
+.markdown-wysiwyg-surface ol,
+.markdown-wysiwyg-surface blockquote {
+  margin: 0 0 12px;
+}
+
+.markdown-wysiwyg-surface ul,
+.markdown-wysiwyg-surface ol {
+  padding-left: 22px;
+}
+
+.markdown-wysiwyg-surface blockquote {
+  border-left: 3px solid #9bb2bc;
+  color: #41545b;
+  padding-left: 12px;
 }
 
 .skills-list-panel {
@@ -1505,7 +1550,6 @@ button.composer-attachment-chip {
   .model-config-grid,
   .inline-form,
   .session-grid,
-  .markdown-editor-grid,
   .skills-layout {
     grid-template-columns: 1fr;
   }
@@ -1836,7 +1880,7 @@ button.composer-attachment-chip {
     min-height: 320px;
   }
 
-  .hermes-profile-editor textarea {
+  .markdown-wysiwyg-surface {
     min-height: 300px;
   }
 

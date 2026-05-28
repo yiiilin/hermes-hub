@@ -228,8 +228,8 @@ async fn skills_fs_exposes_managed_profile_files_and_skills_directory_at_root() 
         root_entries
             .entries
             .iter()
-            .any(|entry| entry.name.as_ref() == b"AGENTS.md"),
-        "Hub FS root must include managed AGENTS.md"
+            .all(|entry| entry.name.as_ref() != b"AGENTS.md"),
+        "Hub FS root must not expose managed AGENTS.md anymore"
     );
     assert!(
         root_entries
@@ -239,24 +239,29 @@ async fn skills_fs_exposes_managed_profile_files_and_skills_directory_at_root() 
         "Hub FS root must include managed SOUL.md"
     );
 
-    let agents_id = fs
-        .lookup(root_id, &b"AGENTS.md".as_slice().into())
+    assert!(matches!(
+        fs.lookup(root_id, &b"AGENTS.md".as_slice().into()).await,
+        Err(nfsstat3::NFS3ERR_NOENT)
+    ));
+
+    let soul_id = fs
+        .lookup(root_id, &b"SOUL.md".as_slice().into())
         .await
-        .expect("managed AGENTS.md can be looked up");
+        .expect("managed SOUL.md can be looked up");
     let (bytes, eof) = fs
-        .read(agents_id, 0, 1024)
+        .read(soul_id, 0, 1024)
         .await
-        .expect("managed AGENTS.md can be read");
-    assert_eq!(bytes, b"# Agents\n");
+        .expect("managed SOUL.md can be read");
+    assert_eq!(bytes, b"# Soul\n");
     assert!(eof);
 
     assert!(matches!(
-        fs.write(agents_id, 0, b"changed").await,
+        fs.write(soul_id, 0, b"changed").await,
         Err(nfsstat3::NFS3ERR_ACCES)
     ));
     assert!(matches!(
         fs.setattr(
-            agents_id,
+            soul_id,
             nfsserve::nfs::sattr3 {
                 size: nfsserve::nfs::set_size3::size(0),
                 ..Default::default()
@@ -266,7 +271,7 @@ async fn skills_fs_exposes_managed_profile_files_and_skills_directory_at_root() 
         Err(nfsstat3::NFS3ERR_ACCES)
     ));
     assert!(matches!(
-        fs.remove(root_id, &b"AGENTS.md".as_slice().into()).await,
+        fs.remove(root_id, &b"SOUL.md".as_slice().into()).await,
         Err(nfsstat3::NFS3ERR_ACCES)
     ));
     assert!(matches!(
@@ -281,11 +286,11 @@ async fn skills_fs_exposes_managed_profile_files_and_skills_directory_at_root() 
     ));
     assert_eq!(
         operator
-            .read("managed-profile/current/AGENTS.md")
+            .read("managed-profile/current/SOUL.md")
             .await
-            .expect("managed AGENTS.md remains untouched")
+            .expect("managed SOUL.md remains untouched")
             .to_vec(),
-        b"# Agents\n"
+        b"# Soul\n"
     );
 }
 
@@ -293,21 +298,21 @@ async fn skills_fs_exposes_managed_profile_files_and_skills_directory_at_root() 
 async fn skills_fs_refreshes_managed_profile_file_attributes_after_object_update() {
     let operator = test_operator().await;
     operator
-        .write("managed-profile/current/AGENTS.md", "old")
+        .write("managed-profile/current/SOUL.md", "old")
         .await
-        .expect("AGENTS.md fixture can be written");
+        .expect("SOUL.md fixture can be written");
     let fs = SkillsFs::new(operator.clone(), "managed-skills/current")
         .expect("fs can be created")
         .with_profile_prefix("managed-profile/current")
         .expect("profile prefix is valid");
     let root_id = fs.root_dir();
 
-    let agents_id = fs
-        .lookup(root_id, &b"AGENTS.md".as_slice().into())
+    let soul_id = fs
+        .lookup(root_id, &b"SOUL.md".as_slice().into())
         .await
-        .expect("managed AGENTS.md can be looked up");
+        .expect("managed SOUL.md can be looked up");
     assert_eq!(
-        fs.getattr(agents_id)
+        fs.getattr(soul_id)
             .await
             .expect("initial attr can be read")
             .size,
@@ -315,20 +320,20 @@ async fn skills_fs_refreshes_managed_profile_file_attributes_after_object_update
     );
 
     operator
-        .write("managed-profile/current/AGENTS.md", "new managed profile")
+        .write("managed-profile/current/SOUL.md", "new managed soul")
         .await
-        .expect("AGENTS.md can be updated outside NFS");
+        .expect("SOUL.md can be updated outside NFS");
 
     let refreshed_attr = fs
-        .getattr(agents_id)
+        .getattr(soul_id)
         .await
         .expect("updated attr can be read through the old file handle");
-    assert_eq!(refreshed_attr.size, "new managed profile".len() as u64);
+    assert_eq!(refreshed_attr.size, "new managed soul".len() as u64);
     let (bytes, eof) = fs
-        .read(agents_id, 0, 1024)
+        .read(soul_id, 0, 1024)
         .await
-        .expect("updated AGENTS.md can be read through the old file handle");
-    assert_eq!(bytes, b"new managed profile");
+        .expect("updated SOUL.md can be read through the old file handle");
+    assert_eq!(bytes, b"new managed soul");
     assert!(eof);
 }
 

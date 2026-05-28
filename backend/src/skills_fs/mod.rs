@@ -25,7 +25,7 @@ const DIR_MODE: u32 = 0o755;
 const FILE_MODE: u32 = 0o644;
 const HIDDEN_SEGMENTS: [&str; 3] = [".curator_state", ".bundled_manifest", ".hub-directory"];
 const MANAGED_SKILLS_DIR: &str = "skills";
-const MANAGED_PROFILE_FILES: [&str; 2] = ["AGENTS.md", "SOUL.md"];
+const MANAGED_PROFILE_FILES: [&str; 1] = ["SOUL.md"];
 
 #[derive(Debug, Error)]
 pub enum SkillsFsError {
@@ -565,8 +565,8 @@ impl SkillsFs {
         };
         if let Some(node) = cached_node {
             if is_managed_profile_file(&node.path) {
-                // AGENTS.md / SOUL.md 由 Hub 管理界面直接写对象存储；容器里的 NFS
-                // 旧 file handle 必须重新 stat 对象，避免继续返回缓存的 size/mtime。
+                // SOUL.md 由 Hub 管理界面直接写对象存储；容器里的 NFS 旧 file handle
+                // 必须重新 stat 对象，避免继续返回缓存的 size/mtime。
                 return self.lookup_path(&node.path).await;
             }
             return Ok(node);

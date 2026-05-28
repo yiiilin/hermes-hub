@@ -51,8 +51,17 @@ fn hermes_wrapper_entrypoint_links_managed_profile_from_nfs() {
 
     assert!(entrypoint.contains("HERMES_HUB_NFS_DIR=\"${HERMES_HUB_NFS_DIR:-/nfs}\""));
     assert!(entrypoint.contains("chown hermes:hermes /config /workspace"));
-    assert!(entrypoint.contains("ln -sfn \"$HERMES_HUB_NFS_DIR/$file\" \"/config/$file\""));
-    assert!(entrypoint.contains("ln -sfn \"$HERMES_HUB_NFS_DIR/$file\" \"/workspace/$file\""));
+    assert!(entrypoint.contains("ln -sfn \"$HERMES_HUB_NFS_DIR/SOUL.md\" \"/config/SOUL.md\""));
+    assert!(entrypoint.contains("ln -sfn \"$HERMES_HUB_NFS_DIR/SOUL.md\" \"/workspace/SOUL.md\""));
+    assert!(
+        !entrypoint.contains("for file in AGENTS.md SOUL.md"),
+        "entrypoint must not manage AGENTS.md anymore"
+    );
+    assert!(
+        !entrypoint.contains("ln -sfn \"$HERMES_HUB_NFS_DIR/AGENTS.md\""),
+        "entrypoint must not create AGENTS.md links from Hub FS"
+    );
+    assert!(entrypoint.contains("旧版 wrapper 曾经管理 AGENTS.md"));
     assert!(entrypoint.contains("exec /init /opt/hermes/docker/main-wrapper.sh \"$@\""));
     assert!(entrypoint.contains("exec /opt/hermes/docker/entrypoint.sh \"$@\""));
 }
