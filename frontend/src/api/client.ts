@@ -102,6 +102,23 @@ export type ModelConfigKind = "llm" | "image" | "title";
 export type ModelApiType = "chat_completions" | "responses" | "images_generations";
 export type ReasoningEffort = "minimal" | "low" | "medium" | "high";
 
+export type ModelFallbackConfig = {
+  enabled: boolean;
+  provider_name: string;
+  provider_base_url: string;
+  provider_api_key?: string;
+  default_model: string;
+  allowed_models: string[];
+  api_type: ModelApiType;
+  reasoning_effort?: ReasoningEffort | null;
+  allow_streaming: boolean;
+  request_timeout_seconds: number;
+  context_window_tokens: number;
+  max_output_tokens: number;
+  temperature: number;
+  supports_parallel_tools: boolean;
+};
+
 export type ModelConfig = {
   config_kind: ModelConfigKind;
   enabled: boolean;
@@ -118,6 +135,7 @@ export type ModelConfig = {
   max_output_tokens: number;
   temperature: number;
   supports_parallel_tools: boolean;
+  fallback?: ModelFallbackConfig | null;
 };
 
 export type ModelConfigStatus = {
@@ -502,6 +520,7 @@ function normalizedModelConfig(config: ModelConfig): ModelConfig {
     supports_parallel_tools:
       config.config_kind === "llm" ? config.supports_parallel_tools !== false : false,
     allowed_models: [config.default_model],
+    fallback: normalizedModelFallbackConfig(config),
   };
 }
 
@@ -514,6 +533,46 @@ function modelConfigFromPayload(config: ModelConfig): ModelConfig {
     temperature: boundedNumberOrDefault(config.temperature, 0.7, 0, 2),
     supports_parallel_tools:
       config.config_kind === "llm" ? config.supports_parallel_tools !== false : false,
+    fallback: modelFallbackConfigFromPayload(config),
+  };
+}
+
+function normalizedModelFallbackConfig(config: ModelConfig): ModelFallbackConfig | null {
+  if (config.config_kind === "image" || !config.fallback) {
+    return null;
+  }
+  const fallback = config.fallback;
+  return {
+    ...fallback,
+    enabled: Boolean(fallback.enabled),
+    provider_api_key: fallback.provider_api_key ?? "",
+    api_type: fallback.api_type || config.api_type,
+    reasoning_effort: fallback.reasoning_effort ?? null,
+    allowed_models: fallback.default_model ? [fallback.default_model] : [],
+    request_timeout_seconds: positiveNumberOrDefault(fallback.request_timeout_seconds, 60),
+    context_window_tokens: positiveNumberOrDefault(fallback.context_window_tokens, 128000),
+    max_output_tokens: positiveNumberOrDefault(fallback.max_output_tokens, 4096),
+    temperature: boundedNumberOrDefault(fallback.temperature, 0.7, 0, 2),
+    supports_parallel_tools:
+      config.config_kind === "llm" ? fallback.supports_parallel_tools !== false : false,
+  };
+}
+
+function modelFallbackConfigFromPayload(config: ModelConfig): ModelFallbackConfig | null {
+  if (config.config_kind === "image" || !config.fallback) {
+    return null;
+  }
+  const fallback = config.fallback;
+  return {
+    ...fallback,
+    enabled: Boolean(fallback.enabled),
+    provider_api_key: fallback.provider_api_key ?? "",
+    request_timeout_seconds: positiveNumberOrDefault(fallback.request_timeout_seconds, 60),
+    context_window_tokens: positiveNumberOrDefault(fallback.context_window_tokens, 128000),
+    max_output_tokens: positiveNumberOrDefault(fallback.max_output_tokens, 4096),
+    temperature: boundedNumberOrDefault(fallback.temperature, 0.7, 0, 2),
+    supports_parallel_tools:
+      config.config_kind === "llm" ? fallback.supports_parallel_tools !== false : false,
   };
 }
 
@@ -1312,6 +1371,7 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     max_output_tokens: 4096,
     temperature: 0.7,
     supports_parallel_tools: true,
+    fallback: null,
   };
   let modelConfigs: ModelConfig[] = [
     modelConfig,

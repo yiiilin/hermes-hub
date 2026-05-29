@@ -29,7 +29,7 @@ use crate::{
     },
     llm_proxy::{LlmProviderError, LlmProviderRequest},
     model_config::{
-        default_api_type_for_kind, validate_api_type_for_kind, ModelConfig,
+        default_api_type_for_kind, validate_api_type_for_kind, ModelConfig, ModelFallbackConfig,
         CHAT_COMPLETIONS_API_TYPE, DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS,
         DEFAULT_TEMPERATURE, IMAGE_MODEL_CONFIG_KIND, LLM_MODEL_CONFIG_KIND, RESPONSES_API_TYPE,
     },
@@ -156,6 +156,7 @@ struct UpdateModelConfigRequest {
     max_output_tokens: Option<u64>,
     temperature: Option<f64>,
     supports_parallel_tools: Option<bool>,
+    fallback: Option<ModelFallbackConfig>,
 }
 
 #[derive(Serialize)]
@@ -919,22 +920,21 @@ async fn model_config_from_payload(
         .map(ToOwned::to_owned)
         .or(payload.config_kind)
         .unwrap_or_else(|| LLM_MODEL_CONFIG_KIND.to_string());
-    let provider_api_key = if payload.provider_api_key.trim().is_empty() {
-        // 空字符串表示沿用已保存密钥，方便管理员只改模型名或 Base URL。
-        state
-            .model_registry
-            .config_for_kind(&config_kind)
-            .await
-            .map_err(|_| ApiError::BadRequest("invalid model config kind"))?
-            .provider_api_key
-    } else {
-        payload.provider_api_key
-    };
     let existing_config = state
         .model_registry
         .config_for_kind(&config_kind)
         .await
         .ok();
+    let provider_api_key = if payload.provider_api_key.trim().is_empty() {
+        // 空字符串表示沿用已保存密钥，方便管理员只改模型名或 Base URL。
+        existing_config
+            .as_ref()
+            .ok_or(ApiError::BadRequest("invalid model config kind"))?
+            .provider_api_key
+            .clone()
+    } else {
+        payload.provider_api_key
+    };
     let enabled = match payload.enabled {
         Some(enabled) => enabled,
         None => existing_config
@@ -942,6 +942,9 @@ async fn model_config_from_payload(
             .map(|config| config.enabled)
             .unwrap_or(config_kind != IMAGE_MODEL_CONFIG_KIND),
     };
+
+    let fallback =
+        fallback_config_from_payload(&config_kind, payload.fallback, existing_config.as_ref());
 
     Ok(ModelConfig {
         api_type: payload
@@ -985,7 +988,31 @@ async fn model_config_from_payload(
                     .map(|config| config.supports_parallel_tools)
             })
             .unwrap_or(true),
+        fallback,
     })
+}
+
+fn fallback_config_from_payload(
+    config_kind: &str,
+    fallback: Option<ModelFallbackConfig>,
+    existing_config: Option<&ModelConfig>,
+) -> Option<ModelFallbackConfig> {
+    if config_kind == IMAGE_MODEL_CONFIG_KIND {
+        return None;
+    }
+    let Some(mut fallback) = fallback else {
+        return existing_config.and_then(|config| config.fallback.clone());
+    };
+    if fallback.provider_api_key.trim().is_empty() {
+        // fallback API key 和主 API key 一样，空字符串表示沿用后端已保存值。
+        if let Some(existing_key) = existing_config
+            .and_then(|config| config.fallback.as_ref())
+            .map(|fallback| fallback.provider_api_key.clone())
+        {
+            fallback.provider_api_key = existing_key;
+        }
+    }
+    Some(fallback)
 }
 
 fn runtime_model_settings(config: &ModelConfig) -> RuntimeModelSettings {

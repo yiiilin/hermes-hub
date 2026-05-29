@@ -71,6 +71,7 @@ fn ready_model_registry() -> ModelRegistry {
         max_output_tokens: 4096,
         temperature: 0.7,
         supports_parallel_tools: true,
+        fallback: None,
     })
 }
 

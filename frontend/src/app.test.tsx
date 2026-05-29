@@ -726,6 +726,65 @@ describe("App", () => {
     });
   });
 
+  it("saves fallback model settings for main and title models", async () => {
+    const client = createMockApiClient();
+    render(<App apiClient={client} />);
+
+    await openSettingsTab("Model configuration");
+    const llmHeading = await screen.findByRole("heading", { name: "Large language model" });
+    const llmCard = llmHeading.closest("section.panel") as HTMLElement;
+    fireEvent.click(within(llmCard).getByLabelText("Enable fallback"));
+    fireEvent.change(within(llmCard).getByLabelText("Fallback provider"), {
+      target: { value: "fallback-provider" },
+    });
+    fireEvent.change(within(llmCard).getByLabelText("Fallback Base URL"), {
+      target: { value: "https://fallback.example/v1" },
+    });
+    fireEvent.change(within(llmCard).getByLabelText("Fallback API key"), {
+      target: { value: "fallback-key" },
+    });
+    fireEvent.change(within(llmCard).getByLabelText("Fallback model name"), {
+      target: { value: "gpt-4.1-fallback" },
+    });
+    fireEvent.change(within(llmCard).getByLabelText("Fallback max output tokens"), {
+      target: { value: "2048" },
+    });
+    fireEvent.click(within(llmCard).getByLabelText("Fallback parallel tool calls"));
+
+    const titleHeading = screen.getByRole("heading", { name: "Title model" });
+    const titleCard = titleHeading.closest("section.panel") as HTMLElement;
+    fireEvent.click(within(titleCard).getByLabelText("Enable fallback"));
+    fireEvent.change(within(titleCard).getByLabelText("Fallback provider"), {
+      target: { value: "fallback-title-provider" },
+    });
+    fireEvent.change(within(titleCard).getByLabelText("Fallback Base URL"), {
+      target: { value: "https://fallback-title.example/v1" },
+    });
+    fireEvent.change(within(titleCard).getByLabelText("Fallback model name"), {
+      target: { value: "gpt-title-fallback" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(await screen.findByText("Model configuration saved")).toBeInTheDocument();
+    await waitFor(() => {
+      const savedLlmCard = screen
+        .getByRole("heading", { name: "Large language model" })
+        .closest("section.panel") as HTMLElement;
+      const savedTitleCard = screen
+        .getByRole("heading", { name: "Title model" })
+        .closest("section.panel") as HTMLElement;
+      expect(within(savedLlmCard).getByLabelText("Fallback model name")).toHaveValue(
+        "gpt-4.1-fallback",
+      );
+      expect(within(savedLlmCard).getByLabelText("Fallback max output tokens")).toHaveValue(2048);
+      expect(within(savedLlmCard).getByLabelText("Fallback parallel tool calls")).not.toBeChecked();
+      expect(within(savedTitleCard).getByLabelText("Fallback model name")).toHaveValue(
+        "gpt-title-fallback",
+      );
+    });
+  });
+
   it("opens image attachments in a preview dialog", async () => {
     render(
       <App
@@ -2777,6 +2836,22 @@ describe("App", () => {
           max_output_tokens: 8192,
           temperature: 0.3,
           supports_parallel_tools: true,
+          fallback: {
+            enabled: true,
+            provider_name: "fallback-provider",
+            provider_base_url: "https://fallback-provider.example/v1",
+            provider_api_key: "stored-fallback-key",
+            default_model: "gpt-4.1-fallback",
+            allowed_models: ["gpt-4.1-fallback"],
+            api_type: "responses",
+            reasoning_effort: "low",
+            allow_streaming: true,
+            request_timeout_seconds: 45,
+            context_window_tokens: 100000,
+            max_output_tokens: 2048,
+            temperature: 0.2,
+            supports_parallel_tools: false,
+          },
         },
         model_configs: [],
         required_models_ready: true,
@@ -2791,6 +2866,8 @@ describe("App", () => {
     expect(status.model_config.max_output_tokens).toBe(8192);
     expect(status.model_config.temperature).toBe(0.3);
     expect(status.model_config.supports_parallel_tools).toBe(true);
+    expect(status.model_config.fallback?.provider_api_key).toBe("stored-fallback-key");
+    expect(status.model_config.fallback?.max_output_tokens).toBe(2048);
     fetchMock.mockRestore();
   });
 
@@ -2830,6 +2907,65 @@ describe("App", () => {
       context_window_tokens: 200000,
       max_output_tokens: 8192,
       temperature: 0.3,
+      supports_parallel_tools: false,
+    });
+    fetchMock.mockRestore();
+  });
+
+  it("sends fallback model settings through the real API client", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      status: 204,
+    } as Response);
+
+    await createApiClient().updateModelConfig({
+      config_kind: "llm",
+      enabled: true,
+      provider_name: "openai-compatible",
+      provider_base_url: "https://ready-provider.example/v1",
+      provider_api_key: "stored-provider-key",
+      default_model: "gpt-4.1-mini",
+      allowed_models: ["gpt-4.1-mini"],
+      api_type: "responses",
+      reasoning_effort: "medium",
+      allow_streaming: true,
+      request_timeout_seconds: 60,
+      context_window_tokens: 200000,
+      max_output_tokens: 8192,
+      temperature: 0.3,
+      supports_parallel_tools: true,
+      fallback: {
+        enabled: true,
+        provider_name: "fallback-provider",
+        provider_base_url: "https://fallback-provider.example/v1",
+        provider_api_key: "fallback-key",
+        default_model: "gpt-4.1-fallback",
+        allowed_models: [],
+        api_type: "responses",
+        reasoning_effort: "low",
+        allow_streaming: true,
+        request_timeout_seconds: 45,
+        context_window_tokens: 100000,
+        max_output_tokens: 2048,
+        temperature: 0.2,
+        supports_parallel_tools: false,
+      },
+    });
+
+    const requestBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(requestBody.fallback).toMatchObject({
+      enabled: true,
+      provider_name: "fallback-provider",
+      provider_base_url: "https://fallback-provider.example/v1",
+      provider_api_key: "fallback-key",
+      default_model: "gpt-4.1-fallback",
+      allowed_models: ["gpt-4.1-fallback"],
+      api_type: "responses",
+      reasoning_effort: "low",
+      request_timeout_seconds: 45,
+      context_window_tokens: 100000,
+      max_output_tokens: 2048,
+      temperature: 0.2,
       supports_parallel_tools: false,
     });
     fetchMock.mockRestore();

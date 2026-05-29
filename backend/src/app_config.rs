@@ -222,6 +222,7 @@ fn model_config_from_env() -> ModelConfig {
         max_output_tokens,
         temperature,
         supports_parallel_tools,
+        fallback: None,
     }
 }
 
@@ -299,6 +300,7 @@ fn default_model_config() -> ModelConfig {
         max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
         temperature: DEFAULT_TEMPERATURE,
         supports_parallel_tools: true,
+        fallback: None,
     }
 }
 

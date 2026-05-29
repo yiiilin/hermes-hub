@@ -9,6 +9,7 @@ import type {
   ManagedSkillTreeNode,
   ModelApiType,
   ModelConfig,
+  ModelFallbackConfig,
   ModelConfigKind,
   ReasoningEffort,
   SystemSettings,
@@ -65,6 +66,28 @@ const apiTypeLabels: Record<ModelApiType, string> = {
   images_generations: "Images",
 };
 const reasoningEfforts: Array<ReasoningEffort | ""> = ["", "minimal", "low", "medium", "high"];
+
+function fallbackConfigForModel(config: ModelConfig): ModelFallbackConfig {
+  return (
+    config.fallback ?? {
+      enabled: false,
+      provider_name: config.provider_name,
+      provider_base_url: config.provider_base_url,
+      provider_api_key: config.provider_api_key ?? "",
+      default_model: config.default_model,
+      allowed_models: config.default_model ? [config.default_model] : [],
+      api_type: config.config_kind === "image" ? "images_generations" : config.api_type,
+      reasoning_effort: config.reasoning_effort ?? null,
+      allow_streaming: config.config_kind === "llm" ? config.allow_streaming : false,
+      request_timeout_seconds: config.request_timeout_seconds || 60,
+      context_window_tokens: config.context_window_tokens || 128000,
+      max_output_tokens: config.max_output_tokens || 4096,
+      temperature: Number.isFinite(config.temperature) ? config.temperature : 0.7,
+      supports_parallel_tools:
+        config.config_kind === "llm" ? config.supports_parallel_tools !== false : false,
+    }
+  );
+}
 
 function MarkdownVditorEditor({
   value,
@@ -579,6 +602,23 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     setModelConfigs((configs) =>
       configs.map((config) =>
         config.config_kind === kind ? { ...config, ...patch } : config,
+      ),
+    );
+  }
+
+  function updateModelFallback(kind: ModelConfigKind, patch: Partial<ModelFallbackConfig>) {
+    setModelSaved(false);
+    setModelConfigs((configs) =>
+      configs.map((config) =>
+        config.config_kind === kind
+          ? {
+              ...config,
+              fallback: {
+                ...fallbackConfigForModel(config),
+                ...patch,
+              },
+            }
+          : config,
       ),
     );
   }
@@ -1166,6 +1206,200 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                       {t("admin.supportsParallelTools")}
                     </label>
                   ) : null}
+                  {config.config_kind !== "image"
+                    ? (() => {
+                        const fallback = fallbackConfigForModel(config);
+                        return (
+                          <fieldset className="form-section model-fallback-section">
+                            <legend>{t("admin.fallbackModel")}</legend>
+                            <label className="checkbox-row">
+                              <input
+                                type="checkbox"
+                                checked={fallback.enabled}
+                                onChange={(event) =>
+                                  updateModelFallback(config.config_kind, {
+                                    enabled: event.target.checked,
+                                  })
+                                }
+                              />
+                              {t("admin.fallbackEnabled")}
+                            </label>
+                            {fallback.enabled ? (
+                              <>
+                                <label>
+                                  {t("admin.fallbackProvider")}
+                                  <input
+                                    value={fallback.provider_name}
+                                    onChange={(event) =>
+                                      updateModelFallback(config.config_kind, {
+                                        provider_name: event.target.value,
+                                      })
+                                    }
+                                  />
+                                </label>
+                                <label>
+                                  {t("admin.fallbackBaseUrl")}
+                                  <input
+                                    value={fallback.provider_base_url}
+                                    onChange={(event) =>
+                                      updateModelFallback(config.config_kind, {
+                                        provider_base_url: event.target.value,
+                                      })
+                                    }
+                                  />
+                                </label>
+                                <label>
+                                  {t("admin.fallbackApiKey")}
+                                  <input
+                                    type="password"
+                                    value={fallback.provider_api_key ?? ""}
+                                    onChange={(event) =>
+                                      updateModelFallback(config.config_kind, {
+                                        provider_api_key: event.target.value,
+                                      })
+                                    }
+                                  />
+                                </label>
+                                <label>
+                                  {t("admin.fallbackModelName")}
+                                  <input
+                                    value={fallback.default_model}
+                                    onChange={(event) =>
+                                      updateModelFallback(config.config_kind, {
+                                        default_model: event.target.value,
+                                      })
+                                    }
+                                  />
+                                </label>
+                                <label>
+                                  {t("admin.fallbackApi")}
+                                  <select
+                                    value={fallback.api_type}
+                                    onChange={(event) =>
+                                      updateModelFallback(config.config_kind, {
+                                        api_type: event.target.value as ModelApiType,
+                                      })
+                                    }
+                                  >
+                                    {["chat_completions", "responses"].map((apiType) => (
+                                      <option key={apiType} value={apiType}>
+                                        {apiTypeLabels[apiType as ModelApiType]}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </label>
+                                <label>
+                                  {t("admin.fallbackReasoning")}
+                                  <select
+                                    value={fallback.reasoning_effort ?? ""}
+                                    onChange={(event) =>
+                                      updateModelFallback(config.config_kind, {
+                                        reasoning_effort:
+                                          event.target.value === ""
+                                            ? null
+                                            : (event.target.value as ReasoningEffort),
+                                      })
+                                    }
+                                  >
+                                    {reasoningEfforts.map((effort) => (
+                                      <option key={effort || "none"} value={effort}>
+                                        {effort || t("admin.noReasoning")}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </label>
+                                {config.config_kind === "llm" ? (
+                                  <>
+                                    <label>
+                                      {t("admin.fallbackContextWindowTokens")}
+                                      <input
+                                        type="number"
+                                        min={1}
+                                        value={fallback.context_window_tokens}
+                                        onChange={(event) =>
+                                          updateModelFallback(config.config_kind, {
+                                            context_window_tokens: Number(event.target.value),
+                                          })
+                                        }
+                                      />
+                                    </label>
+                                    <label>
+                                      {t("admin.fallbackMaxOutputTokens")}
+                                      <input
+                                        type="number"
+                                        min={1}
+                                        value={fallback.max_output_tokens}
+                                        onChange={(event) =>
+                                          updateModelFallback(config.config_kind, {
+                                            max_output_tokens: Number(event.target.value),
+                                          })
+                                        }
+                                      />
+                                    </label>
+                                    <label>
+                                      {t("admin.fallbackTemperature")}
+                                      <input
+                                        type="number"
+                                        min={0}
+                                        max={2}
+                                        step={0.1}
+                                        value={fallback.temperature}
+                                        onChange={(event) =>
+                                          updateModelFallback(config.config_kind, {
+                                            temperature: Number(event.target.value),
+                                          })
+                                        }
+                                      />
+                                    </label>
+                                  </>
+                                ) : null}
+                                <label>
+                                  {t("admin.fallbackTimeout")}
+                                  <input
+                                    type="number"
+                                    min={1}
+                                    value={fallback.request_timeout_seconds}
+                                    onChange={(event) =>
+                                      updateModelFallback(config.config_kind, {
+                                        request_timeout_seconds: Number(event.target.value),
+                                      })
+                                    }
+                                  />
+                                </label>
+                                {config.config_kind === "llm" ? (
+                                  <label className="checkbox-row">
+                                    <input
+                                      type="checkbox"
+                                      checked={fallback.allow_streaming}
+                                      onChange={(event) =>
+                                        updateModelFallback(config.config_kind, {
+                                          allow_streaming: event.target.checked,
+                                        })
+                                      }
+                                    />
+                                    {t("admin.fallbackStreaming")}
+                                  </label>
+                                ) : null}
+                                {config.config_kind === "llm" ? (
+                                  <label className="checkbox-row">
+                                    <input
+                                      type="checkbox"
+                                      checked={fallback.supports_parallel_tools}
+                                      onChange={(event) =>
+                                        updateModelFallback(config.config_kind, {
+                                          supports_parallel_tools: event.target.checked,
+                                        })
+                                      }
+                                    />
+                                    {t("admin.fallbackSupportsParallelTools")}
+                                  </label>
+                                ) : null}
+                              </>
+                            ) : null}
+                          </fieldset>
+                        );
+                      })()
+                    : null}
                   {config.config_kind === "image" ? (
                     <label className="checkbox-row">
                       <input

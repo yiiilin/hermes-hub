@@ -429,6 +429,10 @@ label {
   padding: 0 6px;
 }
 
+.model-fallback-section {
+  min-width: 0;
+}
+
 .checkbox-row {
   align-items: center;
   display: flex;

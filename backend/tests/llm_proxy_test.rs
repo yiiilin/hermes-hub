@@ -13,12 +13,13 @@ use hermes_hub_backend::{
     hermes::docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
     ldap::DefaultLdapAuthenticator,
     llm_proxy::{
-        DynLlmProviderClient, InMemoryLlmProviderClient, LlmProviderResponse,
-        ReqwestLlmProviderClient,
+        DynLlmProviderClient, InMemoryLlmProviderClient, LlmProviderClient, LlmProviderError,
+        LlmProviderRequest, LlmProviderResponse, ReqwestLlmProviderClient,
     },
     model_config::{
-        ModelConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE, IMAGES_GENERATIONS_API_TYPE,
-        IMAGE_MODEL_CONFIG_KIND, LLM_MODEL_CONFIG_KIND, RESPONSES_API_TYPE,
+        ModelConfig, ModelFallbackConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE,
+        IMAGES_GENERATIONS_API_TYPE, IMAGE_MODEL_CONFIG_KIND, LLM_MODEL_CONFIG_KIND,
+        RESPONSES_API_TYPE,
     },
     session::store::SessionStore,
     storage::InMemoryObjectStorage,
@@ -28,6 +29,45 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
+
+#[derive(Clone)]
+struct SequenceLlmProviderClient {
+    responses: Arc<Mutex<Vec<Result<LlmProviderResponse, LlmProviderError>>>>,
+    requests: Arc<Mutex<Vec<LlmProviderRequest>>>,
+}
+
+impl SequenceLlmProviderClient {
+    fn new(responses: Vec<Result<LlmProviderResponse, LlmProviderError>>) -> Self {
+        Self {
+            responses: Arc::new(Mutex::new(responses)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn shared(self) -> DynLlmProviderClient {
+        Arc::new(self)
+    }
+
+    fn requests(&self) -> Vec<LlmProviderRequest> {
+        self.requests.lock().expect("requests lock").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProviderClient for SequenceLlmProviderClient {
+    async fn send(&self, request: LlmProviderRequest) -> Result<Response, LlmProviderError> {
+        self.requests.lock().expect("requests lock").push(request);
+        let response = self.responses.lock().expect("responses lock").remove(0)?;
+        let mut axum_response = (response.status, response.body).into_response();
+        if let Some(content_type) = response.content_type {
+            axum_response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                content_type.parse().expect("content type header"),
+            );
+        }
+        Ok(axum_response)
+    }
+}
 
 fn test_state(provider: InMemoryLlmProviderClient, registry: ModelRegistry) -> AppState {
     test_state_with_provider(provider.shared(), registry)
@@ -72,6 +112,7 @@ fn test_registry() -> ModelRegistry {
         max_output_tokens: 4096,
         temperature: 0.7,
         supports_parallel_tools: true,
+        fallback: None,
     })
 }
 
@@ -318,6 +359,7 @@ async fn llm_proxy_caps_requested_output_tokens_at_model_config_limit() {
         max_output_tokens: 512,
         temperature: 0.2,
         supports_parallel_tools: false,
+        fallback: None,
     });
     registry.add_instance_token("instance-token");
     let app = test_app(provider.clone(), registry);
@@ -366,6 +408,7 @@ async fn llm_proxy_injects_reasoning_for_chat_and_responses_requests() {
         max_output_tokens: 4096,
         temperature: 0.7,
         supports_parallel_tools: true,
+        fallback: None,
     });
     registry.add_instance_token("instance-token");
     let app = test_app(provider.clone(), registry);
@@ -425,6 +468,7 @@ async fn llm_proxy_uses_image_config_for_image_generation_requests() {
             max_output_tokens: 4096,
             temperature: 0.7,
             supports_parallel_tools: true,
+            fallback: None,
         })
         .await
         .expect("image config can be replaced");
@@ -487,6 +531,7 @@ async fn llm_proxy_rejects_image_generation_when_image_model_is_disabled() {
             max_output_tokens: 4096,
             temperature: 0.7,
             supports_parallel_tools: true,
+            fallback: None,
         })
         .await
         .expect("disabled image config can be saved");
@@ -513,6 +558,87 @@ async fn llm_proxy_rejects_image_generation_when_image_model_is_disabled() {
 }
 
 #[tokio::test]
+async fn llm_proxy_uses_llm_fallback_when_primary_provider_returns_error_status() {
+    let provider = SequenceLlmProviderClient::new(vec![
+        Ok(LlmProviderResponse {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            content_type: Some("application/json".to_string()),
+            body: br#"{"error":"primary failed"}"#.to_vec(),
+        }),
+        Ok(LlmProviderResponse {
+            status: StatusCode::OK,
+            content_type: Some("application/json".to_string()),
+            body: br#"{"id":"fallback-response"}"#.to_vec(),
+        }),
+    ]);
+    let provider_requests = provider.clone();
+    let registry = ModelRegistry::new(ModelConfig {
+        config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
+        provider_name: "primary-provider".to_string(),
+        provider_base_url: "https://primary.example/v1".to_string(),
+        provider_api_key: "primary-token".to_string(),
+        default_model: "gpt-4.1-mini".to_string(),
+        allowed_models: vec!["gpt-4.1-mini".to_string()],
+        api_type: CHAT_COMPLETIONS_API_TYPE.to_string(),
+        reasoning_effort: None,
+        enabled: true,
+        allow_streaming: true,
+        request_timeout_seconds: 60,
+        context_window_tokens: 128_000,
+        max_output_tokens: 4096,
+        temperature: 0.7,
+        supports_parallel_tools: true,
+        fallback: Some(ModelFallbackConfig {
+            enabled: true,
+            provider_name: "fallback-provider".to_string(),
+            provider_base_url: "https://fallback.example/v1".to_string(),
+            provider_api_key: "fallback-token".to_string(),
+            default_model: "gpt-4.1-fallback".to_string(),
+            allowed_models: vec!["gpt-4.1-fallback".to_string()],
+            api_type: CHAT_COMPLETIONS_API_TYPE.to_string(),
+            reasoning_effort: None,
+            allow_streaming: true,
+            request_timeout_seconds: 30,
+            context_window_tokens: 64_000,
+            max_output_tokens: 1024,
+            temperature: 0.2,
+            supports_parallel_tools: false,
+        }),
+    });
+    registry
+        .add_instance_token_for_instance("instance-for-fallback", "instance-token")
+        .await
+        .expect("memory token can be registered");
+    let state = test_state_with_provider(provider.shared(), registry);
+    let app = build_router_with_state(state.clone());
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/internal/llm/v1/chat/completions",
+        json!({ "model": "gpt-4.1-mini", "messages": [] }),
+        Some("instance-token"),
+    )
+    .await;
+
+    let (status, body) = response_json(response).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["id"], "fallback-response");
+    let requests = provider_requests.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].provider_base_url, "https://primary.example/v1");
+    assert_eq!(requests[0].authorization, "Bearer primary-token");
+    assert_eq!(requests[1].provider_base_url, "https://fallback.example/v1");
+    assert_eq!(requests[1].authorization, "Bearer fallback-token");
+    let fallback_body: Value =
+        serde_json::from_slice(&requests[1].body).expect("fallback body is json");
+    assert_eq!(fallback_body["model"], "gpt-4.1-fallback");
+    assert_eq!(fallback_body["max_tokens"], 1024);
+    assert!(fallback_body.get("parallel_tool_calls").is_none());
+    assert_eq!(state.store.llm_usage_count().await.expect("usage count"), 2);
+}
+
+#[tokio::test]
 async fn llm_proxy_uses_real_http_provider_and_records_usage() {
     let captured = CapturedProviderRequest::default();
     let provider_base_url = format!("{}/v1", spawn_provider_server(captured.clone()).await);
@@ -532,6 +658,7 @@ async fn llm_proxy_uses_real_http_provider_and_records_usage() {
         max_output_tokens: 4096,
         temperature: 0.7,
         supports_parallel_tools: true,
+        fallback: None,
     });
     registry
         .add_instance_token_for_instance("instance-for-usage", "instance-token")
@@ -598,6 +725,7 @@ async fn llm_proxy_allows_longer_timeout_for_streaming_provider_requests() {
         max_output_tokens: 4096,
         temperature: 0.7,
         supports_parallel_tools: true,
+        fallback: None,
     });
     registry
         .add_instance_token_for_instance("instance-for-slow-stream", "instance-token")

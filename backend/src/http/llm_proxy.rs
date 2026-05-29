@@ -13,8 +13,9 @@ use crate::{
     http::ApiError,
     llm_proxy::{LlmProviderError, LlmProviderRequest},
     model_config::{
-        ModelRegistryError, CHAT_COMPLETIONS_API_TYPE, IMAGES_GENERATIONS_API_TYPE,
-        IMAGE_MODEL_CONFIG_KIND, LLM_MODEL_CONFIG_KIND, RESPONSES_API_TYPE,
+        InstanceTokenContext, ModelConfig, ModelRegistryError, PreparedFallbackModelRequest,
+        CHAT_COMPLETIONS_API_TYPE, IMAGES_GENERATIONS_API_TYPE, IMAGE_MODEL_CONFIG_KIND,
+        LLM_MODEL_CONFIG_KIND, RESPONSES_API_TYPE,
     },
     session::store::LlmUsageEvent,
     AppState,
@@ -118,15 +119,7 @@ async fn proxy_model_request(
         .await
         .map_err(map_model_error)?;
     let config = prepared.config.clone();
-    let request = LlmProviderRequest {
-        method: Method::POST,
-        provider_base_url: config.provider_base_url.clone(),
-        path: path.to_string(),
-        authorization: format!("Bearer {}", config.provider_api_key),
-        content_type: "application/json".to_string(),
-        body: prepared.body,
-        timeout_seconds: config.request_timeout_seconds,
-    };
+    let request = provider_request_from_model_config(path, &config, prepared.body);
 
     let started = Instant::now();
     let provider = state.llm_provider.send(request).await;
@@ -134,41 +127,134 @@ async fn proxy_model_request(
     match provider {
         Ok(response) => {
             let status = response.status().as_u16();
-            let _ = state
-                .store
-                .record_llm_usage(LlmUsageEvent {
-                    user_id: token_context.user_id,
-                    hermes_instance_id: token_context.hermes_instance_id,
-                    model: prepared.model,
-                    upstream_provider: config.provider_name,
-                    status_code: Some(status),
-                    duration_ms: Some(started.elapsed().as_millis() as u64),
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                    total_tokens: None,
-                })
-                .await;
+            record_llm_usage(
+                &state,
+                token_context.clone(),
+                prepared.model,
+                config.provider_name,
+                Some(status),
+                started.elapsed().as_millis() as u64,
+            )
+            .await;
+            if !response.status().is_success() {
+                if let Some(fallback) = prepared.fallback {
+                    return send_fallback_model_request(&state, token_context, path, fallback)
+                        .await;
+                }
+            }
             Ok(response)
         }
         Err(error) => {
             let mapped = map_provider_error(error);
-            let _ = state
-                .store
-                .record_llm_usage(LlmUsageEvent {
-                    user_id: token_context.user_id,
-                    hermes_instance_id: token_context.hermes_instance_id,
-                    model: prepared.model,
-                    upstream_provider: config.provider_name,
-                    status_code: None,
-                    duration_ms: Some(started.elapsed().as_millis() as u64),
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                    total_tokens: None,
-                })
-                .await;
+            record_llm_usage(
+                &state,
+                token_context.clone(),
+                prepared.model,
+                config.provider_name,
+                None,
+                started.elapsed().as_millis() as u64,
+            )
+            .await;
+            if let Some(fallback) = prepared.fallback {
+                return send_fallback_model_request(&state, token_context, path, fallback).await;
+            }
             Err(mapped)
         }
     }
+}
+
+fn provider_request_from_model_config(
+    path: &str,
+    config: &ModelConfig,
+    body: Vec<u8>,
+) -> LlmProviderRequest {
+    LlmProviderRequest {
+        method: Method::POST,
+        provider_base_url: config.provider_base_url.clone(),
+        path: path.to_string(),
+        authorization: format!("Bearer {}", config.provider_api_key),
+        content_type: "application/json".to_string(),
+        body,
+        timeout_seconds: config.request_timeout_seconds,
+    }
+}
+
+fn provider_request_from_fallback_config(
+    path: &str,
+    prepared: &PreparedFallbackModelRequest,
+) -> LlmProviderRequest {
+    LlmProviderRequest {
+        method: Method::POST,
+        provider_base_url: prepared.config.provider_base_url.clone(),
+        path: path.to_string(),
+        authorization: format!("Bearer {}", prepared.config.provider_api_key),
+        content_type: "application/json".to_string(),
+        body: prepared.body.clone(),
+        timeout_seconds: prepared.config.request_timeout_seconds,
+    }
+}
+
+async fn send_fallback_model_request(
+    state: &AppState,
+    token_context: InstanceTokenContext,
+    path: &str,
+    prepared: PreparedFallbackModelRequest,
+) -> Result<Response, ApiError> {
+    let request = provider_request_from_fallback_config(path, &prepared);
+    let started = Instant::now();
+    let provider = state.llm_provider.send(request).await;
+
+    match provider {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            record_llm_usage(
+                state,
+                token_context,
+                prepared.model,
+                prepared.config.provider_name,
+                Some(status),
+                started.elapsed().as_millis() as u64,
+            )
+            .await;
+            Ok(response)
+        }
+        Err(error) => {
+            record_llm_usage(
+                state,
+                token_context,
+                prepared.model,
+                prepared.config.provider_name,
+                None,
+                started.elapsed().as_millis() as u64,
+            )
+            .await;
+            Err(map_provider_error(error))
+        }
+    }
+}
+
+async fn record_llm_usage(
+    state: &AppState,
+    token_context: InstanceTokenContext,
+    model: String,
+    upstream_provider: String,
+    status_code: Option<u16>,
+    duration_ms: u64,
+) {
+    let _ = state
+        .store
+        .record_llm_usage(LlmUsageEvent {
+            user_id: token_context.user_id,
+            hermes_instance_id: token_context.hermes_instance_id,
+            model,
+            upstream_provider,
+            status_code,
+            duration_ms: Some(duration_ms),
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+        })
+        .await;
 }
 
 async fn verify_instance_token(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {

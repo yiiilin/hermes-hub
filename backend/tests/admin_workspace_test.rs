@@ -93,6 +93,7 @@ fn ready_model_config(kind: &str) -> ModelConfig {
         max_output_tokens: 4096,
         temperature: 0.7,
         supports_parallel_tools: true,
+        fallback: None,
     }
 }
 
@@ -185,7 +186,23 @@ async fn admin_model_config_update_refreshes_managed_config_and_queues_gateway_r
             "context_window_tokens": 200000,
             "max_output_tokens": 8192,
             "temperature": 0.3,
-            "supports_parallel_tools": true
+            "supports_parallel_tools": true,
+            "fallback": {
+                "enabled": true,
+                "provider_name": "fallback-custom",
+                "provider_base_url": "https://fallback-models.example/v1",
+                "provider_api_key": "fallback-secret-v2",
+                "default_model": "gpt-4.1-fallback",
+                "allowed_models": ["gpt-4.1-fallback"],
+                "api_type": "responses",
+                "reasoning_effort": "low",
+                "allow_streaming": true,
+                "request_timeout_seconds": 45,
+                "context_window_tokens": 100000,
+                "max_output_tokens": 2048,
+                "temperature": 0.2,
+                "supports_parallel_tools": false
+            }
         }),
         Some(&admin_cookie),
     )
@@ -787,7 +804,23 @@ async fn admin_workspace_test() {
             "context_window_tokens": 200000,
             "max_output_tokens": 8192,
             "temperature": 0.3,
-            "supports_parallel_tools": true
+            "supports_parallel_tools": true,
+            "fallback": {
+                "enabled": true,
+                "provider_name": "fallback-custom",
+                "provider_base_url": "https://fallback-models.example/v1",
+                "provider_api_key": "fallback-secret-v2",
+                "default_model": "gpt-4.1-fallback",
+                "allowed_models": ["gpt-4.1-fallback"],
+                "api_type": "responses",
+                "reasoning_effort": "low",
+                "allow_streaming": true,
+                "request_timeout_seconds": 45,
+                "context_window_tokens": 100000,
+                "max_output_tokens": 2048,
+                "temperature": 0.2,
+                "supports_parallel_tools": false
+            }
         }),
         Some(&admin_cookie),
     )
@@ -812,6 +845,29 @@ async fn admin_workspace_test() {
     assert_eq!(body["model_config"]["max_output_tokens"], 8192);
     assert_eq!(body["model_config"]["temperature"], 0.3);
     assert_eq!(body["model_config"]["supports_parallel_tools"], true);
+    assert_eq!(body["model_config"]["fallback"]["enabled"], true);
+    assert_eq!(
+        body["model_config"]["fallback"]["provider_name"],
+        "fallback-custom"
+    );
+    assert_eq!(
+        body["model_config"]["fallback"]["provider_base_url"],
+        "https://fallback-models.example/v1"
+    );
+    assert_eq!(
+        body["model_config"]["fallback"]["provider_api_key"],
+        "fallback-secret-v2"
+    );
+    assert_eq!(
+        body["model_config"]["fallback"]["default_model"],
+        "gpt-4.1-fallback"
+    );
+    assert_eq!(body["model_config"]["fallback"]["api_type"], "responses");
+    assert_eq!(body["model_config"]["fallback"]["reasoning_effort"], "low");
+    assert_eq!(
+        body["model_config"]["fallback"]["supports_parallel_tools"],
+        false
+    );
 
     let status_response = request_empty(
         &app,

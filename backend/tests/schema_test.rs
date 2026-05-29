@@ -34,6 +34,8 @@ fn schema_migrations_include_initial_tables() {
     assert!(sql.contains("max_output_tokens bigint not null default 4096"));
     assert!(sql.contains("temperature double precision not null default 0.7"));
     assert!(sql.contains("supports_parallel_tools boolean not null default true"));
+    assert!(sql.contains("fallback_config jsonb"));
+    assert!(sql.contains("alter table model_configs add column if not exists fallback_config"));
     assert!(
         !sql.contains("\n    base_url text not null,"),
         "Hermes instances no longer store an inbound base URL"

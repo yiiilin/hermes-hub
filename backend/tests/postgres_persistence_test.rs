@@ -76,6 +76,7 @@ async fn test_state(pool: PgPool, provider: InMemoryLlmProviderClient) -> AppSta
         max_output_tokens: 4096,
         temperature: 0.7,
         supports_parallel_tools: true,
+        fallback: None,
     };
     let model_registry = ModelRegistry::postgres(pool.clone(), cipher.clone(), default_config)
         .await
@@ -316,13 +317,54 @@ async fn postgres_state_survives_recreated_router_state() {
             "default_model": "gpt-4.1",
             "allowed_models": ["gpt-4.1"],
             "allow_streaming": true,
-            "request_timeout_seconds": 30
+            "request_timeout_seconds": 30,
+            "fallback": {
+                "enabled": true,
+                "provider_name": "fallback-openai-compatible",
+                "provider_base_url": "https://provider-fallback.example/v1",
+                "provider_api_key": "provider-fallback-key",
+                "default_model": "gpt-4.1-fallback",
+                "allowed_models": ["gpt-4.1-fallback"],
+                "api_type": "chat_completions",
+                "reasoning_effort": null,
+                "allow_streaming": true,
+                "request_timeout_seconds": 45,
+                "context_window_tokens": 64000,
+                "max_output_tokens": 2048,
+                "temperature": 0.2,
+                "supports_parallel_tools": false
+            }
         }),
         Some(&admin_cookie),
         None,
     )
     .await;
     assert_eq!(update_model.status(), StatusCode::NO_CONTENT);
+    let stored_fallback_key: Option<String> = sqlx::query_scalar(
+        "select fallback_config->>'provider_api_key' from model_configs where config_kind = 'llm'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("fallback config can be queried");
+    assert_ne!(
+        stored_fallback_key.as_deref(),
+        Some("provider-fallback-key")
+    );
+
+    let saved_model = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/model-config",
+        Some(&admin_cookie),
+        None,
+    )
+    .await;
+    let (status, saved_model_body) = response_json(saved_model).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        saved_model_body["model_config"]["fallback"]["provider_api_key"],
+        "provider-fallback-key"
+    );
 
     let ensured = request_empty(
         &app,

@@ -116,6 +116,7 @@ create table if not exists model_configs (
     max_output_tokens bigint not null default 4096 check (max_output_tokens > 0),
     temperature double precision not null default 0.7 check (temperature >= 0 and temperature <= 2),
     supports_parallel_tools boolean not null default true,
+    fallback_config jsonb,
     is_active boolean not null default true,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
@@ -128,6 +129,7 @@ alter table model_configs add column if not exists context_window_tokens bigint 
 alter table model_configs add column if not exists max_output_tokens bigint not null default 4096;
 alter table model_configs add column if not exists temperature double precision not null default 0.7;
 alter table model_configs add column if not exists supports_parallel_tools boolean not null default true;
+alter table model_configs add column if not exists fallback_config jsonb;
 do $$
 begin
     if not exists (

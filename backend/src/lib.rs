@@ -10,6 +10,7 @@ pub mod model_registry;
 pub mod security;
 pub mod skills_fs;
 pub mod storage;
+pub mod title_generation;
 pub mod session {
     pub mod store;
 }
