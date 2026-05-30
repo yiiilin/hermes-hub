@@ -78,7 +78,7 @@ services:
     profiles: ["hermes-runtime"]
     build:
       context: ${PWD}
-      dockerfile: infra/docker/hermes/Dockerfile
+      dockerfile: docker/hermes/Dockerfile
       args:
         HERMES_VERSION: ${HERMES_VERSION:-latest}
     image: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:${HERMES_VERSION:-latest}}

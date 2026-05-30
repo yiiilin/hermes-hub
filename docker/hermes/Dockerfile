@@ -1,8 +1,9 @@
 ARG HERMES_VERSION=latest
 FROM nousresearch/hermes-agent:${HERMES_VERSION}
 
-COPY infra/docker/hermes/hermes-hub-entrypoint.sh /opt/hermes-hub/entrypoint.sh
-COPY infra/docker/hermes/patch_send_message_tool.py /opt/hermes-hub/patch_send_message_tool.py
+COPY docker/hermes/hermes-hub-entrypoint.sh /opt/hermes-hub/entrypoint.sh
+COPY docker/hermes/patch_send_message_tool.py /opt/hermes-hub/patch_send_message_tool.py
+COPY docker/hermes/plugins /opt/hermes/plugins
 RUN chmod +x /opt/hermes-hub/entrypoint.sh
 RUN python3 /opt/hermes-hub/patch_send_message_tool.py
 

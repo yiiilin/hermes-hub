@@ -9,7 +9,7 @@ frontend-test:
 	cd frontend && npm test
 
 dev-db:
-	docker compose --project-directory . -f infra/docker/docker-compose.yml up -d postgres
+	docker compose -f deploy/compose.dev.yml up -d postgres
 
 hermes-image:
-	docker compose --project-directory . -f infra/docker/docker-compose.hub.yml --profile hermes-runtime build hermes-runtime
+	docker compose -f deploy/compose.dev.yml --profile hermes-runtime build hermes-runtime

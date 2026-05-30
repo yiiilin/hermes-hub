@@ -498,19 +498,15 @@ async fn docker_provisioner_writes_configured_image_model_to_env_and_config() {
 }
 
 #[tokio::test]
-async fn docker_provisioner_writes_adapter_runtime_version_reporter() {
-    let runtime = FakeDockerRuntime::default();
-    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime));
-
-    provisioner
-        .ensure_instance("user-runtime-report", "instance-token")
-        .await
-        .expect("instance can be created");
-
+async fn bundled_hermes_hub_adapter_reports_runtime_version() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("backend crate lives under repo root")
+        .to_path_buf();
     let adapter = std::fs::read_to_string(
-        "/tmp/hermes-hub-test/users/user-runtime-report/config/plugins/platforms/hermes_hub/adapter.py",
+        repo_root.join("docker/hermes/plugins/platforms/hermes_hub/adapter.py"),
     )
-    .expect("managed Hermes adapter is written");
+    .expect("bundled Hermes Hub adapter is present");
     assert!(adapter.contains("import importlib.metadata"));
     assert!(adapter.contains("_report_runtime_status_once"));
     assert!(adapter.contains("\"/instance/status\""));
@@ -965,6 +961,16 @@ async fn docker_provisioner_refreshes_status_from_docker_health() {
 async fn docker_provisioner_test() {
     let runtime = FakeDockerRuntime::default();
     let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime.clone()));
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("backend crate lives under repo root")
+        .to_path_buf();
+    let bundled_plugin_root = repo_root.join("docker/hermes/plugins/platforms/hermes_hub");
+    let stale_plugin_root =
+        PathBuf::from("/tmp/hermes-hub-test/users/user-123/config/plugins/platforms/hermes_hub");
+    std::fs::create_dir_all(&stale_plugin_root).expect("stale plugin directory can be created");
+    std::fs::write(stale_plugin_root.join("adapter.py"), "# stale adapter")
+        .expect("stale plugin marker can be written");
 
     let instance = provisioner
         .ensure_instance("user-123", "instance-token")
@@ -1087,7 +1093,7 @@ async fn docker_provisioner_test() {
         |entry| entry == "HERMES_MEDIA_ALLOW_DIRS=/workspace:/sandbox:/opt/data:/config/cache"
     ));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version" && value == "2026-05-29-nfs-path"
+        key == "hermes_hub_spec_version" && value == "2026-05-30-bundled-platform-plugin"
     }));
     assert!(spec
         .mounts
@@ -1110,23 +1116,21 @@ async fn docker_provisioner_test() {
     let managed_config =
         std::fs::read_to_string("/tmp/hermes-hub-test/users/user-123/config/config.yaml")
             .expect("managed Hermes config is written");
-    let plugin_yaml = std::fs::read_to_string(
-        "/tmp/hermes-hub-test/users/user-123/config/plugins/platforms/hermes_hub/plugin.yaml",
-    )
-    .expect("hermes_hub platform plugin metadata is written");
-    let plugin_init = std::fs::read_to_string(
-        "/tmp/hermes-hub-test/users/user-123/config/plugins/platforms/hermes_hub/__init__.py",
-    )
-    .expect("hermes_hub platform plugin package marker is written");
-    let plugin_adapter = std::fs::read_to_string(
-        "/tmp/hermes-hub-test/users/user-123/config/plugins/platforms/hermes_hub/adapter.py",
-    )
-    .expect("hermes_hub platform adapter is written");
+    let plugin_yaml = std::fs::read_to_string(bundled_plugin_root.join("plugin.yaml"))
+        .expect("hermes_hub bundled platform plugin metadata is present");
+    let plugin_init = std::fs::read_to_string(bundled_plugin_root.join("__init__.py"))
+        .expect("hermes_hub bundled platform plugin package marker is present");
+    let plugin_adapter = std::fs::read_to_string(bundled_plugin_root.join("adapter.py"))
+        .expect("hermes_hub bundled platform adapter is present");
+    assert!(
+        !stale_plugin_root.exists(),
+        "managed config must remove old user plugin files so bundled adapter wins"
+    );
     assert!(managed_config.contains("provider: \"custom\""));
     assert!(managed_config.contains("default: \"gpt-4.1-mini\""));
     assert!(managed_config.contains("api_key: \"instance-token\""));
     assert!(managed_config.contains("plugins:"));
-    assert!(managed_config.contains("enabled: [platforms/hermes_hub]"));
+    assert!(!managed_config.contains("enabled: [platforms/hermes_hub]"));
     assert!(managed_config.contains("memory:"));
     assert!(managed_config.contains("provider: holographic"));
     assert!(managed_config.contains("hermes-memory-store:"));
@@ -1252,7 +1256,8 @@ async fn docker_provisioner_test() {
     assert!(plugin_adapter.contains("item_metadata[\"media_sequence\"] = index"));
     assert!(plugin_adapter.contains("media_metadata.setdefault(\"media_source_url\", raw_url)"));
     assert!(plugin_adapter.contains("media_sequence = metadata.get(\"media_sequence\")"));
-    assert!(plugin_adapter.contains("media_source_url = str(metadata.get(\"media_source_url\") or \"\")"));
+    assert!(plugin_adapter
+        .contains("media_source_url = str(metadata.get(\"media_source_url\") or \"\")"));
     assert!(plugin_adapter.contains("\"remote\""));
     assert!(plugin_adapter.contains("\"local\""));
     assert!(plugin_adapter.contains("def _image_extension_from_url("));
@@ -1262,7 +1267,9 @@ async fn docker_provisioner_test() {
     assert!(plugin_adapter.contains("os.replace(cached_path, renamed_path)"));
     assert!(plugin_adapter.contains("header.startswith(b\"\\x89PNG\\r\\n\\x1a\\n\")"));
     assert!(plugin_adapter.contains("header[8:12] == b\"WEBP\""));
-    assert!(plugin_adapter.contains("explicit_client_message_key = str(metadata.get(\"client_message_key\") or \"\")"));
+    assert!(plugin_adapter.contains(
+        "explicit_client_message_key = str(metadata.get(\"client_message_key\") or \"\")"
+    ));
     assert!(plugin_adapter.contains("if explicit_client_message_key and media_sequence is None:"));
     assert!(plugin_adapter.contains("return f\"{key_prefix}:media:{digest}\""));
     assert!(plugin_adapter.contains("MEDIA:/workspace/report.pdf"));
@@ -1287,7 +1294,10 @@ async fn docker_provisioner_test() {
         .args([
             "-m",
             "py_compile",
-            "/tmp/hermes-hub-test/users/user-123/config/plugins/platforms/hermes_hub/adapter.py",
+            bundled_plugin_root
+                .join("adapter.py")
+                .to_str()
+                .expect("utf-8 path"),
         ])
         .output()
         .expect("python3 is available to compile generated adapter");
@@ -1316,7 +1326,8 @@ async fn docker_provisioner_test() {
     );
     assert!(
         create_call.windows(2).any(|args| {
-            args[0] == "--label" && args[1] == "hermes_hub_spec_version=2026-05-29-nfs-path"
+            args[0] == "--label"
+                && args[1] == "hermes_hub_spec_version=2026-05-30-bundled-platform-plugin"
         }),
         "managed Hermes containers must carry the current spec label"
     );

@@ -6,20 +6,26 @@ fn hermes_wrapper_image_tracks_official_hermes_version() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("backend crate lives under repo root");
-    let dockerfile = std::fs::read_to_string(repo_root.join("infra/docker/hermes/Dockerfile"))
+    let dockerfile = std::fs::read_to_string(repo_root.join("docker/hermes/Dockerfile"))
         .expect("Hermes wrapper Dockerfile is present");
-    let patch_path = repo_root.join("infra/docker/hermes/patch_send_message_tool.py");
-    let compose = std::fs::read_to_string(repo_root.join("infra/docker/docker-compose.hub.yml"))
-        .expect("deployment compose file is present");
-    let dev_compose = std::fs::read_to_string(repo_root.join("infra/docker/docker-compose.yml"))
+    let patch_path = repo_root.join("docker/hermes/patch_send_message_tool.py");
+    let plugin_root = repo_root.join("docker/hermes/plugins/platforms/hermes_hub");
+    let plugin_yaml = std::fs::read_to_string(plugin_root.join("plugin.yaml"))
+        .expect("Hermes Hub bundled platform plugin manifest is present");
+    let prod_compose = std::fs::read_to_string(repo_root.join("deploy/compose.prod.yml"))
+        .expect("production compose file is present");
+    let dev_compose = std::fs::read_to_string(repo_root.join("deploy/compose.dev.yml"))
         .expect("development compose file is present");
 
     assert!(dockerfile.contains("ARG HERMES_VERSION=latest"));
     assert!(dockerfile.contains("FROM nousresearch/hermes-agent:${HERMES_VERSION}"));
-    assert!(dockerfile.contains("COPY infra/docker/hermes/hermes-hub-entrypoint.sh"));
-    assert!(dockerfile.contains("COPY infra/docker/hermes/patch_send_message_tool.py"));
+    assert!(dockerfile.contains("COPY docker/hermes/hermes-hub-entrypoint.sh"));
+    assert!(dockerfile.contains("COPY docker/hermes/patch_send_message_tool.py"));
+    assert!(dockerfile.contains("COPY docker/hermes/plugins /opt/hermes/plugins"));
     assert!(dockerfile.contains("RUN python3 /opt/hermes-hub/patch_send_message_tool.py"));
     assert!(dockerfile.contains("ENTRYPOINT [\"/opt/hermes-hub/entrypoint.sh\"]"));
+    assert!(plugin_yaml.contains("kind: platform"));
+    assert!(plugin_yaml.contains("label: Hermes Hub"));
     assert!(
         patch_path.exists(),
         "Hermes wrapper keeps a minimal MEDIA bridge for plugin send_message delivery"
@@ -45,10 +51,11 @@ fn hermes_wrapper_image_tracks_official_hermes_version() {
         "send_message patch must compile: {}",
         String::from_utf8_lossy(&compile_output.stderr)
     );
-    assert!(compose.contains("HERMES_VERSION: ${HERMES_VERSION:-latest}"));
-    assert!(compose.contains(
-        "HERMES_DOCKER_IMAGE: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:${HERMES_VERSION:-latest}}"
+    assert!(prod_compose.contains(
+        "HERMES_DOCKER_IMAGE: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:latest}"
     ));
+    assert!(dev_compose.contains("dockerfile: docker/hermes/Dockerfile"));
+    assert!(dev_compose.contains("HERMES_VERSION: ${HERMES_VERSION:-latest}"));
     assert!(dev_compose.contains(
         "HERMES_DOCKER_IMAGE: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:${HERMES_VERSION:-latest}}"
     ));
@@ -60,7 +67,7 @@ fn hermes_send_message_patch_applies_to_target_image_when_docker_is_available() 
         .parent()
         .expect("backend crate lives under repo root");
     let patch_path = repo_root
-        .join("infra/docker/hermes/patch_send_message_tool.py")
+        .join("docker/hermes/patch_send_message_tool.py")
         .canonicalize()
         .expect("send_message MEDIA bridge patch is present");
     let image = std::env::var("HERMES_HUB_HERMES_TEST_IMAGE")
@@ -86,7 +93,10 @@ fn hermes_send_message_patch_applies_to_target_image_when_docker_is_available() 
         return;
     }
 
-    let mount = format!("{}:/tmp/patch_send_message_tool.py:ro", patch_path.display());
+    let mount = format!(
+        "{}:/tmp/patch_send_message_tool.py:ro",
+        patch_path.display()
+    );
     let output = Command::new("docker")
         .args([
             "run",
@@ -116,9 +126,12 @@ fn hermes_wrapper_exposes_standard_hub_adapter_surface() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("backend crate lives under repo root");
+    let adapter_path = repo_root.join("docker/hermes/plugins/platforms/hermes_hub/adapter.py");
     let adapter =
+        std::fs::read_to_string(&adapter_path).expect("Hermes Hub adapter source is present");
+    let provisioner =
         std::fs::read_to_string(repo_root.join("backend/src/hermes/docker_provisioner.rs"))
-            .expect("Hermes Hub adapter source is present");
+            .expect("Docker provisioner source is present");
 
     assert!(adapter.contains("async def send_document("));
     assert!(adapter.contains("async def send_image_file("));
@@ -139,7 +152,9 @@ fn hermes_wrapper_exposes_standard_hub_adapter_surface() {
     assert!(adapter.contains("media_metadata.setdefault(\"media_source_url\", raw_url)"));
     assert!(adapter.contains("def _image_extension_from_file("));
     assert!(adapter.contains("os.replace(cached_path, renamed_path)"));
-    assert!(adapter.contains("explicit_client_message_key = str(metadata.get(\"client_message_key\") or \"\")"));
+    assert!(adapter.contains(
+        "explicit_client_message_key = str(metadata.get(\"client_message_key\") or \"\")"
+    ));
     assert!(adapter.contains("if explicit_client_message_key and media_sequence is None:"));
     assert!(adapter.contains("\"remote\""));
     assert!(adapter.contains("\"local\""));
@@ -153,6 +168,25 @@ fn hermes_wrapper_exposes_standard_hub_adapter_surface() {
     assert!(!adapter.contains("async def create_handoff_thread("));
     assert!(!adapter.contains("async def send_draft("));
     assert!(!adapter.contains("def supports_draft_streaming("));
+    assert!(adapter.contains("def register(ctx: Any) -> None:"));
+    assert!(adapter.contains("name=\"hermes_hub\""));
+    assert!(provisioner
+        .contains("remove_path_if_exists(&config_path.join(\"plugins/platforms/hermes_hub\"))"));
+    assert!(!provisioner.contains("HERMES_HUB_ADAPTER_PY"));
+
+    let compile_output = Command::new("python3")
+        .args([
+            "-m",
+            "py_compile",
+            adapter_path.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("python3 can compile Hermes Hub adapter");
+    assert!(
+        compile_output.status.success(),
+        "Hermes Hub adapter must compile: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
 }
 
 #[test]
@@ -161,7 +195,7 @@ fn hermes_wrapper_entrypoint_links_managed_profile_from_nfs() {
         .parent()
         .expect("backend crate lives under repo root");
     let entrypoint =
-        std::fs::read_to_string(repo_root.join("infra/docker/hermes/hermes-hub-entrypoint.sh"))
+        std::fs::read_to_string(repo_root.join("docker/hermes/hermes-hub-entrypoint.sh"))
             .expect("Hermes Hub wrapper entrypoint is present");
 
     assert!(entrypoint.contains("HERMES_HUB_NFS_DIR=\"${HERMES_HUB_NFS_DIR:-/nfs}\""));

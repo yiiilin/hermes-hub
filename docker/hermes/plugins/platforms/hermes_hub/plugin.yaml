@@ -1,0 +1,16 @@
+name: hermes-hub-platform
+label: Hermes Hub
+kind: platform
+version: 1
+description: Hermes Hub 长轮询平台适配器。
+requires_env:
+  - name: HERMES_HUB_CHANNEL_BASE_URL
+    description: Hermes Hub internal channel API base URL
+  - name: HERMES_HUB_CHANNEL_TOKEN
+    description: Hermes Hub instance token
+    password: true
+optional_env:
+  - name: HERMES_HUB_INSTANCE_ID
+    description: Hermes Hub managed instance id
+  - name: HERMES_HUB_USER_ID
+    description: Hermes Hub user id
