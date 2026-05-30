@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-use super::service::{ChannelMessage, ChannelRun};
+use super::service::{ChannelMessage, ChannelRun, ChannelSession};
 
 const CHANNEL_EVENT_CAPACITY: usize = 512;
 
@@ -41,17 +41,30 @@ impl SessionEventHub {
 pub enum SessionEvent {
     MessageCreated { message: ChannelMessage },
     MessageUpdated { message: ChannelMessage },
+    SessionUpdated { session: ChannelSession },
     RunUpdated { run: ChannelRun },
     RunCleared { session_id: String },
     SessionDeleted { session_id: String },
 }
 
 impl SessionEvent {
+    pub fn event_name(&self) -> &'static str {
+        match self {
+            SessionEvent::MessageCreated { .. } => "message_created",
+            SessionEvent::MessageUpdated { .. } => "message_updated",
+            SessionEvent::SessionUpdated { .. } => "session_updated",
+            SessionEvent::RunUpdated { .. } => "run_updated",
+            SessionEvent::RunCleared { .. } => "run_cleared",
+            SessionEvent::SessionDeleted { .. } => "session_deleted",
+        }
+    }
+
     pub fn session_id(&self) -> &str {
         match self {
             SessionEvent::MessageCreated { message } | SessionEvent::MessageUpdated { message } => {
                 &message.session_id
             }
+            SessionEvent::SessionUpdated { session } => &session.id,
             SessionEvent::RunUpdated { run } => &run.session_id,
             SessionEvent::RunCleared { session_id } => session_id,
             SessionEvent::SessionDeleted { session_id } => session_id,

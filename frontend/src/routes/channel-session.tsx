@@ -255,7 +255,15 @@ export function ChannelSessionRoute({
   }, [sessions, selectedSession, setChatSidebar, sidebarCollapsed, t, unreadSessionIds]);
 
   async function createSession() {
-    const session = await apiClient.createSessionPublic("agent");
+    let session: SessionSummary;
+    try {
+      session = await apiClient.createSessionPublic("agent");
+    } catch (cause) {
+      if (cause instanceof ApiRequestError && cause.code === "session_limit_exceeded") {
+        window.alert(userFacingErrorMessage(cause, t("chat.sessionCreateFailed"), t));
+      }
+      throw cause;
+    }
     setSessions((current) => [session, ...current]);
     selectedSessionIdRef.current = session.id;
     setSelectedSession(session);
@@ -355,6 +363,28 @@ export function ChannelSessionRoute({
     pendingAssistantIdsByRunRef.current[run.run_id] = assistantMessageId;
   }
 
+  function applySessionUpdate(updatedSession: SessionSummary) {
+    setSessions((current) => upsertSessionSummary(current, updatedSession));
+    if (selectedSessionIdRef.current !== updatedSession.id) {
+      return;
+    }
+
+    // 标题更新不代表有未读消息；当前会话收到新标题时同步标记已读时间。
+    setSelectedSession(updatedSession);
+    setSeenSessionUpdates((current) => ({
+      ...current,
+      [updatedSession.id]: sessionUpdatedAt(updatedSession),
+    }));
+    setUnreadSessionIds((current) => {
+      if (!current.has(updatedSession.id)) {
+        return current;
+      }
+      const next = new Set(current);
+      next.delete(updatedSession.id);
+      return next;
+    });
+  }
+
   async function handleSessionEvent(
     session: SessionSummary,
     event: ChannelSessionEvent,
@@ -371,6 +401,11 @@ export function ChannelSessionRoute({
       return;
     }
 
+    if (event.type === "session_updated") {
+      applySessionUpdate(event.session);
+      return;
+    }
+
     if (event.type === "message_created" || event.type === "message_updated") {
       const message = event.message;
       const runId = runIdFromHermesMessageKey(message.client_message_key);
@@ -380,7 +415,7 @@ export function ChannelSessionRoute({
           message.role === "assistant" && hasRenderableMessageBody(message)
             ? removePendingAssistantForMessage(current, message, pendingId)
             : current;
-        return mergeMessagesById(withoutPending, [message]);
+        return upsertLiveMessage(withoutPending, message);
       });
       if (message.role === "assistant") {
         const run = activeRunRef.current;
@@ -562,7 +597,7 @@ export function ChannelSessionRoute({
         clientMessageKey: userMessageKey,
       });
       updateMessagesForSession(session.id, (current) =>
-        mergeMessagesById(current, [userMessage]),
+        upsertLiveMessage(current, userMessage),
       );
 
     } catch (cause) {
@@ -823,9 +858,7 @@ export function ChannelSessionRoute({
   const selectedSessionId = selectedSession?.id ?? null;
   const renderedMessages = useMemo(
     () =>
-      sortMessagesForDisplay(
-        messages.filter((message) => !selectedSessionId || message.session_id === selectedSessionId),
-      ),
+      messages.filter((message) => !selectedSessionId || message.session_id === selectedSessionId),
     [messages, selectedSessionId],
   );
   const runInProgress = Boolean(activeRun && !isTerminalHermesRun(activeRun));
@@ -1031,7 +1064,9 @@ function completePendingRunMessages(
   finalMessage: ChannelMessage,
 ) {
   const next = messages.filter((message) => message.id !== pendingMessageId);
-  return upsertMessage(executionMessage ? upsertMessage(next, executionMessage) : next, finalMessage);
+  return dedupeRepeatedAssistantMessages(
+    upsertMessage(executionMessage ? upsertMessage(next, executionMessage) : next, finalMessage),
+  );
 }
 
 function upsertMessage(messages: ChannelMessage[], nextMessage: ChannelMessage) {
@@ -1041,10 +1076,34 @@ function upsertMessage(messages: ChannelMessage[], nextMessage: ChannelMessage) 
   return [...messages, nextMessage];
 }
 
-function mergeMessagesById(messages: ChannelMessage[], nextMessages: ChannelMessage[]) {
-  return sortMessagesForDisplay(
-    nextMessages.reduce((current, message) => upsertMessage(current, message), messages),
-  );
+function upsertLiveMessage(messages: ChannelMessage[], nextMessage: ChannelMessage) {
+  const existingIndex = messages.findIndex((message) => message.id === nextMessage.id);
+  if (existingIndex !== -1) {
+    const next = [...messages];
+    next[existingIndex] = nextMessage;
+    return dedupeRepeatedAssistantMessagesAround(next, existingIndex);
+  }
+
+  // SSE 的 live 事件天然按追加顺序到达；只有收到旧时间戳补偿消息时才做插入，
+  // 避免每个 token/消息事件都全量排序长历史。
+  const insertIndex = liveMessageInsertIndex(messages, nextMessage);
+  const next = [
+    ...messages.slice(0, insertIndex),
+    nextMessage,
+    ...messages.slice(insertIndex),
+  ];
+  return dedupeRepeatedAssistantMessagesAround(next, insertIndex);
+}
+
+function liveMessageInsertIndex(messages: ChannelMessage[], nextMessage: ChannelMessage) {
+  const nextCreatedAt = nextMessage.created_at ?? 0;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const currentCreatedAt = messages[index]?.created_at ?? 0;
+    if (currentCreatedAt <= nextCreatedAt) {
+      return index + 1;
+    }
+  }
+  return 0;
 }
 
 function upsertExecutionMessage(messages: ChannelMessage[], nextMessage: ChannelMessage) {
@@ -1766,6 +1825,16 @@ function sessionUpdatedAt(session: SessionSummary) {
   return session.updated_at ?? session.created_at ?? 0;
 }
 
+function upsertSessionSummary(sessions: SessionSummary[], updatedSession: SessionSummary) {
+  const index = sessions.findIndex((session) => session.id === updatedSession.id);
+  if (index === -1) {
+    return [...sessions, updatedSession];
+  }
+  const next = [...sessions];
+  next[index] = updatedSession;
+  return next;
+}
+
 function activeExecutionMessageForRun(
   messages: ChannelMessage[],
   run: HermesActiveRun | null,
@@ -2069,6 +2138,22 @@ function dedupeRepeatedAssistantMessages(messages: ChannelMessage[]) {
   return deduped;
 }
 
+function dedupeRepeatedAssistantMessagesAround(messages: ChannelMessage[], index: number) {
+  const next = [...messages];
+  const right = next[index + 1];
+  if (right && isRepeatedAssistantMessage(next[index], right)) {
+    next.splice(index + 1, 1);
+  }
+
+  const currentIndex = Math.min(index, next.length - 1);
+  const left = next[currentIndex - 1];
+  if (left && isRepeatedAssistantMessage(left, next[currentIndex])) {
+    next.splice(currentIndex, 1);
+  }
+
+  return next;
+}
+
 function isRepeatedAssistantMessage(left: ChannelMessage, right: ChannelMessage) {
   return (
     left.role === "assistant" &&
@@ -2076,8 +2161,14 @@ function isRepeatedAssistantMessage(left: ChannelMessage, right: ChannelMessage)
     !isExecutionHistoryMessage(left) &&
     !isExecutionHistoryMessage(right) &&
     left.content.trim() !== "" &&
-    left.content.trim() === right.content.trim()
+    left.content.trim() === right.content.trim() &&
+    (left.client_message_key ?? "") === (right.client_message_key ?? "") &&
+    messageAttachmentSignature(left) === messageAttachmentSignature(right)
   );
+}
+
+function messageAttachmentSignature(message: ChannelMessage) {
+  return (message.attachments ?? []).map(attachmentReferenceKey).join("|");
 }
 
 function formatExecutionEntry(event: ExecutionHistoryEntry, t: Translate) {
@@ -2180,15 +2271,28 @@ function MarkdownContent({
   t: Translate;
 }) {
   const referencedAttachmentIds = new Set<string>();
+  const contentParts = markdownAttachmentParts(content, attachments, referencedAttachmentIds);
 
   return (
     <div className="markdown-content">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={markdownComponents(attachments, referencedAttachmentIds, onPreviewImage, t)}
-      >
-        {content}
-      </ReactMarkdown>
+      {contentParts.map((part, index) =>
+        part.type === "attachment" ? (
+          <InlineAttachment
+            key={`attachment-placeholder-${index}-${attachmentReferenceKey(part.attachment)}`}
+            attachment={part.attachment}
+            onPreviewImage={onPreviewImage}
+            t={t}
+          />
+        ) : part.text ? (
+          <ReactMarkdown
+            key={`markdown-text-${index}`}
+            remarkPlugins={[remarkGfm]}
+            components={markdownComponents(attachments, referencedAttachmentIds, onPreviewImage, t)}
+          >
+            {part.text}
+          </ReactMarkdown>
+        ) : null,
+      )}
       <InlineAttachments
         attachments={attachments}
         referencedAttachmentIds={referencedAttachmentIds}
@@ -2197,6 +2301,52 @@ function MarkdownContent({
       />
     </div>
   );
+}
+
+type MarkdownAttachmentPart =
+  | { type: "text"; text: string }
+  | { type: "attachment"; attachment: HermesAttachment };
+
+const ATTACHMENT_PLACEHOLDER_PATTERN = /\{\{attachment:(\d+)\}\}/g;
+
+function markdownAttachmentParts(
+  content: string,
+  attachments: HermesAttachment[],
+  referencedAttachmentIds: Set<string>,
+): MarkdownAttachmentPart[] {
+  const parts: MarkdownAttachmentPart[] = [];
+  let cursor = 0;
+
+  for (const match of content.matchAll(ATTACHMENT_PLACEHOLDER_PATTERN)) {
+    const rawIndex = match[1];
+    const matchText = match[0];
+    const matchIndex = match.index ?? 0;
+    if (matchIndex > cursor) {
+      parts.push({ type: "text", text: content.slice(cursor, matchIndex) });
+    }
+
+    const attachment = attachments[Number(rawIndex)];
+    if (attachment && attachmentPlaceholderIsOwnLine(content, matchIndex, matchIndex + matchText.length)) {
+      // 占位符编号只负责定位；文件名、类型和下载地址仍以 Hub 返回的附件元数据为准。
+      referencedAttachmentIds.add(attachmentReferenceKey(attachment));
+      parts.push({ type: "attachment", attachment });
+    } else {
+      parts.push({ type: "text", text: matchText });
+    }
+    cursor = matchIndex + matchText.length;
+  }
+
+  if (cursor < content.length) {
+    parts.push({ type: "text", text: content.slice(cursor) });
+  }
+  return parts.length ? parts : [{ type: "text", text: content }];
+}
+
+function attachmentPlaceholderIsOwnLine(content: string, start: number, end: number) {
+  const lineStart = content.lastIndexOf("\n", start - 1) + 1;
+  const nextNewline = content.indexOf("\n", end);
+  const lineEnd = nextNewline === -1 ? content.length : nextNewline;
+  return content.slice(lineStart, start).trim() === "" && content.slice(end, lineEnd).trim() === "";
 }
 
 function markdownComponents(
@@ -2210,7 +2360,7 @@ function markdownComponents(
       const url = href ?? "";
       const attachment = attachmentForUrl(attachments, url);
       if (attachment) {
-        referencedAttachmentIds.add(attachment.id ?? attachment.download_url ?? attachment.name);
+        referencedAttachmentIds.add(attachmentReferenceKey(attachment));
         return <InlineAttachment attachment={attachment} onPreviewImage={onPreviewImage} t={t} />;
       }
       const safeHref = safeMarkdownUrl(url, false);
@@ -2226,7 +2376,7 @@ function markdownComponents(
       const url = src ?? "";
       const attachment = attachmentForUrl(attachments, url);
       if (attachment) {
-        referencedAttachmentIds.add(attachment.id ?? attachment.download_url ?? attachment.name);
+        referencedAttachmentIds.add(attachmentReferenceKey(attachment));
         return (
           <InlineAttachment
             attachment={{ ...attachment, name: alt || attachment.name }}
@@ -2293,8 +2443,7 @@ function InlineAttachments({
   t: Translate;
 }) {
   const remaining = attachments.filter(
-    (attachment) =>
-      !referencedAttachmentIds.has(attachment.id ?? attachment.download_url ?? attachment.name),
+    (attachment) => !referencedAttachmentIds.has(attachmentReferenceKey(attachment)),
   );
 
   if (remaining.length === 0) {
@@ -2305,7 +2454,7 @@ function InlineAttachments({
     <span className="inline-attachments">
       {remaining.map((attachment) => (
         <InlineAttachment
-          key={attachment.id ?? attachment.download_url ?? attachment.name}
+          key={attachmentReferenceKey(attachment)}
           attachment={attachment}
           onPreviewImage={onPreviewImage}
           t={t}
@@ -2408,6 +2557,10 @@ function attachmentForUrl(attachments: HermesAttachment[], url: string) {
           (normalizedId && attachmentId === normalizedId)),
     );
   });
+}
+
+function attachmentReferenceKey(attachment: HermesAttachment) {
+  return attachment.id ?? attachment.download_url ?? attachment.name;
 }
 
 function normalizeAttachmentUrl(url: string | undefined) {

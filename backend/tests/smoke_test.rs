@@ -1,4 +1,9 @@
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
 use hermes_hub_backend::{app_config::AppConfig, build_router};
+use tower::ServiceExt;
 
 #[test]
 fn loads_default_config_for_tests() {
@@ -14,4 +19,24 @@ async fn builds_router_for_smoke_tests() {
     let router = build_router(config);
 
     let _ = router;
+}
+
+#[tokio::test]
+async fn normal_api_routes_keep_small_body_limit() {
+    let router = build_router(AppConfig::for_tests());
+    let oversized_json = format!("{{\"kind\":\"{}\"}}", "x".repeat(9 * 1024 * 1024));
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from(oversized_json))
+                .expect("request can be built"),
+        )
+        .await
+        .expect("router can handle request");
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }

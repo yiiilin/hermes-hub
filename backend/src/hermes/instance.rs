@@ -38,6 +38,10 @@ pub struct HermesInstance {
     pub status_message: Option<String>,
     pub runtime_image: Option<String>,
     pub runtime_version: Option<String>,
+    pub last_user_activity_at: Option<u64>,
+    pub last_started_at: Option<u64>,
+    pub last_stopped_at: Option<u64>,
+    pub stopped_reason: Option<String>,
     #[serde(skip_serializing)]
     pub global_skills_write_enabled: bool,
 }
@@ -66,6 +70,10 @@ impl HermesInstance {
             status_message: None,
             runtime_image: None,
             runtime_version: None,
+            last_user_activity_at: None,
+            last_started_at: None,
+            last_stopped_at: None,
+            stopped_reason: None,
             global_skills_write_enabled: false,
         }
     }

@@ -1,6 +1,6 @@
 use axum::{
     body::{to_bytes, Body},
-    extract::{Multipart, Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -23,8 +23,10 @@ use crate::{
     },
     http::{
         attachments::{
-            ensure_attachment_not_expired, map_channel_error,
-            upload_session_attachments_for_context,
+            create_session_attachment_from_file, drain_multipart_field_with_limit,
+            effective_attachment_upload_limit, ensure_attachment_not_expired, map_channel_error,
+            read_multipart_text_field_with_limit, spool_multipart_file_to_temp_with_limit,
+            upload_session_attachments_from_instance,
         },
         ApiError,
     },
@@ -32,6 +34,10 @@ use crate::{
     session::store::{HermesScheduledTaskSnapshot, HermesSchedulerSnapshotInput, StoreError},
     AppState,
 };
+
+const MEDIA_OUTPUT_CONTENT_MAX_BYTES: usize = 2 * 1024 * 1024;
+const MEDIA_OUTPUT_ID_FIELD_MAX_BYTES: usize = 4096;
+const MEDIA_OUTPUT_UNKNOWN_FIELD_MAX_BYTES: usize = 64 * 1024;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -45,7 +51,11 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/internal/channel/v1/sessions/{session_id}/attachments",
-            post(upload_output_attachments),
+            post(upload_output_attachments).layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/internal/channel/v1/sessions/{session_id}/outputs/media",
+            post(deliver_media_output).layer(DefaultBodyLimit::disable()),
         )
         .route("/internal/channel/v1/inbox", get(poll_inbox))
         .route(
@@ -198,7 +208,7 @@ async fn deliver_message(
             "channel message role must be assistant",
         ));
     }
-    let client_message_key = payload.client_message_key;
+    let client_message_key = payload.client_message_key.and_then(trimmed_non_empty);
     let heartbeat_run_id = payload
         .run_id
         .as_deref()
@@ -276,6 +286,7 @@ async fn reject_late_terminal_output(
 }
 
 fn hermes_run_id_from_client_message_key(value: &str) -> Option<&str> {
+    let value = value.trim();
     value.strip_prefix("hermes-run:").and_then(|rest| {
         let run_id = rest.split(':').next().unwrap_or(rest);
         run_id.starts_with("hub-run-").then_some(run_id)
@@ -283,9 +294,15 @@ fn hermes_run_id_from_client_message_key(value: &str) -> Option<&str> {
 }
 
 fn normalize_protocol_run_id(value: &str) -> Option<&str> {
+    let value = value.trim();
     let run_id = value.strip_prefix("hermes-run:").unwrap_or(value);
     let run_id = run_id.split(':').next().unwrap_or(run_id);
     run_id.starts_with("hub-run-").then_some(run_id)
+}
+
+fn trimmed_non_empty(value: String) -> Option<String> {
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 async fn upload_output_attachments(
@@ -305,7 +322,7 @@ async fn upload_output_attachments(
         &session_context.user_id,
         &session_context.hermes_instance_id,
     )?;
-    let attachments = upload_session_attachments_for_context(
+    let attachments = upload_session_attachments_from_instance(
         &state,
         &session_context.user_id,
         &session_context.channel_id,
@@ -319,6 +336,395 @@ async fn upload_output_attachments(
         StatusCode::CREATED,
         Json(AttachmentListResponse { attachments }),
     ))
+}
+
+#[derive(Default)]
+struct MediaOutputForm {
+    content: String,
+    client_message_key: Option<String>,
+    run_id: Option<String>,
+    files: Vec<crate::http::attachments::SpooledMultipartFile>,
+}
+
+async fn deliver_media_output(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    mut multipart: Multipart,
+) -> Result<impl IntoResponse, ApiError> {
+    let token_context = verify_instance_token(&state, &headers).await?;
+    let session_context = state
+        .channel_store
+        .session_context(&session_id)
+        .await
+        .map_err(map_channel_error)?;
+    ensure_token_can_access_session(
+        &token_context,
+        &session_context.user_id,
+        &session_context.hermes_instance_id,
+    )?;
+    let max_upload_bytes = effective_attachment_upload_limit(&state).await?;
+
+    let mut form = MediaOutputForm::default();
+    let parse_result = async {
+        while let Some(field) = multipart
+            .next_field()
+            .await
+            .map_err(|_| ApiError::BadRequest("multipart body is invalid"))?
+        {
+            let name = field.name().unwrap_or("").to_string();
+            match name.as_str() {
+                "file" => {
+                    reject_late_terminal_output(
+                        &state,
+                        &token_context,
+                        form.run_id.as_deref(),
+                        form.client_message_key.as_deref(),
+                    )
+                    .await?;
+                    // Hermes 输出附件和用户上传附件使用同一个系统参数上限，避免实例 token 绕过大小策略。
+                    form.files.push(
+                        spool_multipart_file_to_temp_with_limit(field, Some(max_upload_bytes))
+                            .await?,
+                    );
+                }
+                "content" | "caption" => {
+                    form.content = read_multipart_text_field_with_limit(
+                        field,
+                        MEDIA_OUTPUT_CONTENT_MAX_BYTES,
+                        "media output content is too large",
+                    )
+                    .await?;
+                }
+                "client_message_key" => {
+                    let value = read_multipart_text_field_with_limit(
+                        field,
+                        MEDIA_OUTPUT_ID_FIELD_MAX_BYTES,
+                        "media output metadata field is too large",
+                    )
+                    .await?;
+                    if let Some(value) = trimmed_non_empty(value) {
+                        form.client_message_key = Some(value);
+                        if let Some(existing) = state
+                            .channel_store
+                            .find_session_message_by_client_key(
+                                &session_id,
+                                form.client_message_key.as_deref().unwrap_or(""),
+                            )
+                            .await
+                            .map_err(map_channel_error)?
+                        {
+                            return Ok(Some(existing));
+                        }
+                        reject_late_terminal_output(
+                            &state,
+                            &token_context,
+                            form.run_id.as_deref(),
+                            form.client_message_key.as_deref(),
+                        )
+                        .await?;
+                    }
+                }
+                "run_id" => {
+                    let value = read_multipart_text_field_with_limit(
+                        field,
+                        MEDIA_OUTPUT_ID_FIELD_MAX_BYTES,
+                        "media output metadata field is too large",
+                    )
+                    .await?;
+                    form.run_id = trimmed_non_empty(value);
+                    if form.client_message_key.is_some() {
+                        reject_late_terminal_output(
+                            &state,
+                            &token_context,
+                            form.run_id.as_deref(),
+                            form.client_message_key.as_deref(),
+                        )
+                        .await?;
+                    }
+                }
+                _ => {
+                    reject_late_terminal_output(
+                        &state,
+                        &token_context,
+                        form.run_id.as_deref(),
+                        form.client_message_key.as_deref(),
+                    )
+                    .await?;
+                    // 允许未来 adapter 增加轻量字段；未知字段直接消费丢弃，避免 multipart 卡住。
+                    drain_multipart_field_with_limit(
+                        field,
+                        MEDIA_OUTPUT_UNKNOWN_FIELD_MAX_BYTES,
+                        "multipart field is too large",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok::<Option<ChannelMessage>, ApiError>(None)
+    }
+    .await;
+    match parse_result {
+        Ok(Some(existing)) => {
+            for file in &mut form.files {
+                file.cleanup().await;
+            }
+            return Ok((StatusCode::OK, Json(MessageResponse { message: existing })));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            for file in &mut form.files {
+                file.cleanup().await;
+            }
+            return Err(error);
+        }
+    }
+
+    if form.files.is_empty() {
+        return Err(ApiError::BadRequest("media file is required"));
+    }
+    if let Some(client_message_key) = form.client_message_key.as_deref() {
+        if let Some(existing) = state
+            .channel_store
+            .find_session_message_by_client_key(&session_id, client_message_key)
+            .await
+            .map_err(map_channel_error)?
+        {
+            for file in &mut form.files {
+                file.cleanup().await;
+            }
+            return Ok((StatusCode::OK, Json(MessageResponse { message: existing })));
+        }
+    }
+    if let Err(error) = validate_attachment_placeholders(&form.content, form.files.len()) {
+        // 占位符校验在对象入库前执行；失败时必须主动清理 multipart 临时文件。
+        for file in &mut form.files {
+            file.cleanup().await;
+        }
+        return Err(error);
+    }
+    if let Err(error) = reject_late_terminal_output(
+        &state,
+        &token_context,
+        form.run_id.as_deref(),
+        form.client_message_key.as_deref(),
+    )
+    .await
+    {
+        for file in &mut form.files {
+            file.cleanup().await;
+        }
+        return Err(error);
+    }
+    let mut created_attachments = Vec::with_capacity(form.files.len());
+    for file in &mut form.files {
+        let attachment = create_session_attachment_from_file(
+            &state,
+            &session_context.user_id,
+            &session_context.channel_id,
+            &session_id,
+            ChannelAttachmentDirection::Output,
+            file.file_name.clone(),
+            file.content_type.clone(),
+            file.size,
+            file.path(),
+        )
+        .await;
+        file.cleanup().await;
+        match attachment {
+            Ok(attachment) => created_attachments.push(attachment),
+            Err(error) => {
+                cleanup_created_output_attachments(&state, &session_id, &created_attachments).await;
+                return Err(error);
+            }
+        }
+    }
+    if let Err(error) = reject_late_terminal_output(
+        &state,
+        &token_context,
+        form.run_id.as_deref(),
+        form.client_message_key.as_deref(),
+    )
+    .await
+    {
+        // 文件上传期间用户可能停止/取消 run；append 前再查一次，避免终态后补写输出。
+        cleanup_created_output_attachments(&state, &session_id, &created_attachments).await;
+        return Err(error);
+    }
+    let attachments = json!(created_attachments.clone());
+    let heartbeat_run_id = form
+        .run_id
+        .as_deref()
+        .and_then(normalize_protocol_run_id)
+        .or_else(|| {
+            form.client_message_key
+                .as_deref()
+                .and_then(hermes_run_id_from_client_message_key)
+        })
+        .map(str::to_string);
+    let (status, message, created) = match state
+        .channel_store
+        .append_session_message(
+            &session_context.user_id,
+            &session_context.channel_id,
+            &session_id,
+            ChannelMessageRole::Assistant,
+            form.client_message_key.clone(),
+            form.content,
+            attachments,
+        )
+        .await
+    {
+        Ok(message) => {
+            if message_has_attachment_ids(&message, &created_attachments) {
+                (StatusCode::CREATED, message, true)
+            } else {
+                // 并发重复 client_message_key 时，store 会返回已有消息；这次刚上传的附件
+                // 没有绑定到消息，必须立即删除，避免对象存储和附件表留下孤儿数据。
+                cleanup_created_output_attachments(&state, &session_id, &created_attachments).await;
+                (StatusCode::OK, message, false)
+            }
+        }
+        Err(error) => {
+            cleanup_created_output_attachments(&state, &session_id, &created_attachments).await;
+            return Err(map_channel_error(error));
+        }
+    };
+    if let Some(run_id) = heartbeat_run_id.as_deref() {
+        if let Err(error) = state
+            .channel_store
+            .heartbeat_run_for_session(&session_id, run_id)
+            .await
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                run_id = %run_id,
+                error = %error,
+                "media output heartbeat failed after message creation"
+            );
+        }
+    }
+    if created {
+        state.session_events.publish(SessionEvent::MessageCreated {
+            message: message.clone(),
+        });
+    }
+
+    Ok((status, Json(MessageResponse { message })))
+}
+
+async fn cleanup_created_output_attachments(
+    state: &AppState,
+    session_id: &str,
+    attachments: &[ChannelAttachment],
+) {
+    for attachment in attachments {
+        let _ = state
+            .channel_store
+            .delete_attachment_for_session(session_id, &attachment.id)
+            .await;
+        let _ = state.object_storage.delete(&attachment.object_key).await;
+    }
+}
+
+fn message_has_attachment_ids(message: &ChannelMessage, attachments: &[ChannelAttachment]) -> bool {
+    let expected: std::collections::HashSet<&str> = attachments
+        .iter()
+        .map(|attachment| attachment.id.as_str())
+        .collect();
+    message.attachments.as_array().is_some_and(|items| {
+        let actual: std::collections::HashSet<&str> = items
+            .iter()
+            .filter_map(|attachment| attachment.get("id"))
+            .filter_map(Value::as_str)
+            .collect();
+        expected.is_subset(&actual)
+    })
+}
+
+fn validate_attachment_placeholders(
+    content: &str,
+    attachment_count: usize,
+) -> Result<(), ApiError> {
+    let indexes = attachment_placeholder_indexes(content)?;
+    if attachment_count == 0 {
+        if indexes.is_empty() {
+            return Ok(());
+        }
+        return Err(ApiError::BadRequest(
+            "attachment placeholders require output attachments",
+        ));
+    }
+    if indexes.len() != attachment_count {
+        return Err(ApiError::BadRequest(
+            "each output attachment must be referenced exactly once",
+        ));
+    }
+
+    let mut seen = vec![false; attachment_count];
+    for index in indexes {
+        if index >= attachment_count {
+            return Err(ApiError::BadRequest(
+                "attachment placeholder index is out of range",
+            ));
+        }
+        if seen[index] {
+            return Err(ApiError::BadRequest(
+                "attachment placeholder index is duplicated",
+            ));
+        }
+        seen[index] = true;
+    }
+    if seen.iter().all(|value| *value) {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(
+            "each output attachment must be referenced exactly once",
+        ))
+    }
+}
+
+fn attachment_placeholder_indexes(content: &str) -> Result<Vec<usize>, ApiError> {
+    const MARKER: &str = "{{attachment:";
+    let mut indexes = Vec::new();
+    let mut offset = 0;
+    while let Some(position) = content[offset..].find(MARKER) {
+        let placeholder_start = offset + position;
+        let index_start = offset + position + MARKER.len();
+        let rest = &content[index_start..];
+        let Some(end_position) = rest.find("}}") else {
+            return Err(ApiError::BadRequest("attachment placeholder is malformed"));
+        };
+        let placeholder_end = index_start + end_position + 2;
+        if !attachment_placeholder_is_own_line(content, placeholder_start, placeholder_end) {
+            return Err(ApiError::BadRequest(
+                "attachment placeholder must be on its own line",
+            ));
+        }
+        let raw_index = &rest[..end_position];
+        if raw_index.is_empty() || !raw_index.chars().all(|ch| ch.is_ascii_digit()) {
+            return Err(ApiError::BadRequest("attachment placeholder is malformed"));
+        }
+        let index = raw_index
+            .parse::<usize>()
+            .map_err(|_| ApiError::BadRequest("attachment placeholder index is invalid"))?;
+        indexes.push(index);
+        offset = index_start + end_position + 2;
+    }
+    Ok(indexes)
+}
+
+fn attachment_placeholder_is_own_line(content: &str, start: usize, end: usize) -> bool {
+    let line_start = content[..start]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let line_end = content[end..]
+        .find('\n')
+        .map(|index| end + index)
+        .unwrap_or(content.len());
+
+    content[line_start..start].trim().is_empty() && content[end..line_end].trim().is_empty()
 }
 
 async fn update_message(
@@ -686,12 +1092,12 @@ async fn download_input_attachment(
         &session_context.hermes_instance_id,
     )?;
     ensure_attachment_not_expired(&state, &attachment).await?;
-    let bytes = state
+    let stream = state
         .object_storage
-        .get(&attachment.object_key)
+        .get_stream(&attachment.object_key)
         .await
         .map_err(|_| ApiError::BadGateway("object storage request failed"))?;
-    let mut response = (StatusCode::OK, Body::from(bytes)).into_response();
+    let mut response = (StatusCode::OK, Body::from_stream(stream)).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_str(&attachment.content_type).map_err(|_| ApiError::Internal)?,

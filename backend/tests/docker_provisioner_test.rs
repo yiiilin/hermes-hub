@@ -206,7 +206,7 @@ fn test_config_with_managed_profile() -> DockerProvisionerConfig {
 }
 
 #[tokio::test]
-async fn docker_provisioner_passes_actual_nfs_path_to_wrapper_entrypoint() {
+async fn docker_provisioner_pins_hub_nfs_path_for_wrapper_entrypoint() {
     let runtime = FakeDockerRuntime::default();
     let mut config = test_config_with_managed_profile();
     config
@@ -228,13 +228,19 @@ async fn docker_provisioner_passes_actual_nfs_path_to_wrapper_entrypoint() {
 
     assert!(spec.mounts.iter().any(|mount| matches!(
         mount,
-        ContainerMount::NfsVolume(volume) if volume.container_path == "/hub-managed-skills"
+        ContainerMount::NfsVolume(volume) if volume.container_path == "/nfs"
     )));
     assert!(
         spec.env
             .iter()
-            .any(|item| item == "HERMES_HUB_NFS_DIR=/hub-managed-skills"),
-        "wrapper entrypoint must read SOUL.md from the actual NFS mount path"
+            .any(|item| item == "HERMES_HUB_NFS_DIR=/nfs"),
+        "wrapper entrypoint must read SOUL.md from the fixed Hub NFS mount path"
+    );
+    assert!(
+        spec.env
+            .iter()
+            .all(|item| item != "HERMES_HUB_NFS_DIR=/hub-managed-skills"),
+        "container config must not drift back to the old hub-managed-skills path"
     );
 }
 
@@ -1077,8 +1083,11 @@ async fn docker_provisioner_test() {
         .env
         .iter()
         .any(|entry| entry == "HERMES_ACCEPT_HOOKS=1"));
+    assert!(spec.env.iter().any(
+        |entry| entry == "HERMES_MEDIA_ALLOW_DIRS=/workspace:/sandbox:/opt/data:/config/cache"
+    ));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version" && value == "2026-05-28-managed-nfs-dir-env"
+        key == "hermes_hub_spec_version" && value == "2026-05-29-nfs-path"
     }));
     assert!(spec
         .mounts
@@ -1126,6 +1135,11 @@ async fn docker_provisioner_test() {
     assert!(managed_config.contains("hrr_dim: 1024"));
     assert!(managed_config.contains("auto_extract: false"));
     assert!(managed_config.contains("gateway:"));
+    assert!(managed_config.contains("media_delivery_allow_dirs:"));
+    assert!(managed_config.contains("- \"/workspace\""));
+    assert!(managed_config.contains("- \"/sandbox\""));
+    assert!(managed_config.contains("- \"/opt/data\""));
+    assert!(managed_config.contains("- \"/config/cache\""));
     assert!(managed_config.contains("platforms:"));
     assert!(managed_config.contains("hermes_hub:"));
     assert!(managed_config.contains("enabled: true"));
@@ -1191,6 +1205,8 @@ async fn docker_provisioner_test() {
     assert!(plugin_adapter.contains("env_enablement_fn=_env_enablement"));
     assert!(plugin_adapter.contains("async def on_processing_start("));
     assert!(plugin_adapter.contains("async def on_processing_complete("));
+    assert!(plugin_adapter.contains("async def disconnect("));
+    assert!(plugin_adapter.contains("async def get_chat_info("));
     assert!(plugin_adapter.contains("ProcessingOutcome.CANCELLED"));
     assert!(plugin_adapter.contains("MAX_MESSAGE_LENGTH = 8000"));
     assert!(plugin_adapter.contains("self._last_output_messages: dict[str, dict[str, Any]] = {}"));
@@ -1212,20 +1228,53 @@ async fn docker_provisioner_test() {
     assert!(plugin_adapter.contains("\"output_message_id\": output_message_id"));
     assert!(plugin_adapter.contains("payload[\"client_message_key\"] = client_message_key"));
     assert!(plugin_adapter.contains("payload[\"run_id\"] = run_id"));
-    assert!(plugin_adapter.contains("await self._merge_attachment_into_last_output("));
-    assert!(plugin_adapter.contains("def _content_with_attachment("));
-    assert!(plugin_adapter.contains("def _merge_attachments("));
-    assert!(plugin_adapter.contains("from urllib.parse import unquote, urlencode"));
-    assert!(plugin_adapter.contains("upload_name = unquote(file_name or Path(file_path).name)"));
-    assert!(plugin_adapter.contains("def _client_message_key("));
-    assert!(plugin_adapter.contains("return f\"hermes-run:{run_id}\""));
-    assert!(plugin_adapter.contains("f\"/inbox/{run_id}/ack\""));
-    assert!(plugin_adapter.contains("media_types.append(content_type)"));
-    assert!(plugin_adapter.contains("startswith(\"image/\")"));
+    assert!(plugin_adapter.contains("async def _send_media_output("));
     assert!(plugin_adapter.contains("async def send("));
     assert!(plugin_adapter.contains("async def edit_message("));
     assert!(plugin_adapter.contains("async def send_document("));
     assert!(plugin_adapter.contains("async def send_image_file("));
+    assert!(plugin_adapter.contains("async def send_image("));
+    assert!(plugin_adapter.contains("async def send_multiple_images("));
+    assert!(plugin_adapter.contains("async def send_typing("));
+    assert!(plugin_adapter.contains("async def stop_typing("));
+    assert!(plugin_adapter.contains("async def send_clarify("));
+    assert!(!plugin_adapter.contains("async def send_slash_confirm("));
+    assert!(plugin_adapter.contains("async def send_voice("));
+    assert!(plugin_adapter.contains("async def send_video("));
+    assert!(plugin_adapter.contains("async def send_animation("));
+    assert!(plugin_adapter.contains("file_path=audio_path"));
+    assert!(plugin_adapter.contains("file_path=video_path"));
+    assert!(plugin_adapter.contains("image_url=animation_url"));
+    assert!(plugin_adapter.contains("del chat_id, metadata"));
+    assert!(plugin_adapter.contains("del chat_id"));
+    assert!(plugin_adapter.contains("return await super().send_clarify("));
+    assert!(plugin_adapter.contains("for index, (image_url, alt_text) in enumerate(images):"));
+    assert!(plugin_adapter.contains("item_metadata[\"media_sequence\"] = index"));
+    assert!(plugin_adapter.contains("media_metadata.setdefault(\"media_source_url\", raw_url)"));
+    assert!(plugin_adapter.contains("media_sequence = metadata.get(\"media_sequence\")"));
+    assert!(plugin_adapter.contains("media_source_url = str(metadata.get(\"media_source_url\") or \"\")"));
+    assert!(plugin_adapter.contains("\"remote\""));
+    assert!(plugin_adapter.contains("\"local\""));
+    assert!(plugin_adapter.contains("def _image_extension_from_url("));
+    assert!(plugin_adapter.contains("def _image_extension_from_file("));
+    assert!(plugin_adapter.contains("cache_image_from_url(raw_url, ext=image_ext)"));
+    assert!(plugin_adapter.contains("detected_ext = self._image_extension_from_file(cached_path)"));
+    assert!(plugin_adapter.contains("os.replace(cached_path, renamed_path)"));
+    assert!(plugin_adapter.contains("header.startswith(b\"\\x89PNG\\r\\n\\x1a\\n\")"));
+    assert!(plugin_adapter.contains("header[8:12] == b\"WEBP\""));
+    assert!(plugin_adapter.contains("explicit_client_message_key = str(metadata.get(\"client_message_key\") or \"\")"));
+    assert!(plugin_adapter.contains("if explicit_client_message_key and media_sequence is None:"));
+    assert!(plugin_adapter.contains("return f\"{key_prefix}:media:{digest}\""));
+    assert!(plugin_adapter.contains("MEDIA:/workspace/report.pdf"));
+    assert!(!plugin_adapter.contains("attachments=['/workspace/report.pdf']"));
+    assert!(!plugin_adapter.contains("send_message_with_attachments"));
+    assert!(!plugin_adapter.contains("platform_name == \"origin\""));
+    assert!(!plugin_adapter.contains("async def delete_message("));
+    assert!(!plugin_adapter.contains("async def play_tts("));
+    assert!(!plugin_adapter.contains("async def send_private_notice("));
+    assert!(!plugin_adapter.contains("async def create_handoff_thread("));
+    assert!(!plugin_adapter.contains("async def send_draft("));
+    assert!(!plugin_adapter.contains("def supports_draft_streaming("));
     assert!(plugin_adapter.contains("def _session_matches_current_loop("));
     assert!(plugin_adapter.contains("asyncio.get_running_loop()"));
     assert!(plugin_adapter.contains("async with self._new_client_session() as transient_session"));
@@ -1267,8 +1316,7 @@ async fn docker_provisioner_test() {
     );
     assert!(
         create_call.windows(2).any(|args| {
-            args[0] == "--label"
-                && args[1] == "hermes_hub_spec_version=2026-05-28-managed-nfs-dir-env"
+            args[0] == "--label" && args[1] == "hermes_hub_spec_version=2026-05-29-nfs-path"
         }),
         "managed Hermes containers must carry the current spec label"
     );

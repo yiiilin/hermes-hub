@@ -4,6 +4,9 @@ from pathlib import Path
 tool_path = Path("/opt/hermes/tools/send_message_tool.py")
 source = tool_path.read_text()
 
+if "Hermes Hub plugin media bridge" in source:
+    raise SystemExit(0)
+
 old_live_adapter = """        if adapter is not None:
             try:
                 metadata = {"thread_id": thread_id} if thread_id else None
@@ -19,15 +22,44 @@ old_live_adapter = """        if adapter is not None:
 
 new_live_adapter = """        if adapter is not None:
             try:
-                # Plugin 平台的 live adapter 才知道如何把本地文件变成平台附件；
-                # send_message 的 MEDIA: 路径必须交给 adapter 的媒体方法，而不是丢给纯文本 send。
-                metadata = {"thread_id": thread_id or chat_id}
+                # Hermes Hub plugin media bridge:
+                # 上游 send_message 已能解析 MEDIA:/path，但 plugin live adapter 分支只会调用
+                # adapter.send(...)。这里只把已解析的 media_files 转给标准 adapter 媒体接口，
+                # 不扩展 send_message schema，也不恢复旧 attachments/origin 协议。
+                metadata = {"channel_id": chat_id}
+                if thread_id:
+                    metadata["thread_id"] = thread_id
                 if media_files:
                     last_result = None
-                    for index, (media_path, _is_voice) in enumerate(media_files):
-                        caption = chunk if index == 0 else None
+                    if chunk.strip():
+                        last_result = await adapter.send(
+                            chat_id=chat_id,
+                            content=chunk,
+                            metadata=metadata,
+                        )
+                        if not last_result.success:
+                            return {"error": f"Adapter send failed: {last_result.error}"}
+                    for index, (media_path, is_voice) in enumerate(media_files):
+                        media_metadata = dict(metadata)
+                        media_metadata["media_sequence"] = index
                         extension = os.path.splitext(str(media_path))[1].lower()
                         if (
+                            is_voice
+                            and extension in _VOICE_EXTS
+                            and hasattr(adapter, "send_voice")
+                        ):
+                            last_result = await adapter.send_voice(
+                                chat_id=chat_id,
+                                audio_path=media_path,
+                                metadata=media_metadata,
+                            )
+                        elif extension in _VIDEO_EXTS and hasattr(adapter, "send_video"):
+                            last_result = await adapter.send_video(
+                                chat_id=chat_id,
+                                video_path=media_path,
+                                metadata=media_metadata,
+                            )
+                        elif (
                             not force_document
                             and extension in _IMAGE_EXTS
                             and hasattr(adapter, "send_image_file")
@@ -35,15 +67,13 @@ new_live_adapter = """        if adapter is not None:
                             last_result = await adapter.send_image_file(
                                 chat_id=chat_id,
                                 image_path=media_path,
-                                caption=caption,
-                                metadata=metadata,
+                                metadata=media_metadata,
                             )
                         elif hasattr(adapter, "send_document"):
                             last_result = await adapter.send_document(
                                 chat_id=chat_id,
                                 file_path=media_path,
-                                caption=caption,
-                                metadata=metadata,
+                                metadata=media_metadata,
                             )
                         else:
                             return {"error": f"Plugin platform '{platform.value}' does not support media attachments"}
@@ -99,12 +129,45 @@ new_media_guard = """    # --- Non-media platforms ---
         )
 """
 
-if old_live_adapter not in source:
-    raise SystemExit("send_message live adapter block not found")
-source = source.replace(old_live_adapter, new_live_adapter, 1)
+old_generic_loop = """    last_result = None
+    for chunk in chunks:
+"""
 
-if old_media_guard not in source:
-    raise SystemExit("send_message media guard block not found")
-source = source.replace(old_media_guard, new_media_guard, 1)
+new_generic_loop = """    last_result = None
+    for i, chunk in enumerate(chunks):
+        is_last = i == len(chunks) - 1
+"""
+
+old_plugin_call = """            result = await _send_via_adapter(
+                platform,
+                pconfig,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+                media_files=media_files,
+                force_document=force_document,
+            )
+"""
+
+new_plugin_call = """            result = await _send_via_adapter(
+                platform,
+                pconfig,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+                media_files=media_files if is_last else [],
+                force_document=force_document,
+            )
+"""
+
+for old, new, label in [
+    (old_live_adapter, new_live_adapter, "send_message live adapter block"),
+    (old_media_guard, new_media_guard, "send_message media guard block"),
+    (old_generic_loop, new_generic_loop, "send_message generic chunk loop"),
+    (old_plugin_call, new_plugin_call, "send_message plugin media call"),
+]:
+    if old not in source:
+        raise SystemExit(f"{label} not found")
+    source = source.replace(old, new, 1)
 
 tool_path.write_text(source)

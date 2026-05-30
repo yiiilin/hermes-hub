@@ -1,17 +1,23 @@
 use std::{
     collections::HashMap,
+    path::Path,
     sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::TryStreamExt;
+use futures_util::{
+    stream::{self, BoxStream},
+    StreamExt, TryStreamExt,
+};
 use object_store::{aws::AmazonS3Builder, path::Path as ObjectPath, ObjectStore, ObjectStoreExt};
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 
 use crate::app_config::ObjectStorageConfig;
 
 pub type DynObjectStorage = Arc<dyn HubObjectStorage>;
+pub type ObjectByteStream = BoxStream<'static, Result<Bytes, ObjectStorageError>>;
 
 #[derive(Debug, Error)]
 pub enum ObjectStorageError {
@@ -28,7 +34,9 @@ pub enum ObjectStorageError {
 #[async_trait]
 pub trait HubObjectStorage: Send + Sync + 'static {
     async fn put(&self, key: &str, bytes: Bytes) -> Result<(), ObjectStorageError>;
+    async fn put_file(&self, key: &str, path: &Path) -> Result<(), ObjectStorageError>;
     async fn get(&self, key: &str) -> Result<Bytes, ObjectStorageError>;
+    async fn get_stream(&self, key: &str) -> Result<ObjectByteStream, ObjectStorageError>;
     async fn delete(&self, key: &str) -> Result<(), ObjectStorageError>;
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<ObjectInfo>, ObjectStorageError>;
     fn bucket(&self) -> &str;
@@ -75,6 +83,13 @@ impl HubObjectStorage for InMemoryObjectStorage {
         Ok(())
     }
 
+    async fn put_file(&self, key: &str, path: &Path) -> Result<(), ObjectStorageError> {
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|_| ObjectStorageError::OperationFailed)?;
+        self.put(key, Bytes::from(bytes)).await
+    }
+
     async fn get(&self, key: &str) -> Result<Bytes, ObjectStorageError> {
         self.objects
             .lock()
@@ -82,6 +97,11 @@ impl HubObjectStorage for InMemoryObjectStorage {
             .get(key)
             .cloned()
             .ok_or(ObjectStorageError::NotFound)
+    }
+
+    async fn get_stream(&self, key: &str) -> Result<ObjectByteStream, ObjectStorageError> {
+        let bytes = self.get(key).await?;
+        Ok(stream::once(async move { Ok(bytes) }).boxed())
     }
 
     async fn delete(&self, key: &str) -> Result<(), ObjectStorageError> {
@@ -182,6 +202,73 @@ impl HubObjectStorage for S3ObjectStorage {
         Ok(())
     }
 
+    async fn put_file(&self, key: &str, path: &Path) -> Result<(), ObjectStorageError> {
+        const SINGLE_PUT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+        const MULTIPART_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+
+        let object_path = ObjectPath::from(key);
+        let metadata = tokio::fs::metadata(path)
+            .await
+            .map_err(|_| ObjectStorageError::OperationFailed)?;
+        if metadata.len() <= SINGLE_PUT_MAX_BYTES {
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(|_| ObjectStorageError::OperationFailed)?;
+            return self.put(key, Bytes::from(bytes)).await;
+        }
+
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .map_err(|_| ObjectStorageError::OperationFailed)?;
+        let mut upload = self
+            .store
+            .put_multipart(&object_path)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    bucket = %self.bucket,
+                    key = %key,
+                    error = %error,
+                    "object storage multipart upload init failed"
+                );
+                ObjectStorageError::OperationFailed
+            })?;
+        let mut buffer = vec![0u8; MULTIPART_CHUNK_BYTES];
+
+        loop {
+            let read = match file.read(&mut buffer).await {
+                Ok(read) => read,
+                Err(_) => {
+                    let _ = upload.abort().await;
+                    return Err(ObjectStorageError::OperationFailed);
+                }
+            };
+            if read == 0 {
+                break;
+            }
+            if upload
+                .put_part(Bytes::copy_from_slice(&buffer[..read]).into())
+                .await
+                .is_err()
+            {
+                let _ = upload.abort().await;
+                return Err(ObjectStorageError::OperationFailed);
+            }
+        }
+
+        if let Err(error) = upload.complete().await {
+            tracing::warn!(
+                bucket = %self.bucket,
+                key = %key,
+                error = %error,
+                "object storage multipart upload complete failed"
+            );
+            let _ = upload.abort().await;
+            return Err(ObjectStorageError::OperationFailed);
+        }
+        Ok(())
+    }
+
     async fn get(&self, key: &str) -> Result<Bytes, ObjectStorageError> {
         self.store
             .get(&ObjectPath::from(key))
@@ -210,6 +297,41 @@ impl HubObjectStorage for S3ObjectStorage {
                 );
                 ObjectStorageError::OperationFailed
             })
+    }
+
+    async fn get_stream(&self, key: &str) -> Result<ObjectByteStream, ObjectStorageError> {
+        let object_path = ObjectPath::from(key);
+        let stream = self
+            .store
+            .get(&object_path)
+            .await
+            .map_err(|error| {
+                if matches!(error, object_store::Error::NotFound { .. }) {
+                    ObjectStorageError::NotFound
+                } else {
+                    tracing::warn!(
+                        bucket = %self.bucket,
+                        key = %key,
+                        error = %error,
+                        "object storage get stream failed"
+                    );
+                    ObjectStorageError::OperationFailed
+                }
+            })?
+            .into_stream();
+        let bucket = self.bucket.clone();
+        let key = key.to_string();
+        Ok(stream
+            .map_err(move |error| {
+                tracing::warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    error = %error,
+                    "object storage stream read failed"
+                );
+                ObjectStorageError::OperationFailed
+            })
+            .boxed())
     }
 
     async fn delete(&self, key: &str) -> Result<(), ObjectStorageError> {

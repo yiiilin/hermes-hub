@@ -9,7 +9,10 @@ use hermes_hub_backend::{
     channel::service::{ChannelMessageRole, ChannelRunStatus, ChannelSessionKind, ChannelStore},
     db::migrations::run_migrations,
     docker_config_from_app,
-    hermes::docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
+    hermes::{
+        docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
+        instance::{HermesInstance, HermesInstanceStatus},
+    },
     ldap::DefaultLdapAuthenticator,
     llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
     model_config::{ModelConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND},
@@ -1108,6 +1111,53 @@ async fn postgres_channel_session_persists_hermes_anchors() {
     assert_eq!(
         cleared.hermes_response_id.as_deref(),
         Some("hermes-response-1")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_can_bind_stopped_hermes_instance_without_activity_timestamp() {
+    let Some(pool) = postgres_pool().await else {
+        eprintln!(
+            "skipping postgres stopped Hermes bind test: HERMES_HUB_TEST_DATABASE_URL is not set"
+        );
+        return;
+    };
+    run_migrations(&pool).await.expect("migrations can run");
+
+    let cipher = SecretCipher::from_master_key(TEST_SECRET_KEY).expect("test cipher is valid");
+    let store = SessionStore::postgres(pool.clone(), cipher);
+    let user = store
+        .create_bootstrap_admin("stopped-hermes@example.com", "password")
+        .await
+        .expect("test user can be created");
+    let mut instance = HermesInstance::managed_docker(
+        &user.id,
+        "/tmp/hermes-hub-test/workspace".to_string(),
+        "/tmp/hermes-hub-test/sandbox".to_string(),
+        "/tmp/hermes-hub-test/config".to_string(),
+    );
+    instance.status = HermesInstanceStatus::Stopped;
+    instance.health_status = "stopped".to_string();
+    instance.api_token_secret_ref = Some("persisted-instance-token".to_string());
+
+    // 本地事故来自 stopped 实例第一次 upsert 时 last_user_activity_at 写入 NULL。
+    store
+        .bind_hermes_instance(instance)
+        .await
+        .expect("stopped instance can be inserted without violating lifecycle constraints");
+    let stored = store
+        .hermes_instance_for_user(&user.id)
+        .await
+        .expect("stopped instance can be loaded back");
+
+    assert_eq!(stored.status, HermesInstanceStatus::Stopped);
+    assert!(
+        stored.last_user_activity_at.is_some(),
+        "stopped instances still need an activity baseline for idle-stop UI"
+    );
+    assert!(
+        stored.last_stopped_at.is_some(),
+        "newly stored stopped instances should expose a stopped timestamp"
     );
 }
 

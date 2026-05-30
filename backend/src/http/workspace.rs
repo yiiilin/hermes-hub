@@ -93,13 +93,17 @@ pub async fn ensure_managed_hermes_for_user(
     state: &AppState,
     user_id: &str,
 ) -> Result<HermesInstance, ApiError> {
-    let instance = ensure_managed_hermes_for_user_without_activity(state, user_id).await?;
+    ensure_managed_hermes_for_user_without_activity(state, user_id).await?;
     state
         .store
         .record_hermes_user_activity(user_id)
         .await
         .map_err(|_| ApiError::Internal)?;
-    Ok(instance)
+    state
+        .store
+        .hermes_instance_for_user(user_id)
+        .await
+        .map_err(|_| ApiError::Internal)
 }
 
 pub async fn ensure_managed_hermes_for_user_without_activity(
@@ -162,7 +166,11 @@ pub async fn ensure_managed_hermes_for_user_without_activity(
                 .await
                 .map_err(|_| ApiError::Internal)?;
 
-            return Ok(ensured);
+            return state
+                .store
+                .hermes_instance_for_user(user_id)
+                .await
+                .map_err(|_| ApiError::Internal);
         }
     }
 
@@ -218,7 +226,11 @@ pub async fn ensure_managed_hermes_for_user_without_activity(
         .await
         .map_err(|_| ApiError::Internal)?;
 
-    Ok(instance)
+    state
+        .store
+        .hermes_instance_for_user(user_id)
+        .await
+        .map_err(|_| ApiError::Internal)
 }
 
 async fn user_has_global_skills_write_access(
@@ -256,7 +268,11 @@ pub async fn refresh_managed_hermes_status(
         .bind_hermes_instance(refreshed.clone())
         .await
         .map_err(|_| ApiError::Internal)?;
-    Ok(refreshed)
+    state
+        .store
+        .hermes_instance_for_user(&refreshed.user_id)
+        .await
+        .map_err(|_| ApiError::Internal)
 }
 
 fn runtime_model_settings(config: &crate::model_config::ModelConfig) -> RuntimeModelSettings {

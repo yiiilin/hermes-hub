@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Multipart, Path, State},
+    extract::{DefaultBodyLimit, Multipart, Path, State},
     http::HeaderMap,
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -58,7 +58,7 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/api/channels/{channel_id}/sessions/{session_id}/attachments",
-            post(upload_attachments),
+            post(upload_attachments).layer(DefaultBodyLimit::disable()),
         )
         .route(
             "/api/channels/{channel_id}/sessions/{session_id}/messages",
@@ -530,6 +530,9 @@ async fn generate_session_title(
         .update_session_title(&user.id, &channel_id, &session_id, title)
         .await
         .map_err(map_channel_error)?;
+    state.session_events.publish(SessionEvent::SessionUpdated {
+        session: session.clone(),
+    });
 
     Ok(Json(SessionResponse { session }))
 }
@@ -596,10 +599,7 @@ fn session_live_event_stream(
             loop {
                 match receiver.recv().await {
                     Ok(event) if event.session_id() == session_id => {
-                        return Some((
-                            sse_json_event(session_event_name(&event), &event),
-                            receiver,
-                        ));
+                        return Some((sse_json_event(event.event_name(), &event), receiver));
                     }
                     Ok(_) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -611,16 +611,6 @@ fn session_live_event_stream(
             }
         }
     })
-}
-
-fn session_event_name(event: &SessionEvent) -> &'static str {
-    match event {
-        SessionEvent::MessageCreated { .. } => "message_created",
-        SessionEvent::MessageUpdated { .. } => "message_updated",
-        SessionEvent::RunUpdated { .. } => "run_updated",
-        SessionEvent::RunCleared { .. } => "run_cleared",
-        SessionEvent::SessionDeleted { .. } => "session_deleted",
-    }
 }
 
 fn sse_json_event<T: Serialize>(name: &'static str, payload: &T) -> Result<Event, Infallible> {

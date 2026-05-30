@@ -266,8 +266,8 @@ fn skills_fs_config_from_env() -> SkillsFsConfig {
             .unwrap_or_else(|_| "127.0.0.1:12049".to_string()),
         mount_export: std::env::var("HERMES_HUB_MANAGED_SKILLS_NFS_EXPORT")
             .unwrap_or_else(|_| "/skills".to_string()),
-        container_path: std::env::var("HERMES_HUB_MANAGED_SKILLS_CONTAINER_PATH")
-            .unwrap_or_else(|_| "/nfs".to_string()),
+        // Hermes 配置固定写入 /nfs/skills；容器挂载点也必须固定，避免旧环境变量把挂载漂回旧路径。
+        container_path: "/nfs".to_string(),
     }
 }
 
@@ -476,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn skills_fs_config_reads_nfs_and_mount_env() {
+    fn skills_fs_config_reads_nfs_env_and_pins_container_mount_path() {
         const NAMES: &[&str] = &[
             "HERMES_HUB_SKILLS_FS_BIND_ADDR",
             "HERMES_HUB_SKILLS_FS_PREFIX",
@@ -515,7 +515,7 @@ mod tests {
         assert_eq!(config.mount_volume_name, "skills-vol");
         assert_eq!(config.mount_addr, "10.0.0.5:12049");
         assert_eq!(config.mount_export, "/hub-skills");
-        assert_eq!(config.container_path, "/managed-skills");
+        assert_eq!(config.container_path, "/nfs");
 
         for (name, value) in saved {
             if let Some(value) = value {

@@ -25,13 +25,15 @@ use super::{
 
 /// Hub 托管 Hermes 容器规格版本。只要 env、挂载、工作目录或安全策略有变化，
 /// 就提升这个值，确保已存在的旧容器会被重建并拿到新行为。
-const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-28-managed-nfs-dir-env";
+const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-29-nfs-path";
 const MANAGED_CONTAINER_SPEC_LABEL: &str = "hermes_hub_spec_version";
 const HUB_INBOX_PATH: &str = "/internal/channel/v1/inbox";
 const HUB_INBOX_TIMEOUT_SECONDS: u16 = 25;
 const HUB_INBOX_LIMIT: u16 = 4;
+const HUB_NFS_CONTAINER_DIR: &str = "/nfs";
 const MANAGED_SKILLS_EXTERNAL_DIR: &str = "/nfs/skills";
 const MANAGED_PROFILE_SOUL_FILE: &str = "SOUL.md";
+const HERMES_MEDIA_ALLOW_DIRS: &str = "/workspace:/sandbox:/opt/data:/config/cache";
 const HERMES_HUB_PLUGIN_YAML: &str = r#"name: hermes-hub-platform
 label: Hermes Hub
 kind: platform
@@ -66,10 +68,11 @@ import logging
 import mimetypes
 import os
 import re
+import stat as stat_module
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import unquote, urlencode
+from urllib.parse import unquote, urlencode, urlsplit
 
 try:
     import aiohttp
@@ -85,10 +88,15 @@ from gateway.platforms.base import (
     SendResult,
     cache_document_from_bytes,
     cache_image_from_bytes,
+    cache_image_from_url,
 )
 
 
 logger = logging.getLogger(__name__)
+
+
+class AttachmentFileError(Exception):
+    pass
 
 
 class HermesHubAdapter(BasePlatformAdapter):
@@ -122,7 +130,7 @@ class HermesHubAdapter(BasePlatformAdapter):
         self._poll_task: asyncio.Task | None = None
         self._closed = asyncio.Event()
         # Hermes 会把 thread_id 作为通用路由 metadata 传给所有输出；
-        # Hub 追踪最后一条输出消息，便于图片/文件回传时更新同一气泡。
+        # Hub 只记录最后一条输出消息 id，用于 run 完成回调携带 output_message_id。
         self._last_output_messages: dict[str, dict[str, Any]] = {}
         # thread_id 在 Hub 中稳定等于 session_id，不能当作每轮 run_id 使用；
         # 处理开始/结束钩子用这个表把当前 session 映射到真实 Hub run。
@@ -180,12 +188,6 @@ class HermesHubAdapter(BasePlatformAdapter):
         del reply_to
         session_id = self._session_id(chat_id, metadata)
         run_id = self._run_id(metadata)
-        if run_id and (metadata or {}).get("notify"):
-            merged = await self._merge_text_into_last_attachment_output(
-                chat_id, content, metadata
-            )
-            if merged is not None:
-                return merged
         payload = {
             "role": "assistant",
             "content": content,
@@ -255,7 +257,7 @@ class HermesHubAdapter(BasePlatformAdapter):
         **kwargs: Any,
     ) -> SendResult:
         del reply_to, kwargs
-        return await self._upload_and_send(chat_id, file_path, caption, metadata, file_name)
+        return await self._send_media_output(chat_id, file_path, caption, metadata, file_name)
 
     async def send_image_file(
         self,
@@ -267,7 +269,194 @@ class HermesHubAdapter(BasePlatformAdapter):
         **kwargs: Any,
     ) -> SendResult:
         del reply_to, kwargs
-        return await self._upload_and_send(chat_id, image_path, caption, metadata, None)
+        return await self._send_media_output(chat_id, image_path, caption, metadata, None)
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        del reply_to
+        raw_url = str(image_url or "").strip()
+        if not raw_url:
+            return SendResult(success=False, error="image url is empty", retryable=False)
+        if raw_url.startswith("file://"):
+            return await self.send_image_file(
+                chat_id=chat_id,
+                image_path=unquote(raw_url[7:]),
+                caption=caption,
+                metadata=metadata,
+            )
+        if raw_url.startswith("/") or raw_url.startswith("~/"):
+            return await self.send_image_file(
+                chat_id=chat_id,
+                image_path=os.path.expanduser(raw_url),
+                caption=caption,
+                metadata=metadata,
+            )
+        try:
+            media_metadata = dict(metadata or {})
+            media_metadata.setdefault("media_source_url", raw_url)
+            image_ext = self._image_extension_from_url(raw_url)
+            cached_path = await cache_image_from_url(raw_url, ext=image_ext)
+            detected_ext = self._image_extension_from_file(cached_path)
+            if detected_ext and detected_ext != Path(cached_path).suffix.lower():
+                renamed_path = str(Path(cached_path).with_suffix(detected_ext))
+                os.replace(cached_path, renamed_path)
+                cached_path = renamed_path
+            return await self.send_image_file(
+                chat_id=chat_id,
+                image_path=cached_path,
+                caption=caption,
+                metadata=media_metadata,
+            )
+        except Exception as error:
+            logger.warning("Hermes Hub remote image send failed: %s", error)
+            return SendResult(success=False, error=str(error), retryable=True)
+
+    async def send_multiple_images(
+        self,
+        chat_id: str,
+        images: list[tuple[str, str]],
+        metadata: Optional[Dict[str, Any]] = None,
+        human_delay: float = 0.0,
+    ) -> None:
+        # Hub 不做批量打包，但必须给每个图片稳定编号，避免相同文件在同一 run 内被幂等键合并。
+        for index, (image_url, alt_text) in enumerate(images):
+            if human_delay > 0:
+                await asyncio.sleep(human_delay)
+            item_metadata = dict(metadata or {})
+            item_metadata["media_sequence"] = index
+            caption = alt_text if alt_text else None
+            try:
+                if image_url.startswith("file://"):
+                    result = await self.send_image_file(
+                        chat_id=chat_id,
+                        image_path=unquote(image_url[7:]),
+                        caption=caption,
+                        metadata=item_metadata,
+                    )
+                elif image_url.startswith("/") or image_url.startswith("~/"):
+                    result = await self.send_image_file(
+                        chat_id=chat_id,
+                        image_path=os.path.expanduser(image_url),
+                        caption=caption,
+                        metadata=item_metadata,
+                    )
+                else:
+                    # 批量图片里的 GIF/动画也按图片交付，避免依赖上游内部动画判断。
+                    result = await self.send_image(
+                        chat_id=chat_id,
+                        image_url=image_url,
+                        caption=caption,
+                        metadata=item_metadata,
+                    )
+                if not result.success:
+                    logger.error("Hermes Hub image batch item failed: %s", result.error)
+            except Exception as error:
+                logger.error("Hermes Hub image batch item failed: %s", error, exc_info=True)
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        del kwargs
+        # Hub 目前没有独立语音气泡，音频统一作为普通附件交付。
+        return await self.send_document(
+            chat_id=chat_id,
+            file_path=audio_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        del kwargs
+        # Hub 目前没有独立视频播放器消息，视频统一作为普通附件交付。
+        return await self.send_document(
+            chat_id=chat_id,
+            file_path=video_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    async def send_animation(
+        self,
+        chat_id: str,
+        animation_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        # GIF/动画在 Hub 侧按图片交付，保持和用户看到的图片预览一致。
+        return await self.send_image(
+            chat_id=chat_id,
+            image_url=animation_url,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        del chat_id, metadata
+        # Hub 前端的“正在输入”由 active run 状态驱动；adapter typing 事件保持无副作用。
+        return None
+
+    async def stop_typing(self, chat_id: str) -> None:
+        del chat_id
+        # Hub 前端没有独立 typing 通道，停止输入同样由 run 完成/失败事件驱动。
+        return None
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        # 先复用 Hermes 基类文本回退；后续前端按钮可以在 Hub 协议层单独扩展。
+        return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata)
+
+    def _image_extension_from_url(self, image_url: str) -> str:
+        suffix = Path(unquote(urlsplit(image_url).path)).suffix.lower()
+        return suffix if suffix in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"} else ".jpg"
+
+    def _image_extension_from_file(self, image_path: str) -> str:
+        try:
+            with open(image_path, "rb") as handle:
+                header = handle.read(16)
+        except OSError:
+            return Path(image_path).suffix.lower()
+        if header.startswith(b"\xff\xd8\xff"):
+            return ".jpg"
+        if header.startswith(b"\x89PNG\r\n\x1a\n"):
+            return ".png"
+        if header[:6] in {b"GIF87a", b"GIF89a"}:
+            return ".gif"
+        if len(header) >= 12 and header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+            return ".webp"
+        if header.startswith(b"BM"):
+            return ".bmp"
+        return Path(image_path).suffix.lower()
 
     async def _poll_loop(self) -> None:
         while not self._closed.is_set():
@@ -563,9 +752,11 @@ class HermesHubAdapter(BasePlatformAdapter):
                 logger.warning("Hermes Hub run completion callback failed: %s", error)
         finally:
             self._forget_active_run(event, run_id)
+            if run_id:
+                self._last_output_messages.pop(run_id, None)
             await self._report_scheduler_snapshot(force=True)
 
-    async def _upload_and_send(
+    async def _send_media_output(
         self,
         chat_id: str,
         file_path: str,
@@ -574,154 +765,131 @@ class HermesHubAdapter(BasePlatformAdapter):
         file_name: Optional[str],
     ) -> SendResult:
         session_id = self._session_id(chat_id, metadata)
+        media_file = None
         try:
-            attachment = await self._upload_attachment(session_id, file_path, file_name)
-            merged = await self._merge_attachment_into_last_output(
-                chat_id, file_path, caption, attachment, metadata
-            )
-            if merged is not None:
-                return merged
-            content = self._content_with_attachment("", caption, attachment, file_path)
-            next_metadata = dict(metadata or {})
-            next_metadata["attachments"] = [attachment]
+            media_file = self._open_validated_media_file(file_path)
+            # 对齐 Telegram adapter 语义：一次 send_document/send_image_file 就是一条原生媒体输出。
+            # Hub 端用原子接口完成上传、落库和附件绑定，不再靠本地 last-output 状态猜测合并目标。
+            upload_name = unquote(file_name or media_file["upload_name"])
+            content_type = mimetypes.guess_type(upload_name)[0] or "application/octet-stream"
+            data = aiohttp.FormData()
+            data.add_field("content", self._content_with_single_attachment_placeholder(caption))
             run_id = self._run_id(metadata)
-            attachment_id = attachment.get("id")
-            if run_id and attachment_id:
-                # 如果 Hermes 先发文件再发最终文本，这条附件消息先独立落库；
-                # 后续 notify 文本会用 _merge_text_into_last_attachment_output 合并回同一气泡。
-                next_metadata["client_message_key"] = f"hermes-run:{run_id}:attachment:{attachment_id}"
-            return await self.send(chat_id, content, metadata=next_metadata)
-        except Exception as error:
-            logger.warning("Hermes Hub attachment send failed: %s", error)
-            return SendResult(success=False, error=str(error), retryable=True)
-
-    async def _merge_attachment_into_last_output(
-        self,
-        chat_id: str,
-        file_path: str,
-        caption: Optional[str],
-        attachment: dict[str, Any],
-        metadata: Optional[Dict[str, Any]],
-    ) -> Optional[SendResult]:
-        run_id = self._run_id(metadata)
-        if not run_id:
-            return None
-        existing = self._last_output_message(run_id)
-        if not existing or not self._message_accepts_attachment_merge(run_id, existing):
-            return None
-        message_id = str(existing.get("id") or "")
-        if not message_id:
-            return None
-        merged_content = self._content_with_attachment(
-            str(existing.get("content") or ""), caption, attachment, file_path
-        )
-        merged_attachments = self._merge_attachments(
-            existing.get("attachments") or [], [attachment]
-        )
-        next_metadata = dict(metadata or {})
-        next_metadata["attachments"] = merged_attachments
-        # 文件/图片是 run 输出的一部分时，更新同一条 Hub 消息；这样历史快照和实时
-        # 事件都只有一个最终气泡，附件也天然嵌入在文本位置。
-        return await self.edit_message(
-            chat_id, message_id, merged_content, metadata=next_metadata
-        )
-
-    async def _merge_text_into_last_attachment_output(
-        self,
-        chat_id: str,
-        content: str,
-        metadata: Optional[Dict[str, Any]],
-    ) -> Optional[SendResult]:
-        run_id = self._run_id(metadata)
-        existing = self._last_output_message(run_id) if run_id else None
-        if not existing:
-            return None
-        existing_attachments = existing.get("attachments") or []
-        message_id = str(existing.get("id") or "")
-        if not message_id or not existing_attachments:
-            return None
-        merged_content = self._join_message_parts(content, str(existing.get("content") or ""))
-        next_metadata = dict(metadata or {})
-        next_metadata["attachments"] = existing_attachments
-        return await self.edit_message(
-            chat_id, message_id, merged_content, metadata=next_metadata
-        )
-
-    def _content_with_attachment(
-        self,
-        existing_content: str,
-        caption: Optional[str],
-        attachment: dict[str, Any],
-        file_path: str,
-    ) -> str:
-        content = self._join_message_parts(existing_content, caption or "")
-        download_url = str(attachment.get("download_url") or "")
-        if not download_url:
-            return content
-        # Hermes 生图有时先输出空图片 markdown，再单独发送文件；这里把空地址补成
-        # Hub 下载地址，前端才能在原文位置预览图片。
-        if re.search(r"!\[[^\]]*\]\(\s*\)", content):
-            return re.sub(
-                r"!\[([^\]]*)\]\(\s*\)",
-                lambda match: f"![{match.group(1)}]({download_url})",
-                content,
-                count=1,
+            if run_id:
+                data.add_field("run_id", run_id)
+            client_message_key = self._media_client_message_key(metadata, media_file, upload_name, caption)
+            if client_message_key:
+                data.add_field("client_message_key", client_message_key)
+            # 文件内容只在当前请求中流向 Hub；Hub 后端负责写对象存储并绑定消息。
+            data.add_field(
+                "file",
+                media_file["handle"],
+                filename=upload_name,
+                content_type=content_type,
             )
-        if download_url in content:
-            return content
-        display_name = str(attachment.get("name") or Path(file_path).name)
-        content_type = str(attachment.get("content_type") or "")
-        kind = str(attachment.get("kind") or "")
-        if kind == "image" or content_type.startswith("image/"):
-            markdown = f"![{display_name}]({download_url})"
-        else:
-            markdown = f"[{display_name}]({download_url})"
-        return self._join_message_parts(content, markdown)
-
-    def _join_message_parts(self, *parts: str) -> str:
-        cleaned = [str(part).strip() for part in parts if str(part or "").strip()]
-        return "\n\n".join(cleaned)
-
-    def _merge_attachments(
-        self, existing: list[dict[str, Any]], incoming: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        merged: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for attachment in [*existing, *incoming]:
-            if not isinstance(attachment, dict):
-                continue
-            attachment_id = str(attachment.get("id") or "")
-            dedupe_key = attachment_id or json.dumps(attachment, sort_keys=True, ensure_ascii=False)
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-            merged.append(attachment)
-        return merged
-
-    def _message_accepts_attachment_merge(self, run_id: str, message: dict[str, Any]) -> bool:
-        client_key = str(message.get("client_message_key") or "")
-        if client_key == f"hermes-run:{run_id}":
-            return True
-        if message.get("attachments"):
-            return True
-        return bool(re.search(r"!\[[^\]]*\]\(\s*\)", str(message.get("content") or "")))
-
-    async def _upload_attachment(
-        self, session_id: str, file_path: str, file_name: Optional[str] = None
-    ) -> dict[str, Any]:
-        # Hermes 工具链里有时会把中文文件名先做 URL 编码；Hub 端应恢复成可读名称，
-        # 否则最终下载名会变成一串百分号编码。
-        upload_name = unquote(file_name or Path(file_path).name)
-        content_type = mimetypes.guess_type(upload_name)[0] or "application/octet-stream"
-        data = aiohttp.FormData()
-        # 附件只由 adapter 主动上传到 Hub，Hub 不读取容器挂载路径。
-        with open(file_path, "rb") as handle:
-            data.add_field("file", handle, filename=upload_name, content_type=content_type)
             response = await self._request_json(
-                "POST", f"/sessions/{session_id}/attachments", data=data
+                "POST", f"/sessions/{session_id}/outputs/media", data=data
             )
-        attachments = response.get("attachments") or []
-        return attachments[0] if attachments else {}
+            message = response.get("message", response)
+            self._remember_output_message(metadata, message)
+            return SendResult(
+                success=True,
+                message_id=str(message.get("id", "")),
+                raw_response=message,
+            )
+        except AttachmentFileError as error:
+            return SendResult(success=False, error=str(error), retryable=False)
+        except Exception as error:
+            logger.warning("Hermes Hub media output send failed: %s", error)
+            return SendResult(success=False, error=str(error), retryable=True)
+        finally:
+            if media_file is not None:
+                self._close_media_files([media_file])
+
+    def _content_with_single_attachment_placeholder(self, caption: Optional[str]) -> str:
+        content = str(caption or "").strip()
+        if "{{attachment:" in content:
+            return content
+        return f"{content}\n\n{{{{attachment:0}}}}".strip()
+
+    def _open_validated_media_file(self, file_path: str) -> dict[str, Any]:
+        resolved = os.path.realpath(str(file_path or "").strip())
+        if not resolved:
+            raise AttachmentFileError("attachment file not found")
+        if not self._media_path_is_allowed(resolved):
+            raise AttachmentFileError("attachment file is outside allowed media directories")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = None
+        handle = None
+        try:
+            fd = os.open(resolved, flags)
+            actual_path = self._opened_media_file_path(fd)
+            if not self._media_path_is_allowed(actual_path):
+                raise AttachmentFileError("attachment file is outside allowed media directories")
+            file_stat = os.fstat(fd)
+            if not stat_module.S_ISREG(file_stat.st_mode):
+                raise AttachmentFileError("attachment path is not a readable file")
+            handle = os.fdopen(fd, "rb")
+            fd = None
+            digest = self._file_sha256_from_handle(handle)
+            handle.seek(0)
+            return {
+                "handle": handle,
+                "path": resolved,
+                "upload_name": unquote(Path(resolved).name),
+                "size": int(file_stat.st_size),
+                "mtime_ns": int(
+                    getattr(file_stat, "st_mtime_ns", int(file_stat.st_mtime * 1_000_000_000))
+                ),
+                "sha256": digest,
+            }
+        except AttachmentFileError:
+            if handle is not None:
+                handle.close()
+            raise
+        except FileNotFoundError:
+            if handle is not None:
+                handle.close()
+            raise AttachmentFileError("attachment file not found") from None
+        except PermissionError:
+            if handle is not None:
+                handle.close()
+            raise AttachmentFileError("attachment path is not a readable file") from None
+        except OSError:
+            if handle is not None:
+                handle.close()
+            raise AttachmentFileError("attachment path is not a readable file") from None
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def _media_path_is_allowed(self, resolved: str) -> bool:
+        allow_dirs = [
+            os.path.realpath(path.strip())
+            for path in os.getenv("HERMES_MEDIA_ALLOW_DIRS", "/workspace:/sandbox:/opt/data:/config/cache").split(":")
+            if path.strip()
+        ]
+        for allow_dir in allow_dirs:
+            try:
+                if os.path.commonpath([resolved, allow_dir]) == allow_dir:
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    def _opened_media_file_path(self, fd: int) -> str:
+        try:
+            return os.path.realpath(f"/proc/self/fd/{fd}")
+        except OSError:
+            raise AttachmentFileError("attachment file could not be verified") from None
+
+    def _close_media_files(self, media_files: list[dict[str, Any]]) -> None:
+        for media_file in media_files:
+            handle = media_file.get("handle")
+            if handle is not None:
+                handle.close()
 
     async def _media_from_attachments(
         self, item: dict[str, Any]
@@ -924,6 +1092,57 @@ class HermesHubAdapter(BasePlatformAdapter):
             return f"hermes-run:{run_id}"
         return ""
 
+    def _media_client_message_key(
+        self,
+        metadata: Optional[Dict[str, Any]],
+        media_file: dict[str, Any],
+        upload_name: str,
+        caption: Optional[str],
+    ) -> str:
+        metadata = metadata or {}
+        explicit_client_message_key = str(metadata.get("client_message_key") or "")
+        run_id = self._run_id(metadata)
+        if not run_id and not explicit_client_message_key:
+            return ""
+        media_sequence = metadata.get("media_sequence")
+        if explicit_client_message_key and media_sequence is None:
+            return explicit_client_message_key
+        media_source_url = str(metadata.get("media_source_url") or "")
+        if media_source_url:
+            # 远程图片会先缓存到随机文件名；幂等键必须基于来源和内容，而不是缓存路径。
+            fingerprint_parts = [
+                "remote",
+                media_source_url,
+                media_file["size"],
+                media_file["sha256"],
+                caption or "",
+                media_sequence,
+            ]
+        else:
+            fingerprint_parts = [
+                "local",
+                upload_name,
+                media_file["size"],
+                media_file["mtime_ns"],
+                media_file["sha256"],
+                caption or "",
+                media_sequence,
+            ]
+        fingerprint = json.dumps(
+            fingerprint_parts,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:20]
+        key_prefix = explicit_client_message_key or f"hermes-run:{run_id}"
+        return f"{key_prefix}:media:{digest}"
+
+    def _file_sha256_from_handle(self, handle) -> str:
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+        return digest.hexdigest()
+
     def _outcome_text(self, outcome) -> str:
         return getattr(outcome, "value", str(outcome))
 
@@ -963,7 +1182,9 @@ def register(ctx: Any) -> None:
         platform_hint=(
             "You are running inside Hermes Hub. Replies are persisted to the "
             "Hub session, and files must be sent as attachments rather than "
-            "by referring to container-local paths."
+            "by referring to container-local paths. To deliver a generated file "
+            "or image, put MEDIA:/workspace/report.pdf on its own line in the "
+            "final response; Hermes gateway will upload it through this adapter."
         ),
     )
 "#;
@@ -1050,7 +1271,8 @@ impl ContainerMount {
     pub fn nfs_volume(config: &ManagedSkillsMountConfig, read_only: bool) -> Self {
         Self::NfsVolume(ContainerNfsVolumeMount {
             volume_name: managed_nfs_volume_name(&config.volume_name, read_only),
-            container_path: config.container_path.clone(),
+            // Hermes config 固定引用 /nfs/skills，挂载点也固定到 /nfs，避免旧配置造成路径漂移。
+            container_path: HUB_NFS_CONTAINER_DIR.to_string(),
             read_only,
             addr: config.addr.clone(),
             export: config.export.clone(),
@@ -1262,18 +1484,7 @@ impl DockerProvisioner {
                 !instance.global_skills_write_enabled,
             ));
         }
-        let hub_nfs_dir = self
-            .config
-            .managed_profile
-            .as_ref()
-            .map(|profile| profile.container_path.as_str())
-            .or_else(|| {
-                self.config
-                    .managed_skills
-                    .as_ref()
-                    .map(|skills| skills.container_path.as_str())
-            })
-            .unwrap_or("/nfs");
+        let hub_nfs_dir = HUB_NFS_CONTAINER_DIR;
         let mut env = vec![
             "API_SERVER_ENABLED=true".to_string(),
             // API server 仅作为容器内本地能力保留；Hub 通信全部由 adapter 主动连接。
@@ -1305,6 +1516,7 @@ impl DockerProvisioner {
             format!("HERMES_HUB_INBOX_PATH={HUB_INBOX_PATH}"),
             format!("HERMES_HUB_INBOX_TIMEOUT_SECONDS={HUB_INBOX_TIMEOUT_SECONDS}"),
             format!("HERMES_HUB_INBOX_LIMIT={HUB_INBOX_LIMIT}"),
+            format!("HERMES_MEDIA_ALLOW_DIRS={HERMES_MEDIA_ALLOW_DIRS}"),
             format!("OPENAI_MODEL={}", self.config.default_model),
             format!("HERMES_RUNTIME_IMAGE={}", self.config.image),
             format!(
@@ -1839,6 +2051,11 @@ impl DockerProvisioner {
              \x20\x20\x20\x20timeout: 60\n\
              \x20\x20\x20\x20max_concurrency: 1\n\
              gateway:\n\
+             \x20\x20media_delivery_allow_dirs:\n\
+             \x20\x20\x20\x20- \"/workspace\"\n\
+             \x20\x20\x20\x20- \"/sandbox\"\n\
+             \x20\x20\x20\x20- \"/opt/data\"\n\
+             \x20\x20\x20\x20- \"/config/cache\"\n\
              \x20\x20platforms:\n\
              \x20\x20\x20\x20hermes_hub:\n\
              \x20\x20\x20\x20\x20\x20enabled: true\n\

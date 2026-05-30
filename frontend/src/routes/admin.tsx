@@ -51,6 +51,7 @@ type SelectedSkillNode = {
 } | null;
 
 type HermesAction = "create" | "start" | "stop" | "rebuild";
+type ModelTestTarget = "primary" | "fallback";
 
 type HermesSchedulerTaskRow = {
   snapshot: HermesSchedulerSnapshot;
@@ -59,6 +60,7 @@ type HermesSchedulerTaskRow = {
 
 const defaultInviteHours = 24;
 const bytesPerMegabyte = 1024 * 1024;
+const hermesIdleStopAfterSeconds = 30 * 60;
 const modelConfigOrder: ModelConfigKind[] = ["llm", "title", "image"];
 const apiTypeLabels: Record<ModelApiType, string> = {
   chat_completions: "Chat Completions",
@@ -66,6 +68,10 @@ const apiTypeLabels: Record<ModelApiType, string> = {
   images_generations: "Images",
 };
 const reasoningEfforts: Array<ReasoningEffort | ""> = ["", "minimal", "low", "medium", "high"];
+
+function modelTestKey(kind: ModelConfigKind, target: ModelTestTarget): string {
+  return `${kind}:${target}`;
+}
 
 function fallbackConfigForModel(config: ModelConfig): ModelFallbackConfig {
   return (
@@ -295,6 +301,32 @@ function formatSchedulerSnapshotTime(
   }).format(date);
 }
 
+function formatHermesStartedAt(instance: HermesInstance | undefined, language: string): string {
+  return formatSchedulerSnapshotTime(instance?.last_started_at, language);
+}
+
+function formatHermesStopTime(
+  instance: HermesInstance | undefined,
+  language: string,
+  t: (key: "admin.estimatedStopAt", values?: Record<string, string | number>) => string,
+): string {
+  if (!instance) {
+    return "-";
+  }
+  if (instance.status === "stopped") {
+    return formatSchedulerSnapshotTime(instance.last_stopped_at, language);
+  }
+  const lastActivity = instance.last_user_activity_at ?? instance.last_started_at;
+  if (lastActivity === null || lastActivity === undefined) {
+    return "-";
+  }
+  const estimatedStopAt =
+    typeof lastActivity === "number" ? lastActivity + hermesIdleStopAfterSeconds : lastActivity;
+  return t("admin.estimatedStopAt", {
+    time: formatSchedulerSnapshotTime(estimatedStopAt, language),
+  });
+}
+
 function parentPath(path: string): string {
   return path.split("/").slice(0, -1).join("/");
 }
@@ -438,11 +470,9 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
   const [lastInviteLink, setLastInviteLink] = useState<string | null>(null);
   const [requiredModelsReady, setRequiredModelsReady] = useState(false);
   const [missingRequiredModels, setMissingRequiredModels] = useState<ModelConfigKind[]>([]);
-  const [modelTestMessages, setModelTestMessages] = useState<
-    Partial<Record<ModelConfigKind, string>>
-  >({});
+  const [modelTestMessages, setModelTestMessages] = useState<Record<string, string>>({});
   const [modelSaved, setModelSaved] = useState(false);
-  const [testingModel, setTestingModel] = useState<ModelConfigKind | null>(null);
+  const [testingModel, setTestingModel] = useState<string | null>(null);
   const [pendingHermesAction, setPendingHermesAction] = useState<{
     userId: string;
     action: HermesAction;
@@ -623,25 +653,26 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     );
   }
 
-  async function testModel(config: ModelConfig) {
-    setTestingModel(config.config_kind);
+  async function testModel(config: ModelConfig, target: ModelTestTarget = "primary") {
+    const key = modelTestKey(config.config_kind, target);
+    setTestingModel(key);
     setModelTestMessages((messages) => ({
       ...messages,
-      [config.config_kind]: t("admin.modelTesting"),
+      [key]: t("admin.modelTesting"),
     }));
     try {
-      const result = await apiClient.testModelConfig(config);
+      const result =
+        target === "fallback"
+          ? await apiClient.testModelFallbackConfig(config)
+          : await apiClient.testModelConfig(config);
       setModelTestMessages((messages) => ({
         ...messages,
-          [config.config_kind]: result.ok
-            ? result.message
-            : `HTTP ${result.status_code}: ${result.message}`,
+        [key]: result.ok ? result.message : `HTTP ${result.status_code}: ${result.message}`,
       }));
     } catch (cause) {
       setModelTestMessages((messages) => ({
         ...messages,
-        [config.config_kind]:
-          cause instanceof Error ? cause.message : t("admin.modelTestFailed"),
+        [key]: cause instanceof Error ? cause.message : t("admin.modelTestFailed"),
       }));
     } finally {
       setTestingModel(null);
@@ -825,7 +856,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     setSkillLoading(true);
     setError(null);
     try {
-      const path = skillPathInput.trim();
+      const path = selectedSkillNode?.path ?? skillPathInput.trim();
       if (!path) {
         setError(t("admin.skillPathRequired"));
         return;
@@ -854,6 +885,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
           }
           await apiClient.deleteManagedSkill(selectedSkillNode.path);
           setSelectedSkillNode({ path, kind: "dir" });
+          setSkillPathInput(path);
           setSkillContent("");
           setSkillSaved(true);
           await refreshManagedSkills();
@@ -861,6 +893,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
         }
         await apiClient.createManagedSkillDirectory(path);
         setSelectedSkillNode({ path, kind: "dir" });
+        setSkillPathInput(path);
         setSkillContent("");
         setSkillSaved(true);
         await refreshManagedSkills();
@@ -930,6 +963,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
       ? missingRequiredModels.map((kind) => modelLabels[kind]).join(language === "zh" ? "、" : ", ")
       : [modelLabels.llm, modelLabels.title].join(language === "zh" ? "、" : ", ");
   const modelGateMessage = t("admin.modelGate", { models: missingRequiredModelNames });
+  const skillPathSeparator = language === "zh" ? "：" : ": ";
 
   function renderManagedSkillNode(node: ManagedSkillTreeNode): ReactNode {
     if (node.path === "") {
@@ -1013,31 +1047,32 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
           {error ? <p className="error">{error}</p> : null}
           {modelSaved ? <p className="copy-line">{t("admin.modelSaved")}</p> : null}
           <div className="model-config-grid">
-            {orderedModelConfigs.map((config) => (
-              <section className="panel" key={config.config_kind}>
-                <div className="model-card-heading">
-                  <h2>{modelLabels[config.config_kind]}</h2>
-                  <button
-                    type="button"
-                    className="secondary"
-                    disabled={testingModel === config.config_kind}
-                    onClick={() => void testModel(config)}
-                  >
-                    {t("admin.test")}
-                  </button>
-                </div>
-                {modelTestMessages[config.config_kind] ? (
-                  <p
-                    className={
-                      modelTestMessages[config.config_kind] === "model test succeeded"
-                        ? "copy-line"
-                        : "notice"
-                    }
-                  >
-                    {modelTestMessages[config.config_kind]}
-                  </p>
-                ) : null}
-                <div className="form">
+            {orderedModelConfigs.map((config) => {
+              const primaryTestKey = modelTestKey(config.config_kind, "primary");
+              const primaryTestMessage = modelTestMessages[primaryTestKey];
+              return (
+                <section className="panel" key={config.config_kind}>
+                  <div className="model-card-heading">
+                    <h2>{modelLabels[config.config_kind]}</h2>
+                    <button
+                      type="button"
+                      className="secondary"
+                      disabled={testingModel === primaryTestKey}
+                      onClick={() => void testModel(config)}
+                    >
+                      {t("admin.test")}
+                    </button>
+                  </div>
+                  {primaryTestMessage ? (
+                    <p
+                      className={
+                        primaryTestMessage === "model test succeeded" ? "copy-line" : "notice"
+                      }
+                    >
+                      {primaryTestMessage}
+                    </p>
+                  ) : null}
+                  <div className="form">
                   <label>
                     {t("admin.provider")}
                     <input
@@ -1209,6 +1244,8 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                   {config.config_kind !== "image"
                     ? (() => {
                         const fallback = fallbackConfigForModel(config);
+                        const fallbackTestKey = modelTestKey(config.config_kind, "fallback");
+                        const fallbackTestMessage = modelTestMessages[fallbackTestKey];
                         return (
                           <fieldset className="form-section model-fallback-section">
                             <legend>{t("admin.fallbackModel")}</legend>
@@ -1226,6 +1263,27 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                             </label>
                             {fallback.enabled ? (
                               <>
+                                <div className="button-row">
+                                  <button
+                                    type="button"
+                                    className="secondary"
+                                    disabled={testingModel === fallbackTestKey}
+                                    onClick={() => void testModel(config, "fallback")}
+                                  >
+                                    {t("admin.testFallback")}
+                                  </button>
+                                </div>
+                                {fallbackTestMessage ? (
+                                  <p
+                                    className={
+                                      fallbackTestMessage === "model test succeeded"
+                                        ? "copy-line"
+                                        : "notice"
+                                    }
+                                  >
+                                    {fallbackTestMessage}
+                                  </p>
+                                ) : null}
                                 <label>
                                   {t("admin.fallbackProvider")}
                                   <input
@@ -1414,9 +1472,10 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                       {t("admin.imageEnabled")}
                     </label>
                   ) : null}
-                </div>
-              </section>
-            ))}
+                  </div>
+                </section>
+              );
+            })}
           </div>
         </form>
       </section>,
@@ -1440,6 +1499,8 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                 <th>{t("admin.owner")}</th>
                 <th>{t("admin.kind")}</th>
                 <th>{t("admin.status")}</th>
+                <th>{t("admin.startedAt")}</th>
+                <th>{t("admin.stopTime")}</th>
                 <th>{t("admin.version")}</th>
                 <th>{t("admin.action")}</th>
               </tr>
@@ -1460,6 +1521,8 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                         ) : null}
                       </span>
                     </td>
+                    <td>{formatHermesStartedAt(instance, language)}</td>
+                    <td>{formatHermesStopTime(instance, language, t)}</td>
                     <td title={instance?.runtime_image ?? undefined}>
                       {formatHermesRuntimeVersion(instance)}
                     </td>
@@ -1975,6 +2038,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
   }
 
   if (activeTab === "skills") {
+    const currentSkillPath = selectedSkillNode?.path ?? skillPathInput.trim();
     return renderSystemSettingsShell(
       <section className="admin-page" id="admin-skills">
         <div className="tab-actions">
@@ -2042,17 +2106,15 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
             )}
           </div>
           <form className="panel form skill-editor" onSubmit={(event) => void saveManagedSkill(event)}>
-            <label>
-              {t("admin.skillPath")}
-              <input
-                value={skillPathInput}
-                onChange={(event) => {
-                  setSkillPathInput(event.target.value);
-                  setSkillSaved(false);
-                }}
-                required
-              />
-            </label>
+            {currentSkillPath ? (
+              <p className="skill-path-line">
+                {t("admin.skillPath")}
+                {skillPathSeparator}
+                {currentSkillPath}
+              </p>
+            ) : (
+              <p className="notice">{t("admin.skillSelectOrCreate")}</p>
+            )}
             {skillEditorMode === "file" ? (
               <MarkdownVditorEditor
                 className="skill-vditor-editor"
@@ -2068,7 +2130,10 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
               <p className="notice">{t("admin.skillDirectorySelected")}</p>
             )}
             <div className="button-row">
-              <button type="submit" disabled={skillLoading || skillPathInput.trim() === ""}>
+              <button
+                type="submit"
+                disabled={skillLoading || currentSkillPath === ""}
+              >
                 {skillEditorMode === "directory" ? t("admin.skillCreateFolder") : t("admin.save")}
               </button>
               <button

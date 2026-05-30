@@ -73,6 +73,10 @@ export type HermesInstance = {
   status_message?: string | null;
   runtime_image?: string | null;
   runtime_version?: string | null;
+  last_user_activity_at?: number | null;
+  last_started_at?: number | null;
+  last_stopped_at?: number | null;
+  stopped_reason?: string | null;
 };
 
 export type HermesScheduledTaskSnapshot = {
@@ -254,6 +258,7 @@ export type ChannelSessionEvent =
     }
   | { type: "message_created"; message: ChannelMessage }
   | { type: "message_updated"; message: ChannelMessage }
+  | { type: "session_updated"; session: SessionSummary }
   | { type: "run_updated"; run: ChannelRun }
   | { type: "run_cleared"; session_id: string }
   | { type: "session_deleted"; session_id: string };
@@ -361,6 +366,7 @@ export type ApiClient = {
   updateModelConfig: (config: ModelConfig) => Promise<void>;
   updateModelConfigs: (configs: ModelConfig[]) => Promise<void>;
   testModelConfig: (config: ModelConfig) => Promise<ModelConfigTestResult>;
+  testModelFallbackConfig: (config: ModelConfig) => Promise<ModelConfigTestResult>;
   systemSettings: () => Promise<SystemSettings>;
   updateSystemSettings: (settings: SystemSettings) => Promise<void>;
   hermesProfile: () => Promise<HermesProfile>;
@@ -990,6 +996,15 @@ export function createApiClient(): ApiClient {
         },
       );
     },
+    async testModelFallbackConfig(config) {
+      return request<ModelConfigTestResult>(
+        `/api/admin/model-config/${config.config_kind}/fallback/test`,
+        {
+          method: "POST",
+          body: normalizedModelConfig(config),
+        },
+      );
+    },
     async systemSettings() {
       const payload = await request<{ settings: SystemSettingsPayload }>(
         "/api/admin/system-settings",
@@ -1073,6 +1088,7 @@ export function createApiClient(): ApiClient {
         "messages_snapshot",
         "message_created",
         "message_updated",
+        "session_updated",
         "run_updated",
         "run_cleared",
         "session_deleted",
@@ -1186,6 +1202,7 @@ export function createApiClient(): ApiClient {
         "messages_snapshot",
         "message_created",
         "message_updated",
+        "session_updated",
         "run_updated",
         "run_cleared",
         "session_deleted",
@@ -1354,6 +1371,10 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     status: "running",
     runtime_image: "ghcr.io/yiiilin/hermes-hub-hermes:latest",
     runtime_version: null,
+    last_user_activity_at: null,
+    last_started_at: null,
+    last_stopped_at: null,
+    stopped_reason: null,
   };
   let modelConfig: ModelConfig = {
     config_kind: "llm",
@@ -1580,19 +1601,40 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
         status: "running",
         runtime_image: "ghcr.io/yiiilin/hermes-hub-hermes:latest",
         runtime_version: null,
+        last_user_activity_at: Date.now() / 1000,
+        last_started_at: Date.now() / 1000,
+        last_stopped_at: null,
+        stopped_reason: null,
       };
       return instance;
     },
     async startHermesInstance() {
-      instance = { ...(instance as HermesInstance), status: "running" };
+      const now = Date.now() / 1000;
+      instance = {
+        ...(instance as HermesInstance),
+        status: "running",
+        last_started_at: now,
+        stopped_reason: null,
+      };
       return instance;
     },
     async stopHermesInstance() {
-      instance = { ...(instance as HermesInstance), status: "stopped" };
+      instance = {
+        ...(instance as HermesInstance),
+        status: "stopped",
+        last_stopped_at: Date.now() / 1000,
+        stopped_reason: "manual",
+      };
       return instance;
     },
     async rebuildHermesInstance() {
-      instance = { ...(instance as HermesInstance), status: "running" };
+      const now = Date.now() / 1000;
+      instance = {
+        ...(instance as HermesInstance),
+        status: "running",
+        last_started_at: now,
+        stopped_reason: null,
+      };
       return instance;
     },
     async listHermesSchedulerSnapshots() {
@@ -1818,6 +1860,14 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       }
     },
     async testModelConfig() {
+      return {
+        ok: true,
+        status_code: 200,
+        message: "model test succeeded",
+        duration_ms: 12,
+      };
+    },
+    async testModelFallbackConfig() {
       return {
         ok: true,
         status_code: 200,

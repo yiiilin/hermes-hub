@@ -1,6 +1,6 @@
 use axum::{
     body::to_bytes,
-    extract::{Multipart, Path, State},
+    extract::{DefaultBodyLimit, Multipart, Path, State},
     http::{HeaderMap, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -19,6 +19,10 @@ use crate::{
         provisioner::HermesProvisioner,
     },
     http::{
+        attachments::{
+            drain_multipart_field_with_limit, read_multipart_text_field_with_limit,
+            spool_multipart_file_to_temp_with_limit, SpooledMultipartFile,
+        },
         auth::require_admin,
         map_provisioner_error,
         workspace::{
@@ -78,6 +82,10 @@ pub fn router() -> Router<AppState> {
             post(test_model_config),
         )
         .route(
+            "/api/admin/model-config/{config_kind}/fallback/test",
+            post(test_model_fallback_config),
+        )
+        .route(
             "/api/admin/system-settings",
             get(get_system_settings).put(update_system_settings),
         )
@@ -92,7 +100,7 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/api/admin/managed-skills/upload",
-            post(upload_managed_skills),
+            post(upload_managed_skills).layer(DefaultBodyLimit::disable()),
         )
         .route(
             "/api/admin/managed-skills/directories/{*path}",
@@ -232,7 +240,12 @@ struct ManagedSkillUploadResponse {
 
 struct ManagedSkillUploadPart {
     file_name: String,
-    bytes: Bytes,
+    file: SpooledMultipartFile,
+}
+
+struct ManagedSkillUpload {
+    path: String,
+    file: SpooledMultipartFile,
 }
 
 #[derive(Default)]
@@ -418,6 +431,11 @@ async fn rebuild_managed_hermes_instance(
         .bind_hub_channel_to_instance(&user_id, &instance.id)
         .await
         .map_err(|_| ApiError::Internal)?;
+    let instance = state
+        .store
+        .hermes_instance_for_user(&user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
     Ok(Json(HermesInstanceResponse {
         hermes_instance: instance,
     }))
@@ -459,6 +477,11 @@ async fn stop_managed_hermes_instance(
     state
         .store
         .bind_hermes_instance(instance.clone())
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let instance = state
+        .store
+        .hermes_instance_for_user(&user_id)
         .await
         .map_err(|_| ApiError::Internal)?;
     Ok(Json(HermesInstanceResponse {
@@ -540,6 +563,27 @@ async fn test_model_config(
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
     let config = model_config_from_payload(&state, Some(&config_kind), payload).await?;
+    Ok(Json(execute_model_config_test(&state, &config).await?))
+}
+
+async fn test_model_fallback_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(config_kind): Path<String>,
+    Json(payload): Json<UpdateModelConfigRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    let config = model_config_from_payload(&state, Some(&config_kind), payload).await?;
+    let fallback_config = model_config_for_fallback_test(&config)?;
+    Ok(Json(
+        execute_model_config_test(&state, &fallback_config).await?,
+    ))
+}
+
+async fn execute_model_config_test(
+    state: &AppState,
+    config: &ModelConfig,
+) -> Result<ModelConfigTestResponse, ApiError> {
     let (path, body) = model_test_request(&config)?;
     let request = LlmProviderRequest {
         method: Method::POST,
@@ -566,12 +610,12 @@ async fn test_model_config(
         test_response_message(status, &bytes)
     };
 
-    Ok(Json(ModelConfigTestResponse {
+    Ok(ModelConfigTestResponse {
         ok: status.is_success(),
         status_code: status.as_u16(),
         message,
         duration_ms: started.elapsed().as_millis() as u64,
-    }))
+    })
 }
 
 async fn get_system_settings(
@@ -875,14 +919,16 @@ async fn upload_managed_skills(
     let prefix = managed_skills_prefix(&state)?;
     let mut skills = Vec::with_capacity(uploads.len());
 
-    for (path, bytes) in uploads {
+    for mut upload in uploads {
+        let path = upload.path;
         let key = managed_skill_object_key(&prefix, &path);
-        let size = bytes.len() as u64;
-        state
+        let size = upload.file.size;
+        let upload_result = state
             .object_storage
-            .put(&key, bytes)
-            .await
-            .map_err(map_object_storage_error)?;
+            .put_file(&key, upload.file.path())
+            .await;
+        upload.file.cleanup().await;
+        upload_result.map_err(map_object_storage_error)?;
         skills.push(ManagedSkillSummary { path, size });
     }
     skills.sort_by(|left, right| left.path.cmp(&right.path));
@@ -1015,6 +1061,44 @@ fn fallback_config_from_payload(
     Some(fallback)
 }
 
+fn model_config_for_fallback_test(config: &ModelConfig) -> Result<ModelConfig, ApiError> {
+    if config.config_kind == IMAGE_MODEL_CONFIG_KIND {
+        return Err(ApiError::BadRequest(
+            "fallback model test is not available for image model",
+        ));
+    }
+    let fallback = config
+        .fallback
+        .as_ref()
+        .filter(|fallback| fallback.enabled)
+        .ok_or(ApiError::BadRequest("fallback model is not enabled"))?;
+    if fallback.provider_name.trim().is_empty()
+        || fallback.provider_base_url.trim().is_empty()
+        || fallback.provider_api_key.trim().is_empty()
+        || fallback.default_model.trim().is_empty()
+    {
+        return Err(ApiError::BadRequest("fallback model config is incomplete"));
+    }
+
+    // fallback 单独测试复用主模型测试报文，但所有 provider/model/运行时参数都切到 fallback。
+    let mut fallback_config = config.clone();
+    fallback_config.provider_name = fallback.provider_name.clone();
+    fallback_config.provider_base_url = fallback.provider_base_url.clone();
+    fallback_config.provider_api_key = fallback.provider_api_key.clone();
+    fallback_config.default_model = fallback.default_model.clone();
+    fallback_config.allowed_models = fallback.allowed_models.clone();
+    fallback_config.api_type = fallback.api_type.clone();
+    fallback_config.reasoning_effort = fallback.reasoning_effort.clone();
+    fallback_config.allow_streaming = fallback.allow_streaming;
+    fallback_config.request_timeout_seconds = fallback.request_timeout_seconds;
+    fallback_config.context_window_tokens = fallback.context_window_tokens;
+    fallback_config.max_output_tokens = fallback.max_output_tokens;
+    fallback_config.temperature = fallback.temperature;
+    fallback_config.supports_parallel_tools = fallback.supports_parallel_tools;
+    fallback_config.fallback = None;
+    Ok(fallback_config)
+}
+
 fn runtime_model_settings(config: &ModelConfig) -> RuntimeModelSettings {
     RuntimeModelSettings {
         default_model: config.default_model.clone(),
@@ -1116,7 +1200,7 @@ fn managed_skill_directory_marker_path(prefix: &str, key: &str) -> Option<String
 async fn parse_managed_skill_upload(
     state: &AppState,
     mut multipart: Multipart,
-) -> Result<Vec<(String, Bytes)>, ApiError> {
+) -> Result<Vec<ManagedSkillUpload>, ApiError> {
     let mut target_path = String::new();
     let mut parts = Vec::new();
     let mut total_bytes = 0usize;
@@ -1134,15 +1218,19 @@ async fn parse_managed_skill_upload(
     {
         let field_name = field.name().map(ToOwned::to_owned).unwrap_or_default();
         if field_name == "target_path" {
-            let value = field
-                .text()
-                .await
-                .map_err(|_| ApiError::BadRequest("multipart body is invalid"))?;
+            let value = read_multipart_text_field_with_limit(
+                field,
+                4096,
+                "managed skill target path is too large",
+            )
+            .await?;
             target_path = normalize_managed_skill_optional_path(&value)?;
             continue;
         }
 
         let Some(file_name) = field.file_name().map(ToOwned::to_owned) else {
+            drain_multipart_field_with_limit(field, 64 * 1024, "multipart field is too large")
+                .await?;
             continue;
         };
         let content_type = field.content_type().map(ToOwned::to_owned);
@@ -1152,17 +1240,18 @@ async fn parse_managed_skill_upload(
                 "managed skill zip uploads are not supported",
             ));
         }
-        let bytes = field
-            .bytes()
-            .await
-            .map_err(|_| ApiError::BadRequest("managed skill upload body is invalid"))?;
+        let remaining_upload_bytes = max_upload_bytes.saturating_sub(total_bytes);
+        let file =
+            spool_multipart_file_to_temp_with_limit(field, Some(remaining_upload_bytes)).await?;
+        let file_size = usize::try_from(file.size)
+            .map_err(|_| ApiError::BadRequest("managed skill upload is too large"))?;
         total_bytes = total_bytes
-            .checked_add(bytes.len())
+            .checked_add(file_size)
             .ok_or(ApiError::BadRequest("managed skill upload is too large"))?;
         if total_bytes > max_upload_bytes {
             return Err(ApiError::BadRequest("managed skill upload is too large"));
         }
-        parts.push(ManagedSkillUploadPart { file_name, bytes });
+        parts.push(ManagedSkillUploadPart { file_name, file });
         if parts.len() > MAX_MANAGED_SKILL_UPLOAD_FILES {
             return Err(ApiError::BadRequest(
                 "managed skill upload has too many files",
@@ -1173,7 +1262,10 @@ async fn parse_managed_skill_upload(
     let mut uploads = Vec::new();
     for part in parts {
         let path = normalize_managed_skill_upload_path(&target_path, &part.file_name)?;
-        uploads.push((path, part.bytes));
+        uploads.push(ManagedSkillUpload {
+            path,
+            file: part.file,
+        });
         if uploads.len() > MAX_MANAGED_SKILL_UPLOAD_FILES {
             return Err(ApiError::BadRequest(
                 "managed skill upload has too many files",
@@ -1181,8 +1273,8 @@ async fn parse_managed_skill_upload(
         }
     }
 
-    uploads.sort_by(|left, right| left.0.cmp(&right.0));
-    uploads.dedup_by(|left, right| left.0 == right.0);
+    uploads.sort_by(|left, right| left.path.cmp(&right.path));
+    uploads.dedup_by(|left, right| left.path == right.path);
     Ok(uploads)
 }
 

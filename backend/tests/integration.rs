@@ -301,6 +301,58 @@ async fn integration_test() {
     assert_eq!(forwarded_body["model"], "gpt-4.1-mini");
     assert_eq!(forwarded_body["reasoning"]["effort"], "low");
 
+    let test_llm_fallback_model = request_json(
+        &app,
+        Method::POST,
+        "/api/admin/model-config/llm/fallback/test",
+        json!({
+            "provider_name": "openai-compatible",
+            "provider_base_url": "https://provider-one.example/v1",
+            "provider_api_key": "provider-key-one",
+            "default_model": "gpt-4.1-mini",
+            "allowed_models": ["gpt-4.1-mini", "gpt-4.1"],
+            "api_type": "responses",
+            "reasoning_effort": "low",
+            "allow_streaming": true,
+            "request_timeout_seconds": 30,
+            "fallback": {
+                "enabled": true,
+                "provider_name": "fallback-openai-compatible",
+                "provider_base_url": "https://fallback-provider.example/v1",
+                "provider_api_key": "fallback-provider-key",
+                "default_model": "gpt-4.1-fallback",
+                "allowed_models": ["gpt-4.1-fallback"],
+                "api_type": "responses",
+                "reasoning_effort": "medium",
+                "allow_streaming": true,
+                "request_timeout_seconds": 45,
+                "context_window_tokens": 100000,
+                "max_output_tokens": 2048,
+                "temperature": 0.2,
+                "supports_parallel_tools": false
+            }
+        }),
+        Some(&admin_cookie),
+        None,
+    )
+    .await;
+    let (status, body) = response_json(test_llm_fallback_model).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+    let forwarded = provider
+        .last_request()
+        .expect("fallback model test provider request");
+    assert_eq!(
+        forwarded.provider_base_url,
+        "https://fallback-provider.example/v1"
+    );
+    assert_eq!(forwarded.path, "/responses");
+    assert_eq!(forwarded.authorization, "Bearer fallback-provider-key");
+    assert_eq!(forwarded.timeout_seconds, 45);
+    let forwarded_body: Value = serde_json::from_slice(&forwarded.body).expect("provider json");
+    assert_eq!(forwarded_body["model"], "gpt-4.1-fallback");
+    assert_eq!(forwarded_body["reasoning"]["effort"], "medium");
+
     let test_image_model = request_json(
         &app,
         Method::POST,

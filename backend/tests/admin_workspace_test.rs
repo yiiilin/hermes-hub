@@ -15,7 +15,7 @@ use hermes_hub_backend::{
         ModelConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND,
         TITLE_MODEL_CONFIG_KIND,
     },
-    session::store::SessionStore,
+    session::store::{SessionStore, SystemSettings},
     storage::InMemoryObjectStorage,
     AppConfig, AppState,
 };
@@ -951,6 +951,19 @@ async fn admin_workspace_test() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["hermes_instance"]["kind"], "managed_docker");
     assert_eq!(body["hermes_instance"]["status"], "running");
+    assert!(
+        body["hermes_instance"]["last_started_at"]
+            .as_u64()
+            .is_some(),
+        "managed Hermes create response must expose its start time"
+    );
+    assert!(
+        body["hermes_instance"]["last_user_activity_at"]
+            .as_u64()
+            .is_some(),
+        "managed Hermes create response must expose the activity timestamp used for idle stop"
+    );
+    assert_eq!(body["hermes_instance"]["last_stopped_at"], Value::Null);
     let managed_config = std::fs::read_to_string(format!(
         "/tmp/hermes-hub/users/{admin_id}/config/config.yaml"
     ))
@@ -980,6 +993,13 @@ async fn admin_workspace_test() {
     let (status, body) = response_json(stop).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["hermes_instance"]["status"], "stopped");
+    assert!(
+        body["hermes_instance"]["last_stopped_at"]
+            .as_u64()
+            .is_some(),
+        "managed Hermes stop response must expose its stopped time"
+    );
+    assert_eq!(body["hermes_instance"]["stopped_reason"], "manual");
 
     let start = request_empty(
         &app,
@@ -991,6 +1011,13 @@ async fn admin_workspace_test() {
     let (status, body) = response_json(start).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["hermes_instance"]["status"], "running");
+    assert!(
+        body["hermes_instance"]["last_started_at"]
+            .as_u64()
+            .is_some(),
+        "managed Hermes start response must expose its latest start time"
+    );
+    assert_eq!(body["hermes_instance"]["stopped_reason"], Value::Null);
 
     let instances = request_empty(
         &app,
@@ -1002,6 +1029,12 @@ async fn admin_workspace_test() {
     let (status, body) = response_json(instances).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["hermes_instances"][0]["user_id"], admin_id);
+    assert!(
+        body["hermes_instances"][0]["last_started_at"]
+            .as_u64()
+            .is_some(),
+        "Hermes management list must include lifecycle timestamps"
+    );
 
     let removed_legacy_config = request_json(
         &app,
@@ -1083,6 +1116,51 @@ async fn admin_can_configure_per_user_session_limit() {
     .await;
     assert_eq!(update.status(), StatusCode::NO_CONTENT);
 
+    let large_attachment_update = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/system-settings",
+        json!({
+            "max_sessions_per_user": 2,
+            "max_attachment_upload_bytes": 15_000_u64 * 1024 * 1024,
+            "attachment_retention_days": 30,
+            "oidc": {
+                "enabled": true,
+                "display_name": "Acme SSO",
+                "client_id": "hermes-hub",
+                "client_secret": "oidc-secret",
+                "issuer_url": "https://idp.example.com",
+                "authorization_url": "https://idp.example.com/oauth2/v1/authorize",
+                "token_url": "https://idp.example.com/oauth2/v1/token",
+                "userinfo_url": "https://idp.example.com/oauth2/v1/userinfo",
+                "logout_url": "https://idp.example.com/logout",
+                "scopes": "openid profile email",
+                "username_claim": "preferred_username",
+                "email_claim": "email",
+                "allow_password_login": true,
+                "auto_create_users": true
+            },
+            "ldap": {
+                "enabled": true,
+                "display_name": "Corporate LDAP",
+                "url": "ldaps://ldap.example.com:636",
+                "bind_dn": "cn=hub,ou=apps,dc=example,dc=com",
+                "bind_password": "ldap-bind-secret",
+                "base_dn": "ou=people,dc=example,dc=com",
+                "user_filter": "(&(objectClass=person)(mail={email}))",
+                "email_attribute": "mail",
+                "auto_create_users": true
+            }
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(
+        large_attachment_update.status(),
+        StatusCode::NO_CONTENT,
+        "15000 MB must be a valid per-file attachment upload limit"
+    );
+
     let settings = request_empty(
         &app,
         Method::GET,
@@ -1095,7 +1173,7 @@ async fn admin_can_configure_per_user_session_limit() {
     assert_eq!(body["settings"]["max_sessions_per_user"], 2);
     assert_eq!(
         body["settings"]["max_attachment_upload_bytes"],
-        64 * 1024 * 1024
+        15_000_u64 * 1024 * 1024
     );
     assert_eq!(body["settings"]["attachment_retention_days"], 30);
     assert_eq!(body["settings"]["oidc"]["enabled"], true);
@@ -1491,6 +1569,75 @@ async fn admin_can_upload_managed_skill_files_and_folders() {
     let (status, body) = response_json(read).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["skill"]["content"], "Read primary sources.\n");
+}
+
+#[tokio::test]
+async fn managed_skill_upload_can_exceed_default_json_body_limit() {
+    let app = test_app();
+    let admin_cookie = bootstrap_admin(&app).await;
+    let boundary = "managed-skills-large-upload-boundary";
+    let large_skill = vec![b'a'; 9 * 1024 * 1024];
+    let mut upload_body = Vec::new();
+    multipart_file(
+        &mut upload_body,
+        boundary,
+        "files",
+        "large/SKILL.md",
+        "text/markdown",
+        &large_skill,
+    );
+    finish_multipart(&mut upload_body, boundary);
+
+    let upload = request_raw(
+        &app,
+        Method::POST,
+        "/api/admin/managed-skills/upload",
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload_body,
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(upload).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["skills"][0]["path"], "large/SKILL.md");
+    assert_eq!(body["skills"][0]["size"], large_skill.len());
+}
+
+#[tokio::test]
+async fn managed_skill_upload_obeys_configured_size_limit_while_streaming() {
+    let (state, _runtime) = app_state_with_recording_docker_runtime().await;
+    let mut settings = SystemSettings::default();
+    settings.max_attachment_upload_bytes = 1024;
+    state
+        .store
+        .update_system_settings(settings)
+        .await
+        .expect("system settings can be lowered");
+    let app = build_router_with_state(state);
+    let admin_cookie = bootstrap_admin(&app).await;
+    let boundary = "managed-skills-size-limit-boundary";
+    let oversized_skill = vec![b'a'; 2048];
+    let mut upload_body = Vec::new();
+    multipart_file(
+        &mut upload_body,
+        boundary,
+        "files",
+        "large/SKILL.md",
+        "text/markdown",
+        &oversized_skill,
+    );
+    finish_multipart(&mut upload_body, boundary);
+
+    let upload = request_raw(
+        &app,
+        Method::POST,
+        "/api/admin/managed-skills/upload",
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload_body,
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(upload.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

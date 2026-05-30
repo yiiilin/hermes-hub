@@ -23,7 +23,7 @@ const SESSION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_MAX_SESSIONS_PER_USER: u32 = 20;
 const MAX_CONFIGURABLE_SESSIONS_PER_USER: u32 = 500;
 pub const DEFAULT_MAX_ATTACHMENT_UPLOAD_BYTES: usize = 200 * 1024 * 1024;
-pub const MAX_CONFIGURABLE_ATTACHMENT_UPLOAD_BYTES: usize = 1024 * 1024 * 1024;
+pub const MAX_CONFIGURABLE_ATTACHMENT_UPLOAD_BYTES: usize = 20usize * 1024 * 1024 * 1024;
 const DEFAULT_ATTACHMENT_RETENTION_DAYS: u32 = 7;
 const MAX_ATTACHMENT_RETENTION_DAYS: u32 = 3650;
 const MAX_SESSIONS_PER_USER_KEY: &str = "max_sessions_per_user";
@@ -885,6 +885,8 @@ impl SessionStore {
             SessionStoreBackend::Memory(inner) => {
                 let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
                 update_memory_lifecycle_from_instance(&mut inner, &instance, None);
+                let lifecycle = inner.hermes_lifecycle_by_instance_id.get(&instance.id);
+                let instance = instance_with_lifecycle(instance, lifecycle);
                 inner
                     .hermes_instances_by_user_id
                     .insert(instance.user_id.clone(), instance);
@@ -901,11 +903,14 @@ impl SessionStore {
                         id, user_id, kind, status, name, api_token_secret_ref,
                         container_id, host_workspace_path, host_sandbox_path, host_config_path,
                         health_status, status_message, runtime_image, runtime_version,
-                        last_started_at, last_stopped_at, stopped_reason, updated_at
+                        last_user_activity_at, last_started_at, last_stopped_at, stopped_reason,
+                        updated_at
                     )
                     values (
                         $1::uuid, $2::uuid, $3, $4, $5, $6,
                         $7, $8, $9, $10, $11, $12, $13, $14,
+                        -- 停止态实例也必须有活动时间基线，否则 upsert 会先触发 NOT NULL 约束。
+                        now(),
                         case when $4 = 'running' then now() else null end,
                         case when $4 = 'stopped' then now() else null end,
                         case when $4 = 'stopped' then 'manual' else null end,
@@ -925,6 +930,10 @@ impl SessionStore {
                         status_message = excluded.status_message,
                         runtime_image = excluded.runtime_image,
                         runtime_version = excluded.runtime_version,
+                        last_user_activity_at = coalesce(
+                            hermes_instances.last_user_activity_at,
+                            excluded.last_user_activity_at
+                        ),
                         last_started_at = case
                             when excluded.status = 'running' and hermes_instances.status <> 'running' then now()
                             else coalesce(hermes_instances.last_started_at, excluded.last_started_at)
@@ -971,11 +980,13 @@ impl SessionStore {
         match &self.backend {
             SessionStoreBackend::Memory(inner) => {
                 let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
-                inner
+                let instance = inner
                     .hermes_instances_by_user_id
                     .get(user_id)
                     .cloned()
-                    .ok_or(StoreError::InviteNotFound)
+                    .ok_or(StoreError::InviteNotFound)?;
+                let lifecycle = inner.hermes_lifecycle_by_instance_id.get(&instance.id);
+                Ok(instance_with_lifecycle(instance, lifecycle))
             }
             SessionStoreBackend::Postgres { pool, cipher } => block_on_db(async {
                 let hermes_sql = hermes_instance_select("select", "where user_id = $1::uuid", "");
@@ -999,7 +1010,12 @@ impl SessionStore {
                     .hermes_instances_by_user_id
                     .values()
                     .filter(|instance| instance.kind == HermesInstanceKind::ManagedDocker)
-                    .cloned()
+                    .map(|instance| {
+                        instance_with_lifecycle(
+                            instance.clone(),
+                            inner.hermes_lifecycle_by_instance_id.get(&instance.id),
+                        )
+                    })
                     .collect::<Vec<_>>();
                 instances.sort_by(|left, right| left.user_id.cmp(&right.user_id));
                 Ok(instances)
@@ -1030,18 +1046,39 @@ impl SessionStore {
         match &self.backend {
             SessionStoreBackend::Memory(inner) => {
                 let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
-                let instance = inner
+                let mut instance = inner
                     .hermes_instances_by_user_id
-                    .get_mut(user_id)
+                    .get(user_id)
+                    .cloned()
                     .ok_or(StoreError::InviteNotFound)?;
                 instance.status = status;
-                Ok(instance.clone())
+                update_memory_lifecycle_from_instance(&mut inner, &instance, None);
+                let lifecycle = inner.hermes_lifecycle_by_instance_id.get(&instance.id);
+                let instance = instance_with_lifecycle(instance, lifecycle);
+                inner
+                    .hermes_instances_by_user_id
+                    .insert(instance.user_id.clone(), instance.clone());
+                Ok(instance)
             }
             SessionStoreBackend::Postgres { pool, cipher } => block_on_db(async {
                 let row = sqlx::query(
                     r#"
                     update hermes_instances
-                    set status = $2, updated_at = now()
+                    set status = $2,
+                        last_started_at = case
+                            when $2 = 'running' and status <> 'running' then now()
+                            else last_started_at
+                        end,
+                        last_stopped_at = case
+                            when $2 = 'stopped' and status <> 'stopped' then now()
+                            else last_stopped_at
+                        end,
+                        stopped_reason = case
+                            when $2 = 'running' then null
+                            when $2 = 'stopped' and status <> 'stopped' then 'manual'
+                            else stopped_reason
+                        end,
+                        updated_at = now()
                     where user_id = $1::uuid
                     returning id::text as id,
                               user_id::text as user_id,
@@ -1056,7 +1093,11 @@ impl SessionStore {
                               health_status,
                               status_message,
                               runtime_image,
-                              runtime_version
+                              runtime_version,
+                              extract(epoch from last_user_activity_at)::bigint as last_user_activity_at,
+                              extract(epoch from last_started_at)::bigint as last_started_at,
+                              extract(epoch from last_stopped_at)::bigint as last_stopped_at,
+                              stopped_reason
                     "#,
                 )
                 .bind(user_id)
@@ -1092,7 +1133,11 @@ impl SessionStore {
                 if runtime_version.is_some() {
                     instance.runtime_version = runtime_version;
                 }
-                Ok(instance.clone())
+                let instance = instance.clone();
+                Ok(instance_with_lifecycle(
+                    instance,
+                    inner.hermes_lifecycle_by_instance_id.get(instance_id),
+                ))
             }
             SessionStoreBackend::Postgres { pool, cipher } => block_on_db(async {
                 let row = sqlx::query(
@@ -1115,7 +1160,11 @@ impl SessionStore {
                               health_status,
                               status_message,
                               runtime_image,
-                              runtime_version
+                              runtime_version,
+                              extract(epoch from last_user_activity_at)::bigint as last_user_activity_at,
+                              extract(epoch from last_started_at)::bigint as last_started_at,
+                              extract(epoch from last_stopped_at)::bigint as last_stopped_at,
+                              stopped_reason
                     "#,
                 )
                 .bind(instance_id)
@@ -2256,7 +2305,11 @@ fn hermes_instance_select(prefix: &str, filter: &str, suffix: &str) -> String {
            health_status,
            status_message,
            runtime_image,
-           runtime_version
+           runtime_version,
+           extract(epoch from last_user_activity_at)::bigint as last_user_activity_at,
+           extract(epoch from last_started_at)::bigint as last_started_at,
+           extract(epoch from last_stopped_at)::bigint as last_stopped_at,
+           stopped_reason
            from hermes_instances
            {filter}
            {suffix}"#
@@ -2423,6 +2476,21 @@ fn row_to_hermes_instance(
         runtime_version: row
             .try_get("runtime_version")
             .map_err(|_| StoreError::DatabaseFailed)?,
+        last_user_activity_at: row
+            .try_get::<Option<i64>, _>("last_user_activity_at")
+            .map_err(|_| StoreError::DatabaseFailed)?
+            .map(|value| value as u64),
+        last_started_at: row
+            .try_get::<Option<i64>, _>("last_started_at")
+            .map_err(|_| StoreError::DatabaseFailed)?
+            .map(|value| value as u64),
+        last_stopped_at: row
+            .try_get::<Option<i64>, _>("last_stopped_at")
+            .map_err(|_| StoreError::DatabaseFailed)?
+            .map(|value| value as u64),
+        stopped_reason: row
+            .try_get("stopped_reason")
+            .map_err(|_| StoreError::DatabaseFailed)?,
         global_skills_write_enabled: false,
     })
 }
@@ -2499,6 +2567,19 @@ fn row_to_lifecycle_state(row: &sqlx::postgres::PgRow) -> Result<HermesLifecycle
             .try_get("stopped_reason")
             .map_err(|_| StoreError::DatabaseFailed)?,
     })
+}
+
+fn instance_with_lifecycle(
+    mut instance: HermesInstance,
+    lifecycle: Option<&HermesLifecycleState>,
+) -> HermesInstance {
+    if let Some(lifecycle) = lifecycle {
+        instance.last_user_activity_at = lifecycle.last_user_activity_at;
+        instance.last_started_at = lifecycle.last_started_at;
+        instance.last_stopped_at = lifecycle.last_stopped_at;
+        instance.stopped_reason = lifecycle.stopped_reason.clone();
+    }
+    instance
 }
 
 fn default_lifecycle_state(instance: &HermesInstance) -> HermesLifecycleState {

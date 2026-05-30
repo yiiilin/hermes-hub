@@ -228,6 +228,10 @@ fn managed_instance_for(user_id: &str) -> HermesInstance {
         status_message: None,
         runtime_image: Some("ghcr.io/yiiilin/hermes-hub-hermes:1.2.3".to_string()),
         runtime_version: Some("1.2.3".to_string()),
+        last_user_activity_at: None,
+        last_started_at: None,
+        last_stopped_at: None,
+        stopped_reason: None,
         global_skills_write_enabled: false,
     }
 }
@@ -989,7 +993,7 @@ async fn hermes_instance_can_deliver_channel_message_to_hub() {
         .add_instance_token_for_instance("instance-1", instance_token)
         .await
         .expect("instance token can be registered");
-    let app = build_router_with_state(state);
+    let app = build_router_with_state(state.clone());
     let cookie = bootstrap_and_login(&app).await;
     let user_id = store
         .user_by_session_cookie(&cookie, "hermes_hub_session")
@@ -1174,6 +1178,79 @@ async fn channel_session_events_stream_snapshot_and_adapter_messages() {
 }
 
 #[tokio::test]
+async fn public_session_events_stream_session_title_updates() {
+    let store = SessionStore::default();
+    let state = test_state(store.clone());
+    let app = build_router_with_state(state.clone());
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    store
+        .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
+        .expect("instance can be bound");
+
+    let session = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent" }),
+        Some(&cookie),
+    )
+    .await;
+    let (_, session_body) = response_json(session).await;
+    let session_id = session_body["session"]["id"].as_str().expect("session id");
+
+    let stream_response = request_empty(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{session_id}/events"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(stream_response.status(), StatusCode::OK);
+    let mut body = stream_response.into_body().into_data_stream();
+    let _snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+        .await
+        .expect("snapshot event arrives")
+        .expect("snapshot chunk exists")
+        .expect("snapshot chunk is readable");
+
+    let created = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{session_id}/messages"),
+        json!({
+            "role": "user",
+            "content": "标题实时刷新",
+            "attachments": []
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    let mut observed_events = String::new();
+    for _ in 0..6 {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+            .await
+            .expect("live event arrives")
+            .expect("live chunk exists")
+            .expect("live chunk is readable");
+        observed_events.push_str(&String::from_utf8_lossy(&chunk));
+        if observed_events.contains("session_updated") {
+            assert!(observed_events.contains("标题实时刷新"));
+            return;
+        }
+    }
+
+    panic!("expected session_updated event, observed: {observed_events}");
+}
+
+#[tokio::test]
 async fn hermes_channel_protocol_uploads_output_file_before_delivering_message() {
     let store = SessionStore::default();
     let state = test_state(store.clone());
@@ -1183,7 +1260,7 @@ async fn hermes_channel_protocol_uploads_output_file_before_delivering_message()
         .add_instance_token_for_instance("instance-1", instance_token)
         .await
         .expect("instance token can be registered");
-    let app = build_router_with_state(state);
+    let app = build_router_with_state(state.clone());
     let cookie = bootstrap_and_login(&app).await;
     let user_id = store
         .user_by_session_cookie(&cookie, "hermes_hub_session")
@@ -1355,6 +1432,569 @@ async fn hermes_channel_protocol_uploads_output_file_before_delivering_message()
 }
 
 #[tokio::test]
+async fn hermes_channel_protocol_delivers_atomic_media_output_message() {
+    let store = SessionStore::default();
+    store
+        .update_system_settings(SystemSettings {
+            max_attachment_upload_bytes: 4096,
+            ..SystemSettings::default()
+        })
+        .await
+        .expect("system attachment limit can be updated");
+    let state = test_state(store.clone());
+    let instance_token = "instance-channel-atomic-media-token";
+    state
+        .model_registry
+        .add_instance_token_for_instance("instance-1", instance_token)
+        .await
+        .expect("instance token can be registered");
+    let app = build_router_with_state(state.clone());
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    store
+        .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
+        .expect("instance can be bound");
+
+    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
+    let (_, channel_body) = response_json(channel).await;
+    let channel_id = channel_body["channels"][0]["id"]
+        .as_str()
+        .expect("channel id");
+    let session = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions"),
+        json!({ "kind": "agent" }),
+        Some(&cookie),
+    )
+    .await;
+    let (_, session_body) = response_json(session).await;
+    let session_id = session_body["session"]["id"].as_str().expect("session id");
+
+    let boundary = "hermes-channel-atomic-media-boundary";
+    let payload = vec![b'i'; 2048];
+    fn atomic_media_body(boundary: &str, payload: &[u8]) -> Vec<u8> {
+        let mut body = format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"caption\"\r\n\r\n\
+             图片已生成\n\n{{{{attachment:0}}}}\r\n\
+             --{boundary}\r\n\
+             Content-Disposition: form-data; name=\"client_message_key\"\r\n\r\n\
+             atomic-media-key\r\n\
+             --{boundary}\r\n\
+             Content-Disposition: form-data; name=\"file\"; filename=\"结果.png\"\r\n\
+             Content-Type: image/png\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(payload);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        body
+    }
+    let upload_body = atomic_media_body(boundary, &payload);
+
+    let unauthorized = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/outputs/media"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload_body.clone(),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let delivered = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/outputs/media"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload_body,
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, delivered_body) = response_json(delivered).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let message = &delivered_body["message"];
+    let message_id = message["id"].as_str().expect("message id");
+    assert_eq!(message["content"], "图片已生成\n\n{{attachment:0}}");
+    assert_eq!(message["attachments"][0]["direction"], "output");
+    assert_eq!(message["attachments"][0]["kind"], "image");
+    assert_eq!(message["attachments"][0]["name"], "结果.png");
+    assert_eq!(message["attachments"][0]["content_type"], "image/png");
+    assert_eq!(message["attachments"][0]["size"], payload.len());
+    assert_eq!(message["attachments"][0]["message_id"], message_id);
+
+    let download_url = message["attachments"][0]["download_url"]
+        .as_str()
+        .expect("download url");
+    let download = request_empty(&app, Method::GET, download_url, Some(&cookie)).await;
+    assert_eq!(download.status(), StatusCode::OK);
+    let bytes = to_bytes(download.into_body(), usize::MAX)
+        .await
+        .expect("download body");
+    assert_eq!(&bytes[..], payload.as_slice());
+
+    let messages = request_empty(
+        &app,
+        Method::GET,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        Some(&cookie),
+    )
+    .await;
+    let (status, messages_body) = response_json(messages).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        messages_body["messages"]
+            .as_array()
+            .expect("messages")
+            .len(),
+        1
+    );
+    assert_eq!(messages_body["messages"][0]["id"], message_id);
+
+    let repeated = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/outputs/media"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        atomic_media_body(boundary, b"second payload should be ignored"),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, repeated_body) = response_json(repeated).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(repeated_body["message"]["id"], message_id);
+    let objects = state
+        .object_storage
+        .list_prefix("")
+        .await
+        .expect("objects can be listed");
+    assert_eq!(objects.len(), 1);
+}
+
+#[tokio::test]
+async fn hermes_channel_protocol_accepts_ordered_attachment_placeholders() {
+    let store = SessionStore::default();
+    let state = test_state(store.clone());
+    let instance_token = "instance-channel-ordered-attachments-token";
+    state
+        .model_registry
+        .add_instance_token_for_instance("instance-1", instance_token)
+        .await
+        .expect("instance token can be registered");
+    let app = build_router_with_state(state.clone());
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    store
+        .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
+        .expect("instance can be bound");
+
+    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
+    let (_, channel_body) = response_json(channel).await;
+    let channel_id = channel_body["channels"][0]["id"]
+        .as_str()
+        .expect("channel id");
+    let session = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions"),
+        json!({ "kind": "agent" }),
+        Some(&cookie),
+    )
+    .await;
+    let (_, session_body) = response_json(session).await;
+    let session_id = session_body["session"]["id"].as_str().expect("session id");
+
+    let boundary = "hermes-channel-ordered-attachments-boundary";
+    let script_payload = b"#!/bin/sh\n./start_ntp.sh\n";
+    let image_payload = b"fake image bytes";
+    let content = "脚本如下：\n\n{{attachment:0}}\n\n图片如下：\n\n{{attachment:1}}";
+    let mut upload_body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"content\"\r\n\r\n\
+         {content}\r\n\
+         --{boundary}\r\n\
+         Content-Disposition: form-data; name=\"client_message_key\"\r\n\r\n\
+         ordered-attachments-key\r\n\
+         --{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"start_ntp.sh\"\r\n\
+         Content-Type: text/x-shellscript\r\n\r\n"
+    )
+    .into_bytes();
+    upload_body.extend_from_slice(script_payload);
+    upload_body.extend_from_slice(
+        format!(
+            "\r\n--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"file\"; filename=\"结果.png\"\r\n\
+             Content-Type: image/png\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    upload_body.extend_from_slice(image_payload);
+    upload_body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let delivered = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/outputs/media"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload_body,
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, delivered_body) = response_json(delivered).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let message = &delivered_body["message"];
+    let message_id = message["id"].as_str().expect("message id");
+    assert_eq!(message["content"], content);
+    assert_eq!(
+        message["attachments"]
+            .as_array()
+            .expect("attachments")
+            .len(),
+        2
+    );
+    assert_eq!(message["attachments"][0]["name"], "start_ntp.sh");
+    assert_eq!(message["attachments"][0]["kind"], "file");
+    assert_eq!(message["attachments"][0]["message_id"], message_id);
+    assert_eq!(message["attachments"][1]["name"], "结果.png");
+    assert_eq!(message["attachments"][1]["kind"], "image");
+    assert_eq!(message["attachments"][1]["message_id"], message_id);
+
+    let script_download_url = message["attachments"][0]["download_url"]
+        .as_str()
+        .expect("script download url");
+    let script_download =
+        request_empty(&app, Method::GET, script_download_url, Some(&cookie)).await;
+    assert_eq!(script_download.status(), StatusCode::OK);
+    let script_bytes = to_bytes(script_download.into_body(), usize::MAX)
+        .await
+        .expect("script download body");
+    assert_eq!(&script_bytes[..], script_payload);
+
+    let repeated = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/outputs/media"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"content\"\r\n\r\n\
+             {content}\r\n\
+             --{boundary}\r\n\
+             Content-Disposition: form-data; name=\"client_message_key\"\r\n\r\n\
+             ordered-attachments-key\r\n\
+             --{boundary}\r\n\
+             Content-Disposition: form-data; name=\"file\"; filename=\"ignored.txt\"\r\n\
+             Content-Type: text/plain\r\n\r\n\
+             ignored\r\n\
+             --{boundary}--\r\n"
+        )
+        .into_bytes(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, repeated_body) = response_json(repeated).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(repeated_body["message"]["id"], message_id);
+}
+
+#[tokio::test]
+async fn hermes_channel_protocol_rejects_attachment_without_placeholder() {
+    let store = SessionStore::default();
+    let state = test_state(store.clone());
+    let instance_token = "instance-channel-placeholder-validation-token";
+    state
+        .model_registry
+        .add_instance_token_for_instance("instance-1", instance_token)
+        .await
+        .expect("instance token can be registered");
+    let app = build_router_with_state(state.clone());
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    store
+        .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
+        .expect("instance can be bound");
+
+    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
+    let (_, channel_body) = response_json(channel).await;
+    let channel_id = channel_body["channels"][0]["id"]
+        .as_str()
+        .expect("channel id");
+    let session = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions"),
+        json!({ "kind": "agent" }),
+        Some(&cookie),
+    )
+    .await;
+    let (_, session_body) = response_json(session).await;
+    let session_id = session_body["session"]["id"].as_str().expect("session id");
+
+    let boundary = "hermes-channel-placeholder-validation-boundary";
+    let upload_body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"content\"\r\n\r\n\
+         这里没有附件占位符\r\n\
+         --{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"orphan.txt\"\r\n\
+         Content-Type: text/plain\r\n\r\n\
+         orphan\r\n\
+         --{boundary}--\r\n"
+    )
+    .into_bytes();
+
+    let delivered = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/outputs/media"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload_body,
+        None,
+        Some(instance_token),
+    )
+    .await;
+    assert_eq!(delivered.status(), StatusCode::BAD_REQUEST);
+
+    let inline_upload_body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"content\"\r\n\r\n\
+         内联占位符 {{attachment:0}}\r\n\
+         --{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"inline.txt\"\r\n\
+         Content-Type: text/plain\r\n\r\n\
+         inline\r\n\
+         --{boundary}--\r\n"
+    )
+    .into_bytes();
+    let inline_delivered = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/outputs/media"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        inline_upload_body,
+        None,
+        Some(instance_token),
+    )
+    .await;
+    assert_eq!(inline_delivered.status(), StatusCode::BAD_REQUEST);
+
+    let large_content = "x".repeat(2 * 1024 * 1024 + 1);
+    let oversized_content_body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"content\"\r\n\r\n\
+         {large_content}\r\n\
+         --{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"large-content.txt\"\r\n\
+         Content-Type: text/plain\r\n\r\n\
+         ignored\r\n\
+         --{boundary}--\r\n"
+    )
+    .into_bytes();
+    let oversized_content = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/outputs/media"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        oversized_content_body,
+        None,
+        Some(instance_token),
+    )
+    .await;
+    assert_eq!(oversized_content.status(), StatusCode::BAD_REQUEST);
+
+    let large_unknown = "x".repeat(64 * 1024 + 1);
+    let oversized_unknown_body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"ignored\"\r\n\r\n\
+         {large_unknown}\r\n\
+         --{boundary}--\r\n"
+    )
+    .into_bytes();
+    let oversized_unknown = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/outputs/media"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        oversized_unknown_body,
+        None,
+        Some(instance_token),
+    )
+    .await;
+    assert_eq!(oversized_unknown.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn hermes_channel_protocol_returns_existing_media_output_after_run_stops() {
+    let store = SessionStore::default();
+    let state = test_state(store.clone());
+    let instance_token = "instance-channel-media-retry-token";
+    state
+        .model_registry
+        .add_instance_token_for_instance("instance-1", instance_token)
+        .await
+        .expect("instance token can be registered");
+    let app = build_router_with_state(state.clone());
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    store
+        .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
+        .expect("instance can be bound");
+
+    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
+    let (_, channel_body) = response_json(channel).await;
+    let channel_id = channel_body["channels"][0]["id"]
+        .as_str()
+        .expect("channel id");
+    let session = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions"),
+        json!({ "kind": "agent" }),
+        Some(&cookie),
+    )
+    .await;
+    let (_, session_body) = response_json(session).await;
+    let session_id = session_body["session"]["id"].as_str().expect("session id");
+
+    let created_run = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/runs"),
+        json!({
+            "content": "生成一张图",
+            "client_message_key": "media-retry-user-turn"
+        }),
+        Some(&cookie),
+    )
+    .await;
+    let (status, created_run_body) = response_json(created_run).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let run_id = created_run_body["run"]["run_id"].as_str().expect("run id");
+    let client_message_key = format!("hermes-run:{run_id}:media:1");
+    let boundary = "hermes-channel-media-retry-boundary";
+
+    fn media_retry_body(
+        boundary: &str,
+        run_id: &str,
+        client_message_key: &str,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut body = format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"caption\"\r\n\r\n\
+             结果图\n\n{{{{attachment:0}}}}\r\n\
+             --{boundary}\r\n\
+             Content-Disposition: form-data; name=\"run_id\"\r\n\r\n\
+             {run_id}\r\n\
+             --{boundary}\r\n\
+             Content-Disposition: form-data; name=\"client_message_key\"\r\n\r\n\
+             {client_message_key}\r\n\
+             --{boundary}\r\n\
+             Content-Disposition: form-data; name=\"file\"; filename=\"retry.png\"\r\n\
+             Content-Type: image/png\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(payload);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    let delivered = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/outputs/media"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        media_retry_body(boundary, run_id, &client_message_key, b"first image"),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, delivered_body) = response_json(delivered).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let message_id = delivered_body["message"]["id"]
+        .as_str()
+        .expect("message id");
+
+    let stopped = request_empty(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/active-run/stop"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(stopped.status(), StatusCode::OK);
+
+    let repeated = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/outputs/media"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        media_retry_body(
+            boundary,
+            run_id,
+            &client_message_key,
+            b"late retry should be ignored",
+        ),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, repeated_body) = response_json(repeated).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(repeated_body["message"]["id"], message_id);
+
+    let messages = request_empty(
+        &app,
+        Method::GET,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        Some(&cookie),
+    )
+    .await;
+    let (status, messages_body) = response_json(messages).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        messages_body["messages"]
+            .as_array()
+            .expect("messages")
+            .len(),
+        2
+    );
+    let objects = state
+        .object_storage
+        .list_prefix("")
+        .await
+        .expect("objects can be listed");
+    assert_eq!(objects.len(), 1);
+}
+
+#[tokio::test]
 async fn hermes_channel_protocol_accepts_large_output_files_within_config_limit() {
     let store = SessionStore::default();
     let state = test_state(store.clone());
@@ -1420,7 +2060,7 @@ async fn hermes_channel_protocol_accepts_large_output_files_within_config_limit(
 }
 
 #[tokio::test]
-async fn hermes_channel_protocol_rejects_output_file_over_system_upload_limit() {
+async fn hermes_channel_protocol_rejects_output_attachment_over_system_upload_limit() {
     let store = SessionStore::default();
     store
         .update_system_settings(SystemSettings {
@@ -1482,6 +2122,139 @@ async fn hermes_channel_protocol_rejects_output_file_over_system_upload_limit() 
         upload_body,
         None,
         Some(instance_token),
+    )
+    .await;
+    let (status, body) = response_json(upload).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["message"], "attachment is too large");
+}
+
+#[tokio::test]
+async fn hermes_channel_protocol_rejects_media_output_file_over_system_upload_limit() {
+    let store = SessionStore::default();
+    store
+        .update_system_settings(SystemSettings {
+            max_attachment_upload_bytes: 1024,
+            ..SystemSettings::default()
+        })
+        .await
+        .expect("system attachment limit can be updated");
+    let state = test_state(store.clone());
+    let instance_token = "instance-channel-too-large-media-token";
+    state
+        .model_registry
+        .add_instance_token_for_instance("instance-1", instance_token)
+        .await
+        .expect("instance token can be registered");
+    let app = build_router_with_state(state.clone());
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    store
+        .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
+        .expect("instance can be bound");
+
+    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
+    let (_, channel_body) = response_json(channel).await;
+    let channel_id = channel_body["channels"][0]["id"]
+        .as_str()
+        .expect("channel id");
+    let session = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions"),
+        json!({ "kind": "agent" }),
+        Some(&cookie),
+    )
+    .await;
+    let (_, session_body) = response_json(session).await;
+    let session_id = session_body["session"]["id"].as_str().expect("session id");
+
+    let boundary = "hermes-channel-too-large-media-boundary";
+    let mut upload_body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"content\"\r\n\r\n\
+         文件如下\n\n{{{{attachment:0}}}}\r\n\
+         --{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"too-large.bin\"\r\n\
+         Content-Type: application/octet-stream\r\n\r\n"
+    )
+    .into_bytes();
+    upload_body.extend_from_slice(&vec![b'a'; 2048]);
+    upload_body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let upload = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/outputs/media"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload_body,
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, body) = response_json(upload).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["message"], "attachment is too large");
+    let objects = state
+        .object_storage
+        .list_prefix("")
+        .await
+        .expect("objects can be listed");
+    assert!(objects.is_empty());
+}
+
+#[tokio::test]
+async fn user_attachment_upload_rejects_file_over_system_upload_limit() {
+    let store = SessionStore::default();
+    store
+        .update_system_settings(SystemSettings {
+            max_attachment_upload_bytes: 1024,
+            ..SystemSettings::default()
+        })
+        .await
+        .expect("system attachment limit can be updated");
+    let app = test_app(store.clone());
+    let cookie = bootstrap_and_login(&app).await;
+
+    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
+    let (_, channel_body) = response_json(channel).await;
+    let channel_id = channel_body["channels"][0]["id"]
+        .as_str()
+        .expect("channel id");
+    let session = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions"),
+        json!({ "kind": "agent" }),
+        Some(&cookie),
+    )
+    .await;
+    let (_, session_body) = response_json(session).await;
+    let session_id = session_body["session"]["id"].as_str().expect("session id");
+
+    let boundary = "user-too-large-file-boundary";
+    let mut upload_body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"too-large.bin\"\r\n\
+         Content-Type: application/octet-stream\r\n\r\n"
+    )
+    .into_bytes();
+    upload_body.extend_from_slice(&vec![b'a'; 2048]);
+    upload_body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let upload = request_raw(
+        &app,
+        Method::POST,
+        &format!("/api/channels/{channel_id}/sessions/{session_id}/attachments"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload_body,
+        Some(&cookie),
+        None,
     )
     .await;
     let (status, body) = response_json(upload).await;

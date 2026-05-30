@@ -6,7 +6,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -1169,17 +1169,25 @@ impl ChannelStore {
                 Ok(message)
             }
             ChannelStoreBackend::Postgres(pool) => block_on_db(async {
+                let mut tx = pool
+                    .begin()
+                    .await
+                    .map_err(|_| ChannelStoreError::DatabaseFailed)?;
                 if let Some(key) = client_message_key.as_deref() {
                     if let Some(message) =
-                        find_postgres_message_by_client_key(pool, session_id, key).await?
+                        find_postgres_message_by_client_key_in_transaction(&mut tx, session_id, key)
+                            .await?
                     {
-                        bind_postgres_attachments(
-                            pool,
+                        bind_postgres_attachments_in_transaction(
+                            &mut tx,
                             session_id,
                             &message.id,
                             &message.attachments,
                         )
                         .await?;
+                        tx.commit()
+                            .await
+                            .map_err(|_| ChannelStoreError::DatabaseFailed)?;
                         return Ok(message);
                     }
                 }
@@ -1208,18 +1216,26 @@ impl ChannelStore {
                 .bind(client_message_key)
                 .bind(content)
                 .bind(attachments)
-                .fetch_one(pool)
+                .fetch_one(&mut *tx)
                 .await
                 .map_err(|_| ChannelStoreError::DatabaseFailed)?;
 
                 let message = row_to_message(&row)?;
                 sqlx::query("update channel_sessions set updated_at = now() where id = $1::uuid")
                     .bind(session_id)
-                    .execute(pool)
+                    .execute(&mut *tx)
                     .await
                     .map_err(|_| ChannelStoreError::DatabaseFailed)?;
-                bind_postgres_attachments(pool, session_id, &message.id, &message.attachments)
-                    .await?;
+                bind_postgres_attachments_in_transaction(
+                    &mut tx,
+                    session_id,
+                    &message.id,
+                    &message.attachments,
+                )
+                .await?;
+                tx.commit()
+                    .await
+                    .map_err(|_| ChannelStoreError::DatabaseFailed)?;
                 Ok(message)
             }),
         }
@@ -2253,6 +2269,55 @@ impl ChannelStore {
         }
     }
 
+    pub async fn delete_attachment_for_session(
+        &self,
+        session_id: &str,
+        attachment_id: &str,
+    ) -> Result<ChannelAttachment, ChannelStoreError> {
+        match &self.backend {
+            ChannelStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
+                let attachment = inner
+                    .attachments_by_id
+                    .get(attachment_id)
+                    .cloned()
+                    .ok_or(ChannelStoreError::AttachmentNotFound)?;
+                if attachment.session_id != session_id {
+                    return Err(ChannelStoreError::InvalidAttachment);
+                }
+                inner.attachments_by_id.remove(attachment_id);
+                Ok(attachment)
+            }
+            ChannelStoreBackend::Postgres(pool) => block_on_db(async {
+                let row = sqlx::query(
+                    r#"
+                    delete from channel_attachments
+                    where id = $1::uuid and session_id = $2::uuid
+                    returning id::text as id,
+                              session_id::text as session_id,
+                              message_id::text as message_id,
+                              direction,
+                              bucket,
+                              object_key,
+                              name,
+                              content_type,
+                              size_bytes as size,
+                              kind,
+                              extract(epoch from created_at)::bigint as created_at
+                    "#,
+                )
+                .bind(attachment_id)
+                .bind(session_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|_| ChannelStoreError::DatabaseFailed)?
+                .ok_or(ChannelStoreError::AttachmentNotFound)?;
+
+                row_to_attachment(&row)
+            }),
+        }
+    }
+
     pub async fn delete_session(
         &self,
         user_id: &str,
@@ -2641,6 +2706,34 @@ async fn find_postgres_message_by_client_key(
     row.as_ref().map(row_to_message).transpose()
 }
 
+async fn find_postgres_message_by_client_key_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: &str,
+    client_message_key: &str,
+) -> Result<Option<ChannelMessage>, ChannelStoreError> {
+    let row = sqlx::query(
+        r#"
+        select id::text as id,
+               session_id::text as session_id,
+               role,
+               client_message_key,
+               content,
+               attachments,
+               extract(epoch from created_at)::bigint as created_at,
+               extract(epoch from updated_at)::bigint as updated_at
+        from channel_session_messages
+        where session_id = $1::uuid and client_message_key = $2
+        "#,
+    )
+    .bind(session_id)
+    .bind(client_message_key)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+
+    row.as_ref().map(row_to_message).transpose()
+}
+
 fn row_to_attachment(row: &sqlx::postgres::PgRow) -> Result<ChannelAttachment, ChannelStoreError> {
     let direction = row
         .try_get::<String, _>("direction")
@@ -2734,6 +2827,30 @@ async fn bind_postgres_attachments(
         .bind(attachment_id)
         .bind(session_id)
         .execute(pool)
+        .await
+        .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+    }
+    Ok(())
+}
+
+async fn bind_postgres_attachments_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: &str,
+    message_id: &str,
+    attachments: &Value,
+) -> Result<(), ChannelStoreError> {
+    for attachment_id in attachment_ids(attachments) {
+        sqlx::query(
+            r#"
+            update channel_attachments
+            set message_id = $1::uuid
+            where id = $2::uuid and session_id = $3::uuid
+            "#,
+        )
+        .bind(message_id)
+        .bind(attachment_id)
+        .bind(session_id)
+        .execute(&mut **tx)
         .await
         .map_err(|_| ChannelStoreError::DatabaseFailed)?;
     }

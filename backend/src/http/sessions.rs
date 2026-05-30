@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Multipart, Path, State},
+    extract::{DefaultBodyLimit, Multipart, Path, State},
     http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -46,7 +46,7 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/api/sessions/{session_id}/attachments",
-            post(upload_attachments),
+            post(upload_attachments).layer(DefaultBodyLimit::disable()),
         )
         .route("/api/sessions/{session_id}/events", get(session_events))
         .route("/api/sessions/{session_id}/stop", post(stop_active_run))
@@ -236,11 +236,14 @@ async fn append_session_message(
 
         if session.title.is_none() && !message.content.trim().is_empty() {
             let title = model_generated_title(&state, &user.id, &message.content).await;
-            let _ = state
+            let updated_session = state
                 .channel_store
                 .update_session_title(&user.id, &channel.id, &session_id, title)
                 .await
                 .map_err(map_channel_error)?;
+            state.session_events.publish(SessionEvent::SessionUpdated {
+                session: updated_session,
+            });
         }
     }
 
@@ -441,10 +444,7 @@ fn session_live_event_stream(
             loop {
                 match receiver.recv().await {
                     Ok(event) if event.session_id() == session_id => {
-                        return Some((
-                            sse_json_event(session_event_name(&event), &event),
-                            receiver,
-                        ));
+                        return Some((sse_json_event(event.event_name(), &event), receiver));
                     }
                     Ok(_) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -456,16 +456,6 @@ fn session_live_event_stream(
             }
         }
     })
-}
-
-fn session_event_name(event: &SessionEvent) -> &'static str {
-    match event {
-        SessionEvent::MessageCreated { .. } => "message_created",
-        SessionEvent::MessageUpdated { .. } => "message_updated",
-        SessionEvent::RunUpdated { .. } => "run_updated",
-        SessionEvent::RunCleared { .. } => "run_cleared",
-        SessionEvent::SessionDeleted { .. } => "session_deleted",
-    }
 }
 
 fn sse_json_event<T: Serialize>(name: &'static str, payload: &T) -> Result<Event, Infallible> {

@@ -63,6 +63,7 @@ describe("App", () => {
   afterEach(() => {
     vditorMock.instances.splice(0);
     vditorMock.Vditor.mockClear();
+    vi.restoreAllMocks();
     window.history.pushState({}, "", "/");
     localStorage.clear();
   });
@@ -785,6 +786,51 @@ describe("App", () => {
     });
   });
 
+  it("tests the fallback model separately from the primary model", async () => {
+    const client = createMockApiClient();
+    const testFallback = vi.fn(async () => ({
+      ok: true,
+      status_code: 200,
+      message: "model test succeeded",
+      duration_ms: 12,
+    }));
+    client.testModelFallbackConfig = testFallback;
+    render(<App apiClient={client} />);
+
+    await openSettingsTab("Model configuration");
+    const llmHeading = await screen.findByRole("heading", { name: "Large language model" });
+    const llmCard = llmHeading.closest("section.panel") as HTMLElement;
+    fireEvent.click(within(llmCard).getByLabelText("Enable fallback"));
+    fireEvent.change(within(llmCard).getByLabelText("Fallback provider"), {
+      target: { value: "fallback-provider" },
+    });
+    fireEvent.change(within(llmCard).getByLabelText("Fallback Base URL"), {
+      target: { value: "https://fallback.example/v1" },
+    });
+    fireEvent.change(within(llmCard).getByLabelText("Fallback API key"), {
+      target: { value: "fallback-key" },
+    });
+    fireEvent.change(within(llmCard).getByLabelText("Fallback model name"), {
+      target: { value: "gpt-4.1-fallback" },
+    });
+
+    fireEvent.click(within(llmCard).getByRole("button", { name: "Test fallback" }));
+
+    await waitFor(() => {
+      expect(testFallback).toHaveBeenCalledWith(
+        expect.objectContaining({
+          config_kind: "llm",
+          fallback: expect.objectContaining({
+            provider_name: "fallback-provider",
+            provider_base_url: "https://fallback.example/v1",
+            provider_api_key: "fallback-key",
+            default_model: "gpt-4.1-fallback",
+          }),
+        }),
+      );
+    });
+  });
+
   it("opens image attachments in a preview dialog", async () => {
     render(
       <App
@@ -972,6 +1018,110 @@ describe("App", () => {
     const markdown = document.querySelector(".markdown-content");
     expect(markdown?.textContent).toContain("文件：练习.pptx");
     expect(document.querySelector(".message-attachments")).not.toBeInTheDocument();
+  });
+
+  it("renders attachment placeholders at their markdown positions", async () => {
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialMessagesBySessionId: {
+            "session-1": [
+              {
+                id: "message-attachment-placeholders",
+                session_id: "session-1",
+                role: "assistant",
+                content:
+                  "先看脚本：\n\n{{attachment:0}}\n\n再看图片：\n\n{{attachment:1}}\n\n结束",
+                attachments: [
+                  {
+                    id: "script",
+                    name: "start_ntp.sh",
+                    content_type: "text/x-shellscript",
+                    kind: "file",
+                    size: 12,
+                    download_url: "/api/attachments/script/download",
+                  },
+                  {
+                    id: "chart",
+                    name: "chart.png",
+                    content_type: "image/png",
+                    kind: "image",
+                    size: 99,
+                    download_url: "/api/attachments/chart/download",
+                  },
+                ],
+                created_at: 1,
+              },
+            ],
+          },
+        })}
+      />,
+    );
+
+    const firstText = await screen.findByText("先看脚本：");
+    const scriptChip = screen.getByRole("link", { name: "Download file start_ntp.sh" });
+    const secondText = screen.getByText("再看图片：");
+    const imagePreview = screen.getByRole("button", { name: "Preview image chart.png" });
+    const markdown = document.querySelector(".markdown-content");
+
+    expect(markdown?.textContent).not.toContain("{{attachment:");
+    expect(firstText.compareDocumentPosition(scriptChip) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(scriptChip.compareDocumentPosition(secondText) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(secondText.compareDocumentPosition(imagePreview) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
+  it("keeps repeated assistant content when attachment ids differ", async () => {
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialMessagesBySessionId: {
+            "session-1": [
+              {
+                id: "message-first-image",
+                session_id: "session-1",
+                role: "assistant",
+                content: "图片已生成\n\n{{attachment:0}}",
+                attachments: [
+                  {
+                    id: "first-image",
+                    name: "first.png",
+                    content_type: "image/png",
+                    kind: "image",
+                    download_url: "/api/attachments/first-image/download",
+                  },
+                ],
+                created_at: 1,
+              },
+              {
+                id: "message-second-image",
+                session_id: "session-1",
+                role: "assistant",
+                content: "图片已生成\n\n{{attachment:0}}",
+                attachments: [
+                  {
+                    id: "second-image",
+                    name: "second.png",
+                    content_type: "image/png",
+                    kind: "image",
+                    download_url: "/api/attachments/second-image/download",
+                  },
+                ],
+                created_at: 2,
+              },
+            ],
+          },
+        })}
+      />,
+    );
+
+    expect(await screen.findByRole("button", { name: "Preview image first.png" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Preview image second.png" })).toBeInTheDocument();
   });
 
   it("renders bare links inside user message bubbles", async () => {
@@ -1175,6 +1325,46 @@ describe("App", () => {
       listener({ type: "run_cleared", session_id: "session-1" });
     }
     await waitFor(() => expectNoPendingLoader());
+  });
+
+  it("updates the visible conversation title from live session events", async () => {
+    let listener: ((event: ChannelSessionEvent) => void) | null = null;
+    const client = createMockApiClient({
+      subscribeSessionEvents(_channelId, _sessionId, onEvent) {
+        listener = onEvent;
+        queueMicrotask(() => {
+          onEvent({
+            type: "messages_snapshot",
+            messages: [],
+            active_run: null,
+          });
+        });
+        return () => {
+          listener = null;
+        };
+      },
+    });
+
+    render(<App apiClient={client} />);
+
+    expect(await screen.findByRole("heading", { name: "Session" })).toBeInTheDocument();
+
+    await act(async () => {
+      listener?.({
+        type: "session_updated",
+        session: {
+          id: "session-1",
+          title: "自动标题",
+          created_at: 1,
+          updated_at: 2,
+        },
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "自动标题" })).toBeInTheDocument();
+    });
+    expect(screen.getAllByText("自动标题").length).toBeGreaterThanOrEqual(2);
   });
 
   it("does not render an empty assistant run message before formal content arrives", async () => {
@@ -1395,6 +1585,57 @@ describe("App", () => {
       expect(bubbles.length).toBeLessThan(80);
     });
     expect(screen.queryByText("message 0")).not.toBeInTheDocument();
+  });
+
+  it("renders live session events immediately in long chat histories", async () => {
+    const messages = Array.from({ length: 140 }, (_, index): ChannelMessage => ({
+      id: `message-live-long-${index}`,
+      session_id: "session-1",
+      role: index % 2 === 0 ? "user" : "assistant",
+      message_kind: "text",
+      content: `live history ${index}`,
+      attachments: [],
+      created_at: index + 1,
+    }));
+    let listener: ((event: ChannelSessionEvent) => void) | null = null;
+    const client = createMockApiClient({
+      subscribeSessionEvents(_channelId, _sessionId, onEvent) {
+        listener = onEvent;
+        queueMicrotask(() => {
+          onEvent({
+            type: "messages_snapshot",
+            messages,
+            active_run: null,
+          });
+        });
+        return () => {
+          listener = null;
+        };
+      },
+    });
+
+    render(<App apiClient={client} />);
+
+    expect(await screen.findByText("live history 139")).toBeInTheDocument();
+    await act(async () => {
+      listener?.({
+        type: "message_created",
+        message: {
+          id: "message-live-now",
+          session_id: "session-1",
+          role: "assistant",
+          message_kind: "text",
+          content: "live event result",
+          attachments: [],
+          created_at: 141,
+        },
+      });
+    });
+
+    expect(screen.getByText("live event result")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(document.querySelectorAll(".message-bubble").length).toBeLessThan(80);
+    });
   });
 
   it("keeps execution bubbles in the session append order", async () => {
@@ -2022,6 +2263,7 @@ describe("App", () => {
   });
 
   it("shows the configured session limit message when a new session is blocked", async () => {
+    const alertSpy = vi.spyOn(window, "alert").mockImplementation(() => undefined);
     const client = createMockApiClient({
       createSession: async () => {
         throw new ApiRequestError("session limit exceeded", {
@@ -2037,11 +2279,10 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "New chat" }));
 
     await waitFor(() => {
-      expect(
-        screen.getByText(
-          "Each user can have at most 2 sessions. Delete a session before creating a new one.",
-        ),
-      ).toBeInTheDocument();
+      const message =
+        "Each user can have at most 2 sessions. Delete a session before creating a new one.";
+      expect(screen.getByText(message)).toBeInTheDocument();
+      expect(alertSpy).toHaveBeenCalledWith(message);
     });
   });
 
@@ -2128,7 +2369,7 @@ describe("App", () => {
     await openSettingsTab("System parameters");
 
     fireEvent.change(await screen.findByLabelText("Max attachment upload size (MB)"), {
-      target: { value: "128" },
+      target: { value: "15000" },
     });
     fireEvent.change(screen.getByLabelText("Attachment retention (days)"), {
       target: { value: "14" },
@@ -2137,13 +2378,14 @@ describe("App", () => {
 
     expect(await screen.findByText("Settings saved")).toBeInTheDocument();
     expect(savedSettings).toMatchObject({
-      max_attachment_upload_bytes: 128 * 1024 * 1024,
+      max_attachment_upload_bytes: 15000 * 1024 * 1024,
       attachment_retention_days: 14,
     });
   });
 
   it("localizes the configured session limit message in Chinese", async () => {
     localStorage.setItem("hermes-hub-language", "zh");
+    const alertSpy = vi.spyOn(window, "alert").mockImplementation(() => undefined);
     const client = createMockApiClient({
       createSession: async () => {
         throw new ApiRequestError("session limit exceeded", {
@@ -2159,9 +2401,9 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "新建对话" }));
 
     await waitFor(() => {
-      expect(
-        screen.getByText("每个用户最多2个会话，你得先删除一个会话才能创建新会话"),
-      ).toBeInTheDocument();
+      const message = "每个用户最多2个会话，你得先删除一个会话才能创建新会话";
+      expect(screen.getByText(message)).toBeInTheDocument();
+      expect(alertSpy).toHaveBeenCalledWith(message);
     });
   });
 
@@ -2387,6 +2629,46 @@ describe("App", () => {
 
     expect(await screen.findByRole("columnheader", { name: "Version" })).toBeInTheDocument();
     expect(screen.getByText("1.2.3")).toBeInTheDocument();
+  });
+
+  it("shows Hermes start time and estimated stop time in the management table", async () => {
+    const lastStartedAt = 1_735_689_600;
+    const lastUserActivityAt = 1_735_690_200;
+    const expectedStarted = new Intl.DateTimeFormat("en-US", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(new Date(lastStartedAt * 1000));
+    const expectedStop = new Intl.DateTimeFormat("en-US", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(new Date((lastUserActivityAt + 30 * 60) * 1000));
+
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialInstance: {
+            id: "instance-1",
+            user_id: "user-1",
+            kind: "managed_docker",
+            status: "running",
+            last_started_at: lastStartedAt,
+            last_user_activity_at: lastUserActivityAt,
+            last_stopped_at: null,
+          },
+        })}
+      />,
+    );
+
+    await openSettingsTab("Hermes management");
+
+    expect(await screen.findByRole("columnheader", { name: "Started" })).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: "Stop time" })).toBeInTheDocument();
+    expect(screen.getByText(expectedStarted)).toBeInTheDocument();
+    expect(screen.getByText(`Estimated: ${expectedStop}`)).toBeInTheDocument();
   });
 
   it("does not show latest as the Hermes runtime version", async () => {
@@ -2645,7 +2927,8 @@ describe("App", () => {
     expect(imageSkillButton).toHaveTextContent("SKILL.md");
     expect(imageSkillButton).toHaveTextContent(/\d+ B/);
     fireEvent.click(imageSkillButton);
-    expect(await screen.findByLabelText("Skill 路径")).toHaveValue("image/SKILL.md");
+    expect(await screen.findByText("Skill 路径：image/SKILL.md")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Skill 路径")).not.toBeInTheDocument();
     const skillEditor = await screen.findByRole("textbox", { name: "Skill 内容" });
     expect(skillEditor).toHaveClass("skill-vditor-editor");
     const skillVditor = vditorInstanceForLabel("Skill 内容");
@@ -2684,7 +2967,7 @@ describe("App", () => {
           .some((button) => button.getAttribute("data-managed-skill-path") === "image/SKILL.md"),
       ).toBe(false);
     });
-    expect(screen.getByLabelText("Skill 路径")).toHaveValue("");
+    expect(screen.queryByLabelText("Skill 路径")).not.toBeInTheDocument();
     await waitFor(() => {
       expect(vditorInstanceForLabel("Skill 内容").setValue).toHaveBeenLastCalledWith("", true);
     });
@@ -2692,31 +2975,21 @@ describe("App", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "writing" }));
     fireEvent.click(screen.getByRole("button", { name: "新建文件夹" }));
-    expect(screen.getByLabelText("Skill 路径")).toHaveValue("writing/new-folder");
-    fireEvent.change(screen.getByLabelText("Skill 路径"), {
-      target: { value: "writing/drafts" },
-    });
+    expect(screen.queryByLabelText("Skill 路径")).not.toBeInTheDocument();
+    expect(screen.getByText("Skill 路径：writing/new-folder")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "创建文件夹" }));
     await waitFor(() => {
-      expect(createManagedSkillDirectory).toHaveBeenCalledWith("writing/drafts");
-      expect(screen.getByRole("button", { name: "drafts" })).toBeInTheDocument();
+      expect(createManagedSkillDirectory).toHaveBeenCalledWith("writing/new-folder");
+      expect(screen.getByRole("button", { name: "new-folder" })).toBeInTheDocument();
     });
 
-    fireEvent.change(screen.getByLabelText("Skill 路径"), {
-      target: { value: "writing/archive" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "创建文件夹" }));
-    await waitFor(() => {
-      expect(createManagedSkillDirectory).toHaveBeenCalledWith("writing/archive");
-      expect(createManagedSkillDirectory).toHaveBeenCalledWith("writing/archive/empty-child");
-      expect(deleteManagedSkill).toHaveBeenCalledWith("writing/drafts");
-      expect(screen.getByRole("button", { name: "archive" })).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "empty-child" })).toBeInTheDocument();
-    });
+    expect(await screen.findByText("Skill 路径：writing/new-folder")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Skill 路径")).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "archive" }));
+    fireEvent.click(screen.getByRole("button", { name: "new-folder" }));
     fireEvent.click(screen.getByRole("button", { name: "新建 Skill" }));
-    expect(screen.getByLabelText("Skill 路径")).toHaveValue("writing/archive/SKILL.md");
+    expect(screen.queryByLabelText("Skill 路径")).not.toBeInTheDocument();
+    expect(screen.getByText("Skill 路径：writing/new-folder/SKILL.md")).toBeInTheDocument();
     expect(vditorInstanceForLabel("Skill 内容").value).toBe("");
   });
 
@@ -2770,7 +3043,8 @@ describe("App", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: /mindoc-search\.tgz/ }));
     expect(await screen.findByText("managed skill is not valid utf-8")).toBeInTheDocument();
-    expect(screen.getByLabelText("Skill path")).toHaveValue("mindoc-search.tgz");
+    expect(screen.getByText("Skill path: mindoc-search.tgz")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Skill path")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Delete" })).not.toBeDisabled();
 
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
@@ -2967,6 +3241,69 @@ describe("App", () => {
       max_output_tokens: 2048,
       temperature: 0.2,
       supports_parallel_tools: false,
+    });
+    fetchMock.mockRestore();
+  });
+
+  it("sends fallback model test requests through the real API client", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        status_code: 200,
+        message: "model test succeeded",
+        duration_ms: 10,
+      }),
+    } as Response);
+
+    await createApiClient().testModelFallbackConfig({
+      config_kind: "llm",
+      enabled: true,
+      provider_name: "openai-compatible",
+      provider_base_url: "https://ready-provider.example/v1",
+      provider_api_key: "stored-provider-key",
+      default_model: "gpt-4.1-mini",
+      allowed_models: ["gpt-4.1-mini"],
+      api_type: "responses",
+      reasoning_effort: "medium",
+      allow_streaming: true,
+      request_timeout_seconds: 60,
+      context_window_tokens: 200000,
+      max_output_tokens: 8192,
+      temperature: 0.3,
+      supports_parallel_tools: true,
+      fallback: {
+        enabled: true,
+        provider_name: "fallback-provider",
+        provider_base_url: "https://fallback-provider.example/v1",
+        provider_api_key: "fallback-key",
+        default_model: "gpt-4.1-fallback",
+        allowed_models: [],
+        api_type: "responses",
+        reasoning_effort: "low",
+        allow_streaming: true,
+        request_timeout_seconds: 45,
+        context_window_tokens: 100000,
+        max_output_tokens: 2048,
+        temperature: 0.2,
+        supports_parallel_tools: false,
+      },
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/admin/model-config/llm/fallback/test",
+      expect.objectContaining({
+        method: "POST",
+      }),
+    );
+    const requestBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(requestBody.fallback).toMatchObject({
+      enabled: true,
+      provider_name: "fallback-provider",
+      provider_base_url: "https://fallback-provider.example/v1",
+      provider_api_key: "fallback-key",
+      default_model: "gpt-4.1-fallback",
     });
     fetchMock.mockRestore();
   });
