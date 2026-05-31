@@ -127,6 +127,8 @@ docker pull ghcr.io/yiiilin/hermes-hub-hermes:latest
 
 The Hub image contains the Rust backend and the built React frontend. The `hermes-hub-hermes` image is the Hermes runtime wrapper used by managed per-user containers. The service listens on port `8080`.
 
+The Hermes runtime wrapper pins its upstream `nousresearch/hermes-agent` base image by digest. Do not rely on `latest` drift for routine Hub releases; update the Dockerfile `HERMES_AGENT_IMAGE` digest only when intentionally aligning to a newer Hermes Agent base.
+
 ## Release
 
 Releases are tag-driven. Pushing a release tag triggers the release workflow, builds the Docker image, pushes GHCR tags, and creates a GitHub Release with the commit list.

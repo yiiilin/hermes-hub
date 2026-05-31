@@ -1,6 +1,33 @@
 use std::path::Path;
 use std::process::Command;
 
+// 从 Dockerfile 读取当前 pin 值，避免把 Hermes Agent 升级入口扩散到测试常量。
+fn hermes_agent_image_from_dockerfile(dockerfile: &str) -> &str {
+    dockerfile
+        .lines()
+        .find_map(|line| line.strip_prefix("ARG HERMES_AGENT_IMAGE="))
+        .expect("Dockerfile pins Hermes Agent image with HERMES_AGENT_IMAGE")
+}
+
+fn assert_pinned_hermes_agent_image(image: &str) {
+    let prefix = "nousresearch/hermes-agent@sha256:";
+    assert!(
+        image.starts_with(prefix),
+        "Hermes Agent image must be pinned by sha256 digest, got {image}"
+    );
+
+    let digest = &image[prefix.len()..];
+    assert_eq!(digest.len(), 64, "sha256 digest must be 64 hex chars");
+    assert!(
+        digest.chars().all(|ch| ch.is_ascii_hexdigit()),
+        "sha256 digest must only contain hex chars"
+    );
+    assert!(
+        !image.contains(":latest"),
+        "Hermes Agent image must not track latest"
+    );
+}
+
 #[test]
 fn backend_image_uses_modern_docker_cli_for_host_daemon_compatibility() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -18,7 +45,7 @@ fn backend_image_uses_modern_docker_cli_for_host_daemon_compatibility() {
 }
 
 #[test]
-fn hermes_wrapper_image_tracks_official_hermes_version() {
+fn hermes_wrapper_image_pins_official_hermes_agent_digest() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("backend crate lives under repo root");
@@ -33,8 +60,11 @@ fn hermes_wrapper_image_tracks_official_hermes_version() {
     let dev_compose = std::fs::read_to_string(repo_root.join("deploy/compose.dev.yml"))
         .expect("development compose file is present");
 
-    assert!(dockerfile.contains("ARG HERMES_VERSION=latest"));
-    assert!(dockerfile.contains("FROM nousresearch/hermes-agent:${HERMES_VERSION}"));
+    let hermes_agent_image = hermes_agent_image_from_dockerfile(&dockerfile);
+    assert_pinned_hermes_agent_image(hermes_agent_image);
+    assert!(dockerfile.contains("ARG HERMES_AGENT_IMAGE="));
+    assert!(dockerfile.contains("FROM ${HERMES_AGENT_IMAGE}"));
+    assert!(!dockerfile.contains("FROM nousresearch/hermes-agent:${HERMES_VERSION}"));
     assert!(dockerfile.contains("COPY docker/hermes/hermes-hub-entrypoint.sh"));
     assert!(dockerfile.contains("COPY docker/hermes/patch_send_message_tool.py"));
     assert!(dockerfile.contains("COPY docker/hermes/plugins /opt/hermes/plugins"));
@@ -71,9 +101,11 @@ fn hermes_wrapper_image_tracks_official_hermes_version() {
         "HERMES_DOCKER_IMAGE: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:latest}"
     ));
     assert!(dev_compose.contains("dockerfile: docker/hermes/Dockerfile"));
-    assert!(dev_compose.contains("HERMES_VERSION: ${HERMES_VERSION:-latest}"));
+    assert!(!dev_compose.contains("HERMES_AGENT_IMAGE:"));
+    assert!(!dev_compose.contains(hermes_agent_image));
+    assert!(!dev_compose.contains("HERMES_VERSION: ${HERMES_VERSION:-latest}"));
     assert!(dev_compose.contains(
-        "HERMES_DOCKER_IMAGE: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:${HERMES_VERSION:-latest}}"
+        "HERMES_DOCKER_IMAGE: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:latest}"
     ));
 }
 
@@ -82,12 +114,15 @@ fn hermes_send_message_patch_applies_to_target_image_when_docker_is_available() 
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("backend crate lives under repo root");
+    let dockerfile = std::fs::read_to_string(repo_root.join("docker/hermes/Dockerfile"))
+        .expect("Hermes wrapper Dockerfile is present");
+    let pinned_hermes_agent_image = hermes_agent_image_from_dockerfile(&dockerfile);
     let patch_path = repo_root
         .join("docker/hermes/patch_send_message_tool.py")
         .canonicalize()
         .expect("send_message MEDIA bridge patch is present");
     let image = std::env::var("HERMES_HUB_HERMES_TEST_IMAGE")
-        .unwrap_or_else(|_| "nousresearch/hermes-agent:latest".to_string());
+        .unwrap_or_else(|_| pinned_hermes_agent_image.to_string());
 
     let docker_available = Command::new("docker")
         .args(["version", "--format", "{{.Server.Version}}"])

@@ -79,9 +79,7 @@ services:
     build:
       context: ${PWD}
       dockerfile: docker/hermes/Dockerfile
-      args:
-        HERMES_VERSION: ${HERMES_VERSION:-latest}
-    image: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:${HERMES_VERSION:-latest}}
+    image: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:latest}
     command: ["true"]
     networks:
       - hermes-hub-net
@@ -129,7 +127,7 @@ services:
       # backend 通过宿主机 Docker daemon 创建兄弟 Hermes 容器；
       # 开发环境默认使用仓库 data 目录的绝对路径，保证 Docker bind mount 能找到真实目录。
       HERMES_DATA_ROOT: ${PWD}/data/hub/users
-      HERMES_DOCKER_IMAGE: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:${HERMES_VERSION:-latest}}
+      HERMES_DOCKER_IMAGE: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:latest}
       HERMES_CONTAINER_NETWORK: hermes-hub-net
       HERMES_CONTAINER_INTERNAL_PORT: 8000
       HERMES_HUB_LLM_BASE_URL: http://hermes-hub:8080/internal/llm/v1

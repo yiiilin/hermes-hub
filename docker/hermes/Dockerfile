@@ -1,5 +1,6 @@
-ARG HERMES_VERSION=latest
-FROM nousresearch/hermes-agent:${HERMES_VERSION}
+# 上游 Hermes Agent 不跟随 latest 自动漂移；升级时显式替换这个 digest。
+ARG HERMES_AGENT_IMAGE=nousresearch/hermes-agent@sha256:5b8f62a9d6675142c8db6c43681134e019e015d6bac98645381607513aba6c44
+FROM ${HERMES_AGENT_IMAGE}
 
 COPY docker/hermes/hermes-hub-entrypoint.sh /opt/hermes-hub/entrypoint.sh
 COPY docker/hermes/patch_send_message_tool.py /opt/hermes-hub/patch_send_message_tool.py
