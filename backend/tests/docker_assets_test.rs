@@ -10,10 +10,10 @@ fn hermes_agent_image_from_dockerfile(dockerfile: &str) -> &str {
 }
 
 fn assert_pinned_hermes_agent_image(image: &str) {
-    let prefix = "nousresearch/hermes-agent@sha256:";
+    let prefix = "nousresearch/hermes-agent:v2026.5.29.2@sha256:";
     assert!(
         image.starts_with(prefix),
-        "Hermes Agent image must be pinned by sha256 digest, got {image}"
+        "Hermes Agent image must use the selected release tag and be pinned by sha256 digest, got {image}"
     );
 
     let digest = &image[prefix.len()..];
@@ -45,7 +45,7 @@ fn backend_image_uses_modern_docker_cli_for_host_daemon_compatibility() {
 }
 
 #[test]
-fn hermes_wrapper_image_pins_official_hermes_agent_digest() {
+fn hermes_wrapper_image_pins_official_hermes_agent_release_digest() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("backend crate lives under repo root");
