@@ -1243,6 +1243,20 @@ async fn admin_can_configure_per_user_session_limit() {
     assert_eq!(body["error"], "session_limit_exceeded");
     assert_eq!(body["message"], "session limit exceeded");
     assert_eq!(body["max_sessions_per_user"], 2);
+
+    let public_blocked = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent" }),
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(public_blocked).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "session_limit_exceeded");
+    assert_eq!(body["message"], "session limit exceeded");
+    assert_eq!(body["max_sessions_per_user"], 2);
 }
 
 #[tokio::test]
