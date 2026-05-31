@@ -1,5 +1,5 @@
-# 上游 Hermes Agent 不跟随 latest 自动漂移；升级时显式替换这个 tag@digest。
-ARG HERMES_AGENT_IMAGE=nousresearch/hermes-agent:v2026.5.29.2@sha256:2bba4ab37729ebdd864d4caf277b24fec4cd8bfc2855185fd9f4c90f9bf7bfa3
+# 上游 Hermes Agent 不跟随 latest 自动漂移；升级时显式替换这个 tag。
+ARG HERMES_AGENT_IMAGE=nousresearch/hermes-agent:v2026.5.29.2
 FROM ${HERMES_AGENT_IMAGE}
 
 COPY docker/hermes/hermes-hub-entrypoint.sh /opt/hermes-hub/entrypoint.sh

@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
-// 从 Dockerfile 读取当前 pin 值，避免把 Hermes Agent 升级入口扩散到测试常量。
+// 从 Dockerfile 读取当前 tag，避免把 Hermes Agent 升级入口扩散到多处配置。
 fn hermes_agent_image_from_dockerfile(dockerfile: &str) -> &str {
     dockerfile
         .lines()
@@ -9,22 +9,18 @@ fn hermes_agent_image_from_dockerfile(dockerfile: &str) -> &str {
         .expect("Dockerfile pins Hermes Agent image with HERMES_AGENT_IMAGE")
 }
 
-fn assert_pinned_hermes_agent_image(image: &str) {
-    let prefix = "nousresearch/hermes-agent:v2026.5.29.2@sha256:";
-    assert!(
-        image.starts_with(prefix),
-        "Hermes Agent image must use the selected release tag and be pinned by sha256 digest, got {image}"
-    );
-
-    let digest = &image[prefix.len()..];
-    assert_eq!(digest.len(), 64, "sha256 digest must be 64 hex chars");
-    assert!(
-        digest.chars().all(|ch| ch.is_ascii_hexdigit()),
-        "sha256 digest must only contain hex chars"
+fn assert_selected_hermes_agent_image(image: &str) {
+    assert_eq!(
+        image, "nousresearch/hermes-agent:v2026.5.29.2",
+        "Hermes Agent image must use the selected release tag"
     );
     assert!(
         !image.contains(":latest"),
         "Hermes Agent image must not track latest"
+    );
+    assert!(
+        !image.contains("@sha256:"),
+        "Hermes Agent image should use tag-only selection"
     );
 }
 
@@ -45,7 +41,7 @@ fn backend_image_uses_modern_docker_cli_for_host_daemon_compatibility() {
 }
 
 #[test]
-fn hermes_wrapper_image_pins_official_hermes_agent_release_digest() {
+fn hermes_wrapper_image_uses_selected_official_hermes_agent_tag() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("backend crate lives under repo root");
@@ -61,7 +57,7 @@ fn hermes_wrapper_image_pins_official_hermes_agent_release_digest() {
         .expect("development compose file is present");
 
     let hermes_agent_image = hermes_agent_image_from_dockerfile(&dockerfile);
-    assert_pinned_hermes_agent_image(hermes_agent_image);
+    assert_selected_hermes_agent_image(hermes_agent_image);
     assert!(dockerfile.contains("ARG HERMES_AGENT_IMAGE="));
     assert!(dockerfile.contains("FROM ${HERMES_AGENT_IMAGE}"));
     assert!(!dockerfile.contains("FROM nousresearch/hermes-agent:${HERMES_VERSION}"));
