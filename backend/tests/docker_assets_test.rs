@@ -2,6 +2,22 @@ use std::path::Path;
 use std::process::Command;
 
 #[test]
+fn backend_image_uses_modern_docker_cli_for_host_daemon_compatibility() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("backend crate lives under repo root");
+    let dockerfile = std::fs::read_to_string(repo_root.join("docker/backend.Dockerfile"))
+        .expect("backend Dockerfile is present");
+
+    // backend 直接连接宿主机 Docker socket，客户端版本必须跟得上新 daemon。
+    assert!(dockerfile.contains("FROM docker:29.1.3-cli AS docker-cli"));
+    assert!(
+        dockerfile.contains("COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker")
+    );
+    assert!(!dockerfile.contains("ca-certificates curl docker.io"));
+}
+
+#[test]
 fn hermes_wrapper_image_tracks_official_hermes_version() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

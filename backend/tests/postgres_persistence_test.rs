@@ -219,6 +219,106 @@ fn cookie_from(response: &Response<Body>) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn postgres_user_password_update_persists() {
+    let Some(pool) = postgres_pool().await else {
+        eprintln!("skipping postgres persistence test: HERMES_HUB_TEST_DATABASE_URL is not set");
+        return;
+    };
+    run_migrations(&pool).await.expect("migrations can run");
+
+    let cipher = SecretCipher::from_master_key(TEST_SECRET_KEY).expect("test cipher is valid");
+    let store = SessionStore::postgres(pool.clone(), cipher.clone());
+    store
+        .create_bootstrap_admin("admin@example.com", "admin-password-123")
+        .await
+        .expect("admin can be created");
+
+    let admin = store
+        .login("admin@example.com", "admin-password-123")
+        .await
+        .expect("old password initially works");
+    store
+        .update_user_password(&admin.id, "new-password-456")
+        .await
+        .expect("postgres password hash can be updated");
+
+    assert!(store
+        .login("admin@example.com", "admin-password-123")
+        .await
+        .is_err());
+
+    // 重新创建 store，确保新密码不是只写在内存对象里。
+    let reloaded_store = SessionStore::postgres(pool, cipher);
+    let reloaded_admin = reloaded_store
+        .login("admin@example.com", "new-password-456")
+        .await
+        .expect("new password survives store recreation");
+    assert_eq!(reloaded_admin.id, admin.id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_external_auth_users_share_password_login_by_email() {
+    let Some(pool) = postgres_pool().await else {
+        eprintln!("skipping postgres persistence test: HERMES_HUB_TEST_DATABASE_URL is not set");
+        return;
+    };
+    run_migrations(&pool).await.expect("migrations can run");
+
+    let cipher = SecretCipher::from_master_key(TEST_SECRET_KEY).expect("test cipher is valid");
+    let store = SessionStore::postgres(pool.clone(), cipher.clone());
+    let admin = store
+        .create_bootstrap_admin("admin@example.com", "admin-password-123")
+        .await
+        .expect("admin can be created");
+
+    let linked_oidc = store
+        .get_or_create_oidc_user("ADMIN@example.com", false)
+        .await
+        .expect("OIDC login links existing user by email");
+    assert!(!linked_oidc.created);
+    assert_eq!(linked_oidc.user.id, admin.id);
+
+    let linked_ldap = store
+        .get_or_create_ldap_user("admin@example.com", false)
+        .await
+        .expect("LDAP login links existing user by email");
+    assert!(!linked_ldap.created);
+    assert_eq!(linked_ldap.user.id, admin.id);
+
+    let oidc_user = store
+        .get_or_create_oidc_user("oidc-user@example.com", true)
+        .await
+        .expect("OIDC user can be auto-created");
+    store
+        .update_user_password(&oidc_user.user.id, "oidc-local-password")
+        .await
+        .expect("OIDC-created user can set local password");
+
+    let ldap_user = store
+        .get_or_create_ldap_user("ldap-user@example.com", true)
+        .await
+        .expect("LDAP user can be auto-created");
+    store
+        .update_user_password(&ldap_user.user.id, "ldap-local-password")
+        .await
+        .expect("LDAP-created user can set local password");
+
+    // 重新创建 store，确保外部认证用户补充的本地密码持久化在 PostgreSQL 中。
+    let reloaded_store = SessionStore::postgres(pool, cipher);
+    let reloaded_oidc = reloaded_store
+        .login("oidc-user@example.com", "oidc-local-password")
+        .await
+        .expect("OIDC-created user can later use password login");
+    assert_eq!(reloaded_oidc.id, oidc_user.user.id);
+
+    let reloaded_ldap = reloaded_store
+        .login("ldap-user@example.com", "ldap-local-password")
+        .await
+        .expect("LDAP-created user can later use password login");
+    assert_eq!(reloaded_ldap.id, ldap_user.user.id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn postgres_state_survives_recreated_router_state() {
     let Some(pool) = postgres_pool().await else {
         eprintln!("skipping postgres persistence test: HERMES_HUB_TEST_DATABASE_URL is not set");

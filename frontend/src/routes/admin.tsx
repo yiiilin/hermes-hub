@@ -1926,22 +1926,6 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
             <label className="checkbox-row">
               <input
                 type="checkbox"
-                checked={systemSettings.oidc.allow_password_login}
-                onChange={(event) =>
-                  setSystemSettings({
-                    ...systemSettings,
-                    oidc: {
-                      ...systemSettings.oidc,
-                      allow_password_login: event.target.checked,
-                    },
-                  })
-                }
-              />
-              {t("admin.oidcAllowPasswordLogin")}
-            </label>
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
                 checked={systemSettings.oidc.auto_create_users}
                 onChange={(event) =>
                   setSystemSettings({

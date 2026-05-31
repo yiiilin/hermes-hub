@@ -23,12 +23,22 @@ pub enum UserStatus {
     Disabled,
 }
 
+/// 用户最初的认证来源；登录方式仍统一按邮箱关联到同一个账号。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UserAuthProvider {
+    Local,
+    Oidc,
+    Ldap,
+    Legacy,
+}
+
 /// Internal user record kept by the MVP store.
 #[derive(Clone, Debug)]
 pub struct User {
     pub id: String,
     pub email: String,
     pub password_hash: String,
+    pub auth_provider: UserAuthProvider,
     pub role: UserRole,
     pub status: UserStatus,
     pub created_at: u64,

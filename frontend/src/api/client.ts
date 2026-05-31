@@ -211,6 +211,7 @@ export type OidcSettings = {
 export type OidcPublicConfig = {
   enabled: boolean;
   display_name: string;
+  allow_password_login: boolean;
 };
 
 export type LdapSettings = {
@@ -296,6 +297,7 @@ export type ApiClient = {
     email: string,
     password: string,
   ) => Promise<User>;
+  updatePassword: (newPassword: string) => Promise<void>;
   logout: () => Promise<void>;
   listUsers: () => Promise<User[]>;
   disableUser: (userId: string) => Promise<User>;
@@ -731,6 +733,12 @@ export function createApiClient(): ApiClient {
         body: { invite_token: inviteToken, email, password },
       });
       return payload.user;
+    },
+    async updatePassword(newPassword) {
+      await request<void>("/api/auth/password", {
+        method: "PUT",
+        body: { new_password: newPassword },
+      });
     },
     async logout() {
       await request<void>("/api/auth/logout", { method: "POST" });
@@ -1529,6 +1537,7 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       return options.oidcPublicConfig ?? {
         enabled: systemSettings.oidc.enabled,
         display_name: systemSettings.oidc.display_name,
+        allow_password_login: systemSettings.oidc.allow_password_login,
       };
     },
     async ldapConfig() {
@@ -1555,6 +1564,9 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     },
     async registerWithInvite(_inviteToken, email) {
       return authenticateUserByEmail(email, "user");
+    },
+    async updatePassword() {
+      // mock 客户端不存明文密码；测试只需要确认调用链和错误处理。
     },
     async logout() {
       currentUser = null;

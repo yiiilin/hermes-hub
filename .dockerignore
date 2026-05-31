@@ -13,5 +13,7 @@ dist
 !.env.example
 *.log
 *.tmp
+__pycache__/
+*.pyc
 README.md
 docs

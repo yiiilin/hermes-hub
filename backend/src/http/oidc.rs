@@ -59,6 +59,7 @@ struct OidcPublicConfigResponse {
 struct OidcPublicConfig {
     enabled: bool,
     display_name: String,
+    allow_password_login: bool,
 }
 
 #[derive(Deserialize)]
@@ -93,6 +94,8 @@ async fn oidc_config(State(state): State<AppState>) -> Result<impl IntoResponse,
         oidc: OidcPublicConfig {
             enabled: settings.oidc.enabled,
             display_name: settings.oidc.display_name,
+            // 账号统一按邮箱关联，密码登录不再因 OIDC 开关被全局关闭；该字段保留给旧前端兼容。
+            allow_password_login: true,
         },
     }))
 }

@@ -2,7 +2,7 @@ use axum::{
     extract::State,
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/auth/register", post(register_with_invite))
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
+        .route("/api/auth/password", put(update_password))
         .route("/api/auth/me", get(me))
 }
 
@@ -42,6 +43,11 @@ struct InviteRegisterRequest {
 struct LoginRequest {
     email: String,
     password: String,
+}
+
+#[derive(Deserialize)]
+struct UpdatePasswordRequest {
+    new_password: String,
 }
 
 #[derive(Serialize)]
@@ -169,6 +175,26 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Res
     Ok(response)
 }
 
+async fn update_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<UpdatePasswordRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = current_user(&state, &headers).await?;
+    if payload.new_password.trim().is_empty() {
+        return Err(ApiError::BadRequest("password cannot be empty"));
+    }
+
+    // 个人设置更新的是 Hub 本地密码；OIDC/LDAP 登录仍按同一邮箱复用这个账号。
+    state
+        .store
+        .update_user_password(&user.id, &payload.new_password)
+        .await
+        .map_err(map_update_password_error)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn me(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -256,6 +282,14 @@ fn map_invite_register_error(error: StoreError) -> ApiError {
 fn map_login_error(error: StoreError) -> ApiError {
     match error {
         StoreError::InvalidCredentials => ApiError::Unauthorized,
+        _ => ApiError::Internal,
+    }
+}
+
+fn map_update_password_error(error: StoreError) -> ApiError {
+    match error {
+        StoreError::Unauthorized => ApiError::Unauthorized,
+        StoreError::PasswordFailed => ApiError::BadRequest("password could not be stored"),
         _ => ApiError::Internal,
     }
 }

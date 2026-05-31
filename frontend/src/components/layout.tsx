@@ -3,18 +3,18 @@ import type { User } from "../api/client";
 import {
   Bot,
   CalendarClock,
-  Languages,
   LogOut,
   Menu,
   PanelLeftClose,
   PanelLeftOpen,
   SlidersHorizontal,
+  UserCog,
   X,
 } from "lucide-react";
 import { useI18n } from "../i18n";
 import { createContext, useContext, useEffect, useState } from "react";
 
-export type AppView = "chat" | "admin-settings" | "scheduled-tasks";
+export type AppView = "chat" | "admin-settings" | "scheduled-tasks" | "personal-settings";
 
 type ChatSidebarSetter = Dispatch<SetStateAction<ReactNode>>;
 
@@ -30,11 +30,10 @@ type LayoutProps = {
 };
 
 export function Layout({ children, user, activeView, onNavigate, onLogout }: LayoutProps) {
-  const { language, setLanguage, t } = useI18n();
+  const { t } = useI18n();
   const [chatSidebar, setChatSidebar] = useState<ReactNode>(null);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
 
   useEffect(() => {
     if (!mobileSidebarOpen) {
@@ -174,38 +173,16 @@ export function Layout({ children, user, activeView, onNavigate, onLogout }: Lay
                     <span>{t("layout.scheduledTasks")}</span>
                   </button>
                 </div>
-                <div className="settings-area keep-sidebar-open">
+                <div className="nav-group">
                   <button
                     type="button"
-                    className="nav-link settings-trigger"
-                    aria-expanded={settingsOpen}
-                    onClick={() => setSettingsOpen((open) => !open)}
-                    title={t("layout.personalization")}
+                    className={activeView === "personal-settings" ? "nav-link active" : "nav-link"}
+                    onClick={() => navigate("personal-settings")}
+                    title={t("layout.personalSettings")}
                   >
-                    <Languages aria-hidden="true" size={17} />
-                    <span className="settings-label">{t("layout.personalization")}</span>
+                    <UserCog aria-hidden="true" size={18} />
+                    <span>{t("layout.personalSettings")}</span>
                   </button>
-                  {settingsOpen ? (
-                    <div className="settings-panel" role="group" aria-label={t("layout.personalization")}>
-                      <span>{t("i18n.language")}</span>
-                      <div className="language-switch">
-                        <button
-                          type="button"
-                          className={language === "zh" ? "active" : ""}
-                          onClick={() => setLanguage("zh")}
-                        >
-                          {t("i18n.chinese")}
-                        </button>
-                        <button
-                          type="button"
-                          className={language === "en" ? "active" : ""}
-                          onClick={() => setLanguage("en")}
-                        >
-                          {t("i18n.english")}
-                        </button>
-                      </div>
-                    </div>
-                  ) : null}
                 </div>
                 <div className="account">
                   <span className="account-email">{user.email}</span>

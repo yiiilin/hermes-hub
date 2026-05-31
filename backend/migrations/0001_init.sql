@@ -2,11 +2,24 @@ create table if not exists users (
     id uuid primary key,
     email text not null unique,
     password_hash text not null,
+    auth_provider text not null default 'local' check (auth_provider in ('local', 'oidc', 'ldap', 'legacy')),
     role text not null check (role in ('admin', 'user')),
     status text not null default 'active' check (status in ('active', 'disabled')),
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
+
+alter table users
+    add column if not exists auth_provider text not null default 'legacy';
+
+alter table users
+    alter column auth_provider set default 'local';
+
+alter table users
+    drop constraint if exists users_auth_provider_check;
+
+alter table users
+    add constraint users_auth_provider_check check (auth_provider in ('local', 'oidc', 'ldap', 'legacy'));
 
 create table if not exists sessions (
     id uuid primary key,

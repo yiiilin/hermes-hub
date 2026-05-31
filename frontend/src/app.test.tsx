@@ -506,7 +506,13 @@ describe("App", () => {
     expect(document.querySelector(".shell.sidebar-collapsed")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Delete session" })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Personalization" }));
+    fireEvent.click(screen.getByRole("button", { name: "Personal settings" }));
+    expect(await screen.findByRole("heading", { name: "Personal settings" })).toBeInTheDocument();
+    const personalTabs = screen.getByRole("tablist", { name: "Personal settings" });
+    expect(within(personalTabs).getByRole("tab", { name: "Personalization" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
     fireEvent.click(screen.getByRole("button", { name: "中文" }));
     expect(screen.getByRole("button", { name: "新建对话" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "English" }));
@@ -574,6 +580,60 @@ describe("App", () => {
     fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Hermes management" }));
     expect(await screen.findByRole("columnheader", { name: "Owner" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Hermes management" })).not.toBeInTheDocument();
+  });
+
+  it("moves personalization into personal settings and updates local password", async () => {
+    const client = createMockApiClient();
+    client.updatePassword = vi.fn(async () => undefined);
+    render(<App apiClient={client} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Personal settings" }));
+
+    expect(await screen.findByRole("heading", { name: "Personal settings" })).toBeInTheDocument();
+    const personalTabs = screen.getByRole("tablist", { name: "Personal settings" });
+    expect(within(personalTabs).getByRole("tab", { name: "Personalization" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByRole("group", { name: "Language" })).toBeInTheDocument();
+
+    fireEvent.click(within(personalTabs).getByRole("tab", { name: "Change password" }));
+    fireEvent.change(screen.getByLabelText("New password"), {
+      target: { value: "new-password-456" },
+    });
+    fireEvent.change(screen.getByLabelText("Confirm password"), {
+      target: { value: "different-password" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save password" }));
+
+    expect(await screen.findByText("Passwords do not match")).toBeInTheDocument();
+    expect(client.updatePassword).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText("Confirm password"), {
+      target: { value: "new-password-456" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save password" }));
+
+    await waitFor(() => {
+      expect(client.updatePassword).toHaveBeenCalledWith("new-password-456");
+    });
+    expect(await screen.findByText("Password saved")).toBeInTheDocument();
+    expect(screen.getByLabelText("New password")).toHaveValue("");
+    expect(screen.getByLabelText("Confirm password")).toHaveValue("");
+
+    fireEvent.change(screen.getByLabelText("New password"), {
+      target: { value: "draft-password" },
+    });
+    fireEvent.change(screen.getByLabelText("Confirm password"), {
+      target: { value: "draft-password" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+    fireEvent.click(screen.getByRole("button", { name: "Personal settings" }));
+    fireEvent.click(within(screen.getByRole("tablist", { name: "Personal settings" })).getByRole("tab", {
+      name: "Change password",
+    }));
+    expect(screen.getByLabelText("New password")).toHaveValue("");
+    expect(screen.getByLabelText("Confirm password")).toHaveValue("");
   });
 
   it("groups admin modules under system settings tabs", async () => {
@@ -1018,6 +1078,33 @@ describe("App", () => {
     const markdown = document.querySelector(".markdown-content");
     expect(markdown?.textContent).toContain("文件：练习.pptx");
     expect(document.querySelector(".message-attachments")).not.toBeInTheDocument();
+  });
+
+  it("preserves single newlines in markdown responses like Hermes slash help output", async () => {
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialMessagesBySessionId: {
+            "session-1": [
+              {
+                id: "message-help-output",
+                session_id: "session-1",
+                role: "assistant",
+                content: "/help\n/start - start service\n/stop - stop service",
+                attachments: [],
+                created_at: 1,
+              },
+            ],
+          },
+        })}
+      />,
+    );
+
+    await waitFor(() => {
+      const markdown = document.querySelector(".markdown-content");
+      expect(markdown?.textContent).toContain("/start - start service");
+      expect(markdown?.querySelectorAll("br")).toHaveLength(2);
+    });
   });
 
   it("renders attachment placeholders at their markdown positions", async () => {
@@ -2435,6 +2522,7 @@ describe("App", () => {
       oidcPublicConfig: {
         enabled: true,
         display_name: "Acme SSO",
+        allow_password_login: true,
       },
     });
 
@@ -2782,7 +2870,7 @@ describe("App", () => {
     render(<App apiClient={client} />);
 
     const scheduledTasksNav = await screen.findByRole("button", { name: "Scheduled tasks" });
-    const personalizationNav = screen.getByRole("button", { name: "Personalization" });
+    const personalizationNav = screen.getByRole("button", { name: "Personal settings" });
     expect(
       scheduledTasksNav.compareDocumentPosition(personalizationNav) &
         Node.DOCUMENT_POSITION_FOLLOWING,

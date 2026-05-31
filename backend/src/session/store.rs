@@ -1,6 +1,8 @@
 use crate::domain::{
     invite::{Invite, InviteStatus, PublicInvite},
-    user::{hash_password, verify_password, User, UserListItem, UserRole, UserStatus},
+    user::{
+        hash_password, verify_password, User, UserAuthProvider, UserListItem, UserRole, UserStatus,
+    },
 };
 use crate::hermes::instance::{HermesInstance, HermesInstanceKind, HermesInstanceStatus};
 use crate::{
@@ -377,7 +379,7 @@ impl SessionStore {
                     return Err(StoreError::BootstrapClosed);
                 }
 
-                inner.create_user(email, password, UserRole::Admin)
+                inner.create_user(email, password, UserRole::Admin, UserAuthProvider::Local)
             }
             SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
                 let mut tx = pool.begin().await.map_err(|_| StoreError::DatabaseFailed)?;
@@ -396,9 +398,14 @@ impl SessionStore {
                     return Err(StoreError::BootstrapClosed);
                 }
 
-                let user =
-                    postgres_create_user_with_executor(&mut *tx, email, password, UserRole::Admin)
-                        .await?;
+                let user = postgres_create_user_with_executor(
+                    &mut *tx,
+                    email,
+                    password,
+                    UserRole::Admin,
+                    UserAuthProvider::Local,
+                )
+                .await?;
                 tx.commit().await.map_err(|_| StoreError::DatabaseFailed)?;
                 Ok(user)
             }),
@@ -452,9 +459,14 @@ impl SessionStore {
                     return Err(StoreError::EmailAlreadyRegistered);
                 }
 
-                let user =
-                    postgres_create_user_with_executor(&mut *tx, email, password, UserRole::User)
-                        .await?;
+                let user = postgres_create_user_with_executor(
+                    &mut *tx,
+                    email,
+                    password,
+                    UserRole::User,
+                    UserAuthProvider::Local,
+                )
+                .await?;
                 let next_used_count = invite.used_count + 1;
                 let next_status = if next_used_count >= invite.max_uses {
                     "exhausted"
@@ -494,25 +506,81 @@ impl SessionStore {
     pub async fn login(&self, email: &str, password: &str) -> Result<User, StoreError> {
         match &self.backend {
             SessionStoreBackend::Memory(inner) => {
-                let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
-                login_in_memory(&inner, email, password)
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                login_in_memory(&mut inner, email, password)
             }
             SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
-                let user = postgres_user_by_email(pool, email)
+                let mut user = postgres_user_by_email(pool, email)
                     .await?
                     .ok_or(StoreError::InvalidCredentials)?;
 
                 if user.status != UserStatus::Active {
                     return Err(StoreError::InvalidCredentials);
                 }
-
                 let verified = verify_password(&user.password_hash, password)
                     .map_err(|_| StoreError::PasswordFailed)?;
                 if !verified {
                     return Err(StoreError::InvalidCredentials);
                 }
+                if user.auth_provider == UserAuthProvider::Legacy {
+                    // 升级前没有 auth_provider 字段。能通过本地密码校验的 legacy 账号可安全提升为 local。
+                    sqlx::query(
+                        "update users set auth_provider = 'local', updated_at = now() where id = $1::uuid",
+                    )
+                    .bind(&user.id)
+                    .execute(pool)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?;
+                    user.auth_provider = UserAuthProvider::Local;
+                    user.updated_at = unix_now();
+                }
 
                 Ok(user)
+            }),
+        }
+    }
+
+    pub async fn update_user_password(
+        &self,
+        user_id: &str,
+        password: &str,
+    ) -> Result<(), StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let user = inner
+                    .users_by_id
+                    .get_mut(user_id)
+                    .ok_or(StoreError::Unauthorized)?;
+                let password_hash =
+                    hash_password(password).map_err(|_| StoreError::PasswordFailed)?;
+                // 同一邮箱对应同一 Hub 账号，因此 OIDC/LDAP 创建的用户也可以补充本地密码。
+                user.password_hash = password_hash;
+                user.updated_at = unix_now();
+                Ok(())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let password_hash =
+                    hash_password(password).map_err(|_| StoreError::PasswordFailed)?;
+                let result = sqlx::query(
+                    r#"
+                    update users
+                    set password_hash = $2,
+                        updated_at = now()
+                    where id = $1::uuid
+                    "#,
+                )
+                .bind(user_id)
+                .bind(password_hash)
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::Unauthorized);
+                }
+
+                Ok(())
             }),
         }
     }
@@ -551,20 +619,31 @@ impl SessionStore {
             return Err(StoreError::InvalidCredentials);
         }
 
-        // OIDC 用户不使用密码登录；这里生成不可猜测占位密码哈希，保持现有 users 表结构。
+        // 新 OIDC 用户尚未设置本地密码，先生成不可猜测占位哈希以保持 users 表结构完整。
         let placeholder_password = format!("oidc:{}", Uuid::new_v4());
         match &self.backend {
             SessionStoreBackend::Memory(inner) => {
                 let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
-                let user = inner.create_user(email, &placeholder_password, UserRole::User)?;
+                let user = inner.create_user(
+                    email,
+                    &placeholder_password,
+                    UserRole::User,
+                    UserAuthProvider::Oidc,
+                )?;
                 Ok(OidcUserResult {
                     user,
                     created: true,
                 })
             }
             SessionStoreBackend::Postgres { pool, .. } => {
-                let user = postgres_create_user(pool, email, &placeholder_password, UserRole::User)
-                    .await?;
+                let user = postgres_create_user(
+                    pool,
+                    email,
+                    &placeholder_password,
+                    UserRole::User,
+                    UserAuthProvider::Oidc,
+                )
+                .await?;
                 Ok(OidcUserResult {
                     user,
                     created: true,
@@ -592,20 +671,31 @@ impl SessionStore {
             return Err(StoreError::InvalidCredentials);
         }
 
-        // LDAP 用户不使用本地密码登录；占位密码只为保持现有 users 表结构完整。
+        // 新 LDAP 用户尚未设置本地密码，先生成不可猜测占位哈希以保持 users 表结构完整。
         let placeholder_password = format!("ldap:{}", Uuid::new_v4());
         match &self.backend {
             SessionStoreBackend::Memory(inner) => {
                 let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
-                let user = inner.create_user(email, &placeholder_password, UserRole::User)?;
+                let user = inner.create_user(
+                    email,
+                    &placeholder_password,
+                    UserRole::User,
+                    UserAuthProvider::Ldap,
+                )?;
                 Ok(LdapUserResult {
                     user,
                     created: true,
                 })
             }
             SessionStoreBackend::Postgres { pool, .. } => {
-                let user = postgres_create_user(pool, email, &placeholder_password, UserRole::User)
-                    .await?;
+                let user = postgres_create_user(
+                    pool,
+                    email,
+                    &placeholder_password,
+                    UserRole::User,
+                    UserAuthProvider::Ldap,
+                )
+                .await?;
                 Ok(LdapUserResult {
                     user,
                     created: true,
@@ -663,6 +753,7 @@ impl SessionStore {
                            users.id::text as id,
                            users.email,
                            users.password_hash,
+                           users.auth_provider,
                            users.role,
                            users.status,
                            extract(epoch from users.created_at)::bigint as created_at,
@@ -852,6 +943,7 @@ impl SessionStore {
                     select id::text as id,
                            email,
                            password_hash,
+                           auth_provider,
                            role,
                            status,
                            extract(epoch from created_at)::bigint as created_at,
@@ -1856,6 +1948,7 @@ impl SessionStore {
                     returning id::text as id,
                               email,
                               password_hash,
+                              auth_provider,
                               role,
                               status,
                               extract(epoch from created_at)::bigint as created_at,
@@ -1972,6 +2065,7 @@ impl StoreInner {
         email: &str,
         password: &str,
         role: UserRole,
+        auth_provider: UserAuthProvider,
     ) -> Result<User, StoreError> {
         let email = normalize_email(email);
 
@@ -1984,6 +2078,7 @@ impl StoreInner {
             id: Uuid::new_v4().to_string(),
             email: email.clone(),
             password_hash: hash_password(password).map_err(|_| StoreError::PasswordFailed)?,
+            auth_provider,
             role,
             status: UserStatus::Active,
             created_at: now,
@@ -2035,7 +2130,7 @@ fn register_with_invite_in_memory(
         return Err(StoreError::EmailAlreadyRegistered);
     }
 
-    let user = inner.create_user(email, password, UserRole::User)?;
+    let user = inner.create_user(email, password, UserRole::User, UserAuthProvider::Local)?;
     let invite = inner
         .invites_by_id
         .get_mut(&invite_id)
@@ -2050,7 +2145,11 @@ fn register_with_invite_in_memory(
     Ok(user)
 }
 
-fn login_in_memory(inner: &StoreInner, email: &str, password: &str) -> Result<User, StoreError> {
+fn login_in_memory(
+    inner: &mut StoreInner,
+    email: &str,
+    password: &str,
+) -> Result<User, StoreError> {
     let email = normalize_email(email);
     let user_id = inner
         .user_ids_by_email
@@ -2058,18 +2157,23 @@ fn login_in_memory(inner: &StoreInner, email: &str, password: &str) -> Result<Us
         .ok_or(StoreError::InvalidCredentials)?;
     let user = inner
         .users_by_id
-        .get(user_id)
+        .get_mut(user_id)
         .ok_or(StoreError::InvalidCredentials)?;
 
     if user.status != UserStatus::Active {
         return Err(StoreError::InvalidCredentials);
     }
-
     let verified =
         verify_password(&user.password_hash, password).map_err(|_| StoreError::PasswordFailed)?;
 
     if !verified {
         return Err(StoreError::InvalidCredentials);
+    }
+
+    if user.auth_provider == UserAuthProvider::Legacy {
+        // 升级前没有 auth_provider 字段。能通过本地密码校验的 legacy 账号可安全提升为 local。
+        user.auth_provider = UserAuthProvider::Local;
+        user.updated_at = unix_now();
     }
 
     Ok(user.clone())
@@ -2170,6 +2274,7 @@ async fn postgres_create_user_with_executor<'e, E>(
     email: &str,
     password: &str,
     role: UserRole,
+    auth_provider: UserAuthProvider,
 ) -> Result<User, StoreError>
 where
     E: Executor<'e, Database = Postgres>,
@@ -2180,6 +2285,7 @@ where
         id: Uuid::new_v4().to_string(),
         email,
         password_hash: hash_password(password).map_err(|_| StoreError::PasswordFailed)?,
+        auth_provider,
         role,
         status: UserStatus::Active,
         created_at: now,
@@ -2188,13 +2294,14 @@ where
 
     sqlx::query(
         r#"
-        insert into users (id, email, password_hash, role, status, created_at, updated_at)
-        values ($1::uuid, $2, $3, $4, $5, to_timestamp($6), to_timestamp($7))
+        insert into users (id, email, password_hash, auth_provider, role, status, created_at, updated_at)
+        values ($1::uuid, $2, $3, $4, $5, $6, to_timestamp($7), to_timestamp($8))
         "#,
     )
     .bind(&user.id)
     .bind(&user.email)
     .bind(&user.password_hash)
+    .bind(user_auth_provider_as_str(&user.auth_provider))
     .bind(user_role_as_str(&user.role))
     .bind(user_status_as_str(&user.status))
     .bind(user.created_at as f64)
@@ -2211,8 +2318,9 @@ async fn postgres_create_user(
     email: &str,
     password: &str,
     role: UserRole,
+    auth_provider: UserAuthProvider,
 ) -> Result<User, StoreError> {
-    postgres_create_user_with_executor(pool, email, password, role).await
+    postgres_create_user_with_executor(pool, email, password, role, auth_provider).await
 }
 
 async fn postgres_user_id_by_email_with_executor<'e, E>(
@@ -2238,6 +2346,7 @@ async fn postgres_user_by_email(pool: &PgPool, email: &str) -> Result<Option<Use
         select id::text as id,
                email,
                password_hash,
+               auth_provider,
                role,
                status,
                extract(epoch from created_at)::bigint as created_at,
@@ -2370,6 +2479,9 @@ fn row_to_user(row: &sqlx::postgres::PgRow) -> Result<User, StoreError> {
     let status = row
         .try_get::<String, _>("status")
         .map_err(|_| StoreError::DatabaseFailed)?;
+    let auth_provider = row
+        .try_get::<String, _>("auth_provider")
+        .map_err(|_| StoreError::DatabaseFailed)?;
 
     Ok(User {
         id: row.try_get("id").map_err(|_| StoreError::DatabaseFailed)?,
@@ -2379,6 +2491,7 @@ fn row_to_user(row: &sqlx::postgres::PgRow) -> Result<User, StoreError> {
         password_hash: row
             .try_get("password_hash")
             .map_err(|_| StoreError::DatabaseFailed)?,
+        auth_provider: parse_user_auth_provider(&auth_provider)?,
         role: parse_user_role(&role)?,
         status: parse_user_status(&status)?,
         created_at: row
@@ -2659,6 +2772,16 @@ fn parse_user_status(value: &str) -> Result<UserStatus, StoreError> {
     }
 }
 
+fn parse_user_auth_provider(value: &str) -> Result<UserAuthProvider, StoreError> {
+    match value {
+        "local" => Ok(UserAuthProvider::Local),
+        "oidc" => Ok(UserAuthProvider::Oidc),
+        "ldap" => Ok(UserAuthProvider::Ldap),
+        "legacy" => Ok(UserAuthProvider::Legacy),
+        _ => Err(StoreError::DatabaseFailed),
+    }
+}
+
 fn parse_invite_status(value: &str) -> Result<InviteStatus, StoreError> {
     match value {
         "pending" => Ok(InviteStatus::Pending),
@@ -2697,6 +2820,15 @@ fn user_status_as_str(status: &UserStatus) -> &'static str {
     match status {
         UserStatus::Active => "active",
         UserStatus::Disabled => "disabled",
+    }
+}
+
+fn user_auth_provider_as_str(provider: &UserAuthProvider) -> &'static str {
+    match provider {
+        UserAuthProvider::Local => "local",
+        UserAuthProvider::Oidc => "oidc",
+        UserAuthProvider::Ldap => "ldap",
+        UserAuthProvider::Legacy => "legacy",
     }
 }
 

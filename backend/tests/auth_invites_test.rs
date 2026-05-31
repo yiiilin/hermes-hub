@@ -179,6 +179,143 @@ async fn login(app: &Router, email: &str, password: &str) -> String {
 }
 
 #[tokio::test]
+async fn authenticated_user_can_update_local_password() {
+    let app = test_app();
+    let unauthorized = request_json(
+        &app,
+        Method::PUT,
+        "/api/auth/password",
+        json!({
+            "new_password": "new-password-456"
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    bootstrap_admin(&app).await;
+    let admin_cookie = login(&app, "admin@example.com", "admin-password-123").await;
+
+    let empty = request_json(
+        &app,
+        Method::PUT,
+        "/api/auth/password",
+        json!({
+            "new_password": " "
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+
+    let update = request_json(
+        &app,
+        Method::PUT,
+        "/api/auth/password",
+        json!({
+            "new_password": "new-password-456"
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+
+    let old_login = request_json(
+        &app,
+        Method::POST,
+        "/api/auth/login",
+        json!({
+            "email": "admin@example.com",
+            "password": "admin-password-123"
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(old_login.status(), StatusCode::UNAUTHORIZED);
+
+    let new_cookie = login(&app, "admin@example.com", "new-password-456").await;
+    let me = request_empty(&app, Method::GET, "/api/auth/me", Some(&new_cookie)).await;
+    assert_eq!(me.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn ldap_auto_created_user_can_set_local_password_by_same_email() {
+    let ldap = InMemoryLdapAuthenticator::default();
+    ldap.add_user(
+        "uid=ldap-user,ou=people,dc=example,dc=com",
+        "ldap-user@example.com",
+        "ldap-password-123",
+    );
+    let app = test_app_with_ldap(ldap.shared());
+    bootstrap_admin(&app).await;
+    let admin_cookie = login(&app, "admin@example.com", "admin-password-123").await;
+    configure_required_model_configs(&app, &admin_cookie).await;
+
+    let update_settings = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/system-settings",
+        json!({
+            "max_sessions_per_user": 20,
+            "oidc": { "enabled": false },
+            "ldap": {
+                "enabled": true,
+                "display_name": "Corporate LDAP",
+                "url": "ldaps://ldap.example.com:636",
+                "bind_dn": "cn=hub,ou=apps,dc=example,dc=com",
+                "bind_password": "ldap-bind-secret",
+                "base_dn": "ou=people,dc=example,dc=com",
+                "user_filter": "(mail={email})",
+                "email_attribute": "mail",
+                "auto_create_users": true
+            }
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update_settings.status(), StatusCode::NO_CONTENT);
+
+    let ldap_login = request_json(
+        &app,
+        Method::POST,
+        "/api/auth/ldap/login",
+        json!({
+            "email": "ldap-user@example.com",
+            "password": "ldap-password-123"
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(ldap_login.status(), StatusCode::OK);
+    let ldap_cookie = cookie_from(&ldap_login);
+
+    let password_update = request_json(
+        &app,
+        Method::PUT,
+        "/api/auth/password",
+        json!({
+            "new_password": "local-password-456"
+        }),
+        Some(&ldap_cookie),
+    )
+    .await;
+    assert_eq!(password_update.status(), StatusCode::NO_CONTENT);
+
+    let local_login = request_json(
+        &app,
+        Method::POST,
+        "/api/auth/login",
+        json!({
+            "email": "ldap-user@example.com",
+            "password": "local-password-456"
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(local_login.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn oidc_start_redirects_with_configured_authorization_parameters() {
     let app = test_app();
     bootstrap_admin(&app).await;
@@ -280,6 +417,57 @@ async fn oidc_start_uses_forwarded_origin_for_redirect_uri() {
 }
 
 #[tokio::test]
+async fn oidc_password_login_stays_available_for_same_email_accounts() {
+    let app = test_app();
+    bootstrap_admin(&app).await;
+    let admin_cookie = login(&app, "admin@example.com", "admin-password-123").await;
+
+    let update = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/system-settings",
+        json!({
+            "max_sessions_per_user": 20,
+            "oidc": {
+                "enabled": true,
+                "display_name": "Acme SSO",
+                "client_id": "hermes-hub",
+                "client_secret": "oidc-secret",
+                "authorization_url": "https://idp.example.com/oauth2/v1/authorize",
+                "token_url": "https://idp.example.com/oauth2/v1/token",
+                "userinfo_url": "https://idp.example.com/oauth2/v1/userinfo",
+                "scopes": "openid profile email",
+                "email_claim": "email",
+                "username_claim": "preferred_username",
+                "allow_password_login": false,
+                "auto_create_users": true
+            }
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+
+    let password_login = request_json(
+        &app,
+        Method::POST,
+        "/api/auth/login",
+        json!({
+            "email": "admin@example.com",
+            "password": "admin-password-123"
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(password_login.status(), StatusCode::OK);
+
+    let public_config = request_empty(&app, Method::GET, "/api/auth/oidc/config", None).await;
+    let (status, body) = response_json(public_config).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["oidc"]["allow_password_login"], true);
+}
+
+#[tokio::test]
 async fn oidc_callback_exchanges_code_creates_user_and_sets_session_cookie() {
     let provider_base_url = spawn_oidc_provider_server().await;
     let app = test_app();
@@ -338,6 +526,31 @@ async fn oidc_callback_exchanges_code_creates_user_and_sets_session_cookie() {
     );
     let session_cookie = cookie_from(&callback);
 
+    let password_update = request_json(
+        &app,
+        Method::PUT,
+        "/api/auth/password",
+        json!({
+            "new_password": "local-password-456"
+        }),
+        Some(&session_cookie),
+    )
+    .await;
+    assert_eq!(password_update.status(), StatusCode::NO_CONTENT);
+
+    let local_login = request_json(
+        &app,
+        Method::POST,
+        "/api/auth/login",
+        json!({
+            "email": "oidc-user@example.com",
+            "password": "local-password-456"
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(local_login.status(), StatusCode::OK);
+
     let me = request_empty(&app, Method::GET, "/api/auth/me", Some(&session_cookie)).await;
     let (status, body) = response_json(me).await;
     assert_eq!(status, StatusCode::OK);
@@ -360,6 +573,76 @@ async fn oidc_callback_exchanges_code_creates_user_and_sets_session_cookie() {
     assert_eq!(body["hermes_instances"][0]["user_id"], oidc_user_id);
     assert_eq!(body["hermes_instances"][0]["kind"], "managed_docker");
     assert_eq!(body["hermes_instances"][0]["status"], "running");
+}
+
+#[tokio::test]
+async fn oidc_login_links_existing_local_user_by_email() {
+    let provider_base_url = spawn_oidc_provider_server().await;
+    let app = test_app();
+    bootstrap_admin(&app).await;
+    let admin_cookie = login(&app, "admin@example.com", "admin-password-123").await;
+    configure_required_model_configs(&app, &admin_cookie).await;
+
+    let invite = create_invite(&app, &admin_cookie, unix_now() + 86_400, 1).await;
+    let token = invite["token"].as_str().expect("token exists");
+    let registered = redeem_invite(&app, token, "oidc-user@example.com").await;
+    let (status, registered_body) = response_json(registered).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let existing_user_id = registered_body["user"]["id"]
+        .as_str()
+        .expect("registered user id exists")
+        .to_string();
+
+    let update = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/system-settings",
+        json!({
+            "max_sessions_per_user": 20,
+            "oidc": {
+                "enabled": true,
+                "display_name": "Acme SSO",
+                "client_id": "hermes-hub",
+                "client_secret": "oidc-secret",
+                "authorization_url": format!("{provider_base_url}/authorize"),
+                "token_url": format!("{provider_base_url}/token"),
+                "userinfo_url": format!("{provider_base_url}/userinfo"),
+                "scopes": "openid profile email",
+                "email_claim": "email",
+                "username_claim": "preferred_username",
+                "allow_password_login": true,
+                "auto_create_users": false
+            }
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+
+    let start = request_empty(&app, Method::GET, "/api/auth/oidc/start", None).await;
+    assert_eq!(start.status(), StatusCode::FOUND);
+    let state_cookie = cookie_from(&start);
+    let state = state_cookie
+        .split_once('=')
+        .map(|(_, value)| value)
+        .expect("state cookie has a value");
+
+    let callback = request_empty(
+        &app,
+        Method::GET,
+        &format!("/api/auth/oidc/callback?code=auth-code&state={state}"),
+        Some(&state_cookie),
+    )
+    .await;
+    assert_eq!(callback.status(), StatusCode::FOUND);
+    let session_cookie = cookie_from(&callback);
+
+    let me = request_empty(&app, Method::GET, "/api/auth/me", Some(&session_cookie)).await;
+    let (status, body) = response_json(me).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["user"]["id"], existing_user_id);
+    assert_eq!(body["user"]["email"], "oidc-user@example.com");
+    assert_eq!(body["user"]["role"], "user");
 }
 
 #[tokio::test]

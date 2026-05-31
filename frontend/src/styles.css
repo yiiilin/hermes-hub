@@ -164,25 +164,6 @@ nav,
   color: #f7fbfc;
 }
 
-.settings-area {
-  display: grid;
-  gap: 8px;
-}
-
-.settings-panel {
-  background: #0f1a1f;
-  border: 1px solid #2c4049;
-  border-radius: 8px;
-  display: grid;
-  gap: 8px;
-  padding: 10px;
-}
-
-.settings-panel > span {
-  color: #9fb2ba;
-  font-size: 12px;
-}
-
 .language-switch {
   display: grid;
   gap: 6px;
@@ -205,7 +186,6 @@ nav,
 
 .shell.sidebar-collapsed .desktop-brand span,
 .shell.sidebar-collapsed .nav-link span,
-.shell.sidebar-collapsed .settings-label,
 .shell.sidebar-collapsed .account-email,
 .shell.sidebar-collapsed .chat-sidebar-menu > button span,
 .shell.sidebar-collapsed .session-title,
@@ -215,7 +195,6 @@ nav,
 
 .shell.sidebar-collapsed .desktop-brand,
 .shell.sidebar-collapsed .nav-link,
-.shell.sidebar-collapsed .settings-trigger,
 .shell.sidebar-collapsed .chat-sidebar-menu > button {
   gap: 0;
   justify-content: center;
@@ -240,20 +219,6 @@ nav,
 
 .shell.sidebar-collapsed .account {
   justify-content: center;
-}
-
-.shell.sidebar-collapsed .settings-panel {
-  margin-left: -2px;
-  width: 44px;
-}
-
-.shell.sidebar-collapsed .language-switch {
-  grid-template-columns: 1fr;
-}
-
-.shell.sidebar-collapsed .language-switch button {
-  font-size: 11px;
-  padding: 5px 3px;
 }
 
 .content {
@@ -1623,7 +1588,7 @@ button.composer-attachment-chip {
 
   .sidebar {
     bottom: 0;
-    box-shadow: 24px 0 60px rgba(0, 0, 0, 0.26);
+    box-shadow: none;
     display: grid;
     gap: 8px;
     grid-template-rows: auto minmax(86px, 1fr) auto;
@@ -1646,7 +1611,6 @@ button.composer-attachment-chip {
   }
 
   .shell.sidebar-collapsed .nav-link span,
-  .shell.sidebar-collapsed .settings-label,
   .shell.sidebar-collapsed .account-email,
   .shell.sidebar-collapsed .chat-sidebar-menu > button span,
   .shell.sidebar-collapsed .session-title,
@@ -1667,22 +1631,13 @@ button.composer-attachment-chip {
   }
 
   .shell.sidebar-collapsed .chat-sidebar-menu > button,
-  .shell.sidebar-collapsed .nav-link,
-  .shell.sidebar-collapsed .settings-trigger {
+  .shell.sidebar-collapsed .nav-link {
     gap: 8px;
     justify-content: flex-start;
   }
 
-  .shell.sidebar-collapsed .settings-panel {
-    margin-left: 0;
-    width: auto;
-  }
-
-  .shell.sidebar-collapsed .language-switch {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
   .sidebar.open {
+    box-shadow: 24px 0 60px rgba(0, 0, 0, 0.26);
     transform: translateX(0);
   }
 
@@ -1804,10 +1759,6 @@ button.composer-attachment-chip {
     gap: 8px;
     min-height: 42px;
     padding-top: 8px;
-  }
-
-  .settings-panel {
-    padding: 8px;
   }
 
   .account span {
@@ -1949,5 +1900,9 @@ button.composer-attachment-chip {
 
   .panel {
     padding: 14px;
+  }
+
+  .personal-settings-page .personal-language-switch {
+    max-width: 340px;
   }
 }

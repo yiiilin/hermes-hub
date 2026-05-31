@@ -4,6 +4,7 @@ import { Layout, type AppView } from "./components/layout";
 import { I18nProvider, useI18n } from "./i18n";
 import { ChannelSessionRoute } from "./routes/channel-session";
 import { LoginRoute } from "./routes/login";
+import { PersonalSettingsRoute } from "./routes/personal-settings";
 import { ScheduledTasksRoute } from "./routes/scheduled-tasks";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 
@@ -91,6 +92,10 @@ function AppContent({ apiClient }: Required<AppProps>) {
       ) : null}
       <ScheduledTasksRoute
         active={activeView === "scheduled-tasks"}
+        apiClient={apiClient}
+      />
+      <PersonalSettingsRoute
+        active={activeView === "personal-settings"}
         apiClient={apiClient}
       />
     </Layout>

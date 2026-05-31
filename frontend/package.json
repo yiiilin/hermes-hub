@@ -1,7 +1,7 @@
 {
   "name": "hermes-hub-frontend",
   "private": true,
-  "version": "0.0.13",
+  "version": "0.0.14",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -16,6 +16,7 @@
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
     "react-markdown": "^10.1.0",
+    "remark-breaks": "^4.0.0",
     "remark-gfm": "^4.0.1",
     "typescript": "^5.9.3",
     "vditor": "^3.11.2",

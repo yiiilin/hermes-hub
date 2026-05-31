@@ -5,6 +5,10 @@ fn schema_migrations_include_initial_tables() {
     let sql = schema_migrations();
 
     assert!(sql.contains("create table if not exists users"));
+    assert!(sql.contains("auth_provider text not null default 'local'"));
+    assert!(sql.contains("add column if not exists auth_provider text not null default 'legacy'"));
+    assert!(sql.contains("alter column auth_provider set default 'local'"));
+    assert!(sql.contains("users_auth_provider_check"));
     assert!(sql.contains("create table if not exists invites"));
     assert!(sql.contains("create table if not exists hermes_instances"));
     assert!(sql.contains("create table if not exists llm_usage_events"));

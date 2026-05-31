@@ -5,5 +5,7 @@
 /frontend/playwright-report
 /frontend/test-results
 /frontend/tsconfig.tsbuildinfo
+__pycache__/
+*.pyc
 docs/
 /data

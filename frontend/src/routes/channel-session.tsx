@@ -12,6 +12,7 @@ import { ApiRequestError } from "../api/client";
 import { useChatSidebar, useSidebarCollapsed } from "../components/layout";
 import { useI18n } from "../i18n";
 import ReactMarkdown, { type Components } from "react-markdown";
+import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import {
   File,
@@ -2286,7 +2287,7 @@ function MarkdownContent({
         ) : part.text ? (
           <ReactMarkdown
             key={`markdown-text-${index}`}
-            remarkPlugins={[remarkGfm]}
+            remarkPlugins={[remarkGfm, remarkBreaks]}
             components={markdownComponents(attachments, referencedAttachmentIds, onPreviewImage, t)}
           >
             {part.text}

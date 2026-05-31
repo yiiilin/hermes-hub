@@ -483,6 +483,30 @@ test("shows Hermes input state and opens image attachments in a lightbox", async
 
 test("uses a left drawer for the chat sidebar on mobile", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
+  const mobileSessions = [
+    {
+      id: "session-1",
+      title: "Mobile Run",
+      created_at: 100,
+      updated_at: 100,
+    },
+    ...Array.from({ length: 18 }, (_, index) => ({
+      id: `session-mobile-${index}`,
+      title: `Mobile History ${index + 1}`,
+      created_at: 90 - index,
+      updated_at: 90 - index,
+    })),
+  ];
+  const storedMessages = [
+    {
+      id: "message-1",
+      session_id: "session-1",
+      role: "assistant" as const,
+      content: "stored answer",
+      attachments: [],
+      created_at: 1,
+    },
+  ];
   await page.route("**/api/auth/me", async (route) => {
     await route.fulfill({
       json: {
@@ -512,6 +536,30 @@ test("uses a left drawer for the chat sidebar on mobile", async ({ page }) => {
           status: "running",
         },
       },
+    });
+  });
+  await page.route("**/api/sessions", async (route) => {
+    await route.fulfill({
+      json: {
+        sessions: mobileSessions,
+      },
+    });
+  });
+  await page.route("**/api/sessions/session-1/messages", async (route) => {
+    await route.fulfill({
+      json: {
+        messages: storedMessages,
+      },
+    });
+  });
+  await page.route("**/api/sessions/session-1/events", async (route) => {
+    await route.fulfill({
+      contentType: "text/event-stream",
+      body: `event: messages_snapshot\ndata: ${JSON.stringify({
+        type: "messages_snapshot",
+        messages: storedMessages,
+        active_run: null,
+      })}\n\n`,
     });
   });
   await page.route("**/api/channels/channel-1/sessions", async (route) => {
@@ -598,13 +646,15 @@ test("uses a left drawer for the chat sidebar on mobile", async ({ page }) => {
 
   const closedLeft = await page.locator(".sidebar").evaluate((node) => node.getBoundingClientRect().right);
   expect(closedLeft).toBeLessThanOrEqual(0);
+  await expect(page.locator(".sidebar")).toHaveCSS("box-shadow", "none");
 
   await page.getByRole("button", { name: "Open menu" }).click();
   await expect(page.getByRole("button", { name: "Close menu" }).first()).toBeVisible();
   await expect(page.locator(".sidebar")).toHaveClass(/open/);
+  await expect(page.locator(".sidebar")).not.toHaveCSS("box-shadow", "none");
   await expect(page.getByRole("button", { name: "New chat" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Mobile Run" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "User management" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "System settings" })).toBeVisible();
   await expect
     .poll(() => page.locator(".sidebar").evaluate((node) => node.getBoundingClientRect().left))
     .toBeGreaterThanOrEqual(0);
