@@ -2367,9 +2367,36 @@ describe("App", () => {
 
     await waitFor(() => {
       const message =
-        "Each user can have at most 2 sessions. Delete a session before creating a new one.";
-      expect(screen.getByText(message)).toBeInTheDocument();
+        "You can create up to 2 sessions. Delete an old session before creating a new one.";
       expect(alertSpy).toHaveBeenCalledWith(message);
+      expect(screen.queryByText(message)).not.toBeInTheDocument();
+    });
+  });
+
+  it("keeps automatic session-create limit errors inline when sending a first message", async () => {
+    const alertSpy = vi.spyOn(window, "alert").mockImplementation(() => undefined);
+    const client = createMockApiClient({
+      createSession: async () => {
+        throw new ApiRequestError("session limit exceeded", {
+          error: "session_limit_exceeded",
+          max_sessions_per_user: 2,
+        });
+      },
+    });
+    client.listSessionsPublic = vi.fn(async () => []);
+
+    render(<App apiClient={client} />);
+
+    fireEvent.change(await screen.findByLabelText("Message"), {
+      target: { value: "hello" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => {
+      const message =
+        "You can create up to 2 sessions. Delete an old session before creating a new one.";
+      expect(screen.getByText(message)).toBeInTheDocument();
+      expect(alertSpy).not.toHaveBeenCalled();
     });
   });
 
@@ -2488,9 +2515,9 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "新建对话" }));
 
     await waitFor(() => {
-      const message = "每个用户最多2个会话，你得先删除一个会话才能创建新会话";
-      expect(screen.getByText(message)).toBeInTheDocument();
+      const message = "最多创建2个会话，请删除旧会话后再创建新会话";
       expect(alertSpy).toHaveBeenCalledWith(message);
+      expect(screen.queryByText(message)).not.toBeInTheDocument();
     });
   });
 

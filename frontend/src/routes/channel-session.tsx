@@ -256,15 +256,7 @@ export function ChannelSessionRoute({
   }, [sessions, selectedSession, setChatSidebar, sidebarCollapsed, t, unreadSessionIds]);
 
   async function createSession() {
-    let session: SessionSummary;
-    try {
-      session = await apiClient.createSessionPublic("agent");
-    } catch (cause) {
-      if (cause instanceof ApiRequestError && cause.code === "session_limit_exceeded") {
-        window.alert(userFacingErrorMessage(cause, t("chat.sessionCreateFailed"), t));
-      }
-      throw cause;
-    }
+    const session = await apiClient.createSessionPublic("agent");
     setSessions((current) => [session, ...current]);
     selectedSessionIdRef.current = session.id;
     setSelectedSession(session);
@@ -291,6 +283,11 @@ export function ChannelSessionRoute({
         throw new Error(t("chat.sessionCreateFailed"));
       }
     } catch (cause) {
+      const limitMessage = sessionLimitExceededMessage(cause, t);
+      if (limitMessage) {
+        window.alert(limitMessage);
+        return;
+      }
       setError(userFacingErrorMessage(cause, t("chat.sessionCreateFailed"), t));
     }
   }
@@ -1938,8 +1935,9 @@ function hermesRunErrorMessage(
 }
 
 function userFacingErrorMessage(cause: unknown, fallback: string, t: Translate) {
-  if (cause instanceof ApiRequestError && cause.code === "session_limit_exceeded") {
-    return t("chat.sessionLimitExceeded", { count: cause.maxSessionsPerUser ?? 20 });
+  const limitMessage = sessionLimitExceededMessage(cause, t);
+  if (limitMessage) {
+    return limitMessage;
   }
 
   if (cause instanceof Error && cause.message.trim()) {
@@ -1947,6 +1945,14 @@ function userFacingErrorMessage(cause: unknown, fallback: string, t: Translate) 
   }
 
   return fallback;
+}
+
+function sessionLimitExceededMessage(cause: unknown, t: Translate) {
+  if (cause instanceof ApiRequestError && cause.code === "session_limit_exceeded") {
+    return t("chat.sessionLimitExceeded", { count: cause.maxSessionsPerUser ?? 20 });
+  }
+
+  return null;
 }
 
 function hermesRunMessageKey(runId: string) {
