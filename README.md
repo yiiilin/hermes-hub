@@ -92,7 +92,7 @@ COMPOSE_PROFILES=asr
 HERMES_HUB_SPEECH_INPUT_ENABLED=true
 ```
 
-The default ASR image is `ghcr.io/yiiilin/hermes-hub-asr:0.0.17`. It wraps `sherpa-onnx` + SenseVoice int8 and exposes an OpenAI-compatible `http://asr:9991/v1/audio/transcriptions` endpoint. The ASR image is version-pinned; update `HERMES_HUB_ASR_IMAGE` only when intentionally aligning to a newer ASR image. You can replace it with any image that exposes an HTTP multipart transcription endpoint accepting `file` and `model` fields and returning JSON with `text` or `transcript`.
+The default ASR image is `ghcr.io/yiiilin/hermes-hub-asr:0.0.18`. It wraps `sherpa-onnx` + SenseVoice int8 and exposes an OpenAI-compatible `http://asr:9991/v1/audio/transcriptions` endpoint. The ASR image is version-pinned; update `HERMES_HUB_ASR_IMAGE` only when intentionally aligning to a newer ASR image. You can replace it with any image that exposes an HTTP multipart transcription endpoint accepting `file` and `model` fields and returning JSON with `text` or `transcript`.
 
 Start without ASR:
 
@@ -138,7 +138,7 @@ Release images are published to GitHub Container Registry:
 ```bash
 docker pull ghcr.io/yiiilin/hermes-hub:latest
 docker pull ghcr.io/yiiilin/hermes-hub-hermes:latest
-docker pull ghcr.io/yiiilin/hermes-hub-asr:0.0.17
+docker pull ghcr.io/yiiilin/hermes-hub-asr:0.0.18
 ```
 
 The Hub image contains the Rust backend and the built React frontend. The `hermes-hub-hermes` image is the Hermes runtime wrapper used by managed per-user containers. The optional `hermes-hub-asr` image wraps sherpa-onnx + SenseVoice for speech input. The service listens on port `8080`.

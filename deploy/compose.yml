@@ -109,7 +109,7 @@ services:
 
   asr:
     profiles: ["asr"]
-    image: ${HERMES_HUB_ASR_IMAGE:-ghcr.io/yiiilin/hermes-hub-asr:0.0.17}
+    image: ${HERMES_HUB_ASR_IMAGE:-ghcr.io/yiiilin/hermes-hub-asr:0.0.18}
     restart: unless-stopped
     environment:
       # 默认 ASR 镜像用 sherpa-onnx 跑 SenseVoice，并暴露 OpenAI 兼容转写接口。
