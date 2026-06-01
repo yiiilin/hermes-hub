@@ -49,6 +49,7 @@ import {
   isValidElement,
   useMemo,
   useRef,
+  useLayoutEffect,
   useState,
 } from "react";
 
@@ -77,6 +78,9 @@ const MESSAGE_VIRTUALIZATION_DEFAULT_VIEWPORT_PX = 720;
 const MESSAGE_VIRTUALIZATION_DEFAULT_ROW_HEIGHT_PX = 112;
 const MESSAGE_VIRTUALIZATION_MIN_ROW_HEIGHT_PX = 44;
 const MESSAGE_VIRTUALIZATION_DEFAULT_GAP_PX = 16;
+const MESSAGE_INITIAL_VISIBLE_TURNS = 2;
+const MESSAGE_HISTORY_PAGE_SIZE = 24;
+const MESSAGE_HISTORY_LOAD_TOP_PX = 48;
 
 export function ChannelSessionRoute({
   active = true,
@@ -916,6 +920,7 @@ export function ChannelSessionRoute({
 
         <MessageList
           activeExecutionMessageId={activeExecutionMessage?.id ?? null}
+          historyKey={selectedSession?.id ?? "empty"}
           language={language}
           liveExecutionVisible={liveExecutionVisible}
           messageListRef={messageListRef}
@@ -1173,6 +1178,7 @@ export function createClientMessageId(source: BrowserCrypto | undefined = global
 
 const MessageList = memo(function MessageList({
   activeExecutionMessageId,
+  historyKey,
   language,
   liveExecutionVisible,
   messageListRef,
@@ -1184,6 +1190,7 @@ const MessageList = memo(function MessageList({
   verboseEvents,
 }: {
   activeExecutionMessageId: string | null;
+  historyKey: string;
   language: Language;
   liveExecutionVisible: boolean;
   messageListRef: { current: HTMLDivElement | null };
@@ -1209,9 +1216,118 @@ const MessageList = memo(function MessageList({
       }, []),
     [activeExecutionMessageId, liveExecutionVisible, messages, pendingAssistantMessageId],
   );
-  const virtualized = renderableMessages.length > MESSAGE_VIRTUALIZATION_THRESHOLD;
+  const [visibleHistoryCount, setVisibleHistoryCount] = useState(0);
+  const previousRenderableLengthRef = useRef(0);
+  const pendingHistoryPrependRef = useRef<{
+    previousScrollHeight: number;
+    previousScrollTop: number;
+  } | null>(null);
+
+  // 切换会话时先回到轻量窗口，避免中长历史在首屏一次性挂载。
+  useEffect(() => {
+    previousRenderableLengthRef.current = 0;
+    pendingHistoryPrependRef.current = null;
+    setVisibleHistoryCount(0);
+  }, [historyKey]);
+
+  useEffect(() => {
+    const initialCount = recentConversationWindowSize(
+      renderableMessages,
+      MESSAGE_INITIAL_VISIBLE_TURNS,
+    );
+    const previousLength = previousRenderableLengthRef.current;
+    previousRenderableLengthRef.current = renderableMessages.length;
+
+    setVisibleHistoryCount((current) => {
+      if (renderableMessages.length === 0) {
+        return 0;
+      }
+
+      if (current === 0) {
+        return initialCount;
+      }
+
+      const boundedCurrent = Math.min(current, renderableMessages.length);
+      const appendedCount = Math.max(0, renderableMessages.length - previousLength);
+      const nextCount =
+        appendedCount > 0
+          ? Math.min(renderableMessages.length, boundedCurrent + appendedCount)
+          : boundedCurrent;
+      return Math.max(nextCount, initialCount);
+    });
+  }, [renderableMessages]);
+
+  const effectiveVisibleCount =
+    renderableMessages.length === 0
+      ? 0
+      : Math.min(
+          renderableMessages.length,
+          Math.max(
+            visibleHistoryCount,
+            recentConversationWindowSize(renderableMessages, MESSAGE_INITIAL_VISIBLE_TURNS),
+          ),
+        );
+  const visibleStartIndex = Math.max(0, renderableMessages.length - effectiveVisibleCount);
+  const visibleMessages = renderableMessages.slice(visibleStartIndex);
+  const hasOlderMessages = visibleStartIndex > 0;
+
+  const revealOlderMessages = useCallback(() => {
+    if (!hasOlderMessages) {
+      return;
+    }
+    const node = messageListRef.current;
+    if (node) {
+      // prepend 更早消息前记录滚动尺寸，渲染后用差值把视口留在原内容附近。
+      pendingHistoryPrependRef.current = {
+        previousScrollHeight: node.scrollHeight,
+        previousScrollTop: node.scrollTop,
+      };
+    }
+    setVisibleHistoryCount((current) =>
+      Math.min(
+        renderableMessages.length,
+        Math.max(current, effectiveVisibleCount) + MESSAGE_HISTORY_PAGE_SIZE,
+      ),
+    );
+  }, [effectiveVisibleCount, hasOlderMessages, messageListRef, renderableMessages.length]);
+
+  useEffect(() => {
+    const node = messageListRef.current;
+    if (!node || !hasOlderMessages) {
+      return;
+    }
+
+    function handleHistoryScroll() {
+      const current = messageListRef.current;
+      if (
+        !current ||
+        current.scrollHeight <= current.clientHeight + 1 ||
+        current.scrollTop > MESSAGE_HISTORY_LOAD_TOP_PX
+      ) {
+        return;
+      }
+      revealOlderMessages();
+    }
+
+    node.addEventListener("scroll", handleHistoryScroll, { passive: true });
+    return () => node.removeEventListener("scroll", handleHistoryScroll);
+  }, [hasOlderMessages, messageListRef, revealOlderMessages]);
+
+  useLayoutEffect(() => {
+    const pending = pendingHistoryPrependRef.current;
+    const node = messageListRef.current;
+    if (!pending || !node) {
+      return;
+    }
+    pendingHistoryPrependRef.current = null;
+    const heightDelta = node.scrollHeight - pending.previousScrollHeight;
+    node.scrollTop = pending.previousScrollTop + Math.max(0, heightDelta);
+    node.dispatchEvent(new Event("scroll"));
+  }, [effectiveVisibleCount, messageListRef]);
+
+  const virtualized = visibleMessages.length > MESSAGE_VIRTUALIZATION_THRESHOLD;
   const virtualWindow = useVirtualMessageWindow(
-    renderableMessages,
+    visibleMessages,
     virtualized,
     messageListRef,
     stickToBottomRef,
@@ -1266,21 +1382,49 @@ const MessageList = memo(function MessageList({
           })}
         </div>
       ) : (
-        renderableMessages.map((entry) => (
-          <MessageBubble
-            key={entry.message.id}
-            message={entry.message}
-            pending={entry.pending}
-            executionEvents={entry.pending && verboseEvents.length > 0 ? verboseEvents : undefined}
-            onPreviewImage={onPreviewImage}
-            t={t}
-            language={language}
-          />
-        ))
+        <>
+          {hasOlderMessages ? (
+            <button type="button" className="message-history-trigger" onClick={revealOlderMessages}>
+              {t("chat.loadEarlier")}
+            </button>
+          ) : null}
+          {visibleMessages.map((entry) => (
+            <MessageBubble
+              key={entry.message.id}
+              message={entry.message}
+              pending={entry.pending}
+              executionEvents={
+                entry.pending && verboseEvents.length > 0 ? verboseEvents : undefined
+              }
+              onPreviewImage={onPreviewImage}
+              t={t}
+              language={language}
+            />
+          ))}
+        </>
       )}
     </div>
   );
 });
+
+function recentConversationWindowSize(entries: RenderableMessage[], turns: number) {
+  if (entries.length === 0) {
+    return 0;
+  }
+
+  let seenUserTurns = 0;
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    if (entries[index].message.role !== "user") {
+      continue;
+    }
+    seenUserTurns += 1;
+    if (seenUserTurns === turns) {
+      return entries.length - index;
+    }
+  }
+
+  return Math.min(entries.length, Math.max(turns * 2, 1));
+}
 
 function useVirtualMessageWindow(
   entries: RenderableMessage[],

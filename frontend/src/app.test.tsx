@@ -2261,6 +2261,38 @@ describe("App", () => {
     expect(screen.queryByText("message 0")).not.toBeInTheDocument();
   });
 
+  it("opens a session with only the two most recent conversation turns mounted", async () => {
+    const messages = Array.from(
+      { length: 12 },
+      (_, index): ChannelMessage => ({
+        id: `message-window-${index}`,
+        session_id: "session-1",
+        role: index % 2 === 0 ? "user" : "assistant",
+        message_kind: "text",
+        content: `window message ${index}`,
+        attachments: [],
+        created_at: index + 1,
+      }),
+    );
+
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialMessagesBySessionId: {
+            "session-1": messages,
+          },
+        })}
+      />,
+    );
+
+    expect(await screen.findByText("window message 11")).toBeInTheDocument();
+    expect(screen.getByText("window message 8")).toBeInTheDocument();
+    expect(screen.queryByText("window message 7")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Load earlier messages" }));
+    expect(await screen.findByText("window message 0")).toBeInTheDocument();
+  });
+
   it("renders live session events immediately in long chat histories", async () => {
     const messages = Array.from(
       { length: 140 },
