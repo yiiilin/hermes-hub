@@ -109,7 +109,7 @@ services:
 
   asr:
     profiles: ["asr"]
-    image: ${HERMES_HUB_ASR_IMAGE:-ghcr.io/yiiilin/hermes-hub-asr:0.0.16}
+    image: ${HERMES_HUB_ASR_IMAGE:-ghcr.io/yiiilin/hermes-hub-asr:0.0.17}
     restart: unless-stopped
     environment:
       # 默认 ASR 镜像用 sherpa-onnx 跑 SenseVoice，并暴露 OpenAI 兼容转写接口。
@@ -148,6 +148,7 @@ services:
       HERMES_HUB_BIND_ADDR: 0.0.0.0:8080
       HERMES_HUB_COOKIE_NAME: ${HERMES_HUB_COOKIE_NAME:-hermes_hub_session}
       HERMES_HUB_STATIC_DIR: /app/public
+      HERMES_HUB_PUBLIC_PLATFORM_ENABLED: ${HERMES_HUB_PUBLIC_PLATFORM_ENABLED:-false}
       DATABASE_URL: postgres://${POSTGRES_USER:-hermes_hub}:${POSTGRES_PASSWORD:-change-me-postgres}@postgres:5432/${POSTGRES_DB:-hermes_hub}
       HERMES_HUB_SECRET_MASTER_KEY: ${HERMES_HUB_SECRET_MASTER_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA}
 

@@ -21,6 +21,7 @@ pub struct AppConfig {
     pub skills_fs: SkillsFsConfig,
     pub managed_profile: ManagedProfileConfig,
     pub speech_input: SpeechInputConfig,
+    pub public_platform_enabled: bool,
     pub max_proxy_body_bytes: usize,
     pub static_dir: PathBuf,
 }
@@ -108,6 +109,7 @@ impl AppConfig {
             skills_fs: default_skills_fs_config(),
             managed_profile: default_managed_profile_config(),
             speech_input: default_speech_input_config(),
+            public_platform_enabled: false,
             max_proxy_body_bytes: 10 * 1024 * 1024,
             static_dir: PathBuf::from("frontend/dist"),
         }
@@ -132,6 +134,7 @@ impl AppConfig {
             skills_fs: skills_fs_config_from_env(),
             managed_profile: managed_profile_config_from_env(),
             speech_input: speech_input_config_from_env(),
+            public_platform_enabled: env_bool_any(&["HERMES_HUB_PUBLIC_PLATFORM_ENABLED"], false),
             max_proxy_body_bytes: env_usize("HERMES_HUB_MAX_PROXY_BODY_BYTES", 10 * 1024 * 1024),
             static_dir: PathBuf::from(
                 std::env::var("HERMES_HUB_STATIC_DIR")

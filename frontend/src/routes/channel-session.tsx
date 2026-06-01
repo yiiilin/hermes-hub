@@ -399,7 +399,13 @@ export function ChannelSessionRoute({
     }
 
     // 标题更新不代表有未读消息；当前会话收到新标题时同步标记已读时间。
-    setSelectedSession(updatedSession);
+    setSelectedSession((current) =>
+      current?.id === updatedSession.id &&
+      updatedSession.recycle_at === undefined &&
+      current.recycle_at !== undefined
+        ? { ...updatedSession, recycle_at: current.recycle_at }
+        : updatedSession,
+    );
     setSeenSessionUpdates((current) => ({
       ...current,
       [updatedSession.id]: sessionUpdatedAt(updatedSession),
@@ -420,6 +426,9 @@ export function ChannelSessionRoute({
     }
 
     if (event.type === "messages_snapshot") {
+      if (event.session) {
+        applySessionUpdate(event.session);
+      }
       const nextMessages = sortMessagesForDisplay(event.messages);
       setMessages(nextMessages);
       hydrateExecutionHistory(session.id, nextMessages, event.active_run);
@@ -895,6 +904,12 @@ export function ChannelSessionRoute({
     () => activeExecutionMessageForRun(renderedMessages, activeRun),
     [activeRun, renderedMessages],
   );
+  const recycleAtDate = sessionRecycleAtDate(selectedSession);
+  const recycleHint = recycleAtDate
+    ? t("chat.publicSessionRecycleAt", {
+        time: formatSessionRecycleTime(recycleAtDate, language),
+      })
+    : null;
 
   if (!active) {
     return null;
@@ -906,6 +921,11 @@ export function ChannelSessionRoute({
         <header className="chat-header">
           <div className="chat-title-row">
             <h2 id="chat-title">{selectedSession?.title ?? t("chat.newConversation")}</h2>
+            {recycleHint ? (
+              <span className="header-recycle" title={recycleHint} aria-label={recycleHint}>
+                {recycleHint}
+              </span>
+            ) : null}
             {runInProgress ? (
               <span className="header-typing" aria-live="polite">
                 {t("chat.typing")}
@@ -962,6 +982,7 @@ const LEGACY_HERMES_EXECUTION_HINT = /(^|\n)\S+\s+[A-Za-z0-9_.-]+\(/u;
 const EXECUTION_HISTORY_EVENTS_CACHE_LIMIT = 500;
 const executionHistoryEventsCache = new Map<string, ExecutionHistoryEntry[] | null>();
 const messageTimeFormatters = new Map<Language, Intl.DateTimeFormat>();
+const sessionRecycleTimeFormatters = new Map<Language, Intl.DateTimeFormat>();
 
 function filesFromClipboardData(clipboardData: DataTransfer) {
   const directFiles = Array.from(clipboardData.files ?? []);
@@ -2328,8 +2349,13 @@ function upsertSessionSummary(sessions: SessionSummary[], updatedSession: Sessio
   if (index === -1) {
     return [...sessions, updatedSession];
   }
+  const previousSession = sessions[index];
+  const nextSession =
+    updatedSession.recycle_at === undefined && previousSession.recycle_at !== undefined
+      ? { ...updatedSession, recycle_at: previousSession.recycle_at }
+      : updatedSession;
   const next = [...sessions];
-  next[index] = updatedSession;
+  next[index] = nextSession;
   return next;
 }
 
@@ -2575,12 +2601,30 @@ function formatMessageUpdatedTime(date: Date, language: Language) {
   return formatter.format(date);
 }
 
+function formatSessionRecycleTime(date: Date, language: Language) {
+  let formatter = sessionRecycleTimeFormatters.get(language);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat(language, {
+      dateStyle: "short",
+      timeStyle: "short",
+    });
+    sessionRecycleTimeFormatters.set(language, formatter);
+  }
+  return formatter.format(date);
+}
+
+function sessionRecycleAtDate(session: SessionSummary | null) {
+  return timestampToDate(session?.recycle_at ?? null);
+}
+
 function messageUpdatedAtDate(message: ChannelMessage) {
-  const timestamp = message.updated_at ?? message.created_at;
-  if (!Number.isFinite(timestamp)) {
+  return timestampToDate(message.updated_at ?? message.created_at);
+}
+
+function timestampToDate(timestamp: number | null | undefined) {
+  if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) {
     return null;
   }
-
   // 后端返回秒级时间戳；本地 pending/mock 消息沿用 Date.now() 的毫秒值。
   return new Date(timestamp > 1_000_000_000_000 ? timestamp : timestamp * 1000);
 }

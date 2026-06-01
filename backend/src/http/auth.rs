@@ -58,6 +58,7 @@ struct UserResponse {
 #[derive(Serialize)]
 struct BootstrapStatusResponse {
     bootstrap_open: bool,
+    public_platform_enabled: bool,
 }
 
 async fn bootstrap_status(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
@@ -66,8 +67,14 @@ async fn bootstrap_status(State(state): State<AppState>) -> Result<impl IntoResp
         .bootstrap_open()
         .await
         .map_err(|_| ApiError::Internal)?;
+    // 公共平台开关按部署环境即时生效，不能回写数据库，否则多个环境共享数据库时
+    // 会互相覆盖对方的配置。
+    let public_platform_enabled = state.config.public_platform_enabled;
 
-    Ok(Json(BootstrapStatusResponse { bootstrap_open }))
+    Ok(Json(BootstrapStatusResponse {
+        bootstrap_open,
+        public_platform_enabled,
+    }))
 }
 
 async fn bootstrap_register(

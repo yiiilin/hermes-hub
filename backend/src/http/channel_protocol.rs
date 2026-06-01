@@ -28,6 +28,7 @@ use crate::{
             read_multipart_text_field_with_limit, spool_multipart_file_to_temp_with_limit,
             upload_session_attachments_from_instance,
         },
+        sessions::refresh_public_session_retention_from_message,
         ApiError,
     },
     model_config::InstanceTokenContext,
@@ -251,6 +252,19 @@ async fn deliver_message(
     state.session_events.publish(SessionEvent::MessageCreated {
         message: message.clone(),
     });
+    if let Some(updated_session) = refresh_public_session_retention_from_message(
+        &state,
+        &session_context.user_id,
+        &session_context.channel_id,
+        &session_id,
+        message.updated_at,
+    )
+    .await?
+    {
+        state.session_events.publish(SessionEvent::SessionUpdated {
+            session: updated_session,
+        });
+    }
 
     Ok((StatusCode::CREATED, Json(MessageResponse { message })))
 }
@@ -609,6 +623,19 @@ async fn deliver_media_output(
             message: message.clone(),
         });
     }
+    if let Some(updated_session) = refresh_public_session_retention_from_message(
+        &state,
+        &session_context.user_id,
+        &session_context.channel_id,
+        &session_id,
+        message.updated_at,
+    )
+    .await?
+    {
+        state.session_events.publish(SessionEvent::SessionUpdated {
+            session: updated_session,
+        });
+    }
 
     Ok((status, Json(MessageResponse { message })))
 }
@@ -791,6 +818,19 @@ async fn update_message(
     } else {
         state.session_events.publish(SessionEvent::MessageUpdated {
             message: message.clone(),
+        });
+    }
+    if let Some(updated_session) = refresh_public_session_retention_from_message(
+        &state,
+        &session_context.user_id,
+        &session_context.channel_id,
+        &session_id,
+        message.updated_at,
+    )
+    .await?
+    {
+        state.session_events.publish(SessionEvent::SessionUpdated {
+            session: updated_session,
         });
     }
 

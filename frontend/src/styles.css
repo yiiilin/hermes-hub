@@ -1049,6 +1049,12 @@ td {
   gap: 7px;
 }
 
+.header-recycle {
+  color: #71848b;
+  font-size: 12px;
+  line-height: 1.25;
+}
+
 .message-list {
   align-content: start;
   --message-list-gap: 16px;

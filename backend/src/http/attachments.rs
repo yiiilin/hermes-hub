@@ -436,6 +436,11 @@ async fn public_attachment_for_cookie(
         .get_attachment(&public_user_id, attachment_id)
         .await
         .map_err(map_channel_error)?;
+    if crate::http::sessions::cleanup_public_session_if_recycled(state, &attachment.session_id)
+        .await?
+    {
+        return Err(ApiError::Unauthorized);
+    }
     let allowed = state
         .store
         .public_token_can_access_session(&token, &attachment.session_id)
@@ -444,20 +449,6 @@ async fn public_attachment_for_cookie(
     if !allowed {
         return Err(ApiError::Unauthorized);
     }
-    let settings = state
-        .store
-        .system_settings()
-        .await
-        .map_err(|_| ApiError::Internal)?;
-    state
-        .store
-        .grant_public_session_access(
-            &token,
-            &attachment.session_id,
-            settings.public_platform.temporary_session_retention_hours,
-        )
-        .await
-        .map_err(|_| ApiError::Internal)?;
 
     Ok(attachment)
 }

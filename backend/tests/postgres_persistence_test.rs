@@ -1294,6 +1294,7 @@ async fn postgres_system_settings_persist_session_limit() {
             attachment_retention_days: 14,
             speech_input: SpeechInputSettings { enabled: true },
             public_platform: PublicPlatformSettings {
+                enabled: true,
                 temporary_session_retention_hours: 48,
             },
             oidc: OidcSettings {

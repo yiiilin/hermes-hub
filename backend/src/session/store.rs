@@ -122,6 +122,7 @@ pub struct SpeechInputSettings {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct PublicPlatformSettings {
+    pub enabled: bool,
     pub temporary_session_retention_hours: u32,
 }
 
@@ -200,6 +201,7 @@ impl Default for SpeechInputSettings {
 impl Default for PublicPlatformSettings {
     fn default() -> Self {
         Self {
+            enabled: false,
             temporary_session_retention_hours: DEFAULT_PUBLIC_SESSION_RETENTION_HOURS,
         }
     }
@@ -2204,6 +2206,42 @@ impl SessionStore {
                     .map(|row| row.try_get::<String, _>("session_id"))
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|_| StoreError::DatabaseFailed)
+            }),
+        }
+    }
+
+    pub async fn refresh_public_session_access_for_session(
+        &self,
+        session_id: &str,
+        expires_at: u64,
+    ) -> Result<(), StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                for access in inner
+                    .public_session_access
+                    .iter_mut()
+                    .filter(|access| access.session_id == session_id)
+                {
+                    // 消息事件可能乱序到达，只允许延长，不因旧事件缩短回收窗口。
+                    access.expires_at = access.expires_at.max(expires_at);
+                }
+                Ok(())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                sqlx::query(
+                    r#"
+                    update public_session_access
+                    set expires_at = greatest(expires_at, to_timestamp($2))
+                    where session_id = $1::uuid
+                    "#,
+                )
+                .bind(session_id)
+                .bind(expires_at as f64)
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+                Ok(())
             }),
         }
     }

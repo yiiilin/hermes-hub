@@ -1801,6 +1801,22 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
           </div>
           {error ? <p className="error">{error}</p> : null}
           {settingsSaved ? <p className="copy-line">{t("admin.settingsSaved")}</p> : null}
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={systemSettings.public_platform.enabled}
+              onChange={(event) =>
+                setSystemSettings({
+                  ...systemSettings,
+                  public_platform: {
+                    ...systemSettings.public_platform,
+                    enabled: event.target.checked,
+                  },
+                })
+              }
+            />
+            {t("admin.enable")}
+          </label>
           <label>
             {t("admin.publicTemporarySessionRetentionHours")}
             <input

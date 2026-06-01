@@ -19,6 +19,7 @@ async fn system_settings_include_public_platform_retention_hours() {
     store
         .update_system_settings(SystemSettings {
             public_platform: PublicPlatformSettings {
+                enabled: false,
                 temporary_session_retention_hours: 48,
             },
             ..defaults

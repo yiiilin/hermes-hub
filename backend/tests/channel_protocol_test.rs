@@ -32,7 +32,24 @@ fn test_state(store: SessionStore) -> AppState {
 }
 
 fn test_state_with_channel_store(store: SessionStore, channel_store: ChannelStore) -> AppState {
-    let config = AppConfig::for_tests();
+    test_state_with_channel_store_and_public_platform(store, channel_store, false)
+}
+
+fn test_state_with_public_platform(store: SessionStore, public_platform_enabled: bool) -> AppState {
+    test_state_with_channel_store_and_public_platform(
+        store,
+        ChannelStore::default(),
+        public_platform_enabled,
+    )
+}
+
+fn test_state_with_channel_store_and_public_platform(
+    store: SessionStore,
+    channel_store: ChannelStore,
+    public_platform_enabled: bool,
+) -> AppState {
+    let mut config = AppConfig::for_tests();
+    config.public_platform_enabled = public_platform_enabled;
     let asr_client = hermes_hub_backend::asr::default_asr_client(&config.speech_input);
     AppState {
         docker_provisioner: DockerProvisioner::new_with_runtime(
@@ -79,6 +96,15 @@ fn ready_model_registry() -> ModelRegistry {
 
 fn test_app(store: SessionStore) -> Router {
     build_router_with_state(test_state(store))
+}
+
+async fn enable_public_platform(store: &SessionStore) {
+    let mut settings = store.system_settings().await.expect("settings can be read");
+    settings.public_platform.enabled = true;
+    store
+        .update_system_settings(settings)
+        .await
+        .expect("public platform can be enabled for tests");
 }
 
 async fn request_json(
@@ -1255,7 +1281,8 @@ async fn public_session_events_stream_session_title_updates() {
 #[tokio::test]
 async fn unauthenticated_public_sessions_are_scoped_by_public_cookie() {
     let store = SessionStore::default();
-    let state = test_state(store.clone());
+    enable_public_platform(&store).await;
+    let state = test_state_with_public_platform(store.clone(), true);
     let app = build_router_with_state(state.clone());
     let admin_cookie = bootstrap_and_login(&app).await;
     let admin_id = store
@@ -1370,9 +1397,93 @@ async fn unauthenticated_public_sessions_are_scoped_by_public_cookie() {
 }
 
 #[tokio::test]
+async fn public_session_recycle_at_tracks_latest_message_time() {
+    let store = SessionStore::default();
+    enable_public_platform(&store).await;
+    let state = test_state_with_public_platform(store.clone(), true);
+    let app = build_router_with_state(state.clone());
+    let _admin_cookie = bootstrap_and_login(&app).await;
+    let retention_seconds = store
+        .system_settings()
+        .await
+        .expect("settings can be read")
+        .public_platform
+        .temporary_session_retention_hours as u64
+        * 60
+        * 60;
+
+    let created = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent", "title": "public recycle" }),
+        None,
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let public_cookie = cookie_from(&created);
+    let (_, created_body) = response_json(created).await;
+    let session_id = created_body["session"]["id"].as_str().expect("session id");
+    let created_at = created_body["session"]["created_at"]
+        .as_u64()
+        .expect("session created_at");
+    let initial_recycle_at = created_body["session"]["recycle_at"]
+        .as_u64()
+        .expect("initial recycle_at");
+    assert_eq!(initial_recycle_at, created_at + retention_seconds);
+    let stream_response = request_empty(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{session_id}/events"),
+        Some(&public_cookie),
+    )
+    .await;
+    assert_eq!(stream_response.status(), StatusCode::OK);
+    let mut stream_body = stream_response.into_body().into_data_stream();
+    let snapshot_chunk =
+        tokio::time::timeout(std::time::Duration::from_secs(1), stream_body.next())
+            .await
+            .expect("snapshot event arrives")
+            .expect("snapshot chunk exists")
+            .expect("snapshot chunk is readable");
+    let snapshot_text = String::from_utf8_lossy(&snapshot_chunk);
+    assert!(snapshot_text.contains("\"session\""));
+    assert!(snapshot_text.contains("\"recycle_at\""));
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let appended = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{session_id}/messages"),
+        json!({
+            "role": "user",
+            "content": "refresh public recycle time",
+            "attachments": []
+        }),
+        Some(&public_cookie),
+    )
+    .await;
+    assert_eq!(appended.status(), StatusCode::CREATED);
+    let (_, appended_body) = response_json(appended).await;
+    let message_updated_at = appended_body["message"]["updated_at"]
+        .as_u64()
+        .expect("message updated_at");
+
+    let listed = request_empty(&app, Method::GET, "/api/sessions", Some(&public_cookie)).await;
+    let (status, listed_body) = response_json(listed).await;
+    assert_eq!(status, StatusCode::OK);
+    let recycle_at = listed_body["sessions"][0]["recycle_at"]
+        .as_u64()
+        .expect("listed recycle_at");
+    assert_eq!(recycle_at, message_updated_at + retention_seconds);
+    assert!(recycle_at > initial_recycle_at);
+}
+
+#[tokio::test]
 async fn public_sessions_do_not_consume_admin_session_limit() {
     let store = SessionStore::default();
-    let state = test_state(store.clone());
+    enable_public_platform(&store).await;
+    let state = test_state_with_public_platform(store.clone(), true);
     let app = build_router_with_state(state.clone());
     let admin_cookie = bootstrap_and_login(&app).await;
     let mut settings = store.system_settings().await.expect("settings can be read");
@@ -1417,7 +1528,8 @@ async fn public_sessions_do_not_consume_admin_session_limit() {
 #[tokio::test]
 async fn invalid_public_session_cookie_lists_empty_without_creating_public_user() {
     let store = SessionStore::default();
-    let app = test_app(store.clone());
+    enable_public_platform(&store).await;
+    let app = build_router_with_state(test_state_with_public_platform(store.clone(), true));
     let _admin_cookie = bootstrap_and_login(&app).await;
 
     let listed = request_empty(
@@ -1443,7 +1555,8 @@ async fn invalid_public_session_cookie_lists_empty_without_creating_public_user(
 #[tokio::test]
 async fn public_session_attachment_download_uses_public_cookie() {
     let store = SessionStore::default();
-    let state = test_state(store.clone());
+    enable_public_platform(&store).await;
+    let state = test_state_with_public_platform(store.clone(), true);
     let app = build_router_with_state(state.clone());
     let _admin_cookie = bootstrap_and_login(&app).await;
 

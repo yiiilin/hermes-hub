@@ -26,6 +26,7 @@ export type ChannelSession = {
   title?: string | null;
   created_at?: number;
   updated_at?: number;
+  recycle_at?: number | null;
 };
 
 export type SessionSummary = {
@@ -33,6 +34,7 @@ export type SessionSummary = {
   title?: string | null;
   created_at?: number;
   updated_at?: number;
+  recycle_at?: number | null;
 };
 
 export type ChannelMessage = {
@@ -171,6 +173,7 @@ export type SpeechInputSettings = {
 };
 
 export type PublicPlatformSettings = {
+  enabled: boolean;
   temporary_session_retention_hours: number;
 };
 
@@ -277,6 +280,7 @@ export type ChannelSessionEvent =
       type: "messages_snapshot";
       messages: ChannelMessage[];
       active_run: HermesActiveRun | null;
+      session?: SessionSummary;
     }
   | { type: "message_created"; message: ChannelMessage }
   | { type: "message_updated"; message: ChannelMessage }
@@ -307,7 +311,7 @@ export type CreateInviteInput = {
 
 export type ApiClient = {
   me: () => Promise<User | null>;
-  bootstrapStatus: () => Promise<{ bootstrap_open: boolean }>;
+  bootstrapStatus: () => Promise<{ bootstrap_open: boolean; public_platform_enabled: boolean }>;
   oidcConfig: () => Promise<OidcPublicConfig>;
   ldapConfig: () => Promise<LdapPublicConfig>;
   login: (email: string, password: string) => Promise<User>;
@@ -695,6 +699,7 @@ export function defaultSpeechInputSettings(): SpeechInputSettings {
 
 export function defaultPublicPlatformSettings(): PublicPlatformSettings {
   return {
+    enabled: false,
     temporary_session_retention_hours: 24,
   };
 }
@@ -752,7 +757,9 @@ export function createApiClient(): ApiClient {
       return payload?.user ?? null;
     },
     async bootstrapStatus() {
-      return request<{ bootstrap_open: boolean }>("/api/auth/bootstrap-status");
+      return request<{ bootstrap_open: boolean; public_platform_enabled: boolean }>(
+        "/api/auth/bootstrap-status",
+      );
     },
     async oidcConfig() {
       const payload = await request<{ oidc: OidcPublicConfig }>("/api/auth/oidc/config");
@@ -1328,6 +1335,7 @@ type MockApiClientOptions = {
   uploadManagedSkills?: ApiClient["uploadManagedSkills"];
   initialHermesProfile?: HermesProfilePayload;
   initialHermesSchedulerSnapshots?: HermesSchedulerSnapshot[];
+  publicPlatformSettings?: Partial<PublicPlatformSettings>;
 };
 
 function withMockMessageKind(message: ChannelMessage): ChannelMessage {
@@ -1483,7 +1491,10 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     max_attachment_upload_bytes: 200 * 1024 * 1024,
     attachment_retention_days: 7,
     speech_input: defaultSpeechInputSettings(),
-    public_platform: defaultPublicPlatformSettings(),
+    public_platform: {
+      ...defaultPublicPlatformSettings(),
+      ...(options.publicPlatformSettings ?? {}),
+    },
     oidc: defaultOidcSettings(),
     ldap: defaultLdapSettings(),
   };
@@ -1589,7 +1600,10 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       return currentUser;
     },
     async bootstrapStatus() {
-      return { bootstrap_open: !hasAnyUser };
+      return {
+        bootstrap_open: !hasAnyUser,
+        public_platform_enabled: systemSettings.public_platform.enabled,
+      };
     },
     async oidcConfig() {
       return (
@@ -2090,11 +2104,12 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       return sessions
         .slice()
         .sort((left, right) => (right.updated_at ?? 0) - (left.updated_at ?? 0))
-        .map(({ id, title, created_at, updated_at }) => ({
+        .map(({ id, title, created_at, updated_at, recycle_at }) => ({
           id,
           title,
           created_at,
           updated_at,
+          recycle_at,
         }));
     },
     async createSessionPublic(kind = "agent", title) {
@@ -2106,6 +2121,7 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
         title: session.title,
         created_at: session.created_at,
         updated_at: session.updated_at,
+        recycle_at: session.recycle_at,
       };
     },
     async deleteSessionPublic(sessionId) {

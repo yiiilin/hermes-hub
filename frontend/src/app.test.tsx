@@ -594,7 +594,10 @@ describe("App", () => {
   });
 
   it("opens the public chat for unauthenticated visitors and keeps sign-in in the lower sidebar", async () => {
-    const client = createMockApiClient({ initialUser: null });
+    const client = createMockApiClient({
+      initialUser: null,
+      publicPlatformSettings: { enabled: true },
+    });
 
     render(<App apiClient={client} />);
 
@@ -605,6 +608,58 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
 
     expect(await screen.findByLabelText("Email")).toBeInTheDocument();
+  });
+
+  it("shows public session recycle time in the chat header", async () => {
+    const client = createMockApiClient({
+      initialUser: null,
+      publicPlatformSettings: { enabled: true },
+    });
+    client.listSessionsPublic = vi.fn(async () => [
+      {
+        id: "public-session-1",
+        title: "Public recycle session",
+        created_at: 1_767_225_600,
+        updated_at: 1_767_225_600,
+        recycle_at: 1_767_312_000,
+      } as unknown as Awaited<ReturnType<ApiClient["listSessionsPublic"]>>[number],
+    ]);
+
+    render(<App apiClient={client} />);
+
+    expect(await screen.findByText("Public recycle session")).toBeInTheDocument();
+    expect(screen.getByText(/Recycles at/)).toBeInTheDocument();
+  });
+
+  it("localizes the public session recycle hint", async () => {
+    localStorage.setItem("hermes-hub-language", "zh");
+    const client = createMockApiClient({
+      initialUser: null,
+      publicPlatformSettings: { enabled: true },
+    });
+    client.listSessionsPublic = vi.fn(async () => [
+      {
+        id: "public-session-1",
+        title: "公共回收会话",
+        created_at: 1_767_225_600,
+        updated_at: 1_767_225_600,
+        recycle_at: 1_767_312_000,
+      } as unknown as Awaited<ReturnType<ApiClient["listSessionsPublic"]>>[number],
+    ]);
+
+    render(<App apiClient={client} />);
+
+    expect(await screen.findByText("公共回收会话")).toBeInTheDocument();
+    expect(screen.getByText(/回收时间/)).toBeInTheDocument();
+  });
+
+  it("shows the embedded login page when public platform is disabled", async () => {
+    const client = createMockApiClient({ initialUser: null });
+
+    render(<App apiClient={client} />);
+
+    expect(await screen.findByLabelText("Email")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "New chat" })).not.toBeInTheDocument();
   });
 
   it("renders the authenticated admin workspace and can send a Hermes prompt", async () => {
@@ -3206,9 +3261,6 @@ describe("App", () => {
 
     render(<App apiClient={client} />);
 
-    expect(await screen.findByRole("button", { name: "New chat" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
-
     expect(await screen.findByRole("heading", { name: "Hermes Hub" })).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Email"), {
       target: { value: "admin@example.com" },
@@ -3262,8 +3314,6 @@ describe("App", () => {
 
     render(<App apiClient={client} />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Sign in" }));
-
     const ldapButton = await screen.findByRole("button", {
       name: "Sign in with Corporate LDAP",
     });
@@ -3289,7 +3339,7 @@ describe("App", () => {
 
     render(<App apiClient={client} />);
 
-    expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
+    expect(await screen.findByLabelText("Email")).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Need to create the first admin?" }),
     ).not.toBeInTheDocument();
@@ -3303,8 +3353,6 @@ describe("App", () => {
     });
 
     render(<App apiClient={client} />);
-
-    fireEvent.click(await screen.findByRole("button", { name: "Sign in" }));
 
     expect(await screen.findByRole("button", { name: "Create account" })).toBeInTheDocument();
     expect(screen.getByLabelText("Confirm password")).toBeInTheDocument();

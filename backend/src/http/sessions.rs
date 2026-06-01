@@ -11,7 +11,12 @@ use axum::{
 use futures_util::{stream, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::HashSet, convert::Infallible, path::PathBuf, time::Duration};
+use std::{
+    collections::HashSet,
+    convert::Infallible,
+    path::PathBuf,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use uuid::Uuid;
 
 use crate::{
@@ -82,6 +87,8 @@ struct PublicSessionSummary {
     title: Option<String>,
     created_at: u64,
     updated_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recycle_at: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -134,6 +141,7 @@ async fn list_sessions(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     let is_authenticated = current_user(&state, &headers).await.is_ok();
+    ensure_public_platform_enabled_for_anonymous(&state, is_authenticated).await?;
     let public_token = public_session_token_from_headers(&headers);
     if !is_authenticated && public_token.is_none() {
         return Ok(Json(SessionListResponse { sessions: vec![] }));
@@ -177,9 +185,18 @@ async fn list_sessions(
         .await
         .map_err(map_channel_error)?;
     let sessions = filter_sessions_for_access(&state, &access, sessions).await?;
+    let mut summaries = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        if matches!(access, SessionAccess::Public { .. })
+            && cleanup_public_session_if_recycled(&state, &session.id).await?
+        {
+            continue;
+        }
+        summaries.push(public_session_summary_for_access(&state, &access, session).await?);
+    }
 
     Ok(Json(SessionListResponse {
-        sessions: sessions.into_iter().map(public_session_summary).collect(),
+        sessions: summaries,
     }))
 }
 
@@ -188,6 +205,11 @@ async fn create_session(
     headers: HeaderMap,
     Json(payload): Json<CreateSessionRequest>,
 ) -> Result<Response, ApiError> {
+    ensure_public_platform_enabled_for_anonymous(
+        &state,
+        current_user(&state, &headers).await.is_ok(),
+    )
+    .await?;
     let access = session_create_access(&state, &headers).await?;
     if access.token.is_some() {
         cleanup_expired_public_sessions(&state).await?;
@@ -201,7 +223,8 @@ async fn create_session(
         .system_settings()
         .await
         .map_err(|_| ApiError::Internal)?;
-    let session = if access.token.is_some() {
+    let is_public_session = access.token.is_some();
+    let session = if is_public_session {
         state
             .channel_store
             .create_session(&access.owner_user_id, &channel.id, kind, payload.title)
@@ -231,14 +254,9 @@ async fn create_session(
             .await
             .map_err(|_| ApiError::Internal)?;
     }
+    let session = public_session_summary_for_create(&state, is_public_session, session).await?;
 
-    let mut response = (
-        StatusCode::CREATED,
-        Json(SessionResponse {
-            session: public_session_summary(session),
-        }),
-    )
-        .into_response();
+    let mut response = (StatusCode::CREATED, Json(SessionResponse { session })).into_response();
     if let Some(cookie) = access.set_cookie {
         response.headers_mut().insert(
             header::SET_COOKIE,
@@ -324,6 +342,19 @@ async fn append_session_message(
     state.session_events.publish(SessionEvent::MessageCreated {
         message: message.clone(),
     });
+    if let Some(updated_session) = refresh_public_session_retention_from_message(
+        &state,
+        access.user_id(),
+        &channel.id,
+        &session_id,
+        message.updated_at,
+    )
+    .await?
+    {
+        state.session_events.publish(SessionEvent::SessionUpdated {
+            session: updated_session,
+        });
+    }
 
     if role == ChannelMessageRole::User {
         let run = state
@@ -382,6 +413,19 @@ async fn update_session_message(
     state.session_events.publish(SessionEvent::MessageUpdated {
         message: message.clone(),
     });
+    if let Some(updated_session) = refresh_public_session_retention_from_message(
+        &state,
+        access.user_id(),
+        &channel.id,
+        &session_id,
+        message.updated_at,
+    )
+    .await?
+    {
+        state.session_events.publish(SessionEvent::SessionUpdated {
+            session: updated_session,
+        });
+    }
 
     Ok(Json(MessageResponse { message }))
 }
@@ -417,14 +461,16 @@ async fn session_events(
 ) -> Result<impl IntoResponse, ApiError> {
     let access = session_access_requiring_session(&state, &headers, &session_id).await?;
     let channel = ensure_public_channel(&state, access.user_id()).await?;
-    state
+    // 先订阅事件，再读取快照，避免读取快照期间提交的新消息丢掉 live 事件。
+    let receiver = state.session_events.subscribe();
+    let session = state
         .channel_store
         .get_session(access.user_id(), &channel.id, &session_id)
         .await
         .map_err(map_channel_error)?;
+    let snapshot_session = public_session_summary_for_access(&state, &access, session).await?;
 
     // SSE 首包带完整快照，浏览器只需要订阅这一条 public 事件流。
-    let receiver = state.session_events.subscribe();
     let messages = state
         .channel_store
         .list_session_messages(access.user_id(), &channel.id, &session_id)
@@ -441,10 +487,16 @@ async fn session_events(
         "type": "messages_snapshot",
         "messages": messages,
         "active_run": active_run,
+        "session": snapshot_session,
     });
     let snapshot_stream =
         stream::once(async move { sse_json_event("messages_snapshot", &snapshot) });
-    let live_stream = session_live_event_stream(receiver, session_id);
+    let live_stream = session_live_event_stream(
+        state.clone(),
+        receiver,
+        session_id,
+        matches!(access, SessionAccess::Public { .. }),
+    );
 
     Ok(Sse::new(snapshot_stream.chain(live_stream)).keep_alive(
         KeepAlive::new()
@@ -522,19 +574,130 @@ async fn clear_persisted_hermes_run(
     Ok(())
 }
 
-fn public_session_summary(session: ChannelSession) -> PublicSessionSummary {
+async fn public_session_summary_for_access(
+    state: &AppState,
+    access: &SessionAccess,
+    session: ChannelSession,
+) -> Result<PublicSessionSummary, ApiError> {
+    let recycle_at = if matches!(access, SessionAccess::Public { .. }) {
+        Some(public_session_recycle_at(state, &session).await?)
+    } else {
+        None
+    };
+    Ok(public_session_summary(session, recycle_at))
+}
+
+async fn public_session_summary_for_create(
+    state: &AppState,
+    is_public_session: bool,
+    session: ChannelSession,
+) -> Result<PublicSessionSummary, ApiError> {
+    let recycle_at = if is_public_session {
+        Some(public_session_recycle_at(state, &session).await?)
+    } else {
+        None
+    };
+    Ok(public_session_summary(session, recycle_at))
+}
+
+fn public_session_summary(
+    session: ChannelSession,
+    recycle_at: Option<u64>,
+) -> PublicSessionSummary {
     PublicSessionSummary {
         id: session.id,
         title: session.title,
         created_at: session.created_at,
         updated_at: session.updated_at,
+        recycle_at,
     }
+}
+
+async fn public_session_recycle_at(
+    state: &AppState,
+    session: &ChannelSession,
+) -> Result<u64, ApiError> {
+    let settings = state
+        .store
+        .system_settings()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    public_session_recycle_at_with_retention(
+        state,
+        session,
+        settings.public_platform.temporary_session_retention_hours,
+    )
+    .await
+}
+
+async fn public_session_recycle_at_with_retention(
+    state: &AppState,
+    session: &ChannelSession,
+    retention_hours: u32,
+) -> Result<u64, ApiError> {
+    let latest_message_at = state
+        .channel_store
+        .latest_session_message_updated_at(&session.id)
+        .await
+        .map_err(map_channel_error)?;
+    let anchor_at = latest_message_at.unwrap_or(session.created_at);
+    Ok(public_session_recycle_at_from_anchor(
+        anchor_at,
+        retention_hours,
+    ))
+}
+
+fn public_session_recycle_at_from_anchor(anchor_at: u64, retention_hours: u32) -> u64 {
+    anchor_at.saturating_add(u64::from(retention_hours) * 60 * 60)
+}
+
+pub(crate) async fn refresh_public_session_retention_from_message(
+    state: &AppState,
+    user_id: &str,
+    channel_id: &str,
+    session_id: &str,
+    message_updated_at: u64,
+) -> Result<Option<ChannelSession>, ApiError> {
+    let Some(public_user_id) = state
+        .store
+        .public_platform_user_id()
+        .await
+        .map_err(|_| ApiError::Internal)?
+    else {
+        return Ok(None);
+    };
+    if public_user_id != user_id {
+        return Ok(None);
+    }
+    let settings = state
+        .store
+        .system_settings()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let recycle_at = public_session_recycle_at_from_anchor(
+        message_updated_at,
+        settings.public_platform.temporary_session_retention_hours,
+    );
+    state
+        .store
+        .refresh_public_session_access_for_session(session_id, recycle_at)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    // 推一个 session_updated 事件给公共页面，让标题栏回收时间不必等手动刷新。
+    let session = state
+        .channel_store
+        .get_session(user_id, channel_id, session_id)
+        .await
+        .map_err(map_channel_error)?;
+    Ok(Some(session))
 }
 
 async fn session_access(state: &AppState, headers: &HeaderMap) -> Result<SessionAccess, ApiError> {
     if let Ok(user) = current_user(state, headers).await {
         return Ok(SessionAccess::Authenticated { user_id: user.id });
     }
+    ensure_public_platform_enabled_for_anonymous(state, false).await?;
 
     let owner_user_id = public_platform_owner_user_id(state).await?;
 
@@ -555,6 +718,7 @@ async fn session_create_access(
             set_cookie: None,
         });
     }
+    ensure_public_platform_enabled_for_anonymous(state, false).await?;
 
     let owner_user_id = public_platform_owner_user_id(state).await?;
     let existing_token = public_session_token_from_headers(headers);
@@ -586,6 +750,9 @@ async fn session_access_requiring_session(
             return Err(ApiError::Unauthorized);
         }
         cleanup_expired_public_sessions(state).await?;
+        if cleanup_public_session_if_recycled(state, session_id).await? {
+            return Err(ApiError::Unauthorized);
+        }
         let allowed = state
             .store
             .public_token_can_access_session(token, session_id)
@@ -594,20 +761,6 @@ async fn session_access_requiring_session(
         if !allowed {
             return Err(ApiError::Unauthorized);
         }
-        let settings = state
-            .store
-            .system_settings()
-            .await
-            .map_err(|_| ApiError::Internal)?;
-        state
-            .store
-            .grant_public_session_access(
-                token,
-                session_id,
-                settings.public_platform.temporary_session_retention_hours,
-            )
-            .await
-            .map_err(|_| ApiError::Internal)?;
     }
     Ok(access)
 }
@@ -661,6 +814,22 @@ fn public_session_cookie(public_token: &str) -> String {
     format!("{PUBLIC_SESSION_COOKIE_NAME}={public_token}; HttpOnly; SameSite=Lax; Path=/")
 }
 
+async fn ensure_public_platform_enabled_for_anonymous(
+    state: &AppState,
+    is_authenticated: bool,
+) -> Result<(), ApiError> {
+    if is_authenticated {
+        return Ok(());
+    }
+    // 匿名公共平台是否开放由部署环境决定，避免多环境共享数据库时互相改写。
+    let enabled = state.config.public_platform_enabled;
+    if enabled {
+        Ok(())
+    } else {
+        Err(ApiError::NotFound("public platform is disabled"))
+    }
+}
+
 async fn public_platform_owner_user_id(state: &AppState) -> Result<String, ApiError> {
     let has_active_admin = state
         .store
@@ -694,16 +863,24 @@ async fn ensure_public_channel(
 }
 
 fn session_live_event_stream(
+    state: AppState,
     receiver: tokio::sync::broadcast::Receiver<SessionEvent>,
     session_id: String,
+    include_public_recycle_at: bool,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     stream::unfold(receiver, move |mut receiver| {
         let session_id = session_id.clone();
+        let state = state.clone();
         async move {
             loop {
                 match receiver.recv().await {
                     Ok(event) if event.session_id() == session_id => {
-                        return Some((sse_json_event(event.event_name(), &event), receiver));
+                        let event_name = event.event_name();
+                        if include_public_recycle_at {
+                            let payload = public_session_event_payload(&state, &event).await;
+                            return Some((sse_json_event(event_name, &payload), receiver));
+                        }
+                        return Some((sse_json_event(event_name, &event), receiver));
                     }
                     Ok(_) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -715,6 +892,24 @@ fn session_live_event_stream(
             }
         }
     })
+}
+
+async fn public_session_event_payload(state: &AppState, event: &SessionEvent) -> Value {
+    match event {
+        SessionEvent::SessionUpdated { session } => {
+            match public_session_recycle_at(state, session).await {
+                Ok(recycle_at) => json!({
+                    "type": "session_updated",
+                    "session": public_session_summary(session.clone(), Some(recycle_at)),
+                }),
+                Err(error) => {
+                    tracing::warn!(error = ?error, session_id = %session.id, "public recycle_at event mapping failed");
+                    json!(event)
+                }
+            }
+        }
+        _ => json!(event),
+    }
 }
 
 fn sse_json_event<T: Serialize>(name: &'static str, payload: &T) -> Result<Event, Infallible> {
@@ -755,55 +950,144 @@ pub(crate) async fn cleanup_expired_public_sessions(state: &AppState) -> Result<
     else {
         return Ok(());
     };
+    let settings = state
+        .store
+        .system_settings()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let retention_hours = settings.public_platform.temporary_session_retention_hours;
+    let now = unix_now();
 
     for session_id in expired_session_ids {
-        let context = match state.channel_store.session_context(&session_id).await {
-            Ok(context) => context,
-            Err(ChannelStoreError::ChannelNotFound) => {
-                state
-                    .store
-                    .delete_public_session_access_for_session(&session_id)
-                    .await
-                    .map_err(|_| ApiError::Internal)?;
-                continue;
-            }
-            Err(error) => return Err(map_channel_error(error)),
-        };
-        if context.user_id != public_user_id {
-            continue;
-        }
-
-        // 公共会话过期是真删除：停止仍在跑的 run，清理 cron 关联，再删 session 和对象。
-        let _ =
-            stop_active_run_for_session(state, &context.user_id, &context.channel_id, &session_id)
-                .await?;
-        delete_managed_cron_jobs_for_session(state, &context.user_id, &session_id).await?;
-        let attachments = state
-            .channel_store
-            .list_session_attachments(&session_id)
-            .await
-            .map_err(map_channel_error)?;
-        delete_session_objects(state, &attachments).await?;
-        let deleted = match state
-            .channel_store
-            .delete_session(&context.user_id, &context.channel_id, &session_id)
-            .await
-        {
-            Ok(deleted) => deleted,
-            Err(ChannelStoreError::ChannelNotFound) => continue,
-            Err(error) => return Err(map_channel_error(error)),
-        };
-        state.session_events.publish(SessionEvent::SessionDeleted {
-            session_id: deleted.session.id.clone(),
-        });
-        state
-            .store
-            .delete_public_session_access_for_session(&session_id)
-            .await
-            .map_err(|_| ApiError::Internal)?;
+        cleanup_public_session_if_recycled_with_retention(
+            state,
+            &session_id,
+            &public_user_id,
+            retention_hours,
+            now,
+        )
+        .await?;
     }
 
     Ok(())
+}
+
+pub(crate) async fn cleanup_public_session_if_recycled(
+    state: &AppState,
+    session_id: &str,
+) -> Result<bool, ApiError> {
+    let Some(public_user_id) = state
+        .store
+        .public_platform_user_id()
+        .await
+        .map_err(|_| ApiError::Internal)?
+    else {
+        return Ok(false);
+    };
+    let settings = state
+        .store
+        .system_settings()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    cleanup_public_session_if_recycled_with_retention(
+        state,
+        session_id,
+        &public_user_id,
+        settings.public_platform.temporary_session_retention_hours,
+        unix_now(),
+    )
+    .await
+}
+
+async fn cleanup_public_session_if_recycled_with_retention(
+    state: &AppState,
+    session_id: &str,
+    public_user_id: &str,
+    retention_hours: u32,
+    now: u64,
+) -> Result<bool, ApiError> {
+    let context = match state.channel_store.session_context(session_id).await {
+        Ok(context) => context,
+        Err(ChannelStoreError::ChannelNotFound) => {
+            state
+                .store
+                .delete_public_session_access_for_session(session_id)
+                .await
+                .map_err(|_| ApiError::Internal)?;
+            return Ok(true);
+        }
+        Err(error) => return Err(map_channel_error(error)),
+    };
+    if context.user_id != public_user_id {
+        return Ok(false);
+    }
+    let session = state
+        .channel_store
+        .get_session(&context.user_id, &context.channel_id, session_id)
+        .await
+        .map_err(map_channel_error)?;
+    let recycle_at =
+        public_session_recycle_at_with_retention(state, &session, retention_hours).await?;
+    if recycle_at > now {
+        state
+            .store
+            .refresh_public_session_access_for_session(session_id, recycle_at)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        return Ok(false);
+    }
+
+    delete_recycled_public_session(state, &context, session_id).await?;
+    Ok(true)
+}
+
+async fn delete_recycled_public_session(
+    state: &AppState,
+    context: &crate::channel::service::ChannelSessionContext,
+    session_id: &str,
+) -> Result<(), ApiError> {
+    // 公共会话过期是真删除：停止仍在跑的 run，清理 cron 关联，再删 session 和对象。
+    let _ = stop_active_run_for_session(state, &context.user_id, &context.channel_id, session_id)
+        .await?;
+    delete_managed_cron_jobs_for_session(state, &context.user_id, session_id).await?;
+    let attachments = state
+        .channel_store
+        .list_session_attachments(session_id)
+        .await
+        .map_err(map_channel_error)?;
+    delete_session_objects(state, &attachments).await?;
+    let deleted = match state
+        .channel_store
+        .delete_session(&context.user_id, &context.channel_id, session_id)
+        .await
+    {
+        Ok(deleted) => deleted,
+        Err(ChannelStoreError::ChannelNotFound) => {
+            state
+                .store
+                .delete_public_session_access_for_session(session_id)
+                .await
+                .map_err(|_| ApiError::Internal)?;
+            return Ok(());
+        }
+        Err(error) => return Err(map_channel_error(error)),
+    };
+    state.session_events.publish(SessionEvent::SessionDeleted {
+        session_id: deleted.session.id.clone(),
+    });
+    state
+        .store
+        .delete_public_session_access_for_session(session_id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    Ok(())
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 pub(crate) async fn delete_managed_cron_jobs_for_session(

@@ -31,6 +31,7 @@ function AppContent({ apiClient }: Required<AppProps>) {
   const { t } = useI18n();
   const [user, setUser] = useState<User | null>(null);
   const [loadingUser, setLoadingUser] = useState(true);
+  const [publicPlatformEnabled, setPublicPlatformEnabled] = useState(false);
   const [activeView, setActiveView] = useState<AppView>("chat");
   const [showLogin, setShowLogin] = useState(() => {
     const params = new URLSearchParams(window.location.search);
@@ -40,6 +41,18 @@ function AppContent({ apiClient }: Required<AppProps>) {
 
   useEffect(() => {
     let alive = true;
+    void apiClient
+      .bootstrapStatus()
+      .then((status) => {
+        if (alive) {
+          setPublicPlatformEnabled(Boolean(status.public_platform_enabled));
+        }
+      })
+      .catch(() => {
+        if (alive) {
+          setPublicPlatformEnabled(false);
+        }
+      });
     void apiClient
       .me()
       .then((nextUser) => {
@@ -75,14 +88,21 @@ function AppContent({ apiClient }: Required<AppProps>) {
   }
 
   if (!user) {
+    const showPublicChat = !showLogin && publicPlatformEnabled;
     return (
       <Layout
         user={null}
-        activeView={showLogin ? "login" : "chat"}
+        activeView={showPublicChat ? "chat" : "login"}
         onNavigate={() => setShowLogin(false)}
-        onLogin={showLogin ? undefined : () => setShowLogin(true)}
+        onLogin={showPublicChat ? () => setShowLogin(true) : undefined}
       >
-        {showLogin ? (
+        {showPublicChat ? (
+          <ChannelSessionRoute
+            active
+            apiClient={apiClient}
+            onOpenChat={() => setShowLogin(false)}
+          />
+        ) : (
           <LoginRoute
             apiClient={apiClient}
             embedded
@@ -90,12 +110,6 @@ function AppContent({ apiClient }: Required<AppProps>) {
               setUser(nextUser);
               setShowLogin(false);
             }}
-          />
-        ) : (
-          <ChannelSessionRoute
-            active
-            apiClient={apiClient}
-            onOpenChat={() => setShowLogin(false)}
           />
         )}
       </Layout>

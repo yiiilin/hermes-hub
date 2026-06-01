@@ -1084,6 +1084,39 @@ impl ChannelStore {
         }
     }
 
+    pub async fn latest_session_message_updated_at(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<u64>, ChannelStoreError> {
+        match &self.backend {
+            ChannelStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
+                Ok(inner
+                    .messages_by_session_id
+                    .get(session_id)
+                    .and_then(|messages| messages.iter().map(|message| message.updated_at).max()))
+            }
+            ChannelStoreBackend::Postgres(pool) => block_on_db(async {
+                let row = sqlx::query(
+                    r#"
+                    select extract(epoch from max(updated_at))::bigint as updated_at
+                    from channel_session_messages
+                    where session_id = $1::uuid
+                    "#,
+                )
+                .bind(session_id)
+                .fetch_one(pool)
+                .await
+                .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+
+                let updated_at: Option<i64> = row
+                    .try_get("updated_at")
+                    .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+                Ok(updated_at.map(|value| value as u64))
+            }),
+        }
+    }
+
     pub async fn find_session_message_by_client_key(
         &self,
         session_id: &str,
