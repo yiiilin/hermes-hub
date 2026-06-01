@@ -19,12 +19,16 @@ use crate::{
         ChannelAttachment, ChannelAttachmentDirection, ChannelAttachmentKind, ChannelStoreError,
         NewChannelAttachment,
     },
-    http::{auth::current_user, ApiError},
+    http::{
+        auth::{cookie_value_from_headers, current_user},
+        ApiError,
+    },
     storage::{session_object_key, ObjectStorageError},
     AppState,
 };
 
 const INTERNAL_ATTACHMENT_METADATA_MAX_BYTES: usize = 64 * 1024;
+const PUBLIC_SESSION_COOKIE_NAME: &str = "hermes_hub_public_session";
 
 pub fn router() -> Router<AppState> {
     Router::new().route(
@@ -381,12 +385,18 @@ async fn download_attachment(
     headers: HeaderMap,
     Path(attachment_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let user = current_user(&state, &headers).await?;
-    let attachment = state
-        .channel_store
-        .get_attachment(&user.id, &attachment_id)
-        .await
-        .map_err(map_channel_error)?;
+    if Uuid::parse_str(&attachment_id).is_err() {
+        return Err(ApiError::NotFound("attachment not found"));
+    }
+    let attachment = if let Ok(user) = current_user(&state, &headers).await {
+        state
+            .channel_store
+            .get_attachment(&user.id, &attachment_id)
+            .await
+            .map_err(map_channel_error)?
+    } else {
+        public_attachment_for_cookie(&state, &headers, &attachment_id).await?
+    };
     ensure_attachment_not_expired(&state, &attachment).await?;
     let stream = state
         .object_storage
@@ -405,6 +415,51 @@ async fn download_attachment(
             .map_err(|_| ApiError::Internal)?,
     );
     Ok(response)
+}
+
+async fn public_attachment_for_cookie(
+    state: &AppState,
+    headers: &HeaderMap,
+    attachment_id: &str,
+) -> Result<ChannelAttachment, ApiError> {
+    let token = cookie_value_from_headers(headers, PUBLIC_SESSION_COOKIE_NAME)
+        .filter(|token| !token.trim().is_empty())
+        .ok_or(ApiError::Unauthorized)?;
+    let public_user_id = state
+        .store
+        .public_platform_user_id()
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::Unauthorized)?;
+    let attachment = state
+        .channel_store
+        .get_attachment(&public_user_id, attachment_id)
+        .await
+        .map_err(map_channel_error)?;
+    let allowed = state
+        .store
+        .public_token_can_access_session(&token, &attachment.session_id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    if !allowed {
+        return Err(ApiError::Unauthorized);
+    }
+    let settings = state
+        .store
+        .system_settings()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    state
+        .store
+        .grant_public_session_access(
+            &token,
+            &attachment.session_id,
+            settings.public_platform.temporary_session_retention_hours,
+        )
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    Ok(attachment)
 }
 
 pub async fn effective_attachment_upload_limit(state: &AppState) -> Result<usize, ApiError> {

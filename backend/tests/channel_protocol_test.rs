@@ -1253,6 +1253,290 @@ async fn public_session_events_stream_session_title_updates() {
 }
 
 #[tokio::test]
+async fn unauthenticated_public_sessions_are_scoped_by_public_cookie() {
+    let store = SessionStore::default();
+    let state = test_state(store.clone());
+    let app = build_router_with_state(state.clone());
+    let admin_cookie = bootstrap_and_login(&app).await;
+    let admin_id = store
+        .user_by_session_cookie(&admin_cookie, "hermes_hub_session")
+        .await
+        .expect("admin can be read from session")
+        .id;
+    store
+        .bind_hermes_instance(managed_instance_for(&admin_id))
+        .await
+        .expect("admin Hermes instance can be bound");
+
+    let initial = request_empty(&app, Method::GET, "/api/sessions", None).await;
+    let (status, initial_body) = response_json(initial).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        initial_body["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .len(),
+        0
+    );
+
+    let created = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent", "title": "public temporary session" }),
+        None,
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let public_cookie = cookie_from(&created);
+    assert!(public_cookie.starts_with("hermes_hub_public_session="));
+    let (_, created_body) = response_json(created).await;
+    let session_id = created_body["session"]["id"].as_str().expect("session id");
+    let public_user_id = store
+        .public_platform_user_id()
+        .await
+        .expect("public platform user lookup succeeds")
+        .expect("public platform user exists");
+    assert_ne!(public_user_id, admin_id);
+
+    let visible = request_empty(&app, Method::GET, "/api/sessions", Some(&public_cookie)).await;
+    let (status, visible_body) = response_json(visible).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(visible_body["sessions"][0]["id"], session_id);
+
+    let isolated = request_empty(&app, Method::GET, "/api/sessions", None).await;
+    let (status, isolated_body) = response_json(isolated).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        isolated_body["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .len(),
+        0
+    );
+    let admin_visible =
+        request_empty(&app, Method::GET, "/api/sessions", Some(&admin_cookie)).await;
+    let (status, admin_visible_body) = response_json(admin_visible).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        admin_visible_body["sessions"]
+            .as_array()
+            .expect("admin sessions array")
+            .len(),
+        0
+    );
+
+    let appended = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{session_id}/messages"),
+        json!({
+            "role": "user",
+            "content": "hello public platform",
+            "attachments": []
+        }),
+        Some(&public_cookie),
+    )
+    .await;
+    assert_eq!(appended.status(), StatusCode::CREATED);
+
+    let rejected = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{session_id}/messages"),
+        json!({
+            "role": "user",
+            "content": "cross public session",
+            "attachments": []
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+    let invalid = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions/not-a-uuid/messages",
+        json!({
+            "role": "user",
+            "content": "invalid public session id",
+            "attachments": []
+        }),
+        Some(&public_cookie),
+    )
+    .await;
+    assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn public_sessions_do_not_consume_admin_session_limit() {
+    let store = SessionStore::default();
+    let state = test_state(store.clone());
+    let app = build_router_with_state(state.clone());
+    let admin_cookie = bootstrap_and_login(&app).await;
+    let mut settings = store.system_settings().await.expect("settings can be read");
+    settings.max_sessions_per_user = 1;
+    store
+        .update_system_settings(settings)
+        .await
+        .expect("settings can be updated");
+
+    let created = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent", "title": "public one" }),
+        None,
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let public_cookie = cookie_from(&created);
+
+    let second_public = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent", "title": "public two" }),
+        Some(&public_cookie),
+    )
+    .await;
+    assert_eq!(second_public.status(), StatusCode::CREATED);
+
+    let admin_session = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent", "title": "admin session" }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(admin_session.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn invalid_public_session_cookie_lists_empty_without_creating_public_user() {
+    let store = SessionStore::default();
+    let app = test_app(store.clone());
+    let _admin_cookie = bootstrap_and_login(&app).await;
+
+    let listed = request_empty(
+        &app,
+        Method::GET,
+        "/api/sessions",
+        Some("hermes_hub_public_session=invalid-token"),
+    )
+    .await;
+    let (status, body) = response_json(listed).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["sessions"].as_array().expect("sessions array").len(),
+        0
+    );
+    assert!(store
+        .public_platform_user_id()
+        .await
+        .expect("public platform user lookup succeeds")
+        .is_none());
+}
+
+#[tokio::test]
+async fn public_session_attachment_download_uses_public_cookie() {
+    let store = SessionStore::default();
+    let state = test_state(store.clone());
+    let app = build_router_with_state(state.clone());
+    let _admin_cookie = bootstrap_and_login(&app).await;
+
+    let created = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent", "title": "public file session" }),
+        None,
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let public_cookie = cookie_from(&created);
+    let (_, created_body) = response_json(created).await;
+    let session_id = created_body["session"]["id"].as_str().expect("session id");
+
+    let boundary = "hermes-public-attachment-boundary";
+    let upload_body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"public.txt\"\r\n\
+         Content-Type: text/plain\r\n\r\n\
+         public attachment\r\n\
+         --{boundary}--\r\n"
+    )
+    .into_bytes();
+    let upload = request_raw(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{session_id}/attachments"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload_body,
+        Some(&public_cookie),
+        None,
+    )
+    .await;
+    let (status, upload_body) = response_json(upload).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let attachment_id = upload_body["attachments"][0]["id"]
+        .as_str()
+        .expect("attachment id");
+
+    let anonymous_download = request_empty(
+        &app,
+        Method::GET,
+        &format!("/api/attachments/{attachment_id}/download"),
+        None,
+    )
+    .await;
+    assert_eq!(anonymous_download.status(), StatusCode::UNAUTHORIZED);
+
+    let invalid_download = request_empty(
+        &app,
+        Method::GET,
+        "/api/attachments/not-a-uuid/download",
+        Some(&public_cookie),
+    )
+    .await;
+    assert_eq!(invalid_download.status(), StatusCode::NOT_FOUND);
+
+    let other_public_session = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent", "title": "other public session" }),
+        None,
+    )
+    .await;
+    assert_eq!(other_public_session.status(), StatusCode::CREATED);
+    let other_public_cookie = cookie_from(&other_public_session);
+    let cross_cookie_download = request_empty(
+        &app,
+        Method::GET,
+        &format!("/api/attachments/{attachment_id}/download"),
+        Some(&other_public_cookie),
+    )
+    .await;
+    assert_eq!(cross_cookie_download.status(), StatusCode::UNAUTHORIZED);
+
+    let download = request_empty(
+        &app,
+        Method::GET,
+        &format!("/api/attachments/{attachment_id}/download"),
+        Some(&public_cookie),
+    )
+    .await;
+    assert_eq!(download.status(), StatusCode::OK);
+    let bytes = to_bytes(download.into_body(), usize::MAX)
+        .await
+        .expect("download body can be read");
+    assert_eq!(&bytes[..], b"public attachment");
+}
+
+#[tokio::test]
 async fn hermes_channel_protocol_uploads_output_file_before_delivering_message() {
     let store = SessionStore::default();
     let state = test_state(store.clone());

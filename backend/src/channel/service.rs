@@ -2269,6 +2269,51 @@ impl ChannelStore {
         }
     }
 
+    pub async fn list_session_attachments(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ChannelAttachment>, ChannelStoreError> {
+        match &self.backend {
+            ChannelStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
+                let mut attachments = inner
+                    .attachments_by_id
+                    .values()
+                    .filter(|attachment| attachment.session_id == session_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                attachments.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+                Ok(attachments)
+            }
+            ChannelStoreBackend::Postgres(pool) => block_on_db(async {
+                let rows = sqlx::query(
+                    r#"
+                    select id::text as id,
+                           session_id::text as session_id,
+                           message_id::text as message_id,
+                           direction,
+                           bucket,
+                           object_key,
+                           name,
+                           content_type,
+                           size_bytes as size,
+                           kind,
+                           extract(epoch from created_at)::bigint as created_at
+                    from channel_attachments
+                    where session_id = $1::uuid
+                    order by created_at asc
+                    "#,
+                )
+                .bind(session_id)
+                .fetch_all(pool)
+                .await
+                .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+
+                rows.iter().map(row_to_attachment).collect()
+            }),
+        }
+    }
+
     pub async fn delete_attachment_for_session(
         &self,
         session_id: &str,

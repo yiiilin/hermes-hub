@@ -18,7 +18,8 @@ use hermes_hub_backend::{
     model_config::{ModelConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND},
     security::crypto::SecretCipher,
     session::store::{
-        LdapSettings, OidcSettings, SessionStore, SpeechInputSettings, SystemSettings,
+        LdapSettings, OidcSettings, PublicPlatformSettings, SessionStore, SpeechInputSettings,
+        SystemSettings,
     },
     storage::InMemoryObjectStorage,
     AppConfig, AppState,
@@ -1292,6 +1293,9 @@ async fn postgres_system_settings_persist_session_limit() {
             max_attachment_upload_bytes: 128 * 1024 * 1024,
             attachment_retention_days: 14,
             speech_input: SpeechInputSettings { enabled: true },
+            public_platform: PublicPlatformSettings {
+                temporary_session_retention_hours: 48,
+            },
             oidc: OidcSettings {
                 enabled: true,
                 display_name: "Acme SSO".to_string(),
@@ -1348,6 +1352,10 @@ async fn postgres_system_settings_persist_session_limit() {
     assert_eq!(reloaded.max_attachment_upload_bytes, 128 * 1024 * 1024);
     assert_eq!(reloaded.attachment_retention_days, 14);
     assert!(reloaded.speech_input.enabled);
+    assert_eq!(
+        reloaded.public_platform.temporary_session_retention_hours,
+        48
+    );
     assert_eq!(reloaded.oidc.client_secret, "oidc-secret");
     assert_eq!(reloaded.ldap.bind_password, "ldap-bind-secret");
 }

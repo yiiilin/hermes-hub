@@ -161,12 +161,17 @@ export type SystemSettings = {
   max_attachment_upload_bytes: number;
   attachment_retention_days: number;
   speech_input: SpeechInputSettings;
+  public_platform: PublicPlatformSettings;
   oidc: OidcSettings;
   ldap: LdapSettings;
 };
 
 export type SpeechInputSettings = {
   enabled: boolean;
+};
+
+export type PublicPlatformSettings = {
+  temporary_session_retention_hours: number;
 };
 
 export type SpeechInputConfig = {
@@ -688,10 +693,19 @@ export function defaultSpeechInputSettings(): SpeechInputSettings {
   };
 }
 
-type SystemSettingsPayload = Partial<Omit<SystemSettings, "oidc" | "ldap" | "speech_input">> & {
+export function defaultPublicPlatformSettings(): PublicPlatformSettings {
+  return {
+    temporary_session_retention_hours: 24,
+  };
+}
+
+type SystemSettingsPayload = Partial<
+  Omit<SystemSettings, "oidc" | "ldap" | "speech_input" | "public_platform">
+> & {
   oidc?: Partial<OidcSettings> | null;
   ldap?: Partial<LdapSettings> | null;
   speech_input?: Partial<SpeechInputSettings> | null;
+  public_platform?: Partial<PublicPlatformSettings> | null;
 };
 
 function systemSettingsFromPayload(settings: SystemSettingsPayload): SystemSettings {
@@ -705,6 +719,10 @@ function systemSettingsFromPayload(settings: SystemSettingsPayload): SystemSetti
     speech_input: {
       ...defaultSpeechInputSettings(),
       ...(settings.speech_input ?? {}),
+    },
+    public_platform: {
+      ...defaultPublicPlatformSettings(),
+      ...(settings.public_platform ?? {}),
     },
     oidc: { ...defaultOidcSettings(), ...(settings.oidc ?? {}) },
     ldap: { ...defaultLdapSettings(), ...(settings.ldap ?? {}) },
@@ -1465,6 +1483,7 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     max_attachment_upload_bytes: 200 * 1024 * 1024,
     attachment_retention_days: 7,
     speech_input: defaultSpeechInputSettings(),
+    public_platform: defaultPublicPlatformSettings(),
     oidc: defaultOidcSettings(),
     ldap: defaultLdapSettings(),
   };

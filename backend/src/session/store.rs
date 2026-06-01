@@ -28,12 +28,16 @@ pub const DEFAULT_MAX_ATTACHMENT_UPLOAD_BYTES: usize = 200 * 1024 * 1024;
 pub const MAX_CONFIGURABLE_ATTACHMENT_UPLOAD_BYTES: usize = 20usize * 1024 * 1024 * 1024;
 const DEFAULT_ATTACHMENT_RETENTION_DAYS: u32 = 7;
 const MAX_ATTACHMENT_RETENTION_DAYS: u32 = 3650;
+const DEFAULT_PUBLIC_SESSION_RETENTION_HOURS: u32 = 24;
+const MAX_PUBLIC_SESSION_RETENTION_HOURS: u32 = 24 * 365;
 const MAX_SESSIONS_PER_USER_KEY: &str = "max_sessions_per_user";
 const MAX_ATTACHMENT_UPLOAD_BYTES_KEY: &str = "max_attachment_upload_bytes";
 const ATTACHMENT_RETENTION_DAYS_KEY: &str = "attachment_retention_days";
 const SPEECH_INPUT_SETTINGS_KEY: &str = "speech_input";
+const PUBLIC_PLATFORM_SETTINGS_KEY: &str = "public_platform";
 const OIDC_SETTINGS_KEY: &str = "oidc";
 const LDAP_SETTINGS_KEY: &str = "ldap";
+pub const PUBLIC_PLATFORM_USER_EMAIL: &str = "public-platform@hermes-hub.local";
 
 #[derive(Clone)]
 pub struct SessionStore {
@@ -64,6 +68,7 @@ struct StoreInner {
     hermes_gateway_restart_pending_by_instance_id: HashMap<String, bool>,
     hermes_scheduler_snapshots_by_instance_id: HashMap<String, HermesSchedulerSnapshot>,
     hermes_lifecycle_by_instance_id: HashMap<String, HermesLifecycleState>,
+    public_session_access: Vec<PublicSessionAccess>,
     proxy_audit_logs: Vec<ProxyAuditEvent>,
     llm_usage_events: Vec<LlmUsageEvent>,
     system_settings: SystemSettings,
@@ -81,6 +86,7 @@ impl Default for StoreInner {
             hermes_gateway_restart_pending_by_instance_id: HashMap::new(),
             hermes_scheduler_snapshots_by_instance_id: HashMap::new(),
             hermes_lifecycle_by_instance_id: HashMap::new(),
+            public_session_access: Vec::new(),
             proxy_audit_logs: Vec::new(),
             llm_usage_events: Vec::new(),
             system_settings: SystemSettings::default(),
@@ -98,6 +104,8 @@ pub struct SystemSettings {
     #[serde(default)]
     pub speech_input: SpeechInputSettings,
     #[serde(default)]
+    pub public_platform: PublicPlatformSettings,
+    #[serde(default)]
     pub oidc: OidcSettings,
     #[serde(default)]
     pub ldap: LdapSettings,
@@ -108,6 +116,13 @@ pub struct SystemSettings {
 #[serde(default)]
 pub struct SpeechInputSettings {
     pub enabled: bool,
+}
+
+/// 公共平台只保存运行策略；真正的沙盒和公共 Hermes 后续仍由独立组件承接。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PublicPlatformSettings {
+    pub temporary_session_retention_hours: u32,
 }
 
 /// 管理员可配置的 OIDC 参数。字段名尽量贴近 Outline 的环境变量语义，
@@ -169,6 +184,7 @@ impl Default for SystemSettings {
             max_attachment_upload_bytes: DEFAULT_MAX_ATTACHMENT_UPLOAD_BYTES,
             attachment_retention_days: DEFAULT_ATTACHMENT_RETENTION_DAYS,
             speech_input: SpeechInputSettings::default(),
+            public_platform: PublicPlatformSettings::default(),
             oidc: OidcSettings::default(),
             ldap: LdapSettings::default(),
         }
@@ -178,6 +194,14 @@ impl Default for SystemSettings {
 impl Default for SpeechInputSettings {
     fn default() -> Self {
         Self { enabled: false }
+    }
+}
+
+impl Default for PublicPlatformSettings {
+    fn default() -> Self {
+        Self {
+            temporary_session_retention_hours: DEFAULT_PUBLIC_SESSION_RETENTION_HOURS,
+        }
     }
 }
 
@@ -229,6 +253,13 @@ impl Default for LdapSettings {
 #[derive(Clone)]
 struct StoredSession {
     user_id: String,
+    expires_at: u64,
+}
+
+#[derive(Clone)]
+struct PublicSessionAccess {
+    token_hash: String,
+    session_id: String,
     expires_at: u64,
 }
 
@@ -368,15 +399,20 @@ impl SessionStore {
         match &self.backend {
             SessionStoreBackend::Memory(inner) => {
                 let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
-                Ok(inner.users_by_id.is_empty())
+                Ok(inner
+                    .users_by_id
+                    .values()
+                    .all(|user| user.email == PUBLIC_PLATFORM_USER_EMAIL))
             }
             SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
-                let count = sqlx::query("select count(*)::bigint as count from users")
-                    .fetch_one(pool)
-                    .await
-                    .map_err(|_| StoreError::DatabaseFailed)?
-                    .try_get::<i64, _>("count")
-                    .map_err(|_| StoreError::DatabaseFailed)?;
+                let count =
+                    sqlx::query("select count(*)::bigint as count from users where email <> $1")
+                        .bind(PUBLIC_PLATFORM_USER_EMAIL)
+                        .fetch_one(pool)
+                        .await
+                        .map_err(|_| StoreError::DatabaseFailed)?
+                        .try_get::<i64, _>("count")
+                        .map_err(|_| StoreError::DatabaseFailed)?;
 
                 Ok(count == 0)
             }),
@@ -388,11 +424,18 @@ impl SessionStore {
         email: &str,
         password: &str,
     ) -> Result<User, StoreError> {
+        if is_public_platform_reserved_email(email) {
+            return Err(StoreError::EmailAlreadyRegistered);
+        }
         match &self.backend {
             SessionStoreBackend::Memory(inner) => {
                 let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
 
-                if !inner.users_by_id.is_empty() {
+                let has_human_user = inner
+                    .users_by_id
+                    .values()
+                    .any(|user| user.email != PUBLIC_PLATFORM_USER_EMAIL);
+                if has_human_user {
                     return Err(StoreError::BootstrapClosed);
                 }
 
@@ -404,12 +447,14 @@ impl SessionStore {
                     .execute(&mut *tx)
                     .await
                     .map_err(|_| StoreError::DatabaseFailed)?;
-                let count = sqlx::query("select count(*)::bigint as count from users")
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|_| StoreError::DatabaseFailed)?
-                    .try_get::<i64, _>("count")
-                    .map_err(|_| StoreError::DatabaseFailed)?;
+                let count =
+                    sqlx::query("select count(*)::bigint as count from users where email <> $1")
+                        .bind(PUBLIC_PLATFORM_USER_EMAIL)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(|_| StoreError::DatabaseFailed)?
+                        .try_get::<i64, _>("count")
+                        .map_err(|_| StoreError::DatabaseFailed)?;
 
                 if count > 0 {
                     return Err(StoreError::BootstrapClosed);
@@ -435,6 +480,9 @@ impl SessionStore {
         email: &str,
         password: &str,
     ) -> Result<User, StoreError> {
+        if is_public_platform_reserved_email(email) {
+            return Err(StoreError::EmailAlreadyRegistered);
+        }
         match &self.backend {
             SessionStoreBackend::Memory(inner) => {
                 let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
@@ -521,6 +569,9 @@ impl SessionStore {
     }
 
     pub async fn login(&self, email: &str, password: &str) -> Result<User, StoreError> {
+        if is_public_platform_reserved_email(email) {
+            return Err(StoreError::InvalidCredentials);
+        }
         match &self.backend {
             SessionStoreBackend::Memory(inner) => {
                 let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
@@ -617,11 +668,69 @@ impl SessionStore {
         }
     }
 
+    pub async fn public_platform_user_id(&self) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .user_by_email(PUBLIC_PLATFORM_USER_EMAIL)
+            .await?
+            .map(|user| user.id))
+    }
+
+    pub async fn ensure_public_platform_user(&self) -> Result<User, StoreError> {
+        if let Some(user) = self.user_by_email(PUBLIC_PLATFORM_USER_EMAIL).await? {
+            return Ok(user);
+        }
+
+        let password = random_token();
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                if let Some(user_id) = inner
+                    .user_ids_by_email
+                    .get(PUBLIC_PLATFORM_USER_EMAIL)
+                    .cloned()
+                {
+                    return inner
+                        .users_by_id
+                        .get(&user_id)
+                        .cloned()
+                        .ok_or(StoreError::DatabaseFailed);
+                }
+                inner.create_user(
+                    PUBLIC_PLATFORM_USER_EMAIL,
+                    &password,
+                    UserRole::User,
+                    UserAuthProvider::Local,
+                )
+            }
+            SessionStoreBackend::Postgres { pool, .. } => {
+                match postgres_create_user(
+                    pool,
+                    PUBLIC_PLATFORM_USER_EMAIL,
+                    &password,
+                    UserRole::User,
+                    UserAuthProvider::Local,
+                )
+                .await
+                {
+                    Ok(user) => Ok(user),
+                    Err(StoreError::EmailAlreadyRegistered) => self
+                        .user_by_email(PUBLIC_PLATFORM_USER_EMAIL)
+                        .await?
+                        .ok_or(StoreError::DatabaseFailed),
+                    Err(error) => Err(error),
+                }
+            }
+        }
+    }
+
     pub async fn get_or_create_oidc_user(
         &self,
         email: &str,
         auto_create: bool,
     ) -> Result<OidcUserResult, StoreError> {
+        if is_public_platform_reserved_email(email) {
+            return Err(StoreError::InvalidCredentials);
+        }
         if let Some(user) = self.user_by_email(email).await? {
             if user.status == UserStatus::Active {
                 return Ok(OidcUserResult {
@@ -674,6 +783,9 @@ impl SessionStore {
         email: &str,
         auto_create: bool,
     ) -> Result<LdapUserResult, StoreError> {
+        if is_public_platform_reserved_email(email) {
+            return Err(StoreError::InvalidCredentials);
+        }
         if let Some(user) = self.user_by_email(email).await? {
             if user.status == UserStatus::Active {
                 return Ok(LdapUserResult {
@@ -799,7 +911,9 @@ impl SessionStore {
                 }
 
                 let user = row_to_user(&row)?;
-                if user.status != UserStatus::Active {
+                if user.status != UserStatus::Active
+                    || is_public_platform_reserved_email(&user.email)
+                {
                     return Err(StoreError::Unauthorized);
                 }
 
@@ -948,6 +1062,7 @@ impl SessionStore {
                 let mut users = inner
                     .users_by_id
                     .values()
+                    .filter(|user| user.email != PUBLIC_PLATFORM_USER_EMAIL)
                     .map(User::list_item)
                     .collect::<Vec<_>>();
 
@@ -966,9 +1081,11 @@ impl SessionStore {
                            extract(epoch from created_at)::bigint as created_at,
                            extract(epoch from updated_at)::bigint as updated_at
                     from users
+                    where email <> $1
                     order by created_at desc
                     "#,
                 )
+                .bind(PUBLIC_PLATFORM_USER_EMAIL)
                 .fetch_all(pool)
                 .await
                 .map_err(|_| StoreError::DatabaseFailed)?;
@@ -1788,6 +1905,20 @@ impl SessionStore {
                     .transpose()?
                     .unwrap_or_default();
 
+                let public_platform =
+                    sqlx::query("select value from system_settings where key = $1")
+                        .bind(PUBLIC_PLATFORM_SETTINGS_KEY)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(|_| StoreError::DatabaseFailed)?
+                        .and_then(|row| row.try_get::<String, _>("value").ok())
+                        .map(|value| {
+                            serde_json::from_str::<PublicPlatformSettings>(&value)
+                                .map_err(|_| StoreError::DatabaseFailed)
+                        })
+                        .transpose()?
+                        .unwrap_or_default();
+
                 let oidc = sqlx::query("select value from system_settings where key = $1")
                     .bind(OIDC_SETTINGS_KEY)
                     .fetch_optional(pool)
@@ -1821,6 +1952,7 @@ impl SessionStore {
                     max_attachment_upload_bytes,
                     attachment_retention_days,
                     speech_input,
+                    public_platform,
                     oidc,
                     ldap,
                 })
@@ -1853,6 +1985,24 @@ impl SessionStore {
                 )
                 .bind(MAX_SESSIONS_PER_USER_KEY)
                 .bind(settings.max_sessions_per_user.to_string())
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                sqlx::query(
+                    r#"
+                    insert into system_settings (key, value, updated_at)
+                    values ($1, $2, now())
+                    on conflict (key) do update set
+                        value = excluded.value,
+                        updated_at = now()
+                    "#,
+                )
+                .bind(PUBLIC_PLATFORM_SETTINGS_KEY)
+                .bind(
+                    serde_json::to_string(&settings.public_platform)
+                        .map_err(|_| StoreError::DatabaseFailed)?,
+                )
                 .execute(pool)
                 .await
                 .map_err(|_| StoreError::DatabaseFailed)?;
@@ -1936,6 +2086,263 @@ impl SessionStore {
                 .map_err(|_| StoreError::DatabaseFailed)?;
 
                 Ok(settings)
+            }),
+        }
+    }
+
+    pub async fn first_active_admin_user_id(&self) -> Result<Option<String>, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                Ok(inner
+                    .users_by_id
+                    .values()
+                    .filter(|user| {
+                        user.role == UserRole::Admin && user.status == UserStatus::Active
+                    })
+                    .min_by_key(|user| user.created_at)
+                    .map(|user| user.id.clone()))
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let row = sqlx::query(
+                    r#"
+                    select id::text as id
+                    from users
+                    where role = 'admin' and status = 'active'
+                    order by created_at asc
+                    limit 1
+                    "#,
+                )
+                .fetch_optional(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                row.map(|row| row.try_get::<String, _>("id"))
+                    .transpose()
+                    .map_err(|_| StoreError::DatabaseFailed)
+            }),
+        }
+    }
+
+    pub async fn grant_public_session_access(
+        &self,
+        public_token: &str,
+        session_id: &str,
+        retention_hours: u32,
+    ) -> Result<(), StoreError> {
+        let token_hash = hash_token(public_token);
+        let expires_at = unix_now().saturating_add(u64::from(retention_hours) * 60 * 60);
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                // 同一个匿名浏览器重复创建或刷新 session 时，只延长它自己的访问窗口。
+                if let Some(access) = inner.public_session_access.iter_mut().find(|access| {
+                    access.token_hash == token_hash && access.session_id == session_id
+                }) {
+                    access.expires_at = expires_at;
+                } else {
+                    inner.public_session_access.push(PublicSessionAccess {
+                        token_hash,
+                        session_id: session_id.to_string(),
+                        expires_at,
+                    });
+                }
+                Ok(())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                sqlx::query(
+                    r#"
+                    insert into public_session_access (id, token_hash, session_id, expires_at)
+                    values ($1::uuid, $2, $3::uuid, to_timestamp($4))
+                    on conflict (token_hash, session_id) do update set
+                        expires_at = excluded.expires_at
+                    "#,
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(token_hash)
+                .bind(session_id)
+                .bind(expires_at as f64)
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+                Ok(())
+            }),
+        }
+    }
+
+    pub async fn public_session_ids_for_token(
+        &self,
+        public_token: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let token_hash = hash_token(public_token);
+        let now = unix_now();
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                Ok(inner
+                    .public_session_access
+                    .iter()
+                    .filter(|access| access.token_hash == token_hash)
+                    .filter(|access| access.expires_at > now)
+                    .map(|access| access.session_id.clone())
+                    .collect())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let rows = sqlx::query(
+                    r#"
+                    select session_id::text as session_id
+                    from public_session_access
+                    where token_hash = $1 and expires_at > now()
+                    "#,
+                )
+                .bind(token_hash)
+                .fetch_all(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                rows.into_iter()
+                    .map(|row| row.try_get::<String, _>("session_id"))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| StoreError::DatabaseFailed)
+            }),
+        }
+    }
+
+    pub async fn public_token_can_access_session(
+        &self,
+        public_token: &str,
+        session_id: &str,
+    ) -> Result<bool, StoreError> {
+        let token_hash = hash_token(public_token);
+        let now = unix_now();
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                Ok(inner.public_session_access.iter().any(|access| {
+                    access.token_hash == token_hash
+                        && access.session_id == session_id
+                        && access.expires_at > now
+                }))
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let exists = sqlx::query(
+                    r#"
+                    select exists(
+                        select 1
+                        from public_session_access
+                        where token_hash = $1
+                          and session_id = $2::uuid
+                          and expires_at > now()
+                    ) as exists
+                    "#,
+                )
+                .bind(token_hash)
+                .bind(session_id)
+                .fetch_one(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?
+                .try_get::<bool, _>("exists")
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                Ok(exists)
+            }),
+        }
+    }
+
+    pub async fn expired_public_session_ids(&self) -> Result<Vec<String>, StoreError> {
+        let now = unix_now();
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let mut expired_session_ids = inner
+                    .public_session_access
+                    .iter()
+                    .filter(|access| access.expires_at <= now)
+                    .map(|access| access.session_id.clone())
+                    .collect::<Vec<_>>();
+                expired_session_ids.sort();
+                expired_session_ids.dedup();
+                expired_session_ids.retain(|session_id| {
+                    !inner
+                        .public_session_access
+                        .iter()
+                        .any(|access| access.session_id == *session_id && access.expires_at > now)
+                });
+                Ok(expired_session_ids)
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let rows = sqlx::query(
+                    r#"
+                    select distinct expired.session_id::text as session_id
+                    from public_session_access expired
+                    where expired.expires_at <= now()
+                      and not exists (
+                          select 1
+                          from public_session_access remaining
+                          where remaining.session_id = expired.session_id
+                            and remaining.expires_at > now()
+                      )
+                    "#,
+                )
+                .fetch_all(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                rows.into_iter()
+                    .map(|row| row.try_get::<String, _>("session_id"))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| StoreError::DatabaseFailed)
+            }),
+        }
+    }
+
+    pub async fn delete_public_session_access_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<(), StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                inner
+                    .public_session_access
+                    .retain(|access| access.session_id != session_id);
+                Ok(())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                sqlx::query("delete from public_session_access where session_id = $1::uuid")
+                    .bind(session_id)
+                    .execute(pool)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?;
+                Ok(())
+            }),
+        }
+    }
+
+    pub async fn revoke_public_session_access(
+        &self,
+        public_token: &str,
+        session_id: &str,
+    ) -> Result<(), StoreError> {
+        let token_hash = hash_token(public_token);
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                inner.public_session_access.retain(|access| {
+                    !(access.token_hash == token_hash && access.session_id == session_id)
+                });
+                Ok(())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                sqlx::query(
+                    "delete from public_session_access where token_hash = $1 and session_id = $2::uuid",
+                )
+                .bind(token_hash)
+                .bind(session_id)
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+                Ok(())
             }),
         }
     }
@@ -2030,6 +2437,12 @@ fn validate_system_settings(settings: &SystemSettings) -> Result<(), StoreError>
     }
     if settings.attachment_retention_days == 0
         || settings.attachment_retention_days > MAX_ATTACHMENT_RETENTION_DAYS
+    {
+        return Err(StoreError::InvalidSystemSettings);
+    }
+    if settings.public_platform.temporary_session_retention_hours == 0
+        || settings.public_platform.temporary_session_retention_hours
+            > MAX_PUBLIC_SESSION_RETENTION_HOURS
     {
         return Err(StoreError::InvalidSystemSettings);
     }
@@ -2248,7 +2661,9 @@ fn user_by_session_token_in_memory(
     inner
         .users_by_id
         .get(&session.user_id)
-        .filter(|user| user.status == UserStatus::Active)
+        .filter(|user| {
+            user.status == UserStatus::Active && !is_public_platform_reserved_email(&user.email)
+        })
         .cloned()
         .ok_or(StoreError::Unauthorized)
 }
@@ -2907,6 +3322,10 @@ fn hermes_status_as_str(status: &HermesInstanceStatus) -> &'static str {
 
 fn normalize_email(email: &str) -> String {
     email.trim().to_ascii_lowercase()
+}
+
+fn is_public_platform_reserved_email(email: &str) -> bool {
+    normalize_email(email) == PUBLIC_PLATFORM_USER_EMAIL
 }
 
 fn unix_now() -> u64 {

@@ -3,6 +3,7 @@ import type { User } from "../api/client";
 import {
   Bot,
   CalendarClock,
+  LogIn,
   LogOut,
   Menu,
   PanelLeftClose,
@@ -14,7 +15,7 @@ import {
 import { useI18n } from "../i18n";
 import { createContext, useContext, useEffect, useState } from "react";
 
-export type AppView = "chat" | "admin-settings" | "scheduled-tasks" | "personal-settings";
+export type AppView = "chat" | "login" | "admin-settings" | "scheduled-tasks" | "personal-settings";
 
 type ChatSidebarSetter = Dispatch<SetStateAction<ReactNode>>;
 
@@ -26,10 +27,11 @@ type LayoutProps = {
   user: User | null;
   activeView: AppView;
   onNavigate: (view: AppView) => void;
+  onLogin?: () => void;
   onLogout?: () => void;
 };
 
-export function Layout({ children, user, activeView, onNavigate, onLogout }: LayoutProps) {
+export function Layout({ children, user, activeView, onNavigate, onLogin, onLogout }: LayoutProps) {
   const { t } = useI18n();
   const [chatSidebar, setChatSidebar] = useState<ReactNode>(null);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
@@ -145,7 +147,7 @@ export function Layout({ children, user, activeView, onNavigate, onLogout }: Lay
               )}
             </button>
           </div>
-          {user ? <div className="sidebar-chat">{chatSidebar}</div> : null}
+          <div className="sidebar-chat">{chatSidebar}</div>
           <nav className="sidebar-bottom">
             {user?.role === "admin" ? (
               <div className="nav-group">
@@ -197,6 +199,21 @@ export function Layout({ children, user, activeView, onNavigate, onLogout }: Lay
                   </button>
                 </div>
               </>
+            ) : onLogin ? (
+              <div className="nav-group">
+                <button
+                  type="button"
+                  className="nav-link"
+                  onClick={() => {
+                    setMobileSidebarOpen(false);
+                    onLogin?.();
+                  }}
+                  title={t("layout.signIn")}
+                >
+                  <LogIn aria-hidden="true" size={18} />
+                  <span>{t("layout.signIn")}</span>
+                </button>
+              </div>
             ) : null}
           </nav>
         </aside>

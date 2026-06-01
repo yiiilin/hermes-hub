@@ -237,6 +237,16 @@ async fn user_has_global_skills_write_access(
     state: &AppState,
     user_id: &str,
 ) -> Result<bool, ApiError> {
+    if state
+        .store
+        .public_platform_user_id()
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .is_some_and(|public_user_id| public_user_id == user_id)
+    {
+        return Ok(false);
+    }
+
     let users = state
         .store
         .list_users()

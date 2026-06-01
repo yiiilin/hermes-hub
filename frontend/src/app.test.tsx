@@ -593,6 +593,20 @@ describe("App", () => {
     expect(ensureHermes).toHaveBeenCalledTimes(1);
   });
 
+  it("opens the public chat for unauthenticated visitors and keeps sign-in in the lower sidebar", async () => {
+    const client = createMockApiClient({ initialUser: null });
+
+    render(<App apiClient={client} />);
+
+    expect(await screen.findByRole("button", { name: "New chat" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Message")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Email")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+
+    expect(await screen.findByLabelText("Email")).toBeInTheDocument();
+  });
+
   it("renders the authenticated admin workspace and can send a Hermes prompt", async () => {
     render(<App apiClient={createMockApiClient()} />);
 
@@ -3135,6 +3149,33 @@ describe("App", () => {
     });
   });
 
+  it("shows and saves public platform settings", async () => {
+    const client = createMockApiClient();
+    const updateSystemSettings = client.updateSystemSettings.bind(client);
+    let savedSettings: unknown = null;
+    client.updateSystemSettings = vi.fn(async (settings) => {
+      savedSettings = settings;
+      await updateSystemSettings(settings);
+    });
+
+    render(<App apiClient={client} />);
+
+    const settingsTabs = await openSettingsTab("Public platform");
+    fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Public platform" }));
+
+    fireEvent.change(await screen.findByLabelText("Temporary session retention (hours)"), {
+      target: { value: "48" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+
+    expect(await screen.findByText("Settings saved")).toBeInTheDocument();
+    expect(savedSettings).toMatchObject({
+      public_platform: {
+        temporary_session_retention_hours: 48,
+      },
+    });
+  });
+
   it("localizes the configured session limit message in Chinese", async () => {
     localStorage.setItem("hermes-hub-language", "zh");
     const alertSpy = vi.spyOn(window, "alert").mockImplementation(() => undefined);
@@ -3165,15 +3206,17 @@ describe("App", () => {
 
     render(<App apiClient={client} />);
 
+    expect(await screen.findByRole("button", { name: "New chat" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+
     expect(await screen.findByRole("heading", { name: "Hermes Hub" })).toBeInTheDocument();
-    const signInButton = await screen.findByRole("button", { name: "Sign in" });
-    expect(screen.queryByLabelText("Primary")).not.toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Email"), {
       target: { value: "admin@example.com" },
     });
     fireEvent.change(screen.getByLabelText("Password"), {
       target: { value: "admin-password-123" },
     });
+    const signInButton = screen.getByRole("button", { name: "Sign in" });
     fireEvent.click(signInButton);
 
     await waitFor(() => {
@@ -3192,6 +3235,8 @@ describe("App", () => {
     });
 
     render(<App apiClient={client} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Sign in" }));
 
     const oidcButton = await screen.findByRole("link", {
       name: "Sign in with Acme SSO",
@@ -3216,6 +3261,8 @@ describe("App", () => {
     });
 
     render(<App apiClient={client} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Sign in" }));
 
     const ldapButton = await screen.findByRole("button", {
       name: "Sign in with Corporate LDAP",
@@ -3257,9 +3304,11 @@ describe("App", () => {
 
     render(<App apiClient={client} />);
 
+    fireEvent.click(await screen.findByRole("button", { name: "Sign in" }));
+
     expect(await screen.findByRole("button", { name: "Create account" })).toBeInTheDocument();
     expect(screen.getByLabelText("Confirm password")).toBeInTheDocument();
-    expect(screen.queryByLabelText("Primary")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Primary")).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Email"), {
       target: { value: "admin@example.com" },

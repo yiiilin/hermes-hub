@@ -5,12 +5,13 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 
 type LoginRouteProps = {
   apiClient: ApiClient;
+  embedded?: boolean;
   onAuthenticated: (user: User) => void;
 };
 
 type AuthMode = "login" | "bootstrap" | "invite";
 
-export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
+export function LoginRoute({ apiClient, embedded = false, onAuthenticated }: LoginRouteProps) {
   const { t } = useI18n();
   const inviteFromUrl = useMemo(() => {
     const params = new URLSearchParams(window.location.search);
@@ -112,8 +113,10 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
     }
   }
 
+  const Shell = embedded ? "div" : "main";
+
   return (
-    <main className="auth-shell">
+    <Shell className="auth-shell">
       <section className="auth-card" aria-labelledby="login-title">
         <div className="auth-brand" aria-hidden="true">
           <Bot size={28} />
@@ -199,7 +202,7 @@ export function LoginRoute({ apiClient, onAuthenticated }: LoginRouteProps) {
           </button>
         ) : null}
       </section>
-    </main>
+    </Shell>
   );
 }
 

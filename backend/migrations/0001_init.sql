@@ -218,6 +218,21 @@ create table if not exists channel_sessions (
     updated_at timestamptz not null default now()
 );
 
+create table if not exists public_session_access (
+    id uuid primary key,
+    token_hash text not null,
+    session_id uuid not null references channel_sessions(id) on delete cascade,
+    expires_at timestamptz not null,
+    created_at timestamptz not null default now(),
+    unique (token_hash, session_id)
+);
+
+create index if not exists public_session_access_token_hash_idx
+    on public_session_access (token_hash);
+
+create index if not exists public_session_access_expires_at_idx
+    on public_session_access (expires_at);
+
 create table if not exists channel_session_messages (
     id uuid primary key,
     session_id uuid not null references channel_sessions(id) on delete cascade,

@@ -19,6 +19,7 @@ import type {
 import {
   defaultLdapSettings,
   defaultOidcSettings,
+  defaultPublicPlatformSettings,
   defaultSpeechInputSettings,
 } from "../api/client";
 import { useI18n } from "../i18n";
@@ -35,6 +36,7 @@ type AdminSettingsTab =
   | "scheduler"
   | "skills"
   | "system"
+  | "public-platform"
   | "auth";
 
 type AdminRouteProps = {
@@ -461,6 +463,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     max_attachment_upload_bytes: 200 * 1024 * 1024,
     attachment_retention_days: 7,
     speech_input: defaultSpeechInputSettings(),
+    public_platform: defaultPublicPlatformSettings(),
     oidc: defaultOidcSettings(),
     ldap: defaultLdapSettings(),
   });
@@ -519,6 +522,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     { key: "scheduler", label: t("admin.scheduledTasks") },
     { key: "skills", label: t("admin.skillManagement") },
     { key: "system", label: t("admin.systemParameters") },
+    { key: "public-platform", label: t("admin.publicPlatform") },
     { key: "auth", label: t("admin.authSettings") },
   ];
 
@@ -539,7 +543,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
         apiClient.listInvites(),
         apiClient.listHermesInstances(),
         apiClient.modelConfigStatus(),
-        activeTab === "auth" || activeTab === "system"
+        activeTab === "auth" || activeTab === "system" || activeTab === "public-platform"
           ? apiClient.systemSettings()
           : Promise.resolve(null),
         activeTab === "scheduler"
@@ -1778,6 +1782,44 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
               ? t("admin.speechInputRuntimeAvailable")
               : t("admin.speechInputRuntimeUnavailable")}
           </p>
+          <div className="button-row">
+            <button type="submit">{t("admin.saveSettings")}</button>
+          </div>
+        </form>
+      </section>,
+    );
+  }
+
+  if (activeTab === "public-platform") {
+    return renderSystemSettingsShell(
+      <section className="admin-page" id="admin-public-platform">
+        <form className="panel form" onSubmit={(event) => void saveSystemSettings(event)}>
+          <div className="tab-actions">
+            <button type="button" className="secondary" onClick={() => void refresh()}>
+              {t("admin.refresh")}
+            </button>
+          </div>
+          {error ? <p className="error">{error}</p> : null}
+          {settingsSaved ? <p className="copy-line">{t("admin.settingsSaved")}</p> : null}
+          <label>
+            {t("admin.publicTemporarySessionRetentionHours")}
+            <input
+              type="number"
+              min={1}
+              max={8760}
+              value={systemSettings.public_platform.temporary_session_retention_hours}
+              onChange={(event) =>
+                setSystemSettings({
+                  ...systemSettings,
+                  public_platform: {
+                    ...systemSettings.public_platform,
+                    temporary_session_retention_hours: Number(event.target.value),
+                  },
+                })
+              }
+              required
+            />
+          </label>
           <div className="button-row">
             <button type="submit">{t("admin.saveSettings")}</button>
           </div>

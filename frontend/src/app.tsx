@@ -32,6 +32,10 @@ function AppContent({ apiClient }: Required<AppProps>) {
   const [user, setUser] = useState<User | null>(null);
   const [loadingUser, setLoadingUser] = useState(true);
   const [activeView, setActiveView] = useState<AppView>("chat");
+  const [showLogin, setShowLogin] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    return Boolean(params.get("invite") ?? params.get("invite_token"));
+  });
   useHermesActivityPrewarm(user, apiClient);
 
   useEffect(() => {
@@ -63,6 +67,7 @@ function AppContent({ apiClient }: Required<AppProps>) {
     await apiClient.logout();
     setUser(null);
     setActiveView("chat");
+    setShowLogin(false);
   }
 
   if (loadingUser) {
@@ -70,7 +75,31 @@ function AppContent({ apiClient }: Required<AppProps>) {
   }
 
   if (!user) {
-    return <LoginRoute apiClient={apiClient} onAuthenticated={setUser} />;
+    return (
+      <Layout
+        user={null}
+        activeView={showLogin ? "login" : "chat"}
+        onNavigate={() => setShowLogin(false)}
+        onLogin={showLogin ? undefined : () => setShowLogin(true)}
+      >
+        {showLogin ? (
+          <LoginRoute
+            apiClient={apiClient}
+            embedded
+            onAuthenticated={(nextUser) => {
+              setUser(nextUser);
+              setShowLogin(false);
+            }}
+          />
+        ) : (
+          <ChannelSessionRoute
+            active
+            apiClient={apiClient}
+            onOpenChat={() => setShowLogin(false)}
+          />
+        )}
+      </Layout>
+    );
   }
 
   return (
