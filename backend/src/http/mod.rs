@@ -7,6 +7,7 @@ pub mod ldap;
 pub mod llm_proxy;
 pub mod oidc;
 pub mod sessions;
+pub mod speech;
 pub mod workspace;
 
 use axum::{
@@ -28,6 +29,7 @@ pub fn router() -> Router<AppState> {
         .merge(attachments::router())
         .merge(channel_protocol::router())
         .merge(sessions::router())
+        .merge(speech::router())
         .merge(llm_proxy::router())
         .merge(workspace::router())
         .merge(crate::channel::routes::router())
@@ -101,6 +103,7 @@ pub enum ApiError {
     BadGateway(&'static str),
     BadGatewayMessage(String),
     GatewayTimeout(&'static str),
+    ServiceUnavailable(&'static str),
     Internal,
 }
 
@@ -163,6 +166,12 @@ impl IntoResponse for ApiError {
             ApiError::GatewayTimeout(message) => (
                 StatusCode::GATEWAY_TIMEOUT,
                 "gateway_timeout",
+                message.to_string(),
+                None,
+            ),
+            ApiError::ServiceUnavailable(message) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
                 message.to_string(),
                 None,
             ),

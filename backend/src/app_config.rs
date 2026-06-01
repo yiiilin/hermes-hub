@@ -20,6 +20,7 @@ pub struct AppConfig {
     pub object_storage: ObjectStorageConfig,
     pub skills_fs: SkillsFsConfig,
     pub managed_profile: ManagedProfileConfig,
+    pub speech_input: SpeechInputConfig,
     pub max_proxy_body_bytes: usize,
     pub static_dir: PathBuf,
 }
@@ -71,6 +72,28 @@ pub struct ManagedProfileConfig {
     pub prefix: String,
 }
 
+/// 浏览器语音输入配置。这里是部署级 hard switch；管理员系统设置只做运行时软开关。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpeechInputConfig {
+    pub enabled: bool,
+    pub asr_endpoint: Option<String>,
+    pub transcribe_path: String,
+    pub asr_model: String,
+    pub timeout_seconds: u64,
+    pub max_audio_seconds: u32,
+    pub max_upload_bytes: usize,
+}
+
+impl SpeechInputConfig {
+    pub fn available(&self) -> bool {
+        self.enabled
+            && self
+                .asr_endpoint
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+    }
+}
+
 impl AppConfig {
     /// 测试环境使用固定的本地配置，避免依赖真实端口和外部环境变量。
     pub fn for_tests() -> Self {
@@ -84,6 +107,7 @@ impl AppConfig {
             object_storage: default_object_storage_config(),
             skills_fs: default_skills_fs_config(),
             managed_profile: default_managed_profile_config(),
+            speech_input: default_speech_input_config(),
             max_proxy_body_bytes: 10 * 1024 * 1024,
             static_dir: PathBuf::from("frontend/dist"),
         }
@@ -107,6 +131,7 @@ impl AppConfig {
             object_storage: object_storage_config_from_env(),
             skills_fs: skills_fs_config_from_env(),
             managed_profile: managed_profile_config_from_env(),
+            speech_input: speech_input_config_from_env(),
             max_proxy_body_bytes: env_usize("HERMES_HUB_MAX_PROXY_BODY_BYTES", 10 * 1024 * 1024),
             static_dir: PathBuf::from(
                 std::env::var("HERMES_HUB_STATIC_DIR")
@@ -283,6 +308,47 @@ fn managed_profile_config_from_env() -> ManagedProfileConfig {
     }
 }
 
+pub fn speech_input_config_from_env() -> SpeechInputConfig {
+    SpeechInputConfig {
+        enabled: env_bool_any(
+            &[
+                "HERMES_SPEECH_INPUT_ENABLED",
+                "HERMES_HUB_SPEECH_INPUT_ENABLED",
+                "HERMES_HUB_VOICE_INPUT_ENABLED",
+            ],
+            false,
+        ),
+        asr_endpoint: optional_env_any(&["HERMES_ASR_ENDPOINT", "HERMES_HUB_ASR_ENDPOINT"]),
+        transcribe_path: std::env::var("HERMES_ASR_TRANSCRIBE_PATH")
+            .or_else(|_| std::env::var("HERMES_HUB_ASR_TRANSCRIBE_PATH"))
+            .unwrap_or_else(|_| "/v1/audio/transcriptions".to_string()),
+        asr_model: std::env::var("HERMES_ASR_MODEL")
+            .or_else(|_| std::env::var("HERMES_HUB_ASR_MODEL"))
+            .unwrap_or_else(|_| "sensevoice".to_string()),
+        timeout_seconds: env_u64_any(
+            &[
+                "HERMES_ASR_TIMEOUT_SECONDS",
+                "HERMES_HUB_ASR_TIMEOUT_SECONDS",
+            ],
+            90,
+        ),
+        max_audio_seconds: env_u32_any(
+            &[
+                "HERMES_ASR_MAX_AUDIO_SECONDS",
+                "HERMES_HUB_ASR_MAX_AUDIO_SECONDS",
+            ],
+            60,
+        ),
+        max_upload_bytes: env_usize_any(
+            &[
+                "HERMES_ASR_MAX_UPLOAD_BYTES",
+                "HERMES_HUB_ASR_MAX_UPLOAD_BYTES",
+            ],
+            25 * 1024 * 1024,
+        ),
+    }
+}
+
 fn default_model_config() -> ModelConfig {
     ModelConfig {
         config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
@@ -349,6 +415,18 @@ fn default_managed_profile_config() -> ManagedProfileConfig {
     }
 }
 
+fn default_speech_input_config() -> SpeechInputConfig {
+    SpeechInputConfig {
+        enabled: false,
+        asr_endpoint: None,
+        transcribe_path: "/v1/audio/transcriptions".to_string(),
+        asr_model: "sensevoice".to_string(),
+        timeout_seconds: 90,
+        max_audio_seconds: 60,
+        max_upload_bytes: 25 * 1024 * 1024,
+    }
+}
+
 fn optional_env(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -381,11 +459,43 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn env_bool_any(names: &[&str], default: bool) -> bool {
+    names
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u32_any(names: &[&str], default: u32) -> u32 {
+    names
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64_any(names: &[&str], default: u64) -> u64 {
+    names
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize_any(names: &[&str], default: usize) -> usize {
+    names
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         hermes_docker_config_from_env, managed_profile_config_from_env, model_config_from_env,
-        object_storage_config_from_env, skills_fs_config_from_env,
+        object_storage_config_from_env, skills_fs_config_from_env, speech_input_config_from_env,
     };
 
     #[test]
@@ -558,6 +668,65 @@ mod tests {
         );
         let config = managed_profile_config_from_env();
         assert_eq!(config.prefix, "managed-profile/legacy-name");
+
+        for (name, value) in saved {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+    }
+
+    #[test]
+    fn speech_input_config_is_disabled_until_env_enables_asr() {
+        const NAMES: &[&str] = &[
+            "HERMES_SPEECH_INPUT_ENABLED",
+            "HERMES_HUB_SPEECH_INPUT_ENABLED",
+            "HERMES_HUB_VOICE_INPUT_ENABLED",
+            "HERMES_ASR_ENDPOINT",
+            "HERMES_HUB_ASR_ENDPOINT",
+            "HERMES_ASR_TRANSCRIBE_PATH",
+            "HERMES_HUB_ASR_TRANSCRIBE_PATH",
+            "HERMES_ASR_MODEL",
+            "HERMES_HUB_ASR_MODEL",
+            "HERMES_ASR_TIMEOUT_SECONDS",
+            "HERMES_HUB_ASR_TIMEOUT_SECONDS",
+            "HERMES_ASR_MAX_AUDIO_SECONDS",
+            "HERMES_HUB_ASR_MAX_AUDIO_SECONDS",
+            "HERMES_ASR_MAX_UPLOAD_BYTES",
+            "HERMES_HUB_ASR_MAX_UPLOAD_BYTES",
+        ];
+        let saved = NAMES
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect::<Vec<_>>();
+        for name in NAMES {
+            std::env::remove_var(name);
+        }
+
+        let disabled = speech_input_config_from_env();
+        assert!(!disabled.enabled);
+        assert!(disabled.asr_endpoint.is_none());
+        assert_eq!(disabled.transcribe_path, "/v1/audio/transcriptions");
+        assert_eq!(disabled.asr_model, "sensevoice");
+
+        std::env::set_var("HERMES_HUB_SPEECH_INPUT_ENABLED", "true");
+        std::env::set_var("HERMES_HUB_ASR_ENDPOINT", "http://asr:8090");
+        std::env::set_var("HERMES_HUB_ASR_TRANSCRIBE_PATH", "/transcribe");
+        std::env::set_var("HERMES_HUB_ASR_MODEL", "whisper-1");
+        std::env::set_var("HERMES_HUB_ASR_TIMEOUT_SECONDS", "45");
+        std::env::set_var("HERMES_HUB_ASR_MAX_AUDIO_SECONDS", "90");
+        std::env::set_var("HERMES_HUB_ASR_MAX_UPLOAD_BYTES", "12345");
+
+        let enabled = speech_input_config_from_env();
+        assert!(enabled.enabled);
+        assert_eq!(enabled.asr_endpoint.as_deref(), Some("http://asr:8090"));
+        assert_eq!(enabled.transcribe_path, "/transcribe");
+        assert_eq!(enabled.asr_model, "whisper-1");
+        assert_eq!(enabled.timeout_seconds, 45);
+        assert_eq!(enabled.max_audio_seconds, 90);
+        assert_eq!(enabled.max_upload_bytes, 12345);
 
         for (name, value) in saved {
             if let Some(value) = value {

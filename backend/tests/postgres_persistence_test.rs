@@ -17,7 +17,9 @@ use hermes_hub_backend::{
     llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
     model_config::{ModelConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND},
     security::crypto::SecretCipher,
-    session::store::{LdapSettings, OidcSettings, SessionStore, SystemSettings},
+    session::store::{
+        LdapSettings, OidcSettings, SessionStore, SpeechInputSettings, SystemSettings,
+    },
     storage::InMemoryObjectStorage,
     AppConfig, AppState,
 };
@@ -85,6 +87,7 @@ async fn test_state(pool: PgPool, provider: InMemoryLlmProviderClient) -> AppSta
         .await
         .expect("model registry can be initialized");
 
+    let asr_client = hermes_hub_backend::asr::default_asr_client(&config.speech_input);
     AppState {
         docker_provisioner: DockerProvisioner::new_with_runtime(
             docker_config_from_app(&config, &config.initial_model_config),
@@ -98,6 +101,7 @@ async fn test_state(pool: PgPool, provider: InMemoryLlmProviderClient) -> AppSta
         ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
         object_storage: InMemoryObjectStorage::default().shared(),
         session_events: Default::default(),
+        asr_client,
     }
 }
 
@@ -1287,6 +1291,7 @@ async fn postgres_system_settings_persist_session_limit() {
             max_sessions_per_user: 7,
             max_attachment_upload_bytes: 128 * 1024 * 1024,
             attachment_retention_days: 14,
+            speech_input: SpeechInputSettings { enabled: true },
             oidc: OidcSettings {
                 enabled: true,
                 display_name: "Acme SSO".to_string(),
@@ -1342,6 +1347,7 @@ async fn postgres_system_settings_persist_session_limit() {
     assert_eq!(reloaded.max_sessions_per_user, 7);
     assert_eq!(reloaded.max_attachment_upload_bytes, 128 * 1024 * 1024);
     assert_eq!(reloaded.attachment_retention_days, 14);
+    assert!(reloaded.speech_input.enabled);
     assert_eq!(reloaded.oidc.client_secret, "oidc-secret");
     assert_eq!(reloaded.ldap.bind_password, "ldap-bind-secret");
 }

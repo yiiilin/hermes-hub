@@ -132,6 +132,12 @@ impl SpooledMultipartFile {
             .expect("spooled multipart file path should exist until cleanup")
     }
 
+    pub fn into_path(mut self) -> std::path::PathBuf {
+        self.path
+            .take()
+            .expect("spooled multipart file path should exist until it is consumed")
+    }
+
     pub async fn cleanup(&mut self) {
         if let Some(path) = self.path.take() {
             let _ = tokio::fs::remove_file(path).await;

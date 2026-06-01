@@ -2,9 +2,10 @@
 use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::HashMap,
+    ffi::OsStr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -12,6 +13,11 @@ use bytes::Bytes;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use tokio::process::Command;
+#[cfg(unix)]
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::UnixStream,
+};
 
 use crate::{
     model_config::RESPONSES_API_TYPE,
@@ -34,6 +40,7 @@ const HUB_NFS_CONTAINER_DIR: &str = "/nfs";
 const MANAGED_SKILLS_EXTERNAL_DIR: &str = "/nfs/skills";
 const MANAGED_PROFILE_SOUL_FILE: &str = "SOUL.md";
 const HERMES_MEDIA_ALLOW_DIRS: &str = "/workspace:/sandbox:/opt/data:/config/cache";
+const DOCKER_DAEMON_SOCKET: &str = "/var/run/docker.sock";
 /// Docker 托管 Hermes 的运行配置。
 #[derive(Clone, Debug, PartialEq)]
 pub struct DockerProvisionerConfig {
@@ -194,19 +201,77 @@ pub type DynDockerRuntime = Arc<dyn DockerRuntime>;
 #[derive(Clone)]
 pub struct CommandDockerRuntime {
     docker_binary: String,
+    docker_api_version: Arc<Mutex<Option<String>>>,
 }
 
 impl CommandDockerRuntime {
     pub fn new(docker_binary: String) -> Self {
-        Self { docker_binary }
+        Self {
+            docker_binary,
+            docker_api_version: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_cached_docker_api_version(
+        docker_binary: String,
+        docker_api_version: Option<String>,
+    ) -> Self {
+        Self {
+            docker_binary,
+            docker_api_version: Arc::new(Mutex::new(docker_api_version)),
+        }
     }
 }
 
 #[async_trait]
 impl DockerRuntime for CommandDockerRuntime {
     async fn run(&self, args: Vec<String>) -> Result<DockerRuntimeOutput, ProvisionerError> {
-        let output = Command::new(&self.docker_binary)
-            .args(&args)
+        let explicit_api_version = std::env::var_os("DOCKER_API_VERSION");
+        if docker_api_version_env_is_explicit(explicit_api_version.as_deref()) {
+            return self.run_once(&args, None).await;
+        }
+
+        let cached_api_version = self
+            .docker_api_version
+            .lock()
+            .map_err(|error| ProvisionerError::DockerRuntime(error.to_string()))?
+            .clone();
+        if let Some(api_version) = cached_api_version {
+            return self.run_once(&args, Some(api_version.as_str())).await;
+        }
+
+        let output = self.run_once(&args, None).await?;
+        if output.success || !docker_client_api_is_too_new(&output.stderr) {
+            return Ok(output);
+        }
+
+        if let Some(api_version) = detect_docker_daemon_api_version().await {
+            if let Ok(mut cached) = self.docker_api_version.lock() {
+                *cached = Some(api_version.clone());
+            }
+            return self.run_once(&args, Some(api_version.as_str())).await;
+        }
+
+        Ok(output)
+    }
+}
+
+impl CommandDockerRuntime {
+    async fn run_once(
+        &self,
+        args: &[String],
+        docker_api_version: Option<&str>,
+    ) -> Result<DockerRuntimeOutput, ProvisionerError> {
+        let mut command = Command::new(&self.docker_binary);
+        command.args(args);
+
+        if let Some(api_version) = docker_api_version.filter(|value| !value.trim().is_empty()) {
+            // 只有确认当前 CLI 对 daemon 来说太新时才降级 API，避免破坏旧 CLI 自己的协商逻辑。
+            command.env("DOCKER_API_VERSION", api_version);
+        }
+
+        let output = command
             .output()
             .await
             .map_err(|error| ProvisionerError::DockerRuntime(error.to_string()))?;
@@ -217,6 +282,83 @@ impl DockerRuntime for CommandDockerRuntime {
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         })
     }
+}
+
+fn docker_api_version_env_is_explicit(process_env_value: Option<&OsStr>) -> bool {
+    process_env_value
+        .map(|value| !value.to_string_lossy().trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn docker_client_api_is_too_new(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("client version")
+        && stderr.contains("too new")
+        && stderr.contains("maximum supported api version")
+}
+
+#[cfg(unix)]
+async fn detect_docker_daemon_api_version() -> Option<String> {
+    let socket_path = docker_socket_path_from_env(std::env::var_os("DOCKER_HOST").as_deref())?;
+    let timeout = Duration::from_millis(500);
+    let mut stream = tokio::time::timeout(timeout, UnixStream::connect(socket_path))
+        .await
+        .ok()?
+        .ok()?;
+
+    tokio::time::timeout(
+        timeout,
+        stream.write_all(b"GET /version HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n"),
+    )
+    .await
+    .ok()?
+    .ok()?;
+
+    let mut response = String::new();
+    tokio::time::timeout(timeout, stream.read_to_string(&mut response))
+        .await
+        .ok()?
+        .ok()?;
+
+    parse_docker_api_version_response(&response)
+}
+
+#[cfg(not(unix))]
+async fn detect_docker_daemon_api_version() -> Option<String> {
+    None
+}
+
+#[cfg(unix)]
+fn docker_socket_path_from_env(docker_host: Option<&OsStr>) -> Option<PathBuf> {
+    let Some(docker_host) = docker_host else {
+        return Some(PathBuf::from(DOCKER_DAEMON_SOCKET));
+    };
+    let docker_host = docker_host.to_string_lossy();
+    let docker_host = docker_host.trim();
+
+    if docker_host.is_empty() {
+        return Some(PathBuf::from(DOCKER_DAEMON_SOCKET));
+    }
+
+    docker_host
+        .strip_prefix("unix://")
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+fn parse_docker_api_version_response(response: &str) -> Option<String> {
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or(response)
+        .trim();
+    let value: Value = serde_json::from_str(body).ok()?;
+    value
+        .get("ApiVersion")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 /// 单元测试和内存演示模式使用的 Docker runtime。它不碰真实 Docker daemon，
@@ -1414,4 +1556,97 @@ fn set_directory_mode_for_container_tools(_path: &str) -> Result<(), Provisioner
 
 fn yaml_string(value: &str) -> Result<String, ProvisionerError> {
     serde_json::to_string(value).map_err(|error| ProvisionerError::Filesystem(error.to_string()))
+}
+
+#[cfg(test)]
+mod command_docker_runtime_tests {
+    use std::{ffi::OsStr, path::PathBuf};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn parses_docker_daemon_api_version_from_socket_http_response() {
+        let response = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Content-Type: application/json\r\n",
+            "\r\n",
+            r#"{"Version":"24.0.7","ApiVersion":"1.43","MinAPIVersion":"1.12"}"#
+        );
+
+        assert_eq!(
+            parse_docker_api_version_response(response),
+            Some("1.43".to_string())
+        );
+    }
+
+    #[test]
+    fn docker_runtime_only_retries_client_too_new_errors() {
+        assert!(docker_client_api_is_too_new(
+            "Error response from daemon: client version 1.52 is too new. Maximum supported API version is 1.43"
+        ));
+        assert!(!docker_client_api_is_too_new(
+            "Error response from daemon: client version 1.41 is too old. Minimum supported API version is 1.44"
+        ));
+    }
+
+    #[test]
+    fn command_runtime_treats_blank_docker_api_version_as_unset() {
+        assert!(!docker_api_version_env_is_explicit(None));
+        assert!(!docker_api_version_env_is_explicit(Some(OsStr::new(""))));
+        assert_eq!(
+            docker_api_version_env_is_explicit(Some(OsStr::new("1.44"))),
+            true
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_socket_path_tracks_unix_docker_host() {
+        assert_eq!(
+            docker_socket_path_from_env(None),
+            Some(PathBuf::from(DOCKER_DAEMON_SOCKET))
+        );
+        assert_eq!(
+            docker_socket_path_from_env(Some(OsStr::new("unix:///tmp/docker.sock"))),
+            Some(PathBuf::from("/tmp/docker.sock"))
+        );
+        assert_eq!(
+            docker_socket_path_from_env(Some(OsStr::new("tcp://127.0.0.1:2375"))),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn command_runtime_injects_cached_api_version_into_child_process() {
+        let temp_dir = tempfile::tempdir().expect("temporary fake docker dir is created");
+        let docker_path = temp_dir.path().join("docker");
+        std::fs::write(
+            &docker_path,
+            "#!/bin/sh\nprintf '%s' \"$DOCKER_API_VERSION\"\n",
+        )
+        .expect("fake docker binary is written");
+        let mut permissions = std::fs::metadata(&docker_path)
+            .expect("fake docker metadata exists")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&docker_path, permissions)
+            .expect("fake docker binary is executable");
+
+        let runtime = CommandDockerRuntime::new_with_cached_docker_api_version(
+            docker_path.to_string_lossy().to_string(),
+            Some("1.43".to_string()),
+        );
+
+        let output = runtime
+            .run(vec!["version".to_string()])
+            .await
+            .expect("fake docker command runs");
+
+        assert!(output.success);
+        assert_eq!(output.stdout, "1.43");
+    }
 }

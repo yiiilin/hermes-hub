@@ -32,6 +32,7 @@ fn test_app() -> Router {
 
 fn test_app_with_ldap(ldap_authenticator: DynLdapAuthenticator) -> Router {
     let config = AppConfig::for_tests();
+    let asr_client = hermes_hub_backend::asr::default_asr_client(&config.speech_input);
     let state = AppState {
         docker_provisioner: DockerProvisioner::new_with_runtime(
             docker_config_from_app(&config, &config.initial_model_config),
@@ -45,6 +46,7 @@ fn test_app_with_ldap(ldap_authenticator: DynLdapAuthenticator) -> Router {
         ldap_authenticator,
         object_storage: InMemoryObjectStorage::default().shared(),
         session_events: Default::default(),
+        asr_client,
     };
     build_router_with_state(state)
 }

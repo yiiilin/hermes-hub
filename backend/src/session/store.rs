@@ -31,6 +31,7 @@ const MAX_ATTACHMENT_RETENTION_DAYS: u32 = 3650;
 const MAX_SESSIONS_PER_USER_KEY: &str = "max_sessions_per_user";
 const MAX_ATTACHMENT_UPLOAD_BYTES_KEY: &str = "max_attachment_upload_bytes";
 const ATTACHMENT_RETENTION_DAYS_KEY: &str = "attachment_retention_days";
+const SPEECH_INPUT_SETTINGS_KEY: &str = "speech_input";
 const OIDC_SETTINGS_KEY: &str = "oidc";
 const LDAP_SETTINGS_KEY: &str = "ldap";
 
@@ -95,9 +96,18 @@ pub struct SystemSettings {
     #[serde(default = "default_attachment_retention_days")]
     pub attachment_retention_days: u32,
     #[serde(default)]
+    pub speech_input: SpeechInputSettings,
+    #[serde(default)]
     pub oidc: OidcSettings,
     #[serde(default)]
     pub ldap: LdapSettings,
+}
+
+/// 管理员运行时语音输入软开关。真正的 ASR 服务是否存在由环境变量控制。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SpeechInputSettings {
+    pub enabled: bool,
 }
 
 /// 管理员可配置的 OIDC 参数。字段名尽量贴近 Outline 的环境变量语义，
@@ -158,9 +168,16 @@ impl Default for SystemSettings {
             max_sessions_per_user: DEFAULT_MAX_SESSIONS_PER_USER,
             max_attachment_upload_bytes: DEFAULT_MAX_ATTACHMENT_UPLOAD_BYTES,
             attachment_retention_days: DEFAULT_ATTACHMENT_RETENTION_DAYS,
+            speech_input: SpeechInputSettings::default(),
             oidc: OidcSettings::default(),
             ldap: LdapSettings::default(),
         }
+    }
+}
+
+impl Default for SpeechInputSettings {
+    fn default() -> Self {
+        Self { enabled: false }
     }
 }
 
@@ -1758,6 +1775,19 @@ impl SessionStore {
                         .and_then(|value| value.parse::<u32>().ok())
                         .unwrap_or(DEFAULT_ATTACHMENT_RETENTION_DAYS);
 
+                let speech_input = sqlx::query("select value from system_settings where key = $1")
+                    .bind(SPEECH_INPUT_SETTINGS_KEY)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?
+                    .and_then(|row| row.try_get::<String, _>("value").ok())
+                    .map(|value| {
+                        serde_json::from_str::<SpeechInputSettings>(&value)
+                            .map_err(|_| StoreError::DatabaseFailed)
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+
                 let oidc = sqlx::query("select value from system_settings where key = $1")
                     .bind(OIDC_SETTINGS_KEY)
                     .fetch_optional(pool)
@@ -1790,6 +1820,7 @@ impl SessionStore {
                     max_sessions_per_user: value,
                     max_attachment_upload_bytes,
                     attachment_retention_days,
+                    speech_input,
                     oidc,
                     ldap,
                 })
@@ -1852,6 +1883,24 @@ impl SessionStore {
                 )
                 .bind(MAX_ATTACHMENT_UPLOAD_BYTES_KEY)
                 .bind(settings.max_attachment_upload_bytes.to_string())
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                sqlx::query(
+                    r#"
+                    insert into system_settings (key, value, updated_at)
+                    values ($1, $2, now())
+                    on conflict (key) do update set
+                        value = excluded.value,
+                        updated_at = now()
+                    "#,
+                )
+                .bind(SPEECH_INPUT_SETTINGS_KEY)
+                .bind(
+                    serde_json::to_string(&settings.speech_input)
+                        .map_err(|_| StoreError::DatabaseFailed)?,
+                )
                 .execute(pool)
                 .await
                 .map_err(|_| StoreError::DatabaseFailed)?;

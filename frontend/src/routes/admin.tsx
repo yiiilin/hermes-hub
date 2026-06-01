@@ -12,20 +12,17 @@ import type {
   ModelFallbackConfig,
   ModelConfigKind,
   ReasoningEffort,
+  SpeechInputConfig,
   SystemSettings,
   User,
 } from "../api/client";
-import { defaultLdapSettings, defaultOidcSettings } from "../api/client";
-import { useI18n } from "../i18n";
 import {
-  ChangeEvent,
-  FormEvent,
-  ReactNode,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+  defaultLdapSettings,
+  defaultOidcSettings,
+  defaultSpeechInputSettings,
+} from "../api/client";
+import { useI18n } from "../i18n";
+import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { FilePlus2, FileText, Folder, FolderPlus, Upload } from "lucide-react";
 import Vditor from "vditor";
 import "vditor/dist/index.css";
@@ -287,8 +284,7 @@ function formatSchedulerSnapshotTime(
     return "-";
   }
   // Hermes adapter 可能上送秒级 Unix 时间，也可能上送 ISO 字符串；展示层统一容错格式化。
-  const timestamp =
-    typeof value === "number" && value < 10_000_000_000 ? value * 1000 : value;
+  const timestamp = typeof value === "number" && value < 10_000_000_000 ? value * 1000 : value;
   const date = new Date(timestamp);
   if (Number.isNaN(date.getTime())) {
     return String(value);
@@ -344,7 +340,10 @@ function uploadedFileName(file: File): string {
 }
 
 function hasHiddenManagedSkillSegment(path: string): boolean {
-  return path.split("/").filter(Boolean).some((segment) => segment.startsWith("."));
+  return path
+    .split("/")
+    .filter(Boolean)
+    .some((segment) => segment.startsWith("."));
 }
 
 function findManagedSkillTreeNode(
@@ -461,8 +460,15 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     max_sessions_per_user: 20,
     max_attachment_upload_bytes: 200 * 1024 * 1024,
     attachment_retention_days: 7,
+    speech_input: defaultSpeechInputSettings(),
     oidc: defaultOidcSettings(),
     ldap: defaultLdapSettings(),
+  });
+  const [speechInputRuntimeConfig, setSpeechInputRuntimeConfig] = useState<SpeechInputConfig>({
+    enabled: false,
+    runtime_available: false,
+    max_audio_seconds: 60,
+    max_upload_bytes: 25 * 1024 * 1024,
   });
   const [settingsSaved, setSettingsSaved] = useState(false);
   const [inviteHours, setInviteHours] = useState(defaultInviteHours);
@@ -483,10 +489,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     () => new Map(instances.map((instance) => [instance.user_id, instance])),
     [instances],
   );
-  const usersById = useMemo(
-    () => new Map(users.map((user) => [user.id, user])),
-    [users],
-  );
+  const usersById = useMemo(() => new Map(users.map((user) => [user.id, user])), [users]);
   const schedulerTaskRows = useMemo<HermesSchedulerTaskRow[]>(
     () =>
       schedulerSnapshots.flatMap((snapshot) =>
@@ -503,15 +506,11 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     () =>
       [...modelConfigs].sort(
         (left, right) =>
-          modelConfigOrder.indexOf(left.config_kind) -
-          modelConfigOrder.indexOf(right.config_kind),
+          modelConfigOrder.indexOf(left.config_kind) - modelConfigOrder.indexOf(right.config_kind),
       ),
     [modelConfigs],
   );
-  const oidcRedirectUri = useMemo(
-    () => `${window.location.origin}/api/auth/oidc/callback`,
-    [],
-  );
+  const oidcRedirectUri = useMemo(() => `${window.location.origin}/api/auth/oidc/callback`, []);
   const adminSettingsTabs: Array<{ key: AdminSettingsTab; label: string }> = [
     { key: "users", label: t("admin.userManagement") },
     { key: "models", label: t("admin.modelConfig") },
@@ -534,6 +533,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
         nextSettings,
         nextSchedulerSnapshots,
         nextHermesProfile,
+        nextSpeechInputRuntimeConfig,
       ] = await Promise.all([
         apiClient.listUsers(),
         apiClient.listInvites(),
@@ -546,6 +546,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
           ? apiClient.listHermesSchedulerSnapshots()
           : Promise.resolve(null),
         activeTab === "profile" ? apiClient.hermesProfile() : Promise.resolve(null),
+        activeTab === "system" ? apiClient.speechInputConfig() : Promise.resolve(null),
       ]);
       setUsers(nextUsers);
       setInvites(nextInvites);
@@ -561,6 +562,9 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
       }
       if (nextHermesProfile) {
         setHermesProfile(nextHermesProfile);
+      }
+      if (nextSpeechInputRuntimeConfig) {
+        setSpeechInputRuntimeConfig(nextSpeechInputRuntimeConfig);
       }
       if (activeTab === "skills") {
         await refreshManagedSkills();
@@ -630,9 +634,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
   function updateModel(kind: ModelConfigKind, patch: Partial<ModelConfig>) {
     setModelSaved(false);
     setModelConfigs((configs) =>
-      configs.map((config) =>
-        config.config_kind === kind ? { ...config, ...patch } : config,
-      ),
+      configs.map((config) => (config.config_kind === kind ? { ...config, ...patch } : config)),
     );
   }
 
@@ -962,7 +964,9 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     missingRequiredModels.length > 0
       ? missingRequiredModels.map((kind) => modelLabels[kind]).join(language === "zh" ? "、" : ", ")
       : [modelLabels.llm, modelLabels.title].join(language === "zh" ? "、" : ", ");
-  const modelGateMessage = t("admin.modelGate", { models: missingRequiredModelNames });
+  const modelGateMessage = t("admin.modelGate", {
+    models: missingRequiredModelNames,
+  });
   const skillPathSeparator = language === "zh" ? "：" : ": ";
 
   function renderManagedSkillNode(node: ManagedSkillTreeNode): ReactNode {
@@ -974,10 +978,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     }
     const selected = selectedSkillNode?.path === node.path && selectedSkillNode.kind === node.kind;
     return (
-      <li
-        key={`${node.kind}:${node.path}`}
-        className={selected ? "selected" : undefined}
-      >
+      <li key={`${node.kind}:${node.path}`} className={selected ? "selected" : undefined}>
         <button
           type="button"
           className={`skill-tree-button ${node.kind === "dir" ? "directory" : "file"}`}
@@ -1073,405 +1074,411 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                     </p>
                   ) : null}
                   <div className="form">
-                  <label>
-                    {t("admin.provider")}
-                    <input
-                      value={config.provider_name}
-                      onChange={(event) =>
-                        updateModel(config.config_kind, { provider_name: event.target.value })
-                      }
-                    />
-                  </label>
-                  <label>
-                    {t("admin.baseUrl")}
-                    <input
-                      value={config.provider_base_url}
-                      onChange={(event) =>
-                        updateModel(config.config_kind, {
-                          provider_base_url: event.target.value,
-                        })
-                      }
-                    />
-                  </label>
-                  <label>
-                    {t("admin.apiKey")}
-                    <input
-                      type="password"
-                      value={config.provider_api_key ?? ""}
-                      onChange={(event) =>
-                        updateModel(config.config_kind, { provider_api_key: event.target.value })
-                      }
-                    />
-                  </label>
-                  <label>
-                    {t("admin.model")}
-                    <input
-                      value={config.default_model}
-                      onChange={(event) =>
-                        updateModel(config.config_kind, { default_model: event.target.value })
-                      }
-                    />
-                  </label>
-                  <label>
-                    {t("admin.api")}
-                    <select
-                      value={config.api_type}
-                      disabled={config.config_kind === "image"}
-                      onChange={(event) =>
-                        updateModel(config.config_kind, {
-                          api_type: event.target.value as ModelApiType,
-                        })
-                      }
-                    >
-                      {(config.config_kind === "image"
-                        ? ["images_generations"]
-                        : ["chat_completions", "responses"]
-                      ).map((apiType) => (
-                        <option key={apiType} value={apiType}>
-                          {apiTypeLabels[apiType as ModelApiType]}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  {config.config_kind !== "image" ? (
                     <label>
-                      {t("admin.reasoning")}
-                      <select
-                        value={config.reasoning_effort ?? ""}
+                      {t("admin.provider")}
+                      <input
+                        value={config.provider_name}
                         onChange={(event) =>
                           updateModel(config.config_kind, {
-                            reasoning_effort:
-                              event.target.value === ""
-                                ? null
-                                : (event.target.value as ReasoningEffort),
+                            provider_name: event.target.value,
+                          })
+                        }
+                      />
+                    </label>
+                    <label>
+                      {t("admin.baseUrl")}
+                      <input
+                        value={config.provider_base_url}
+                        onChange={(event) =>
+                          updateModel(config.config_kind, {
+                            provider_base_url: event.target.value,
+                          })
+                        }
+                      />
+                    </label>
+                    <label>
+                      {t("admin.apiKey")}
+                      <input
+                        type="password"
+                        value={config.provider_api_key ?? ""}
+                        onChange={(event) =>
+                          updateModel(config.config_kind, {
+                            provider_api_key: event.target.value,
+                          })
+                        }
+                      />
+                    </label>
+                    <label>
+                      {t("admin.model")}
+                      <input
+                        value={config.default_model}
+                        onChange={(event) =>
+                          updateModel(config.config_kind, {
+                            default_model: event.target.value,
+                          })
+                        }
+                      />
+                    </label>
+                    <label>
+                      {t("admin.api")}
+                      <select
+                        value={config.api_type}
+                        disabled={config.config_kind === "image"}
+                        onChange={(event) =>
+                          updateModel(config.config_kind, {
+                            api_type: event.target.value as ModelApiType,
                           })
                         }
                       >
-                        {reasoningEfforts.map((effort) => (
-                          <option key={effort || "none"} value={effort}>
-                            {effort || t("admin.noReasoning")}
+                        {(config.config_kind === "image"
+                          ? ["images_generations"]
+                          : ["chat_completions", "responses"]
+                        ).map((apiType) => (
+                          <option key={apiType} value={apiType}>
+                            {apiTypeLabels[apiType as ModelApiType]}
                           </option>
                         ))}
                       </select>
                     </label>
-                  ) : null}
-                  {config.config_kind === "llm" ? (
-                    <>
+                    {config.config_kind !== "image" ? (
                       <label>
-                        {t("admin.contextWindowTokens")}
-                        <input
-                          type="number"
-                          min={1}
-                          value={config.context_window_tokens}
+                        {t("admin.reasoning")}
+                        <select
+                          value={config.reasoning_effort ?? ""}
                           onChange={(event) =>
                             updateModel(config.config_kind, {
-                              context_window_tokens: Number(event.target.value),
+                              reasoning_effort:
+                                event.target.value === ""
+                                  ? null
+                                  : (event.target.value as ReasoningEffort),
                             })
                           }
-                        />
+                        >
+                          {reasoningEfforts.map((effort) => (
+                            <option key={effort || "none"} value={effort}>
+                              {effort || t("admin.noReasoning")}
+                            </option>
+                          ))}
+                        </select>
                       </label>
-                      <label>
-                        {t("admin.maxOutputTokens")}
-                        <input
-                          type="number"
-                          min={1}
-                          value={config.max_output_tokens}
-                          onChange={(event) =>
-                            updateModel(config.config_kind, {
-                              max_output_tokens: Number(event.target.value),
-                            })
-                          }
-                        />
-                      </label>
-                      <label>
-                        {t("admin.temperature")}
-                        <input
-                          type="number"
-                          min={0}
-                          max={2}
-                          step={0.1}
-                          value={config.temperature}
-                          onChange={(event) =>
-                            updateModel(config.config_kind, {
-                              temperature: Number(event.target.value),
-                            })
-                          }
-                        />
-                      </label>
-                    </>
-                  ) : null}
-                  <label>
-                    {t("admin.timeout")}
-                    <input
-                      type="number"
-                      min={1}
-                      value={config.request_timeout_seconds}
-                      onChange={(event) =>
-                        updateModel(config.config_kind, {
-                          request_timeout_seconds: Number(event.target.value),
-                        })
-                      }
-                    />
-                  </label>
-                  {config.config_kind === "llm" ? (
-                    <label className="checkbox-row">
+                    ) : null}
+                    {config.config_kind === "llm" ? (
+                      <>
+                        <label>
+                          {t("admin.contextWindowTokens")}
+                          <input
+                            type="number"
+                            min={1}
+                            value={config.context_window_tokens}
+                            onChange={(event) =>
+                              updateModel(config.config_kind, {
+                                context_window_tokens: Number(event.target.value),
+                              })
+                            }
+                          />
+                        </label>
+                        <label>
+                          {t("admin.maxOutputTokens")}
+                          <input
+                            type="number"
+                            min={1}
+                            value={config.max_output_tokens}
+                            onChange={(event) =>
+                              updateModel(config.config_kind, {
+                                max_output_tokens: Number(event.target.value),
+                              })
+                            }
+                          />
+                        </label>
+                        <label>
+                          {t("admin.temperature")}
+                          <input
+                            type="number"
+                            min={0}
+                            max={2}
+                            step={0.1}
+                            value={config.temperature}
+                            onChange={(event) =>
+                              updateModel(config.config_kind, {
+                                temperature: Number(event.target.value),
+                              })
+                            }
+                          />
+                        </label>
+                      </>
+                    ) : null}
+                    <label>
+                      {t("admin.timeout")}
                       <input
-                        type="checkbox"
-                        checked={config.allow_streaming}
+                        type="number"
+                        min={1}
+                        value={config.request_timeout_seconds}
                         onChange={(event) =>
                           updateModel(config.config_kind, {
-                            allow_streaming: event.target.checked,
-                          })
-                        }
-                        />
-                      {t("admin.streaming")}
-                    </label>
-                  ) : null}
-                  {config.config_kind === "llm" ? (
-                    <label className="checkbox-row">
-                      <input
-                        type="checkbox"
-                        checked={config.supports_parallel_tools}
-                        onChange={(event) =>
-                          updateModel(config.config_kind, {
-                            supports_parallel_tools: event.target.checked,
+                            request_timeout_seconds: Number(event.target.value),
                           })
                         }
                       />
-                      {t("admin.supportsParallelTools")}
                     </label>
-                  ) : null}
-                  {config.config_kind !== "image"
-                    ? (() => {
-                        const fallback = fallbackConfigForModel(config);
-                        const fallbackTestKey = modelTestKey(config.config_kind, "fallback");
-                        const fallbackTestMessage = modelTestMessages[fallbackTestKey];
-                        return (
-                          <fieldset className="form-section model-fallback-section">
-                            <legend>{t("admin.fallbackModel")}</legend>
-                            <label className="checkbox-row">
-                              <input
-                                type="checkbox"
-                                checked={fallback.enabled}
-                                onChange={(event) =>
-                                  updateModelFallback(config.config_kind, {
-                                    enabled: event.target.checked,
-                                  })
-                                }
-                              />
-                              {t("admin.fallbackEnabled")}
-                            </label>
-                            {fallback.enabled ? (
-                              <>
-                                <div className="button-row">
-                                  <button
-                                    type="button"
-                                    className="secondary"
-                                    disabled={testingModel === fallbackTestKey}
-                                    onClick={() => void testModel(config, "fallback")}
-                                  >
-                                    {t("admin.testFallback")}
-                                  </button>
-                                </div>
-                                {fallbackTestMessage ? (
-                                  <p
-                                    className={
-                                      fallbackTestMessage === "model test succeeded"
-                                        ? "copy-line"
-                                        : "notice"
-                                    }
-                                  >
-                                    {fallbackTestMessage}
-                                  </p>
-                                ) : null}
-                                <label>
-                                  {t("admin.fallbackProvider")}
-                                  <input
-                                    value={fallback.provider_name}
-                                    onChange={(event) =>
-                                      updateModelFallback(config.config_kind, {
-                                        provider_name: event.target.value,
-                                      })
-                                    }
-                                  />
-                                </label>
-                                <label>
-                                  {t("admin.fallbackBaseUrl")}
-                                  <input
-                                    value={fallback.provider_base_url}
-                                    onChange={(event) =>
-                                      updateModelFallback(config.config_kind, {
-                                        provider_base_url: event.target.value,
-                                      })
-                                    }
-                                  />
-                                </label>
-                                <label>
-                                  {t("admin.fallbackApiKey")}
-                                  <input
-                                    type="password"
-                                    value={fallback.provider_api_key ?? ""}
-                                    onChange={(event) =>
-                                      updateModelFallback(config.config_kind, {
-                                        provider_api_key: event.target.value,
-                                      })
-                                    }
-                                  />
-                                </label>
-                                <label>
-                                  {t("admin.fallbackModelName")}
-                                  <input
-                                    value={fallback.default_model}
-                                    onChange={(event) =>
-                                      updateModelFallback(config.config_kind, {
-                                        default_model: event.target.value,
-                                      })
-                                    }
-                                  />
-                                </label>
-                                <label>
-                                  {t("admin.fallbackApi")}
-                                  <select
-                                    value={fallback.api_type}
-                                    onChange={(event) =>
-                                      updateModelFallback(config.config_kind, {
-                                        api_type: event.target.value as ModelApiType,
-                                      })
-                                    }
-                                  >
-                                    {["chat_completions", "responses"].map((apiType) => (
-                                      <option key={apiType} value={apiType}>
-                                        {apiTypeLabels[apiType as ModelApiType]}
-                                      </option>
-                                    ))}
-                                  </select>
-                                </label>
-                                <label>
-                                  {t("admin.fallbackReasoning")}
-                                  <select
-                                    value={fallback.reasoning_effort ?? ""}
-                                    onChange={(event) =>
-                                      updateModelFallback(config.config_kind, {
-                                        reasoning_effort:
-                                          event.target.value === ""
-                                            ? null
-                                            : (event.target.value as ReasoningEffort),
-                                      })
-                                    }
-                                  >
-                                    {reasoningEfforts.map((effort) => (
-                                      <option key={effort || "none"} value={effort}>
-                                        {effort || t("admin.noReasoning")}
-                                      </option>
-                                    ))}
-                                  </select>
-                                </label>
-                                {config.config_kind === "llm" ? (
-                                  <>
-                                    <label>
-                                      {t("admin.fallbackContextWindowTokens")}
-                                      <input
-                                        type="number"
-                                        min={1}
-                                        value={fallback.context_window_tokens}
-                                        onChange={(event) =>
-                                          updateModelFallback(config.config_kind, {
-                                            context_window_tokens: Number(event.target.value),
-                                          })
-                                        }
-                                      />
-                                    </label>
-                                    <label>
-                                      {t("admin.fallbackMaxOutputTokens")}
-                                      <input
-                                        type="number"
-                                        min={1}
-                                        value={fallback.max_output_tokens}
-                                        onChange={(event) =>
-                                          updateModelFallback(config.config_kind, {
-                                            max_output_tokens: Number(event.target.value),
-                                          })
-                                        }
-                                      />
-                                    </label>
-                                    <label>
-                                      {t("admin.fallbackTemperature")}
-                                      <input
-                                        type="number"
-                                        min={0}
-                                        max={2}
-                                        step={0.1}
-                                        value={fallback.temperature}
-                                        onChange={(event) =>
-                                          updateModelFallback(config.config_kind, {
-                                            temperature: Number(event.target.value),
-                                          })
-                                        }
-                                      />
-                                    </label>
-                                  </>
-                                ) : null}
-                                <label>
-                                  {t("admin.fallbackTimeout")}
-                                  <input
-                                    type="number"
-                                    min={1}
-                                    value={fallback.request_timeout_seconds}
-                                    onChange={(event) =>
-                                      updateModelFallback(config.config_kind, {
-                                        request_timeout_seconds: Number(event.target.value),
-                                      })
-                                    }
-                                  />
-                                </label>
-                                {config.config_kind === "llm" ? (
-                                  <label className="checkbox-row">
+                    {config.config_kind === "llm" ? (
+                      <label className="checkbox-row">
+                        <input
+                          type="checkbox"
+                          checked={config.allow_streaming}
+                          onChange={(event) =>
+                            updateModel(config.config_kind, {
+                              allow_streaming: event.target.checked,
+                            })
+                          }
+                        />
+                        {t("admin.streaming")}
+                      </label>
+                    ) : null}
+                    {config.config_kind === "llm" ? (
+                      <label className="checkbox-row">
+                        <input
+                          type="checkbox"
+                          checked={config.supports_parallel_tools}
+                          onChange={(event) =>
+                            updateModel(config.config_kind, {
+                              supports_parallel_tools: event.target.checked,
+                            })
+                          }
+                        />
+                        {t("admin.supportsParallelTools")}
+                      </label>
+                    ) : null}
+                    {config.config_kind !== "image"
+                      ? (() => {
+                          const fallback = fallbackConfigForModel(config);
+                          const fallbackTestKey = modelTestKey(config.config_kind, "fallback");
+                          const fallbackTestMessage = modelTestMessages[fallbackTestKey];
+                          return (
+                            <fieldset className="form-section model-fallback-section">
+                              <legend>{t("admin.fallbackModel")}</legend>
+                              <label className="checkbox-row">
+                                <input
+                                  type="checkbox"
+                                  checked={fallback.enabled}
+                                  onChange={(event) =>
+                                    updateModelFallback(config.config_kind, {
+                                      enabled: event.target.checked,
+                                    })
+                                  }
+                                />
+                                {t("admin.fallbackEnabled")}
+                              </label>
+                              {fallback.enabled ? (
+                                <>
+                                  <div className="button-row">
+                                    <button
+                                      type="button"
+                                      className="secondary"
+                                      disabled={testingModel === fallbackTestKey}
+                                      onClick={() => void testModel(config, "fallback")}
+                                    >
+                                      {t("admin.testFallback")}
+                                    </button>
+                                  </div>
+                                  {fallbackTestMessage ? (
+                                    <p
+                                      className={
+                                        fallbackTestMessage === "model test succeeded"
+                                          ? "copy-line"
+                                          : "notice"
+                                      }
+                                    >
+                                      {fallbackTestMessage}
+                                    </p>
+                                  ) : null}
+                                  <label>
+                                    {t("admin.fallbackProvider")}
                                     <input
-                                      type="checkbox"
-                                      checked={fallback.allow_streaming}
+                                      value={fallback.provider_name}
                                       onChange={(event) =>
                                         updateModelFallback(config.config_kind, {
-                                          allow_streaming: event.target.checked,
+                                          provider_name: event.target.value,
                                         })
                                       }
                                     />
-                                    {t("admin.fallbackStreaming")}
                                   </label>
-                                ) : null}
-                                {config.config_kind === "llm" ? (
-                                  <label className="checkbox-row">
+                                  <label>
+                                    {t("admin.fallbackBaseUrl")}
                                     <input
-                                      type="checkbox"
-                                      checked={fallback.supports_parallel_tools}
+                                      value={fallback.provider_base_url}
                                       onChange={(event) =>
                                         updateModelFallback(config.config_kind, {
-                                          supports_parallel_tools: event.target.checked,
+                                          provider_base_url: event.target.value,
                                         })
                                       }
                                     />
-                                    {t("admin.fallbackSupportsParallelTools")}
                                   </label>
-                                ) : null}
-                              </>
-                            ) : null}
-                          </fieldset>
-                        );
-                      })()
-                    : null}
-                  {config.config_kind === "image" ? (
-                    <label className="checkbox-row">
-                      <input
-                        type="checkbox"
-                        checked={config.enabled}
-                        onChange={(event) =>
-                          updateModel(config.config_kind, {
-                            enabled: event.target.checked,
-                          })
-                        }
-                      />
-                      {t("admin.imageEnabled")}
-                    </label>
-                  ) : null}
+                                  <label>
+                                    {t("admin.fallbackApiKey")}
+                                    <input
+                                      type="password"
+                                      value={fallback.provider_api_key ?? ""}
+                                      onChange={(event) =>
+                                        updateModelFallback(config.config_kind, {
+                                          provider_api_key: event.target.value,
+                                        })
+                                      }
+                                    />
+                                  </label>
+                                  <label>
+                                    {t("admin.fallbackModelName")}
+                                    <input
+                                      value={fallback.default_model}
+                                      onChange={(event) =>
+                                        updateModelFallback(config.config_kind, {
+                                          default_model: event.target.value,
+                                        })
+                                      }
+                                    />
+                                  </label>
+                                  <label>
+                                    {t("admin.fallbackApi")}
+                                    <select
+                                      value={fallback.api_type}
+                                      onChange={(event) =>
+                                        updateModelFallback(config.config_kind, {
+                                          api_type: event.target.value as ModelApiType,
+                                        })
+                                      }
+                                    >
+                                      {["chat_completions", "responses"].map((apiType) => (
+                                        <option key={apiType} value={apiType}>
+                                          {apiTypeLabels[apiType as ModelApiType]}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  </label>
+                                  <label>
+                                    {t("admin.fallbackReasoning")}
+                                    <select
+                                      value={fallback.reasoning_effort ?? ""}
+                                      onChange={(event) =>
+                                        updateModelFallback(config.config_kind, {
+                                          reasoning_effort:
+                                            event.target.value === ""
+                                              ? null
+                                              : (event.target.value as ReasoningEffort),
+                                        })
+                                      }
+                                    >
+                                      {reasoningEfforts.map((effort) => (
+                                        <option key={effort || "none"} value={effort}>
+                                          {effort || t("admin.noReasoning")}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  </label>
+                                  {config.config_kind === "llm" ? (
+                                    <>
+                                      <label>
+                                        {t("admin.fallbackContextWindowTokens")}
+                                        <input
+                                          type="number"
+                                          min={1}
+                                          value={fallback.context_window_tokens}
+                                          onChange={(event) =>
+                                            updateModelFallback(config.config_kind, {
+                                              context_window_tokens: Number(event.target.value),
+                                            })
+                                          }
+                                        />
+                                      </label>
+                                      <label>
+                                        {t("admin.fallbackMaxOutputTokens")}
+                                        <input
+                                          type="number"
+                                          min={1}
+                                          value={fallback.max_output_tokens}
+                                          onChange={(event) =>
+                                            updateModelFallback(config.config_kind, {
+                                              max_output_tokens: Number(event.target.value),
+                                            })
+                                          }
+                                        />
+                                      </label>
+                                      <label>
+                                        {t("admin.fallbackTemperature")}
+                                        <input
+                                          type="number"
+                                          min={0}
+                                          max={2}
+                                          step={0.1}
+                                          value={fallback.temperature}
+                                          onChange={(event) =>
+                                            updateModelFallback(config.config_kind, {
+                                              temperature: Number(event.target.value),
+                                            })
+                                          }
+                                        />
+                                      </label>
+                                    </>
+                                  ) : null}
+                                  <label>
+                                    {t("admin.fallbackTimeout")}
+                                    <input
+                                      type="number"
+                                      min={1}
+                                      value={fallback.request_timeout_seconds}
+                                      onChange={(event) =>
+                                        updateModelFallback(config.config_kind, {
+                                          request_timeout_seconds: Number(event.target.value),
+                                        })
+                                      }
+                                    />
+                                  </label>
+                                  {config.config_kind === "llm" ? (
+                                    <label className="checkbox-row">
+                                      <input
+                                        type="checkbox"
+                                        checked={fallback.allow_streaming}
+                                        onChange={(event) =>
+                                          updateModelFallback(config.config_kind, {
+                                            allow_streaming: event.target.checked,
+                                          })
+                                        }
+                                      />
+                                      {t("admin.fallbackStreaming")}
+                                    </label>
+                                  ) : null}
+                                  {config.config_kind === "llm" ? (
+                                    <label className="checkbox-row">
+                                      <input
+                                        type="checkbox"
+                                        checked={fallback.supports_parallel_tools}
+                                        onChange={(event) =>
+                                          updateModelFallback(config.config_kind, {
+                                            supports_parallel_tools: event.target.checked,
+                                          })
+                                        }
+                                      />
+                                      {t("admin.fallbackSupportsParallelTools")}
+                                    </label>
+                                  ) : null}
+                                </>
+                              ) : null}
+                            </fieldset>
+                          );
+                        })()
+                      : null}
+                    {config.config_kind === "image" ? (
+                      <label className="checkbox-row">
+                        <input
+                          type="checkbox"
+                          checked={config.enabled}
+                          onChange={(event) =>
+                            updateModel(config.config_kind, {
+                              enabled: event.target.checked,
+                            })
+                          }
+                        />
+                        {t("admin.imageEnabled")}
+                      </label>
+                    ) : null}
                   </div>
                 </section>
               );
@@ -1591,9 +1598,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
             </div>
           </div>
           {error ? <p className="error">{error}</p> : null}
-          {hermesProfileSaved ? (
-            <p className="copy-line">{t("admin.hermesProfileSaved")}</p>
-          ) : null}
+          {hermesProfileSaved ? <p className="copy-line">{t("admin.hermesProfileSaved")}</p> : null}
           <MarkdownVditorEditor
             className="soul-vditor-editor"
             label={t("admin.soulMd")}
@@ -1752,6 +1757,27 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
               required
             />
           </label>
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={systemSettings.speech_input.enabled}
+              onChange={(event) =>
+                setSystemSettings({
+                  ...systemSettings,
+                  speech_input: {
+                    ...systemSettings.speech_input,
+                    enabled: event.target.checked,
+                  },
+                })
+              }
+            />
+            {t("admin.speechInputEnabled")}
+          </label>
+          <p className={speechInputRuntimeConfig.runtime_available ? "copy-line" : "error"}>
+            {speechInputRuntimeConfig.runtime_available
+              ? t("admin.speechInputRuntimeAvailable")
+              : t("admin.speechInputRuntimeUnavailable")}
+          </p>
           <div className="button-row">
             <button type="submit">{t("admin.saveSettings")}</button>
           </div>
@@ -1780,7 +1806,10 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                 onChange={(event) =>
                   setSystemSettings({
                     ...systemSettings,
-                    oidc: { ...systemSettings.oidc, enabled: event.target.checked },
+                    oidc: {
+                      ...systemSettings.oidc,
+                      enabled: event.target.checked,
+                    },
                   })
                 }
               />
@@ -1797,7 +1826,10 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                 onChange={(event) =>
                   setSystemSettings({
                     ...systemSettings,
-                    oidc: { ...systemSettings.oidc, display_name: event.target.value },
+                    oidc: {
+                      ...systemSettings.oidc,
+                      display_name: event.target.value,
+                    },
                   })
                 }
               />
@@ -1809,7 +1841,10 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                 onChange={(event) =>
                   setSystemSettings({
                     ...systemSettings,
-                    oidc: { ...systemSettings.oidc, client_id: event.target.value },
+                    oidc: {
+                      ...systemSettings.oidc,
+                      client_id: event.target.value,
+                    },
                   })
                 }
               />
@@ -1822,7 +1857,10 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                 onChange={(event) =>
                   setSystemSettings({
                     ...systemSettings,
-                    oidc: { ...systemSettings.oidc, client_secret: event.target.value },
+                    oidc: {
+                      ...systemSettings.oidc,
+                      client_secret: event.target.value,
+                    },
                   })
                 }
               />
@@ -1834,7 +1872,10 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                 onChange={(event) =>
                   setSystemSettings({
                     ...systemSettings,
-                    oidc: { ...systemSettings.oidc, issuer_url: event.target.value },
+                    oidc: {
+                      ...systemSettings.oidc,
+                      issuer_url: event.target.value,
+                    },
                   })
                 }
               />
@@ -1846,7 +1887,10 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                 onChange={(event) =>
                   setSystemSettings({
                     ...systemSettings,
-                    oidc: { ...systemSettings.oidc, authorization_url: event.target.value },
+                    oidc: {
+                      ...systemSettings.oidc,
+                      authorization_url: event.target.value,
+                    },
                   })
                 }
               />
@@ -1858,7 +1902,10 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                 onChange={(event) =>
                   setSystemSettings({
                     ...systemSettings,
-                    oidc: { ...systemSettings.oidc, token_url: event.target.value },
+                    oidc: {
+                      ...systemSettings.oidc,
+                      token_url: event.target.value,
+                    },
                   })
                 }
               />
@@ -1870,7 +1917,10 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                 onChange={(event) =>
                   setSystemSettings({
                     ...systemSettings,
-                    oidc: { ...systemSettings.oidc, userinfo_url: event.target.value },
+                    oidc: {
+                      ...systemSettings.oidc,
+                      userinfo_url: event.target.value,
+                    },
                   })
                 }
               />
@@ -1882,7 +1932,10 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                 onChange={(event) =>
                   setSystemSettings({
                     ...systemSettings,
-                    oidc: { ...systemSettings.oidc, logout_url: event.target.value },
+                    oidc: {
+                      ...systemSettings.oidc,
+                      logout_url: event.target.value,
+                    },
                   })
                 }
               />
@@ -1894,7 +1947,10 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                 onChange={(event) =>
                   setSystemSettings({
                     ...systemSettings,
-                    oidc: { ...systemSettings.oidc, scopes: event.target.value },
+                    oidc: {
+                      ...systemSettings.oidc,
+                      scopes: event.target.value,
+                    },
                   })
                 }
               />
@@ -1906,7 +1962,10 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                 onChange={(event) =>
                   setSystemSettings({
                     ...systemSettings,
-                    oidc: { ...systemSettings.oidc, username_claim: event.target.value },
+                    oidc: {
+                      ...systemSettings.oidc,
+                      username_claim: event.target.value,
+                    },
                   })
                 }
               />
@@ -1918,7 +1977,10 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                 onChange={(event) =>
                   setSystemSettings({
                     ...systemSettings,
-                    oidc: { ...systemSettings.oidc, email_claim: event.target.value },
+                    oidc: {
+                      ...systemSettings.oidc,
+                      email_claim: event.target.value,
+                    },
                   })
                 }
               />
@@ -1997,9 +2059,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
               {t("admin.ldapEmailAttribute")}
               <input
                 value={systemSettings.ldap.email_attribute}
-                onChange={(event) =>
-                  updateLdapSettings({ email_attribute: event.target.value })
-                }
+                onChange={(event) => updateLdapSettings({ email_attribute: event.target.value })}
               />
             </label>
             <label className="checkbox-row">
@@ -2007,7 +2067,9 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                 type="checkbox"
                 checked={systemSettings.ldap.auto_create_users}
                 onChange={(event) =>
-                  updateLdapSettings({ auto_create_users: event.target.checked })
+                  updateLdapSettings({
+                    auto_create_users: event.target.checked,
+                  })
                 }
               />
               {t("admin.ldapAutoCreateUsers")}
@@ -2089,7 +2151,10 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
               </ul>
             )}
           </div>
-          <form className="panel form skill-editor" onSubmit={(event) => void saveManagedSkill(event)}>
+          <form
+            className="panel form skill-editor"
+            onSubmit={(event) => void saveManagedSkill(event)}
+          >
             {currentSkillPath ? (
               <p className="skill-path-line">
                 {t("admin.skillPath")}
@@ -2114,10 +2179,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
               <p className="notice">{t("admin.skillDirectorySelected")}</p>
             )}
             <div className="button-row">
-              <button
-                type="submit"
-                disabled={skillLoading || currentSkillPath === ""}
-              >
+              <button type="submit" disabled={skillLoading || currentSkillPath === ""}>
                 {skillEditorMode === "directory" ? t("admin.skillCreateFolder") : t("admin.save")}
               </button>
               <button
@@ -2131,7 +2193,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
             </div>
           </form>
         </div>
-      </section>
+      </section>,
     );
   }
 
@@ -2211,8 +2273,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
               <li key={invite.id}>
                 <strong>{invite.status}</strong>
                 <span>
-                  {invite.used_count}/{invite.max_uses} {t("admin.used")} ·{" "}
-                  {t("admin.expiresAt")}{" "}
+                  {invite.used_count}/{invite.max_uses} {t("admin.used")} · {t("admin.expiresAt")}{" "}
                   {new Date(invite.expires_at * 1000).toLocaleString(language)}
                 </span>
                 {invite.status === "pending" ? (

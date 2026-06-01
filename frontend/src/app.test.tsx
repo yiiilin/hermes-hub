@@ -78,7 +78,10 @@ describe("App", () => {
     return { promise, resolve, reject };
   }
 
-  function executionMessage(content: HermesVerboseEvent[], id = "message-execution"): ChannelMessage {
+  function executionMessage(
+    content: HermesVerboseEvent[],
+    id = "message-execution",
+  ): ChannelMessage {
     return {
       id,
       session_id: "session-1",
@@ -118,8 +121,9 @@ describe("App", () => {
   }
 
   function managedSkillTreeButton(path: string): HTMLButtonElement {
-    const button = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-managed-skill-path]"))
-      .find((candidate) => candidate.getAttribute("data-managed-skill-path") === path);
+    const button = Array.from(
+      document.querySelectorAll<HTMLButtonElement>("[data-managed-skill-path]"),
+    ).find((candidate) => candidate.getAttribute("data-managed-skill-path") === path);
     expect(button).toBeDefined();
     return button!;
   }
@@ -138,9 +142,106 @@ describe("App", () => {
     }).format(new Date(timestampSeconds * 1000));
   }
 
+  function installMediaRecorderMock(
+    payload: string,
+    options: { deferGetUserMedia?: boolean; throwOnConstruct?: boolean } = {},
+  ) {
+    const originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
+    const originalMediaRecorder = (
+      globalThis as typeof globalThis & {
+        MediaRecorder?: typeof MediaRecorder;
+      }
+    ).MediaRecorder;
+    const tracksByCall = [[{ stop: vi.fn() }], [{ stop: vi.fn() }]];
+    const mediaStreams = tracksByCall.map(
+      (tracks) =>
+        ({
+          getTracks: () => tracks,
+        }) as unknown as MediaStream,
+    );
+    const getUserMediaDeferred = options.deferGetUserMedia ? createDeferred<MediaStream>() : null;
+    let getUserMediaCallCount = 0;
+    const getUserMediaSpy = vi.fn(() => {
+      const callIndex = getUserMediaCallCount;
+      getUserMediaCallCount += 1;
+      if (getUserMediaDeferred && callIndex === 0) {
+        return getUserMediaDeferred.promise;
+      }
+      return Promise.resolve(mediaStreams[Math.min(callIndex, mediaStreams.length - 1)]);
+    });
+    const stopSpy = vi.fn();
+    const recorderConstructedSpy = vi.fn();
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: getUserMediaSpy,
+      },
+    });
+
+    class MockMediaRecorder {
+      ondataavailable: ((event: { data: Blob }) => void) | null = null;
+      onstop: (() => void) | null = null;
+      state = "inactive";
+
+      constructor() {
+        recorderConstructedSpy();
+        if (options.throwOnConstruct) {
+          throw new Error("MediaRecorder constructor failed");
+        }
+      }
+
+      start() {
+        this.state = "recording";
+      }
+
+      stop() {
+        stopSpy();
+        this.state = "inactive";
+        queueMicrotask(() => {
+          this.ondataavailable?.({
+            data: new Blob([payload], { type: "audio/webm" }),
+          });
+          this.onstop?.();
+        });
+      }
+    }
+
+    Object.defineProperty(globalThis, "MediaRecorder", {
+      configurable: true,
+      value: MockMediaRecorder,
+    });
+
+    const restore = () => {
+      if (originalMediaDevices) {
+        Object.defineProperty(navigator, "mediaDevices", originalMediaDevices);
+      } else {
+        Reflect.deleteProperty(navigator, "mediaDevices");
+      }
+      if (originalMediaRecorder) {
+        Object.defineProperty(globalThis, "MediaRecorder", {
+          configurable: true,
+          value: originalMediaRecorder,
+        });
+      } else {
+        Reflect.deleteProperty(globalThis, "MediaRecorder");
+      }
+    };
+    return {
+      getUserMediaSpy,
+      recorderConstructedSpy,
+      resolveGetUserMedia: () => getUserMediaDeferred?.resolve(mediaStreams[0]),
+      restore,
+      stopSpy,
+      tracks: tracksByCall[0],
+      tracksByCall,
+    };
+  }
+
   async function openSettingsTab(tabName: string, settingsName = "System settings") {
     fireEvent.click(await screen.findByRole("button", { name: settingsName }));
-    const settingsTabs = await screen.findByRole("tablist", { name: settingsName });
+    const settingsTabs = await screen.findByRole("tablist", {
+      name: settingsName,
+    });
     fireEvent.click(within(settingsTabs).getByRole("tab", { name: tabName }));
     return settingsTabs;
   }
@@ -189,66 +290,78 @@ describe("App", () => {
         "session-1": messages,
       },
       async createChannelRun(_channelId, sessionId, input) {
-          createCalled = true;
-          userMessage = {
-            id: "message-user",
-            session_id: sessionId,
-            role: "user",
-            client_message_key: input.clientMessageKey,
-            content: input.content,
-            attachments: input.attachments ?? [],
-            created_at: Date.now(),
-          };
+        createCalled = true;
+        userMessage = {
+          id: "message-user",
+          session_id: sessionId,
+          role: "user",
+          client_message_key: input.clientMessageKey,
+          content: input.content,
+          attachments: input.attachments ?? [],
+          created_at: Date.now(),
+        };
+        run = {
+          id: "run-storage-id",
+          run_id: runId,
+          session_id: sessionId,
+          user_message_id: userMessage.id,
+          status: "queued",
+          input: input.content,
+          input_attachments: input.attachments ?? [],
+          created_at: Date.now(),
+          updated_at: Date.now(),
+        };
+        messages.push(userMessage);
+        emitSessionEvent({ type: "message_created", message: userMessage });
+        run = { ...run, status: "running", updated_at: Date.now() };
+        emitSessionEvent({ type: "run_updated", run });
+        // Hub adapter 会在最终回答前持续落库执行步骤，测试 mock 也要模拟这个实时行为。
+        queueMicrotask(() => pushExecutionMessages(sessionId));
+        if (options.error) {
           run = {
-            id: "run-storage-id",
-            run_id: runId,
-            session_id: sessionId,
-            user_message_id: userMessage.id,
-            status: "queued",
-            input: input.content,
-            input_attachments: input.attachments ?? [],
-            created_at: Date.now(),
+            ...run,
+            status: "failed",
+            error: options.error,
             updated_at: Date.now(),
           };
-          messages.push(userMessage);
-          emitSessionEvent({ type: "message_created", message: userMessage });
-          run = { ...run, status: "running", updated_at: Date.now() };
           emitSessionEvent({ type: "run_updated", run });
-          // Hub adapter 会在最终回答前持续落库执行步骤，测试 mock 也要模拟这个实时行为。
-          queueMicrotask(() => pushExecutionMessages(sessionId));
-          if (options.error) {
-            run = { ...run, status: "failed", error: options.error, updated_at: Date.now() };
-            emitSessionEvent({ type: "run_updated", run });
-            return { message: userMessage, run };
-          }
-          void (async () => {
-            await (options.answerDelay ?? Promise.resolve());
-            pushExecutionMessages(sessionId);
-            const answer = options.answer ?? input.content;
-            const assistantMessage: ChannelMessage = {
-              id: "message-assistant",
-              session_id: sessionId,
-              role: "assistant",
-              client_message_key: `hermes-run:${runId}`,
-              content: answer,
-              attachments: [],
-              created_at: Date.now(),
-            };
-            messages.push(assistantMessage);
-            emitSessionEvent({ type: "message_created", message: assistantMessage });
-            if (run) {
-              emitSessionEvent({
-                type: "run_updated",
-                run: { ...run, status: "completed", output_message_id: assistantMessage.id },
-              });
-            }
-            run = null;
-            emitSessionEvent({ type: "run_cleared", session_id: sessionId });
-          })();
           return { message: userMessage, run };
-        },
-        activeRunsBySessionId: {},
-      });
+        }
+        void (async () => {
+          await (options.answerDelay ?? Promise.resolve());
+          pushExecutionMessages(sessionId);
+          const answer = options.answer ?? input.content;
+          const assistantMessage: ChannelMessage = {
+            id: "message-assistant",
+            session_id: sessionId,
+            role: "assistant",
+            client_message_key: `hermes-run:${runId}`,
+            content: answer,
+            attachments: [],
+            created_at: Date.now(),
+          };
+          messages.push(assistantMessage);
+          emitSessionEvent({
+            type: "message_created",
+            message: assistantMessage,
+          });
+          if (run) {
+            emitSessionEvent({
+              type: "run_updated",
+              run: {
+                ...run,
+                status: "completed",
+                output_message_id: assistantMessage.id,
+              },
+            });
+          }
+          run = null;
+          emitSessionEvent({ type: "run_cleared", session_id: sessionId });
+        })();
+        return { message: userMessage, run };
+      },
+      activeRunsBySessionId: {},
+    });
     client.activeHermesRun = async () => run;
     client.subscribeSessionEvents = (_channelId, sessionId, onEvent) => {
       eventListeners.add(onEvent);
@@ -280,7 +393,12 @@ describe("App", () => {
       createCalled: () => createCalled,
       client,
       setFailed(message: string) {
-        run = { ...run!, status: "failed", error: message, updated_at: Date.now() };
+        run = {
+          ...run!,
+          status: "failed",
+          error: message,
+          updated_at: Date.now(),
+        };
       },
       getRun() {
         return run;
@@ -508,7 +626,9 @@ describe("App", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Personal settings" }));
     expect(await screen.findByRole("heading", { name: "Personal settings" })).toBeInTheDocument();
-    const personalTabs = screen.getByRole("tablist", { name: "Personal settings" });
+    const personalTabs = screen.getByRole("tablist", {
+      name: "Personal settings",
+    });
     expect(within(personalTabs).getByRole("tab", { name: "Personalization" })).toHaveAttribute(
       "aria-selected",
       "true",
@@ -524,13 +644,13 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Session" })).toBeInTheDocument();
 
     fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Model configuration" }));
-    expect(await screen.findByRole("heading", { name: "Large language model" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "Large language model" }),
+    ).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: "Image model" })).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: "Title model" })).toBeInTheDocument();
     expect(
-      screen
-        .getAllByRole("heading", { level: 2 })
-        .map((heading) => heading.textContent),
+      screen.getAllByRole("heading", { level: 2 }).map((heading) => heading.textContent),
     ).toEqual(["Large language model", "Title model", "Image model"]);
     expect(screen.getByLabelText("Context window tokens")).toHaveValue(128000);
     expect(screen.getByLabelText("Max output tokens")).toHaveValue(4096);
@@ -552,9 +672,15 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
     expect(await screen.findByText("Settings saved")).toBeInTheDocument();
 
-    fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Authentication settings" }));
+    fireEvent.click(
+      within(settingsTabs).getByRole("tab", {
+        name: "Authentication settings",
+      }),
+    );
     expect(await screen.findByLabelText("Enable OIDC")).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "Authentication settings" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "Authentication settings" }),
+    ).not.toBeInTheDocument();
     fireEvent.click(screen.getByLabelText("Enable OIDC"));
     fireEvent.change(screen.getByLabelText("OIDC display name"), {
       target: { value: "Acme SSO" },
@@ -590,7 +716,9 @@ describe("App", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Personal settings" }));
 
     expect(await screen.findByRole("heading", { name: "Personal settings" })).toBeInTheDocument();
-    const personalTabs = screen.getByRole("tablist", { name: "Personal settings" });
+    const personalTabs = screen.getByRole("tablist", {
+      name: "Personal settings",
+    });
     expect(within(personalTabs).getByRole("tab", { name: "Personalization" })).toHaveAttribute(
       "aria-selected",
       "true",
@@ -629,9 +757,11 @@ describe("App", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "New chat" }));
     fireEvent.click(screen.getByRole("button", { name: "Personal settings" }));
-    fireEvent.click(within(screen.getByRole("tablist", { name: "Personal settings" })).getByRole("tab", {
-      name: "Change password",
-    }));
+    fireEvent.click(
+      within(screen.getByRole("tablist", { name: "Personal settings" })).getByRole("tab", {
+        name: "Change password",
+      }),
+    );
     expect(screen.getByLabelText("New password")).toHaveValue("");
     expect(screen.getByLabelText("Confirm password")).toHaveValue("");
   });
@@ -639,7 +769,9 @@ describe("App", () => {
   it("groups admin modules under system settings tabs", async () => {
     render(<App apiClient={createMockApiClient()} />);
 
-    const systemSettingsNav = await screen.findByRole("button", { name: "System settings" });
+    const systemSettingsNav = await screen.findByRole("button", {
+      name: "System settings",
+    });
     expect(screen.queryByRole("button", { name: "User management" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Model configuration" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Hermes management" })).not.toBeInTheDocument();
@@ -648,21 +780,37 @@ describe("App", () => {
     fireEvent.click(systemSettingsNav);
     expect(await screen.findByRole("heading", { name: "System settings" })).toBeInTheDocument();
 
-    const settingsTabs = screen.getByRole("tablist", { name: "System settings" });
+    const settingsTabs = screen.getByRole("tablist", {
+      name: "System settings",
+    });
     expect(within(settingsTabs).getByRole("tab", { name: "User management" })).toHaveAttribute(
       "aria-selected",
       "true",
     );
-    expect(within(settingsTabs).getByRole("tab", { name: "Model configuration" })).toBeInTheDocument();
-    expect(within(settingsTabs).getByRole("tab", { name: "Hermes management" })).toBeInTheDocument();
+    expect(
+      within(settingsTabs).getByRole("tab", { name: "Model configuration" }),
+    ).toBeInTheDocument();
+    expect(
+      within(settingsTabs).getByRole("tab", { name: "Hermes management" }),
+    ).toBeInTheDocument();
     expect(within(settingsTabs).getByRole("tab", { name: "Hermes Profile" })).toBeInTheDocument();
     expect(within(settingsTabs).getByRole("tab", { name: "Managed skills" })).toBeInTheDocument();
-    expect(within(settingsTabs).getByRole("tab", { name: "System parameters" })).toBeInTheDocument();
-    expect(within(settingsTabs).queryByRole("tab", { name: "Session settings" })).not.toBeInTheDocument();
-    expect(within(settingsTabs).getByRole("tab", { name: "Authentication settings" })).toBeInTheDocument();
+    expect(
+      within(settingsTabs).getByRole("tab", { name: "System parameters" }),
+    ).toBeInTheDocument();
+    expect(
+      within(settingsTabs).queryByRole("tab", { name: "Session settings" }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(settingsTabs).getByRole("tab", {
+        name: "Authentication settings",
+      }),
+    ).toBeInTheDocument();
 
     fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Model configuration" }));
-    expect(await screen.findByRole("heading", { name: "Large language model" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "Large language model" }),
+    ).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Model configuration" })).not.toBeInTheDocument();
 
     fireEvent.click(within(settingsTabs).getByRole("tab", { name: "System parameters" }));
@@ -670,11 +818,17 @@ describe("App", () => {
     expect(await screen.findByLabelText("Max attachment upload size (MB)")).toBeInTheDocument();
     expect(screen.getByLabelText("Attachment retention (days)")).toBeInTheDocument();
 
-    fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Authentication settings" }));
+    fireEvent.click(
+      within(settingsTabs).getByRole("tab", {
+        name: "Authentication settings",
+      }),
+    );
     const enableOidcRow = await screen.findByLabelText("Enable OIDC");
     expect(enableOidcRow).toBeInTheDocument();
     expect(screen.getByLabelText("OIDC Redirect URI")).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "Authentication settings" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "Authentication settings" }),
+    ).not.toBeInTheDocument();
   });
 
   it("lets admins edit and save only SOUL.md with Vditor's Markdown WYSIWYG editor", async () => {
@@ -741,7 +895,9 @@ describe("App", () => {
     render(<App apiClient={createMockApiClient()} />);
 
     await openSettingsTab("Model configuration");
-    const imageHeading = await screen.findByRole("heading", { name: "Image model" });
+    const imageHeading = await screen.findByRole("heading", {
+      name: "Image model",
+    });
     const imageCard = imageHeading.closest("section.panel");
     expect(imageCard).toBeInTheDocument();
 
@@ -792,7 +948,9 @@ describe("App", () => {
     render(<App apiClient={client} />);
 
     await openSettingsTab("Model configuration");
-    const llmHeading = await screen.findByRole("heading", { name: "Large language model" });
+    const llmHeading = await screen.findByRole("heading", {
+      name: "Large language model",
+    });
     const llmCard = llmHeading.closest("section.panel") as HTMLElement;
     fireEvent.click(within(llmCard).getByLabelText("Enable fallback"));
     fireEvent.change(within(llmCard).getByLabelText("Fallback provider"), {
@@ -858,7 +1016,9 @@ describe("App", () => {
     render(<App apiClient={client} />);
 
     await openSettingsTab("Model configuration");
-    const llmHeading = await screen.findByRole("heading", { name: "Large language model" });
+    const llmHeading = await screen.findByRole("heading", {
+      name: "Large language model",
+    });
     const llmCard = llmHeading.closest("section.panel") as HTMLElement;
     fireEvent.click(within(llmCard).getByLabelText("Enable fallback"));
     fireEvent.change(within(llmCard).getByLabelText("Fallback provider"), {
@@ -959,14 +1119,427 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
     await waitFor(() => expect(hubRun.createCalled()).toBe(true));
-    expect(
-      hubRun.getMessages().find((message) => message.role === "user")?.attachments,
-    ).toEqual([
+    expect(hubRun.getMessages().find((message) => message.role === "user")?.attachments).toEqual([
       expect.objectContaining({
         name: "pasted.png",
         kind: "image",
       }),
     ]);
+  });
+
+  it("records speech while the microphone is held and inserts the transcription", async () => {
+    const { restore: restoreRecorder, stopSpy } = installMediaRecorderMock("audio bytes");
+    try {
+      const hubRun = createHubRunMock({ answer: "unused" });
+      hubRun.client.speechInputConfig = vi.fn(async () => ({
+        enabled: true,
+        runtime_available: true,
+        max_audio_seconds: 60,
+        max_upload_bytes: 25 * 1024 * 1024,
+      }));
+      hubRun.client.transcribeSpeechInput = vi.fn(async (file) => {
+        expect(file.type).toBe("audio/webm");
+        return { text: "语音输入内容" };
+      });
+
+      render(<App apiClient={hubRun.client} />);
+
+      const microphone = await screen.findByRole("button", {
+        name: "Hold to speak",
+      });
+      fireEvent.mouseDown(microphone);
+      expect(await screen.findByText("Recording, release to transcribe")).toBeInTheDocument();
+      window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+
+      await waitFor(() => {
+        expect(stopSpy).toHaveBeenCalledTimes(1);
+      });
+
+      await waitFor(() => {
+        expect(hubRun.client.transcribeSpeechInput).toHaveBeenCalledTimes(1);
+      });
+      expect(screen.getByLabelText("Message")).toHaveValue("语音输入内容");
+      expect(hubRun.createCalled()).toBe(false);
+    } finally {
+      restoreRecorder();
+    }
+  });
+
+  it("explains when the page origin cannot access the microphone", async () => {
+    const originalSecureContext = Object.getOwnPropertyDescriptor(globalThis, "isSecureContext");
+    Object.defineProperty(globalThis, "isSecureContext", {
+      configurable: true,
+      value: false,
+    });
+    const recorder = installMediaRecorderMock("audio bytes");
+    try {
+      const hubRun = createHubRunMock({ answer: "unused" });
+      hubRun.client.speechInputConfig = vi.fn(async () => ({
+        enabled: true,
+        runtime_available: true,
+        max_audio_seconds: 60,
+        max_upload_bytes: 25 * 1024 * 1024,
+      }));
+      render(<App apiClient={hubRun.client} />);
+
+      const microphone = await screen.findByRole("button", {
+        name: "Hold to speak",
+      });
+      fireEvent.mouseDown(microphone);
+
+      expect(
+        await screen.findByText(
+          "Speech input requires HTTPS or localhost. This address cannot access the microphone.",
+        ),
+      ).toBeInTheDocument();
+      expect(recorder.getUserMediaSpy).not.toHaveBeenCalled();
+    } finally {
+      recorder.restore();
+      if (originalSecureContext) {
+        Object.defineProperty(globalThis, "isSecureContext", originalSecureContext);
+      } else {
+        Reflect.deleteProperty(globalThis, "isSecureContext");
+      }
+    }
+  });
+
+  it("does not start speech recording after release before microphone permission resolves", async () => {
+    const recorder = installMediaRecorderMock("audio bytes", {
+      deferGetUserMedia: true,
+    });
+    try {
+      const hubRun = createHubRunMock({ answer: "unused" });
+      hubRun.client.speechInputConfig = vi.fn(async () => ({
+        enabled: true,
+        runtime_available: true,
+        max_audio_seconds: 60,
+        max_upload_bytes: 25 * 1024 * 1024,
+      }));
+      hubRun.client.transcribeSpeechInput = vi.fn(async () => ({
+        text: "should not upload",
+      }));
+
+      render(<App apiClient={hubRun.client} />);
+
+      const microphone = await screen.findByRole("button", {
+        name: "Hold to speak",
+      });
+      fireEvent.mouseDown(microphone);
+      fireEvent.mouseUp(microphone);
+      await act(async () => {
+        recorder.resolveGetUserMedia();
+        await Promise.resolve();
+      });
+
+      await waitFor(() => expect(recorder.tracks[0].stop).toHaveBeenCalledTimes(1));
+      expect(recorder.recorderConstructedSpy).not.toHaveBeenCalled();
+      expect(hubRun.client.transcribeSpeechInput).not.toHaveBeenCalled();
+    } finally {
+      recorder.restore();
+    }
+  });
+
+  it("ignores stale microphone permission results from an older recording attempt", async () => {
+    const recorder = installMediaRecorderMock("second audio", {
+      deferGetUserMedia: true,
+    });
+    try {
+      const hubRun = createHubRunMock({ answer: "unused" });
+      hubRun.client.speechInputConfig = vi.fn(async () => ({
+        enabled: true,
+        runtime_available: true,
+        max_audio_seconds: 60,
+        max_upload_bytes: 25 * 1024 * 1024,
+      }));
+      hubRun.client.transcribeSpeechInput = vi.fn(async () => ({
+        text: "第二次录音",
+      }));
+
+      render(<App apiClient={hubRun.client} />);
+
+      const microphone = await screen.findByRole("button", {
+        name: "Hold to speak",
+      });
+      fireEvent.mouseDown(microphone);
+      fireEvent.mouseUp(microphone);
+      fireEvent.mouseDown(microphone);
+      await act(async () => {
+        await Promise.resolve();
+      });
+      recorder.resolveGetUserMedia();
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      expect(recorder.tracksByCall[0][0].stop).toHaveBeenCalledTimes(1);
+      expect(recorder.recorderConstructedSpy).toHaveBeenCalledTimes(1);
+      window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+      await waitFor(() => expect(recorder.stopSpy).toHaveBeenCalledTimes(1));
+      await waitFor(() => {
+        expect(hubRun.client.transcribeSpeechInput).toHaveBeenCalledTimes(1);
+      });
+      expect(screen.getByLabelText("Message")).toHaveValue("第二次录音");
+    } finally {
+      recorder.restore();
+    }
+  });
+
+  it("does not record speech when unmounted while microphone permission is pending", async () => {
+    const recorder = installMediaRecorderMock("audio bytes", {
+      deferGetUserMedia: true,
+    });
+    try {
+      const hubRun = createHubRunMock({ answer: "unused" });
+      hubRun.client.speechInputConfig = vi.fn(async () => ({
+        enabled: true,
+        runtime_available: true,
+        max_audio_seconds: 60,
+        max_upload_bytes: 25 * 1024 * 1024,
+      }));
+      hubRun.client.transcribeSpeechInput = vi.fn(async () => ({
+        text: "should not upload",
+      }));
+
+      const { unmount } = render(<App apiClient={hubRun.client} />);
+
+      const microphone = await screen.findByRole("button", {
+        name: "Hold to speak",
+      });
+      fireEvent.mouseDown(microphone);
+      unmount();
+      await act(async () => {
+        recorder.resolveGetUserMedia();
+        await Promise.resolve();
+      });
+
+      expect(recorder.tracksByCall[0][0].stop).toHaveBeenCalledTimes(1);
+      expect(recorder.recorderConstructedSpy).not.toHaveBeenCalled();
+      expect(hubRun.client.transcribeSpeechInput).not.toHaveBeenCalled();
+    } finally {
+      recorder.restore();
+    }
+  });
+
+  it("releases the microphone when speech recorder creation fails", async () => {
+    const recorder = installMediaRecorderMock("audio bytes", {
+      throwOnConstruct: true,
+    });
+    try {
+      const hubRun = createHubRunMock({ answer: "unused" });
+      hubRun.client.speechInputConfig = vi.fn(async () => ({
+        enabled: true,
+        runtime_available: true,
+        max_audio_seconds: 60,
+        max_upload_bytes: 25 * 1024 * 1024,
+      }));
+      hubRun.client.transcribeSpeechInput = vi.fn(async () => ({
+        text: "should not upload",
+      }));
+
+      render(<App apiClient={hubRun.client} />);
+
+      const microphone = await screen.findByRole("button", {
+        name: "Hold to speak",
+      });
+      fireEvent.mouseDown(microphone);
+
+      await waitFor(() => expect(recorder.tracksByCall[0][0].stop).toHaveBeenCalledTimes(1));
+      expect(recorder.recorderConstructedSpy).toHaveBeenCalledTimes(1);
+      expect(hubRun.client.transcribeSpeechInput).not.toHaveBeenCalled();
+    } finally {
+      recorder.restore();
+    }
+  });
+
+  it("stops speech recording without transcribing when the composer unmounts", async () => {
+    const recorder = installMediaRecorderMock("audio bytes");
+    try {
+      const hubRun = createHubRunMock({ answer: "unused" });
+      hubRun.client.speechInputConfig = vi.fn(async () => ({
+        enabled: true,
+        runtime_available: true,
+        max_audio_seconds: 60,
+        max_upload_bytes: 25 * 1024 * 1024,
+      }));
+      hubRun.client.transcribeSpeechInput = vi.fn(async () => ({
+        text: "should not upload",
+      }));
+
+      const { unmount } = render(<App apiClient={hubRun.client} />);
+
+      const microphone = await screen.findByRole("button", {
+        name: "Hold to speak",
+      });
+      fireEvent.mouseDown(microphone);
+      expect(await screen.findByText("Recording, release to transcribe")).toBeInTheDocument();
+      unmount();
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      expect(recorder.stopSpy).toHaveBeenCalledTimes(1);
+      expect(recorder.tracksByCall[0][0].stop).toHaveBeenCalledTimes(1);
+      expect(hubRun.client.transcribeSpeechInput).not.toHaveBeenCalled();
+    } finally {
+      recorder.restore();
+    }
+  });
+
+  it("cancels speech recording without transcribing or sending", async () => {
+    const { restore: restoreRecorder, stopSpy } = installMediaRecorderMock("cancelled audio");
+    try {
+      const hubRun = createHubRunMock({ answer: "unused" });
+      hubRun.client.speechInputConfig = vi.fn(async () => ({
+        enabled: true,
+        runtime_available: true,
+        max_audio_seconds: 60,
+        max_upload_bytes: 25 * 1024 * 1024,
+      }));
+      hubRun.client.transcribeSpeechInput = vi.fn(async () => ({
+        text: "should not upload",
+      }));
+
+      render(<App apiClient={hubRun.client} />);
+
+      const microphone = await screen.findByRole("button", {
+        name: "Hold to speak",
+      });
+      fireEvent.mouseDown(microphone);
+      fireEvent.click(await screen.findByRole("button", { name: "Cancel speech input" }));
+
+      await waitFor(() => expect(stopSpy).toHaveBeenCalledTimes(1));
+      expect(hubRun.client.transcribeSpeechInput).not.toHaveBeenCalled();
+      expect(screen.getByLabelText("Message")).toHaveValue("");
+      expect(hubRun.createCalled()).toBe(false);
+    } finally {
+      restoreRecorder();
+    }
+  });
+
+  it("rejects oversized recorded speech before calling the ASR endpoint", async () => {
+    const { restore: restoreRecorder, stopSpy } = installMediaRecorderMock("audio bytes");
+    try {
+      const hubRun = createHubRunMock({ answer: "unused" });
+      hubRun.client.speechInputConfig = vi.fn(async () => ({
+        enabled: true,
+        runtime_available: true,
+        max_audio_seconds: 60,
+        max_upload_bytes: 1,
+      }));
+      hubRun.client.transcribeSpeechInput = vi.fn(async () => ({
+        text: "should not upload",
+      }));
+
+      render(<App apiClient={hubRun.client} />);
+
+      const microphone = await screen.findByRole("button", {
+        name: "Hold to speak",
+      });
+      fireEvent.mouseDown(microphone);
+      expect(await screen.findByText("Recording, release to transcribe")).toBeInTheDocument();
+      window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+
+      await waitFor(() => expect(stopSpy).toHaveBeenCalledTimes(1));
+      expect(
+        await screen.findByText("Recording is larger than 1 B. Record a shorter clip."),
+      ).toBeInTheDocument();
+      expect(hubRun.client.transcribeSpeechInput).not.toHaveBeenCalled();
+    } finally {
+      restoreRecorder();
+    }
+  });
+
+  it("keeps transcribing visible when release events repeat", async () => {
+    const { restore: restoreRecorder, stopSpy } = installMediaRecorderMock("audio bytes");
+    try {
+      const transcription = createDeferred<{ text: string }>();
+      const hubRun = createHubRunMock({ answer: "unused" });
+      hubRun.client.speechInputConfig = vi.fn(async () => ({
+        enabled: true,
+        runtime_available: true,
+        max_audio_seconds: 60,
+        max_upload_bytes: 25 * 1024 * 1024,
+      }));
+      hubRun.client.transcribeSpeechInput = vi.fn(() => transcription.promise);
+
+      render(<App apiClient={hubRun.client} />);
+
+      const microphone = await screen.findByRole("button", {
+        name: "Hold to speak",
+      });
+      fireEvent.mouseDown(microphone);
+      expect(await screen.findByText("Recording, release to transcribe")).toBeInTheDocument();
+      window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+
+      await waitFor(() => expect(stopSpy).toHaveBeenCalledTimes(1));
+      expect(await screen.findByText("Transcribing...")).toBeInTheDocument();
+      window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+      window.dispatchEvent(new Event("pointerup", { bubbles: true, cancelable: true }));
+      expect(screen.getByText("Transcribing...")).toBeInTheDocument();
+
+      await act(async () => {
+        transcription.resolve({ text: "稳定识别" });
+        await Promise.resolve();
+      });
+      expect(screen.getByLabelText("Message")).toHaveValue("稳定识别");
+    } finally {
+      restoreRecorder();
+    }
+  });
+
+  it("automatically stops speech recording at the configured duration", async () => {
+    const { restore: restoreRecorder, stopSpy } = installMediaRecorderMock("timed audio");
+    try {
+      const hubRun = createHubRunMock({ answer: "unused" });
+      hubRun.client.speechInputConfig = vi.fn(async () => ({
+        enabled: true,
+        runtime_available: true,
+        max_audio_seconds: 1,
+        max_upload_bytes: 25 * 1024 * 1024,
+      }));
+      hubRun.client.transcribeSpeechInput = vi.fn(async () => ({
+        text: "计时录音",
+      }));
+
+      render(<App apiClient={hubRun.client} />);
+
+      const microphone = await screen.findByRole("button", {
+        name: "Hold to speak",
+      });
+      vi.useFakeTimers();
+      fireEvent.mouseDown(microphone);
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(screen.getByText("Recording, release to transcribe")).toBeInTheDocument();
+
+      await act(async () => {
+        vi.advanceTimersByTime(1000);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(stopSpy).toHaveBeenCalledTimes(1);
+      expect(hubRun.client.transcribeSpeechInput).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+      restoreRecorder();
+    }
+  });
+
+  it("hides the microphone when speech input is not enabled", async () => {
+    const client = createMockApiClient();
+    client.speechInputConfig = vi.fn(async () => ({
+      enabled: false,
+      runtime_available: false,
+      max_audio_seconds: 60,
+      max_upload_bytes: 25 * 1024 * 1024,
+    }));
+
+    render(<App apiClient={client} />);
+
+    expect(await screen.findByLabelText("Message")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Hold to speak" })).not.toBeInTheDocument();
   });
 
   it("shows each message updated time on the correct bubble edge", async () => {
@@ -1032,8 +1605,7 @@ describe("App", () => {
                 id: "message-markdown",
                 session_id: "session-1",
                 role: "assistant",
-                content:
-                  `## 结果\n\n**加粗文本** 和 \`code\`\n\n\`\`\`bash\n./start_ntp.sh\n\`\`\`\n\n| 场景 | 命令 |\n|------|------|\n| 将本机作为时钟源 | ./start_ntp.sh |\n| 同步指定时钟源 | ./start_ntp.sh <时钟源IP> |\n\n文件：[练习.pptx](${absolutePptUrl})\n\n![cat](/api/attachments/cat/download)\n\n[open](/download)`,
+                content: `## 结果\n\n**加粗文本** 和 \`code\`\n\n\`\`\`bash\n./start_ntp.sh\n\`\`\`\n\n| 场景 | 命令 |\n|------|------|\n| 将本机作为时钟源 | ./start_ntp.sh |\n| 同步指定时钟源 | ./start_ntp.sh <时钟源IP> |\n\n文件：[练习.pptx](${absolutePptUrl})\n\n![cat](/api/attachments/cat/download)\n\n[open](/download)`,
                 attachments: [
                   {
                     id: "attachment-ppt",
@@ -1117,8 +1689,7 @@ describe("App", () => {
                 id: "message-attachment-placeholders",
                 session_id: "session-1",
                 role: "assistant",
-                content:
-                  "先看脚本：\n\n{{attachment:0}}\n\n再看图片：\n\n{{attachment:1}}\n\n结束",
+                content: "先看脚本：\n\n{{attachment:0}}\n\n再看图片：\n\n{{attachment:1}}\n\n结束",
                 attachments: [
                   {
                     id: "script",
@@ -1146,9 +1717,13 @@ describe("App", () => {
     );
 
     const firstText = await screen.findByText("先看脚本：");
-    const scriptChip = screen.getByRole("link", { name: "Download file start_ntp.sh" });
+    const scriptChip = screen.getByRole("link", {
+      name: "Download file start_ntp.sh",
+    });
     const secondText = screen.getByText("再看图片：");
-    const imagePreview = screen.getByRole("button", { name: "Preview image chart.png" });
+    const imagePreview = screen.getByRole("button", {
+      name: "Preview image chart.png",
+    });
     const markdown = document.querySelector(".markdown-content");
 
     expect(markdown?.textContent).not.toContain("{{attachment:");
@@ -1158,9 +1733,9 @@ describe("App", () => {
     expect(scriptChip.compareDocumentPosition(secondText) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
-    expect(secondText.compareDocumentPosition(imagePreview) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
-      Node.DOCUMENT_POSITION_FOLLOWING,
-    );
+    expect(
+      secondText.compareDocumentPosition(imagePreview) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
   });
 
   it("keeps repeated assistant content when attachment ids differ", async () => {
@@ -1207,7 +1782,9 @@ describe("App", () => {
       />,
     );
 
-    expect(await screen.findByRole("button", { name: "Preview image first.png" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("button", { name: "Preview image first.png" }),
+    ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Preview image second.png" })).toBeInTheDocument();
   });
 
@@ -1242,7 +1819,10 @@ describe("App", () => {
 
   it("shows Hermes input status while a response is pending", async () => {
     const deferred = createDeferred<void>();
-    const hubRun = createHubRunMock({ answer: "pong", answerDelay: deferred.promise });
+    const hubRun = createHubRunMock({
+      answer: "pong",
+      answerDelay: deferred.promise,
+    });
 
     render(<App apiClient={hubRun.client} />);
 
@@ -1263,7 +1843,10 @@ describe("App", () => {
 
   it("keeps the composer focused and editable while Hermes is responding", async () => {
     const deferred = createDeferred<void>();
-    const hubRun = createHubRunMock({ answer: "done", answerDelay: deferred.promise });
+    const hubRun = createHubRunMock({
+      answer: "done",
+      answerDelay: deferred.promise,
+    });
 
     render(<App apiClient={hubRun.client} />);
 
@@ -1508,7 +2091,9 @@ describe("App", () => {
     }
 
     await waitFor(() => {
-      expect(document.querySelector(".message-bubble.assistant.empty-body")).not.toBeInTheDocument();
+      expect(
+        document.querySelector(".message-bubble.assistant.empty-body"),
+      ).not.toBeInTheDocument();
       expectPendingLoader();
     });
   });
@@ -1544,7 +2129,7 @@ describe("App", () => {
         {
           kind: "tool.call",
           tool: "image_generate",
-          detail: "{\"prompt\":\"cat\"}",
+          detail: '{"prompt":"cat"}',
         },
       ],
     });
@@ -1556,7 +2141,7 @@ describe("App", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
-    expect(await screen.findByText("call image generation：{\"prompt\":\"cat\"}")).toBeInTheDocument();
+    expect(await screen.findByText('call image generation：{"prompt":"cat"}')).toBeInTheDocument();
     expect(screen.getByLabelText("Hermes run log")).toBeInTheDocument();
 
     deferred.resolve();
@@ -1599,10 +2184,9 @@ describe("App", () => {
                 session_id: "session-1",
                 role: "assistant",
                 message_kind: "execution",
-                content:
-                  `<!-- hermes-hub:execution:v1 -->\n${JSON.stringify([
-                    { kind: "tool.call", tool: "terminal", detail: "from kind" },
-                  ])}`,
+                content: `<!-- hermes-hub:execution:v1 -->\n${JSON.stringify([
+                  { kind: "tool.call", tool: "terminal", detail: "from kind" },
+                ])}`,
                 attachments: [],
                 created_at: 1,
               },
@@ -1645,15 +2229,18 @@ describe("App", () => {
   });
 
   it("virtualizes long chat histories while keeping recent messages rendered", async () => {
-    const messages = Array.from({ length: 140 }, (_, index): ChannelMessage => ({
-      id: `message-long-${index}`,
-      session_id: "session-1",
-      role: index % 2 === 0 ? "user" : "assistant",
-      message_kind: "text",
-      content: `message ${index}`,
-      attachments: [],
-      created_at: index + 1,
-    }));
+    const messages = Array.from(
+      { length: 140 },
+      (_, index): ChannelMessage => ({
+        id: `message-long-${index}`,
+        session_id: "session-1",
+        role: index % 2 === 0 ? "user" : "assistant",
+        message_kind: "text",
+        content: `message ${index}`,
+        attachments: [],
+        created_at: index + 1,
+      }),
+    );
 
     render(
       <App
@@ -1675,15 +2262,18 @@ describe("App", () => {
   });
 
   it("renders live session events immediately in long chat histories", async () => {
-    const messages = Array.from({ length: 140 }, (_, index): ChannelMessage => ({
-      id: `message-live-long-${index}`,
-      session_id: "session-1",
-      role: index % 2 === 0 ? "user" : "assistant",
-      message_kind: "text",
-      content: `live history ${index}`,
-      attachments: [],
-      created_at: index + 1,
-    }));
+    const messages = Array.from(
+      { length: 140 },
+      (_, index): ChannelMessage => ({
+        id: `message-live-long-${index}`,
+        session_id: "session-1",
+        role: index % 2 === 0 ? "user" : "assistant",
+        message_kind: "text",
+        content: `live history ${index}`,
+        attachments: [],
+        created_at: index + 1,
+      }),
+    );
     let listener: ((event: ChannelSessionEvent) => void) | null = null;
     const client = createMockApiClient({
       subscribeSessionEvents(_channelId, _sessionId, onEvent) {
@@ -1994,7 +2584,11 @@ describe("App", () => {
                 content: `<!-- hermes-hub:execution:v1 -->\n${JSON.stringify([
                   ...executionEvents,
                   ...executionEvents,
-                  { kind: "tool.completed", tool: "image_generate", detail: "image done" },
+                  {
+                    kind: "tool.completed",
+                    tool: "image_generate",
+                    detail: "image done",
+                  },
                 ])}`,
                 attachments: [],
                 created_at: 1,
@@ -2122,7 +2716,10 @@ describe("App", () => {
             },
           ];
           for (const listener of eventListeners) {
-            listener({ type: "message_created", message: executionMessage(events) });
+            listener({
+              type: "message_created",
+              message: executionMessage(events),
+            });
           }
         });
         return {
@@ -2481,6 +3078,11 @@ describe("App", () => {
     render(<App apiClient={client} />);
 
     await openSettingsTab("System parameters");
+    expect(
+      await screen.findByText(
+        "ASR service is not configured or the deployment switch is disabled.",
+      ),
+    ).toBeInTheDocument();
 
     fireEvent.change(await screen.findByLabelText("Max attachment upload size (MB)"), {
       target: { value: "15000" },
@@ -2488,12 +3090,16 @@ describe("App", () => {
     fireEvent.change(screen.getByLabelText("Attachment retention (days)"), {
       target: { value: "14" },
     });
+    fireEvent.click(screen.getByLabelText("Enable speech input"));
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
 
     expect(await screen.findByText("Settings saved")).toBeInTheDocument();
     expect(savedSettings).toMatchObject({
       max_attachment_upload_bytes: 15000 * 1024 * 1024,
       attachment_retention_days: 14,
+      speech_input: {
+        enabled: true,
+      },
     });
   });
 
@@ -2555,7 +3161,9 @@ describe("App", () => {
 
     render(<App apiClient={client} />);
 
-    const oidcButton = await screen.findByRole("link", { name: "Sign in with Acme SSO" });
+    const oidcButton = await screen.findByRole("link", {
+      name: "Sign in with Acme SSO",
+    });
     expect(oidcButton).toHaveAttribute("href", "/api/auth/oidc/start");
   });
 
@@ -2595,7 +3203,10 @@ describe("App", () => {
   });
 
   it("hides first-admin registration entry when bootstrap is closed", async () => {
-    const client = createMockApiClient({ initialUser: null, bootstrapOpen: false });
+    const client = createMockApiClient({
+      initialUser: null,
+      bootstrapOpen: false,
+    });
 
     render(<App apiClient={client} />);
 
@@ -2607,7 +3218,10 @@ describe("App", () => {
   });
 
   it("shows the first-user registration form without the app sidebar", async () => {
-    const client = createMockApiClient({ initialUser: null, bootstrapOpen: true });
+    const client = createMockApiClient({
+      initialUser: null,
+      bootstrapOpen: true,
+    });
 
     render(<App apiClient={client} />);
 
@@ -2633,7 +3247,10 @@ describe("App", () => {
 
   it("opens invite links as registration without exposing the token field", async () => {
     window.history.pushState({}, "", "/?invite=secret-invite-token");
-    const client = createMockApiClient({ initialUser: null, bootstrapOpen: false });
+    const client = createMockApiClient({
+      initialUser: null,
+      bootstrapOpen: false,
+    });
 
     render(<App apiClient={client} />);
 
@@ -2646,7 +3263,10 @@ describe("App", () => {
 
   it("returns to sign in after invite registration creates the account", async () => {
     window.history.pushState({}, "", "/?invite=secret-invite-token");
-    const client = createMockApiClient({ initialUser: null, bootstrapOpen: false });
+    const client = createMockApiClient({
+      initialUser: null,
+      bootstrapOpen: false,
+    });
 
     render(<App apiClient={client} />);
 
@@ -2704,18 +3324,26 @@ describe("App", () => {
       throw new Error("prewarm disabled for this action-focused test");
     });
     client.listUsers = async () => [
-      { id: "user-1", email: "admin@example.com", role: "admin", status: "active" },
-      { id: "user-2", email: "user@example.com", role: "user", status: "active" },
+      {
+        id: "user-1",
+        email: "admin@example.com",
+        role: "admin",
+        status: "active",
+      },
+      {
+        id: "user-2",
+        email: "user@example.com",
+        role: "user",
+        status: "active",
+      },
     ];
 
-    render(
-      <App
-        apiClient={client}
-      />,
-    );
+    render(<App apiClient={client} />);
 
     await openSettingsTab("Hermes management");
-    const createButtons = await screen.findAllByRole("button", { name: "Create" });
+    const createButtons = await screen.findAllByRole("button", {
+      name: "Create",
+    });
     expect(createButtons.length).toBeGreaterThan(0);
     fireEvent.click(createButtons[0]);
 
@@ -2852,7 +3480,9 @@ describe("App", () => {
     await openSettingsTab("Scheduled tasks");
 
     expect(listHermesSchedulerSnapshots).toHaveBeenCalled();
-    const schedulerTable = await screen.findByRole("table", { name: "Scheduled tasks" });
+    const schedulerTable = await screen.findByRole("table", {
+      name: "Scheduled tasks",
+    });
     expect(within(schedulerTable).getByText("admin@example.com")).toBeInTheDocument();
     expect(within(schedulerTable).getByText("Daily summary")).toBeInTheDocument();
     expect(within(schedulerTable).getByText("0 9 * * *")).toBeInTheDocument();
@@ -2896,8 +3526,12 @@ describe("App", () => {
 
     render(<App apiClient={client} />);
 
-    const scheduledTasksNav = await screen.findByRole("button", { name: "Scheduled tasks" });
-    const personalizationNav = screen.getByRole("button", { name: "Personal settings" });
+    const scheduledTasksNav = await screen.findByRole("button", {
+      name: "Scheduled tasks",
+    });
+    const personalizationNav = screen.getByRole("button", {
+      name: "Personal settings",
+    });
     expect(
       scheduledTasksNav.compareDocumentPosition(personalizationNav) &
         Node.DOCUMENT_POSITION_FOLLOWING,
@@ -2906,7 +3540,9 @@ describe("App", () => {
     fireEvent.click(scheduledTasksNav);
 
     expect(workspaceHermesSchedulerSnapshot).toHaveBeenCalled();
-    const schedulerTable = await screen.findByRole("table", { name: "Scheduled tasks" });
+    const schedulerTable = await screen.findByRole("table", {
+      name: "Scheduled tasks",
+    });
     expect(within(schedulerTable).getByText("User daily task")).toBeInTheDocument();
     expect(within(schedulerTable).getByText("0 9 * * *")).toBeInTheDocument();
     expect(within(schedulerTable).getByText("scheduled")).toBeInTheDocument();
@@ -2940,8 +3576,18 @@ describe("App", () => {
       throw new Error("prewarm disabled for this action-focused test");
     });
     client.listUsers = async () => [
-      { id: "user-1", email: "admin@example.com", role: "admin", status: "active" },
-      { id: "user-2", email: "user@example.com", role: "user", status: "active" },
+      {
+        id: "user-1",
+        email: "admin@example.com",
+        role: "admin",
+        status: "active",
+      },
+      {
+        id: "user-2",
+        email: "user@example.com",
+        role: "user",
+        status: "active",
+      },
     ];
     const originalCreateHermesInstance = client.createHermesInstance;
     const createHermesInstance = vi.fn(async (userId: string) => {
@@ -2999,7 +3645,10 @@ describe("App", () => {
   it("lets admins manage shared skills from the Chinese navigation", async () => {
     localStorage.setItem("hermes-hub-language", "zh");
     // 用可观测的 mock API 验证页面不会只更新本地状态。
-    const saveManagedSkill = vi.fn(async (path: string, content: string) => ({ path, content }));
+    const saveManagedSkill = vi.fn(async (path: string, content: string) => ({
+      path,
+      content,
+    }));
     const deleteManagedSkill = vi.fn(async () => undefined);
     const createManagedSkillDirectory = vi.fn(async () => undefined);
 
@@ -3012,7 +3661,11 @@ describe("App", () => {
             "writing/.hidden.md": "hidden notes",
             "writing/references/style.md": "Use direct language.\n",
           },
-          initialManagedSkillDirectories: ["research", "writing/.cache", "writing/drafts/empty-child"],
+          initialManagedSkillDirectories: [
+            "research",
+            "writing/.cache",
+            "writing/drafts/empty-child",
+          ],
           saveManagedSkill,
           deleteManagedSkill,
           createManagedSkillDirectory,
@@ -3029,7 +3682,9 @@ describe("App", () => {
     const styleButton = managedSkillTreeButton("writing/references/style.md");
     expect(styleButton).toHaveTextContent("style.md");
     expect(styleButton).toHaveTextContent(/\d+ B/);
-    expect(screen.queryByRole("button", { name: /writing\/references\/style\.md/ })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /writing\/references\/style\.md/ }),
+    ).not.toBeInTheDocument();
     expect(screen.queryByText(".DS_Store")).not.toBeInTheDocument();
     expect(screen.queryByText(".hidden.md")).not.toBeInTheDocument();
     expect(screen.queryByText(".cache")).not.toBeInTheDocument();
@@ -3044,11 +3699,16 @@ describe("App", () => {
     fireEvent.click(imageSkillButton);
     expect(await screen.findByText("Skill 路径：image/SKILL.md")).toBeInTheDocument();
     expect(screen.queryByLabelText("Skill 路径")).not.toBeInTheDocument();
-    const skillEditor = await screen.findByRole("textbox", { name: "Skill 内容" });
+    const skillEditor = await screen.findByRole("textbox", {
+      name: "Skill 内容",
+    });
     expect(skillEditor).toHaveClass("skill-vditor-editor");
     const skillVditor = vditorInstanceForLabel("Skill 内容");
     await waitFor(() => {
-      expect(skillVditor.setValue).toHaveBeenCalledWith("# Image\n\nUse sharp visual prompts.\n", true);
+      expect(skillVditor.setValue).toHaveBeenCalledWith(
+        "# Image\n\nUse sharp visual prompts.\n",
+        true,
+      );
     });
 
     await act(async () => {
@@ -3078,8 +3738,7 @@ describe("App", () => {
           document.querySelectorAll<HTMLButtonElement>(
             "[data-managed-skill-path='image/SKILL.md']",
           ),
-        )
-          .some((button) => button.getAttribute("data-managed-skill-path") === "image/SKILL.md"),
+        ).some((button) => button.getAttribute("data-managed-skill-path") === "image/SKILL.md"),
       ).toBe(false);
     });
     expect(screen.queryByLabelText("Skill 路径")).not.toBeInTheDocument();
@@ -3126,8 +3785,9 @@ describe("App", () => {
     await screen.findByRole("button", { name: "image" });
     expect(
       Boolean(
-        Array.from(document.querySelectorAll<HTMLButtonElement>("[data-managed-skill-path]"))
-          .find((button) => button.getAttribute("data-managed-skill-path") === "image/SKILL.md"),
+        Array.from(document.querySelectorAll<HTMLButtonElement>("[data-managed-skill-path]")).find(
+          (button) => button.getAttribute("data-managed-skill-path") === "image/SKILL.md",
+        ),
       ),
     ).toBe(true);
     expect(screen.queryByRole("heading", { name: "统一 Skill 管理" })).not.toBeInTheDocument();
@@ -3191,7 +3851,9 @@ describe("App", () => {
     expect(screen.queryByRole("button", { name: "上传压缩包" })).not.toBeInTheDocument();
     expect(screen.queryByTestId("managed-skills-zip-input")).not.toBeInTheDocument();
 
-    const folderFile = new File(["# Research\n"], "SKILL.md", { type: "text/markdown" });
+    const folderFile = new File(["# Research\n"], "SKILL.md", {
+      type: "text/markdown",
+    });
     Object.defineProperty(folderFile, "webkitRelativePath", {
       value: "research/SKILL.md",
     });
@@ -3298,6 +3960,48 @@ describe("App", () => {
       temperature: 0.3,
       supports_parallel_tools: false,
     });
+    fetchMock.mockRestore();
+  });
+
+  it("uses the real speech input API endpoints", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (path, init) => {
+      if (path === "/api/speech-input/config") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            speech_input: {
+              enabled: true,
+              runtime_available: true,
+              max_audio_seconds: 60,
+              max_upload_bytes: 26214400,
+            },
+          }),
+        } as Response;
+      }
+      if (path === "/api/speech-input/transcriptions") {
+        expect(init?.method).toBe("POST");
+        expect(init?.credentials).toBe("include");
+        expect(init?.body).toBeInstanceOf(FormData);
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ text: "transcribed text" }),
+        } as Response;
+      }
+      throw new Error(`unexpected fetch ${String(path)}`);
+    });
+
+    const client = createApiClient();
+    await expect(client.speechInputConfig()).resolves.toEqual({
+      enabled: true,
+      runtime_available: true,
+      max_audio_seconds: 60,
+      max_upload_bytes: 26214400,
+    });
+    await expect(
+      client.transcribeSpeechInput(new File(["voice"], "voice.webm", { type: "audio/webm" })),
+    ).resolves.toEqual({ text: "transcribed text" });
     fetchMock.mockRestore();
   });
 
@@ -3525,7 +4229,9 @@ describe("App", () => {
 
       if (path === "/api/channels/channel-1/sessions/session-1/messages/message-1") {
         expect(init?.method).toBe("PUT");
-        expect(JSON.parse(init?.body as string)).toMatchObject({ content: "updated answer" });
+        expect(JSON.parse(init?.body as string)).toMatchObject({
+          content: "updated answer",
+        });
         return {
           ok: true,
           status: 200,
@@ -3592,21 +4298,19 @@ describe("App", () => {
         ok: true,
         status: 201,
         json: async () => ({
-          skills: [
-            { path: "writing/research/SKILL.md", size: 5 },
-          ],
+          skills: [{ path: "writing/research/SKILL.md", size: 5 }],
         }),
       } as Response;
     });
 
-    const folderFile = new File(["hello"], "SKILL.md", { type: "text/markdown" });
+    const folderFile = new File(["hello"], "SKILL.md", {
+      type: "text/markdown",
+    });
     Object.defineProperty(folderFile, "webkitRelativePath", {
       value: "research/SKILL.md",
     });
 
-    await expect(
-      createApiClient().uploadManagedSkills([folderFile], "writing"),
-    ).resolves.toEqual([
+    await expect(createApiClient().uploadManagedSkills([folderFile], "writing")).resolves.toEqual([
       { path: "writing/research/SKILL.md", size: 5 },
     ]);
     fetchMock.mockRestore();
@@ -3614,7 +4318,9 @@ describe("App", () => {
 
   it("rejects managed skill zip uploads before posting in the real API client", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch");
-    const zipFile = new File(["hello"], "skills.zip", { type: "application/zip" });
+    const zipFile = new File(["hello"], "skills.zip", {
+      type: "application/zip",
+    });
 
     await expect(createApiClient().uploadManagedSkills([zipFile], "writing")).rejects.toThrow(
       "managed skill zip uploads are not supported",

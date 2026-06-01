@@ -107,6 +107,33 @@ services:
       # NFS 只给宿主机 Docker daemon 使用，生产环境不绑定公网地址。
       - "127.0.0.1:${HERMES_HUB_SKILLS_FS_HOST_PORT:-12049}:12049"
 
+  asr:
+    profiles: ["asr"]
+    image: ${HERMES_HUB_ASR_IMAGE:-ghcr.io/yiiilin/hermes-hub-asr:0.0.16}
+    restart: unless-stopped
+    environment:
+      # 默认 ASR 镜像用 sherpa-onnx 跑 SenseVoice，并暴露 OpenAI 兼容转写接口。
+      PORT: ${HERMES_HUB_ASR_PORT:-9991}
+      MODEL_ROOT: /models
+      MODEL_URL: ${HERMES_HUB_ASR_MODEL_URL:-https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2}
+      MODEL_ARCHIVE: ${HERMES_HUB_ASR_MODEL_ARCHIVE:-sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2}
+      MODEL_DIR: ${HERMES_HUB_ASR_MODEL_DIR_NAME:-sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17}
+      MODEL_FILE: ${HERMES_HUB_ASR_MODEL_FILE:-model.int8.onnx}
+      TOKENS_FILE: ${HERMES_HUB_ASR_TOKENS_FILE:-tokens.txt}
+      MODEL_SHA256: ${HERMES_HUB_ASR_MODEL_SHA256:-7d1efa2138a65b0b488df37f8b89e3d91a60676e416f515b952358d83dfd347e}
+      USE_ITN: ${HERMES_HUB_ASR_USE_ITN:-true}
+      NUM_THREADS: ${HERMES_HUB_ASR_CPU_NUM:-4}
+      MAX_FILE_SIZE: ${HERMES_HUB_ASR_MAX_UPLOAD_BYTES:-26214400}
+      MAX_AUDIO_SECONDS: ${HERMES_HUB_ASR_MAX_AUDIO_SECONDS:-60}
+      DOWNLOAD_TIMEOUT_SECONDS: ${HERMES_HUB_ASR_DOWNLOAD_TIMEOUT_SECONDS:-60}
+      DOWNLOAD_RETRIES: ${HERMES_HUB_ASR_DOWNLOAD_RETRIES:-3}
+      FFMPEG_TIMEOUT_SECONDS: ${HERMES_HUB_ASR_FFMPEG_TIMEOUT_SECONDS:-180}
+    volumes:
+      # 缓存模型，避免容器重建后重复下载。
+      - ${HERMES_HUB_ASR_MODEL_DIR:-/opt/hermes-hub/data/asr/models}:/models
+    networks:
+      - hermes-hub-net
+
   backend:
     image: ${HERMES_HUB_BACKEND_IMAGE:-ghcr.io/yiiilin/hermes-hub:latest}
     restart: unless-stopped
@@ -152,6 +179,8 @@ services:
       HERMES_CONTAINER_MEMORY_LIMIT: ${HERMES_CONTAINER_MEMORY_LIMIT:-1g}
       HERMES_CONTAINER_CPU_LIMIT: ${HERMES_CONTAINER_CPU_LIMIT:-1.0}
       HERMES_DOCKER_BINARY: ${HERMES_DOCKER_BINARY:-docker}
+      DOCKER_HOST: ${DOCKER_HOST:-}
+      DOCKER_API_VERSION: ${DOCKER_API_VERSION:-}
       HERMES_HUB_MAX_PROXY_BODY_BYTES: ${HERMES_HUB_MAX_PROXY_BODY_BYTES:-10485760}
       HERMES_OBJECT_STORAGE_ENDPOINT: ${HERMES_OBJECT_STORAGE_ENDPOINT:-http://rustfs:9000}
       HERMES_OBJECT_STORAGE_BUCKET: ${HERMES_OBJECT_STORAGE_BUCKET:-hermes-hub}
@@ -160,6 +189,15 @@ services:
       HERMES_OBJECT_STORAGE_SECRET_KEY: ${HERMES_OBJECT_STORAGE_SECRET_KEY:-change-me-rustfs-secret}
       HERMES_OBJECT_STORAGE_FORCE_PATH_STYLE: ${HERMES_OBJECT_STORAGE_FORCE_PATH_STYLE:-true}
       HERMES_OBJECT_STORAGE_PREFIX: ${HERMES_OBJECT_STORAGE_PREFIX:-attachments}
+
+      # 浏览器语音输入只在部署开关开启且 ASR endpoint 配置后才可用。
+      HERMES_HUB_SPEECH_INPUT_ENABLED: ${HERMES_HUB_SPEECH_INPUT_ENABLED:-false}
+      HERMES_HUB_ASR_ENDPOINT: ${HERMES_HUB_ASR_ENDPOINT:-http://asr:9991}
+      HERMES_HUB_ASR_TRANSCRIBE_PATH: ${HERMES_HUB_ASR_TRANSCRIBE_PATH:-/v1/audio/transcriptions}
+      HERMES_HUB_ASR_MODEL: ${HERMES_HUB_ASR_MODEL:-sensevoice}
+      HERMES_HUB_ASR_TIMEOUT_SECONDS: ${HERMES_HUB_ASR_TIMEOUT_SECONDS:-90}
+      HERMES_HUB_ASR_MAX_AUDIO_SECONDS: ${HERMES_HUB_ASR_MAX_AUDIO_SECONDS:-60}
+      HERMES_HUB_ASR_MAX_UPLOAD_BYTES: ${HERMES_HUB_ASR_MAX_UPLOAD_BYTES:-26214400}
     volumes:
       # Docker socket 是高权限边界；backend 需要它来创建每个用户的 Hermes 容器。
       - /var/run/docker.sock:/var/run/docker.sock

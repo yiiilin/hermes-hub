@@ -1,6 +1,6 @@
 [package]
 name = "hermes-hub-backend"
-version = "0.0.15"
+version = "0.0.16"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -19,7 +19,7 @@ nfsserve = "0.11"
 object_store = { version = "0.13", features = ["aws"] }
 opendal = { version = "0.56", features = ["services-s3"] }
 percent-encoding = "2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"

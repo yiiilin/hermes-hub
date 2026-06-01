@@ -52,6 +52,17 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
 
+      - name: ASR metadata
+        id: asr_meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}-asr
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
       - name: Build and push Hub image
         uses: docker/build-push-action@v6
         with:
@@ -74,10 +85,22 @@ jobs:
           cache-from: type=gha,scope=hermes-wrapper
           cache-to: type=gha,mode=max,scope=hermes-wrapper
 
+      - name: Build and push ASR image
+        uses: docker/build-push-action@v6
+        with:
+          context: deploy/asr/sherpa
+          file: deploy/asr/sherpa/Dockerfile
+          push: true
+          tags: ${{ steps.asr_meta.outputs.tags }}
+          labels: ${{ steps.asr_meta.outputs.labels }}
+          cache-from: type=gha,scope=asr
+          cache-to: type=gha,mode=max,scope=asr
+
       - name: Build release notes
         env:
           IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
           HERMES_IMAGE_TAGS: ${{ steps.hermes_meta.outputs.tags }}
+          ASR_IMAGE_TAGS: ${{ steps.asr_meta.outputs.tags }}
           RELEASE_TAG: ${{ github.ref_name }}
           RELEASE_SHA: ${{ github.sha }}
         run: |
@@ -110,6 +133,12 @@ jobs:
             echo
             echo '```text'
             echo "${HERMES_IMAGE_TAGS}"
+            echo '```'
+            echo
+            echo "ASR:"
+            echo
+            echo '```text'
+            echo "${ASR_IMAGE_TAGS}"
             echo '```'
             echo
             echo "## ${changes_title}"

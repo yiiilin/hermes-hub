@@ -51,10 +51,8 @@ fn hermes_wrapper_image_uses_selected_official_hermes_agent_tag() {
     let plugin_root = repo_root.join("docker/hermes/plugins/platforms/hermes_hub");
     let plugin_yaml = std::fs::read_to_string(plugin_root.join("plugin.yaml"))
         .expect("Hermes Hub bundled platform plugin manifest is present");
-    let prod_compose = std::fs::read_to_string(repo_root.join("deploy/compose.prod.yml"))
-        .expect("production compose file is present");
-    let dev_compose = std::fs::read_to_string(repo_root.join("deploy/compose.dev.yml"))
-        .expect("development compose file is present");
+    let compose = std::fs::read_to_string(repo_root.join("deploy/compose.yml"))
+        .expect("compose file is present");
 
     let hermes_agent_image = hermes_agent_image_from_dockerfile(&dockerfile);
     assert_selected_hermes_agent_image(hermes_agent_image);
@@ -93,16 +91,12 @@ fn hermes_wrapper_image_uses_selected_official_hermes_agent_tag() {
         "send_message patch must compile: {}",
         String::from_utf8_lossy(&compile_output.stderr)
     );
-    assert!(prod_compose.contains(
+    assert!(compose.contains(
         "HERMES_DOCKER_IMAGE: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:latest}"
     ));
-    assert!(dev_compose.contains("dockerfile: docker/hermes/Dockerfile"));
-    assert!(!dev_compose.contains("HERMES_AGENT_IMAGE:"));
-    assert!(!dev_compose.contains(hermes_agent_image));
-    assert!(!dev_compose.contains("HERMES_VERSION: ${HERMES_VERSION:-latest}"));
-    assert!(dev_compose.contains(
-        "HERMES_DOCKER_IMAGE: ${HERMES_DOCKER_IMAGE:-ghcr.io/yiiilin/hermes-hub-hermes:latest}"
-    ));
+    assert!(!compose.contains("HERMES_AGENT_IMAGE:"));
+    assert!(!compose.contains(hermes_agent_image));
+    assert!(!compose.contains("HERMES_VERSION: ${HERMES_VERSION:-latest}"));
 }
 
 #[test]

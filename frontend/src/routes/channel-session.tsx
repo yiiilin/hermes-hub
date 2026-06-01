@@ -6,6 +6,7 @@ import type {
   HermesActiveRun,
   HermesAttachment,
   HermesVerboseEvent,
+  SpeechInputConfig,
   SessionSummary,
 } from "../api/client";
 import { ApiRequestError } from "../api/client";
@@ -27,6 +28,7 @@ import {
   FileType,
   Image,
   MessageSquare,
+  Mic,
   Paperclip,
   Plus,
   Presentation,
@@ -94,6 +96,12 @@ export function ChannelSessionRoute({
   const [pendingAssistantSessionId, setPendingAssistantSessionId] = useState<string | null>(null);
   const [activeRun, setActiveRun] = useState<HermesActiveRun | null>(null);
   const [verboseEvents, setVerboseEvents] = useState<ExecutionHistoryEntry[]>([]);
+  const [speechInputConfig, setSpeechInputConfig] = useState<SpeechInputConfig>({
+    enabled: false,
+    runtime_available: false,
+    max_audio_seconds: 60,
+    max_upload_bytes: 25 * 1024 * 1024,
+  });
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const messageListRef = useRef<HTMLDivElement | null>(null);
@@ -173,8 +181,8 @@ export function ChannelSessionRoute({
       });
 
       const nextSelected = selectedSessionId
-        ? nextSessions.find((session) => session.id === selectedSessionId) ?? null
-        : nextSessions[0] ?? null;
+        ? (nextSessions.find((session) => session.id === selectedSessionId) ?? null)
+        : (nextSessions[0] ?? null);
       selectedSessionIdRef.current = nextSelected?.id ?? null;
       setSelectedSession(nextSelected);
       if (!nextSelected) {
@@ -191,6 +199,25 @@ export function ChannelSessionRoute({
   useEffect(() => {
     void refreshSessions();
   }, []);
+
+  useEffect(() => {
+    let activeRequest = true;
+    apiClient
+      .speechInputConfig()
+      .then((config) => {
+        if (activeRequest) {
+          setSpeechInputConfig(config);
+        }
+      })
+      .catch(() => {
+        if (activeRequest) {
+          setSpeechInputConfig((current) => ({ ...current, enabled: false }));
+        }
+      });
+    return () => {
+      activeRequest = false;
+    };
+  }, [apiClient]);
 
   useEffect(() => {
     if (!active || !selectedSession) {
@@ -383,10 +410,7 @@ export function ChannelSessionRoute({
     });
   }
 
-  async function handleSessionEvent(
-    session: SessionSummary,
-    event: ChannelSessionEvent,
-  ) {
+  async function handleSessionEvent(session: SessionSummary, event: ChannelSessionEvent) {
     if (selectedSessionIdRef.current !== session.id) {
       return;
     }
@@ -421,7 +445,7 @@ export function ChannelSessionRoute({
         const runStillActive = Boolean(activeRunId && (!run || !isTerminalHermesRun(run)));
         const hasPendingMessageInSession = Boolean(
           pendingAssistantMessageIdRef.current &&
-            pendingAssistantSessionIdRef.current === message.session_id,
+          pendingAssistantSessionIdRef.current === message.session_id,
         );
         if ((activeRunId && runStillActive) || hasPendingMessageInSession) {
           if (isExecutionHistoryMessage(message)) {
@@ -528,10 +552,13 @@ export function ChannelSessionRoute({
       return;
     }
 
-    const content = run.status === "failed"
-      ? t("chat.runFailed", { message: run.error || t("chat.requestFailed") })
-      : run.output || t("chat.emptyResponse");
-    if (currentMessages.some((message) => message.role === "assistant" && message.content === content)) {
+    const content =
+      run.status === "failed"
+        ? t("chat.runFailed", { message: run.error || t("chat.requestFailed") })
+        : run.output || t("chat.emptyResponse");
+    if (
+      currentMessages.some((message) => message.role === "assistant" && message.content === content)
+    ) {
       return;
     }
 
@@ -552,7 +579,7 @@ export function ChannelSessionRoute({
   }
 
   async function submitPrompt(text: string, nextAttachments: HermesAttachment[]) {
-    if (!selectedSession && (!text && nextAttachments.length === 0)) {
+    if (!selectedSession && !text && nextAttachments.length === 0) {
       return;
     }
 
@@ -594,10 +621,7 @@ export function ChannelSessionRoute({
         attachments: nextAttachments,
         clientMessageKey: userMessageKey,
       });
-      updateMessagesForSession(session.id, (current) =>
-        upsertLiveMessage(current, userMessage),
-      );
-
+      updateMessagesForSession(session.id, (current) => upsertLiveMessage(current, userMessage));
     } catch (cause) {
       const message = hermesRunErrorMessage(cause, t("chat.requestFailed"), t);
       if (sessionForRequest && assistantMessageId) {
@@ -648,10 +672,7 @@ export function ChannelSessionRoute({
     }
   }
 
-  async function appendVerboseEvent(
-    sessionId: string,
-    message: HermesVerboseEvent | string,
-  ) {
+  async function appendVerboseEvent(sessionId: string, message: HermesVerboseEvent | string) {
     const event = normalizeExecutionEntry(message);
     if (!event) {
       return;
@@ -741,7 +762,8 @@ export function ChannelSessionRoute({
     }
 
     const content = executionHistoryContent(events);
-    const clientMessageKey = runId && isHubRunId(runId) ? hermesExecutionMessageKey(runId) : undefined;
+    const clientMessageKey =
+      runId && isHubRunId(runId) ? hermesExecutionMessageKey(runId) : undefined;
     const existingMessage = clientMessageKey
       ? messagesRef.current.find(
           (message) =>
@@ -791,7 +813,9 @@ export function ChannelSessionRoute({
         const executionMessage = await persistExecutionHistoryMessage(sessionId, activeRun.run_id);
         updateMessagesForSession(sessionId, (current) => {
           const withoutPending = current.filter((message) => message.id !== pendingId);
-          return executionMessage ? upsertMessage(withoutPending, executionMessage) : withoutPending;
+          return executionMessage
+            ? upsertMessage(withoutPending, executionMessage)
+            : withoutPending;
         });
       }
       if (selectedSessionIdRef.current === sessionId) {
@@ -907,9 +931,11 @@ export function ChannelSessionRoute({
           busy={busy}
           error={error}
           runInProgress={runInProgress}
+          speechInputConfig={speechInputConfig}
           onPreviewImage={setPreviewAttachment}
           onStop={() => void stopCurrentRun()}
           onSubmit={submitPrompt}
+          onTranscribeSpeechInput={apiClient.transcribeSpeechInput}
           onUploadAttachments={uploadAttachmentFiles}
           t={t}
         />
@@ -947,7 +973,9 @@ function filesFromClipboardData(clipboardData: DataTransfer) {
   });
 }
 
-function normalizeExecutionEntry(message: HermesVerboseEvent | string): ExecutionHistoryEntry | null {
+function normalizeExecutionEntry(
+  message: HermesVerboseEvent | string,
+): ExecutionHistoryEntry | null {
   if (typeof message === "string") {
     const detail = normalizeExecutionText(message);
     return detail ? { kind: "text", detail } : null;
@@ -969,10 +997,7 @@ function normalizeExecutionText(message: string | undefined) {
   return message?.replace(/\s+/g, " ").trim() || "";
 }
 
-function sameExecutionEntry(
-  left: ExecutionHistoryEntry | undefined,
-  right: ExecutionHistoryEntry,
-) {
+function sameExecutionEntry(left: ExecutionHistoryEntry | undefined, right: ExecutionHistoryEntry) {
   return Boolean(left) && JSON.stringify(left) === JSON.stringify(right);
 }
 
@@ -1015,9 +1040,7 @@ function overlappingExecutionPrefixLength(
 function sameExecutionSequence(left: ExecutionHistoryEntry[], right: ExecutionHistoryEntry[]) {
   return (
     left.length === right.length &&
-    left.every((entry, index) =>
-      right[index] ? sameExecutionEntry(entry, right[index]) : false,
-    )
+    left.every((entry, index) => (right[index] ? sameExecutionEntry(entry, right[index]) : false))
   );
 }
 
@@ -1085,11 +1108,7 @@ function upsertLiveMessage(messages: ChannelMessage[], nextMessage: ChannelMessa
   // SSE 的 live 事件天然按追加顺序到达；只有收到旧时间戳补偿消息时才做插入，
   // 避免每个 token/消息事件都全量排序长历史。
   const insertIndex = liveMessageInsertIndex(messages, nextMessage);
-  const next = [
-    ...messages.slice(0, insertIndex),
-    nextMessage,
-    ...messages.slice(insertIndex),
-  ];
+  const next = [...messages.slice(0, insertIndex), nextMessage, ...messages.slice(insertIndex)];
   return dedupeRepeatedAssistantMessagesAround(next, insertIndex);
 }
 
@@ -1126,10 +1145,12 @@ function scrollMessageListToBottom(node: HTMLElement | null) {
     return;
   }
 
-  const schedule = globalThis.requestAnimationFrame ?? ((callback: FrameRequestCallback) => {
-    globalThis.setTimeout(callback, 0);
-    return 0;
-  });
+  const schedule =
+    globalThis.requestAnimationFrame ??
+    ((callback: FrameRequestCallback) => {
+      globalThis.setTimeout(callback, 0);
+      return 0;
+    });
   schedule(() => {
     node.scrollTop = node.scrollHeight;
     // 程序滚动到底部时同步触发滚动监听，让虚拟列表和贴底状态立刻读到新位置。
@@ -1201,9 +1222,7 @@ const MessageList = memo(function MessageList({
       <MessageBubble
         message={entry.message}
         pending={entry.pending}
-        executionEvents={
-          entry.pending && verboseEvents.length > 0 ? verboseEvents : undefined
-        }
+        executionEvents={entry.pending && verboseEvents.length > 0 ? verboseEvents : undefined}
         onPreviewImage={onPreviewImage}
         t={t}
         language={language}
@@ -1252,9 +1271,7 @@ const MessageList = memo(function MessageList({
             key={entry.message.id}
             message={entry.message}
             pending={entry.pending}
-            executionEvents={
-              entry.pending && verboseEvents.length > 0 ? verboseEvents : undefined
-            }
+            executionEvents={entry.pending && verboseEvents.length > 0 ? verboseEvents : undefined}
             onPreviewImage={onPreviewImage}
             t={t}
             language={language}
@@ -1342,9 +1359,9 @@ function useVirtualMessageWindow(
   }, [enabled, entries.length, messageListRef]);
 
   const virtualMetrics = useMemo(() => {
-    const heights = entries.map((entry) =>
-      measuredHeightsRef.current[entry.message.id] ??
-      estimateMessageRowHeight(entry.message),
+    const heights = entries.map(
+      (entry) =>
+        measuredHeightsRef.current[entry.message.id] ?? estimateMessageRowHeight(entry.message),
     );
     const offsets: number[] = [];
     let totalHeight = 0;
@@ -1457,17 +1474,16 @@ function VirtualMessageRow({
   }, [measureKey, messageId, onMeasure]);
 
   return (
-    <div
-      className="message-virtual-row"
-      ref={rowRef}
-      style={{ transform: `translateY(${top}px)` }}
-    >
+    <div className="message-virtual-row" ref={rowRef} style={{ transform: `translateY(${top}px)` }}>
       {children}
     </div>
   );
 }
 
-function virtualMessageMeasureKey(entry: RenderableMessage, verboseEvents: ExecutionHistoryEntry[]) {
+function virtualMessageMeasureKey(
+  entry: RenderableMessage,
+  verboseEvents: ExecutionHistoryEntry[],
+) {
   return [
     entry.message.id,
     entry.message.updated_at ?? entry.message.created_at,
@@ -1501,9 +1517,7 @@ function readMessageListGap(node: HTMLElement) {
   const rawGap =
     styles.getPropertyValue("--message-list-gap").trim() || styles.rowGap || styles.gap;
   const parsed = Number.parseFloat(rawGap);
-  return Number.isFinite(parsed) && parsed > 0
-    ? parsed
-    : MESSAGE_VIRTUALIZATION_DEFAULT_GAP_PX;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : MESSAGE_VIRTUALIZATION_DEFAULT_GAP_PX;
 }
 
 function findFirstVisibleMessageIndex(
@@ -1526,11 +1540,7 @@ function findFirstVisibleMessageIndex(
   return Math.max(0, Math.min(low, offsets.length - 1));
 }
 
-function findLastVisibleMessageIndex(
-  offsets: number[],
-  visibleEnd: number,
-  itemCount: number,
-) {
+function findLastVisibleMessageIndex(offsets: number[], visibleEnd: number, itemCount: number) {
   let low = 0;
   let high = offsets.length;
   while (low < high) {
@@ -1548,31 +1558,49 @@ const ChatComposer = memo(function ChatComposer({
   busy,
   error,
   runInProgress,
+  speechInputConfig,
   onPreviewImage,
   onStop,
   onSubmit,
+  onTranscribeSpeechInput,
   onUploadAttachments,
   t,
 }: {
   busy: boolean;
   error: string | null;
   runInProgress: boolean;
+  speechInputConfig: SpeechInputConfig;
   onPreviewImage: (attachment: HermesAttachment) => void;
   onStop: () => void;
   onSubmit: (text: string, attachments: HermesAttachment[]) => Promise<void>;
+  onTranscribeSpeechInput: (file: Blob & { name?: string }) => Promise<{ text: string }>;
   onUploadAttachments: (files: File[]) => Promise<HermesAttachment[]>;
   t: Translate;
 }) {
   const [prompt, setPrompt] = useState("");
   const [attachments, setAttachments] = useState<HermesAttachment[]>([]);
+  const [voiceState, setVoiceState] = useState<"idle" | "starting" | "recording" | "transcribing">(
+    "idle",
+  );
+  const [voiceError, setVoiceError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const voiceReleaseRequestedRef = useRef(false);
+  const voiceCancelRequestedRef = useRef(false);
+  const voiceStopInitiatedRef = useRef(false);
+  const voiceAttemptIdRef = useRef(0);
+  const voiceMaxDurationTimerRef = useRef<ReturnType<typeof globalThis.setTimeout> | null>(null);
 
   function focusComposerInputSoon() {
-    const schedule = globalThis.requestAnimationFrame ?? ((callback: FrameRequestCallback) => {
-      globalThis.setTimeout(callback, 0);
-      return 0;
-    });
+    const schedule =
+      globalThis.requestAnimationFrame ??
+      ((callback: FrameRequestCallback) => {
+        globalThis.setTimeout(callback, 0);
+        return 0;
+      });
     schedule(() => composerInputRef.current?.focus());
   }
 
@@ -1619,9 +1647,268 @@ const ChatComposer = memo(function ChatComposer({
     void uploadAttachmentFiles(files);
   }
 
+  useEffect(() => {
+    return () => {
+      cleanupVoiceCaptureOnUnmount();
+    };
+  }, []);
+
+  useEffect(() => {
+    function cancelWithKeyboard(event: KeyboardEvent) {
+      if (event.key === "Escape" && (voiceState === "starting" || voiceState === "recording")) {
+        event.preventDefault();
+        stopVoiceRecording(true);
+      }
+    }
+    window.addEventListener("keydown", cancelWithKeyboard);
+    return () => window.removeEventListener("keydown", cancelWithKeyboard);
+  }, [voiceState]);
+
+  useEffect(() => {
+    if (voiceState !== "starting" && voiceState !== "recording") {
+      return;
+    }
+
+    function finishRecording() {
+      stopVoiceRecording(false);
+    }
+
+    function cancelRecording() {
+      stopVoiceRecording(true);
+    }
+
+    window.addEventListener("mouseup", finishRecording);
+    window.addEventListener("touchend", finishRecording);
+    window.addEventListener("pointerup", finishRecording);
+    window.addEventListener("touchcancel", cancelRecording);
+    window.addEventListener("pointercancel", cancelRecording);
+    return () => {
+      window.removeEventListener("mouseup", finishRecording);
+      window.removeEventListener("touchend", finishRecording);
+      window.removeEventListener("pointerup", finishRecording);
+      window.removeEventListener("touchcancel", cancelRecording);
+      window.removeEventListener("pointercancel", cancelRecording);
+    };
+  }, [voiceState]);
+
+  async function startVoiceRecording() {
+    if (busy || runInProgress || voiceState !== "idle") {
+      return;
+    }
+    if (!speechInputConfig.enabled) {
+      return;
+    }
+    const recordingSupport = recordingSupportStatus();
+    if (recordingSupport !== "supported") {
+      setVoiceError(
+        t(
+          recordingSupport === "requires-secure-context"
+            ? "chat.voiceRequiresSecureContext"
+            : "chat.voiceUnsupported",
+        ),
+      );
+      return;
+    }
+
+    const attemptId = voiceAttemptIdRef.current + 1;
+    voiceAttemptIdRef.current = attemptId;
+    try {
+      setVoiceError(null);
+      recordedChunksRef.current = [];
+      voiceReleaseRequestedRef.current = false;
+      voiceCancelRequestedRef.current = false;
+      voiceStopInitiatedRef.current = false;
+      clearVoiceMaxDurationTimer();
+      setVoiceState("starting");
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (voiceAttemptIdRef.current !== attemptId) {
+        stopMediaStream(stream);
+        return;
+      }
+      if (voiceReleaseRequestedRef.current) {
+        stopMediaStream(stream);
+        resetVoiceCaptureState();
+        setVoiceState("idle");
+        return;
+      }
+      mediaStreamRef.current = stream;
+      const recorder = new MediaRecorder(stream, preferredRecorderOptions());
+      mediaRecorderRef.current = recorder;
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          recordedChunksRef.current.push(event.data);
+        }
+      };
+      recorder.onstop = () => void finishVoiceRecording(attemptId);
+      recorder.start();
+      setVoiceState("recording");
+      startVoiceMaxDurationTimer();
+      if (voiceReleaseRequestedRef.current) {
+        stopVoiceRecording(voiceCancelRequestedRef.current);
+      }
+    } catch {
+      if (voiceAttemptIdRef.current !== attemptId) {
+        return;
+      }
+      setVoiceError(t("chat.voicePermissionDenied"));
+      clearVoiceMaxDurationTimer();
+      stopMediaStream(mediaStreamRef.current);
+      mediaStreamRef.current = null;
+      mediaRecorderRef.current = null;
+      resetVoiceCaptureState();
+      setVoiceState("idle");
+    }
+  }
+
+  function stopVoiceRecording(cancelled = false) {
+    if (voiceState === "transcribing") {
+      return;
+    }
+    if (voiceStopInitiatedRef.current) {
+      if (cancelled) {
+        voiceCancelRequestedRef.current = true;
+      }
+      return;
+    }
+    voiceReleaseRequestedRef.current = true;
+    voiceCancelRequestedRef.current = voiceCancelRequestedRef.current || cancelled;
+    const recorder = mediaRecorderRef.current;
+    if (!recorder || recorder.state === "inactive") {
+      if (voiceState === "starting" || voiceState === "idle") {
+        setVoiceState("idle");
+      }
+      return;
+    }
+    voiceStopInitiatedRef.current = true;
+    clearVoiceMaxDurationTimer();
+    recorder.stop();
+  }
+
+  async function finishVoiceRecording(attemptId: number) {
+    if (voiceAttemptIdRef.current !== attemptId) {
+      return;
+    }
+    clearVoiceMaxDurationTimer();
+    const cancelled = voiceCancelRequestedRef.current;
+    const chunks = recordedChunksRef.current;
+    const stream = mediaStreamRef.current;
+    mediaRecorderRef.current = null;
+    mediaStreamRef.current = null;
+    recordedChunksRef.current = [];
+    stopMediaStream(stream);
+    resetVoiceCaptureState();
+    if (cancelled) {
+      setVoiceState("idle");
+      return;
+    }
+
+    const blobType = chunks.find((chunk) => chunk.type)?.type || "audio/webm";
+    const blob = new Blob(chunks, { type: blobType });
+    if (blob.size === 0) {
+      setVoiceState("idle");
+      return;
+    }
+    if (blob.size > speechInputConfig.max_upload_bytes) {
+      setVoiceError(
+        t("chat.voiceTooLarge", {
+          size: formatUploadLimit(speechInputConfig.max_upload_bytes),
+        }),
+      );
+      setVoiceState("idle");
+      focusComposerInputSoon();
+      return;
+    }
+
+    setVoiceState("transcribing");
+    try {
+      const extension = blobType.includes("ogg") ? "ogg" : "webm";
+      const file = Object.assign(blob, {
+        name: `speech-input-${Date.now()}.${extension}`,
+      });
+      const result = await onTranscribeSpeechInput(file);
+      appendPromptText(result.text);
+      setVoiceError(null);
+    } catch {
+      setVoiceError(t("chat.voiceTranscriptionFailed"));
+    } finally {
+      setVoiceState("idle");
+      focusComposerInputSoon();
+    }
+  }
+
+  function appendPromptText(text: string) {
+    const normalized = text.trim();
+    if (!normalized) {
+      return;
+    }
+    setPrompt((current) => (current.trim() ? `${current.trimEnd()} ${normalized}` : normalized));
+  }
+
+  function startVoiceMaxDurationTimer() {
+    clearVoiceMaxDurationTimer();
+    const maxAudioSeconds = Math.max(1, speechInputConfig.max_audio_seconds);
+    voiceMaxDurationTimerRef.current = globalThis.setTimeout(() => {
+      stopVoiceRecording(false);
+    }, maxAudioSeconds * 1000);
+  }
+
+  function clearVoiceMaxDurationTimer() {
+    if (voiceMaxDurationTimerRef.current !== null) {
+      globalThis.clearTimeout(voiceMaxDurationTimerRef.current);
+      voiceMaxDurationTimerRef.current = null;
+    }
+  }
+
+  function resetVoiceCaptureState() {
+    voiceReleaseRequestedRef.current = false;
+    voiceCancelRequestedRef.current = false;
+    voiceStopInitiatedRef.current = false;
+  }
+
+  function cleanupVoiceCaptureOnUnmount() {
+    voiceAttemptIdRef.current += 1;
+    voiceReleaseRequestedRef.current = true;
+    voiceCancelRequestedRef.current = true;
+    clearVoiceMaxDurationTimer();
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      recorder.ondataavailable = null;
+      recorder.onstop = null;
+      try {
+        recorder.stop();
+      } catch {
+        // 卸载阶段只负责释放浏览器资源；停止失败时仍继续清理 stream 引用。
+      }
+    }
+    stopMediaStream(mediaStreamRef.current);
+    mediaRecorderRef.current = null;
+    mediaStreamRef.current = null;
+    recordedChunksRef.current = [];
+    resetVoiceCaptureState();
+  }
+
   return (
     <form className="composer" onSubmit={sendPrompt}>
       {error ? <p className="error">{error}</p> : null}
+      {voiceError ? <p className="error">{voiceError}</p> : null}
+      {voiceState === "starting" || voiceState === "recording" ? (
+        <p className="voice-status" aria-live="polite">
+          <span aria-hidden="true" className="voice-dot" />
+          {t("chat.voiceRecording")}
+          <button
+            type="button"
+            className="voice-cancel-button"
+            onClick={() => stopVoiceRecording(true)}
+          >
+            {t("chat.voiceCancel")}
+          </button>
+        </p>
+      ) : null}
+      {voiceState === "transcribing" ? (
+        <p className="voice-status" aria-live="polite">
+          {t("chat.voiceTranscribing")}
+        </p>
+      ) : null}
       {attachments.length > 0 ? (
         <div className="attachment-row">
           {attachments.map((attachment) => (
@@ -1668,6 +1955,34 @@ const ChatComposer = memo(function ChatComposer({
           <Paperclip aria-hidden="true" size={17} />
           {t("chat.attach")}
         </button>
+        {speechInputConfig.enabled ? (
+          <button
+            type="button"
+            className={`secondary icon-button voice-record-button ${
+              voiceState === "starting" || voiceState === "recording" ? "recording" : ""
+            }`}
+            aria-label={t("chat.voiceHoldToRecord")}
+            title={t("chat.voiceHoldToRecord")}
+            disabled={busy || runInProgress || voiceState === "transcribing"}
+            onMouseDown={() => void startVoiceRecording()}
+            onMouseUp={() => stopVoiceRecording(false)}
+            onTouchStart={(event) => {
+              event.preventDefault();
+              void startVoiceRecording();
+            }}
+            onTouchEnd={(event) => {
+              event.preventDefault();
+              stopVoiceRecording(false);
+            }}
+            onTouchCancel={(event) => {
+              event.preventDefault();
+              stopVoiceRecording(true);
+            }}
+            onPointerCancel={() => stopVoiceRecording(true)}
+          >
+            <Mic aria-hidden="true" size={17} />
+          </button>
+        ) : null}
         <button
           type="button"
           className="secondary icon-text"
@@ -1685,6 +2000,45 @@ const ChatComposer = memo(function ChatComposer({
     </form>
   );
 });
+
+type RecordingSupportStatus = "supported" | "requires-secure-context" | "unsupported";
+
+function recordingSupportStatus(): RecordingSupportStatus {
+  if (globalThis.isSecureContext === false) {
+    return "requires-secure-context";
+  }
+  const mediaDevices = globalThis.navigator?.mediaDevices as Partial<MediaDevices> | undefined;
+  return typeof mediaDevices?.getUserMedia === "function" &&
+    typeof globalThis.MediaRecorder !== "undefined"
+    ? "supported"
+    : "unsupported";
+}
+
+function preferredRecorderOptions(): MediaRecorderOptions | undefined {
+  const recorder = globalThis.MediaRecorder as unknown as
+    | { isTypeSupported?: (mimeType: string) => boolean }
+    | undefined;
+  if (recorder?.isTypeSupported?.("audio/webm;codecs=opus")) {
+    return { mimeType: "audio/webm;codecs=opus" };
+  }
+  return undefined;
+}
+
+function stopMediaStream(stream: MediaStream | null) {
+  for (const track of stream?.getTracks() ?? []) {
+    track.stop();
+  }
+}
+
+function formatUploadLimit(size: number): string {
+  if (size < 1024) {
+    return `${size} B`;
+  }
+  if (size < 1024 * 1024) {
+    return `${(size / 1024).toFixed(1)} KB`;
+  }
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 function ChatSidebar({
   sessions,
@@ -1787,7 +2141,9 @@ function ChatSidebar({
                   title={session.title ?? t("chat.newConversation")}
                 >
                   <MessageSquare aria-hidden="true" size={15} />
-                  <span className="session-title">{session.title ?? t("chat.newConversation")}</span>
+                  <span className="session-title">
+                    {session.title ?? t("chat.newConversation")}
+                  </span>
                 </button>
                 {!collapsed ? (
                   <button
@@ -1833,18 +2189,14 @@ function upsertSessionSummary(sessions: SessionSummary[], updatedSession: Sessio
   return next;
 }
 
-function activeExecutionMessageForRun(
-  messages: ChannelMessage[],
-  run: HermesActiveRun | null,
-) {
+function activeExecutionMessageForRun(messages: ChannelMessage[], run: HermesActiveRun | null) {
   if (!run || isTerminalHermesRun(run)) {
     return null;
   }
 
   const executionKey = hermesExecutionMessageKey(run.run_id);
   const keyedMessage = messages.find(
-    (message) =>
-      message.client_message_key === executionKey && isExecutionHistoryMessage(message),
+    (message) => message.client_message_key === executionKey && isExecutionHistoryMessage(message),
   );
   if (keyedMessage) {
     return keyedMessage;
@@ -1856,8 +2208,7 @@ function activeExecutionMessageForRun(
       .reverse()
       .find(
         (message) =>
-          isExecutionHistoryMessage(message) &&
-          (message.created_at ?? 0) >= runCreatedAt,
+          isExecutionHistoryMessage(message) && (message.created_at ?? 0) >= runCreatedAt,
       ) ?? null
   );
 }
@@ -1884,8 +2235,8 @@ function activeRunFromChannelRun(run: ChannelRun): HermesActiveRun {
 function hasRenderableMessageBody(message: ChannelMessage) {
   return Boolean(
     message.content.trim() ||
-      (message.attachments ?? []).length > 0 ||
-      isExecutionHistoryMessage(message),
+    (message.attachments ?? []).length > 0 ||
+    isExecutionHistoryMessage(message),
   );
 }
 
@@ -1918,11 +2269,7 @@ function removePendingAssistantForMessage(
   );
 }
 
-function hermesRunErrorMessage(
-  cause: unknown,
-  fallback = "Hermes request failed",
-  t?: Translate,
-) {
+function hermesRunErrorMessage(cause: unknown, fallback = "Hermes request failed", t?: Translate) {
   if (t) {
     return userFacingErrorMessage(cause, fallback, t);
   }
@@ -1949,7 +2296,9 @@ function userFacingErrorMessage(cause: unknown, fallback: string, t: Translate) 
 
 function sessionLimitExceededMessage(cause: unknown, t: Translate) {
   if (cause instanceof ApiRequestError && cause.code === "session_limit_exceeded") {
-    return t("chat.sessionLimitExceeded", { count: cause.maxSessionsPerUser ?? 20 });
+    return t("chat.sessionLimitExceeded", {
+      count: cause.maxSessionsPerUser ?? 20,
+    });
   }
 
   return null;
@@ -2201,9 +2550,13 @@ function formatExecutionEntry(event: ExecutionHistoryEntry, t: Translate) {
     return joinExecutionParts(`${action} ${tool}`, compactToolResultDetail(detail));
   }
   if (event.kind === "tool.progress") {
-    return compactExecutionDisplayLine(joinExecutionParts(`${t("execution.progress")} ${tool}`, detail));
+    return compactExecutionDisplayLine(
+      joinExecutionParts(`${t("execution.progress")} ${tool}`, detail),
+    );
   }
-  return compactExecutionDisplayLine(joinExecutionParts(`${t("execution.started")} ${tool}`, detail));
+  return compactExecutionDisplayLine(
+    joinExecutionParts(`${t("execution.started")} ${tool}`, detail),
+  );
 }
 
 function joinExecutionParts(prefix: string, detail: string) {
@@ -2333,7 +2686,10 @@ function markdownAttachmentParts(
     }
 
     const attachment = attachments[Number(rawIndex)];
-    if (attachment && attachmentPlaceholderIsOwnLine(content, matchIndex, matchIndex + matchText.length)) {
+    if (
+      attachment &&
+      attachmentPlaceholderIsOwnLine(content, matchIndex, matchIndex + matchText.length)
+    ) {
       // 占位符编号只负责定位；文件名、类型和下载地址仍以 Hub 返回的附件元数据为准。
       referencedAttachmentIds.add(attachmentReferenceKey(attachment));
       parts.push({ type: "attachment", attachment });
@@ -2559,9 +2915,9 @@ function attachmentForUrl(attachments: HermesAttachment[], url: string) {
     const attachmentId = attachment.id ?? attachmentIdFromUrl(downloadUrl);
     return Boolean(
       normalizedUrl &&
-        (normalizedUrl === downloadUrl ||
-          normalizedUrl === dataUrl ||
-          (normalizedId && attachmentId === normalizedId)),
+      (normalizedUrl === downloadUrl ||
+        normalizedUrl === dataUrl ||
+        (normalizedId && attachmentId === normalizedId)),
     );
   });
 }
@@ -2787,7 +3143,12 @@ function ImagePreviewDialog({
   }
 
   return (
-    <div className="image-lightbox" role="dialog" aria-modal="true" aria-label={t("chat.imagePreview")}>
+    <div
+      className="image-lightbox"
+      role="dialog"
+      aria-modal="true"
+      aria-label={t("chat.imagePreview")}
+    >
       <button
         type="button"
         className="image-lightbox-backdrop"

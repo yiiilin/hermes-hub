@@ -160,8 +160,24 @@ export type SystemSettings = {
   max_sessions_per_user: number;
   max_attachment_upload_bytes: number;
   attachment_retention_days: number;
+  speech_input: SpeechInputSettings;
   oidc: OidcSettings;
   ldap: LdapSettings;
+};
+
+export type SpeechInputSettings = {
+  enabled: boolean;
+};
+
+export type SpeechInputConfig = {
+  enabled: boolean;
+  runtime_available: boolean;
+  max_audio_seconds: number;
+  max_upload_bytes: number;
+};
+
+export type SpeechTranscription = {
+  text: string;
 };
 
 // Hermes Profile 前端只管理 SOUL.md；旧后端字段在读取时兼容忽略。
@@ -292,11 +308,7 @@ export type ApiClient = {
   login: (email: string, password: string) => Promise<User>;
   ldapLogin: (email: string, password: string) => Promise<User>;
   bootstrapRegister: (email: string, password: string) => Promise<User>;
-  registerWithInvite: (
-    inviteToken: string,
-    email: string,
-    password: string,
-  ) => Promise<User>;
+  registerWithInvite: (inviteToken: string, email: string, password: string) => Promise<User>;
   updatePassword: (newPassword: string) => Promise<void>;
   logout: () => Promise<void>;
   listUsers: () => Promise<User[]>;
@@ -390,10 +402,7 @@ export type ApiClient = {
   stopHermesRun: (channelId: string, sessionId: string) => Promise<HermesActiveRun | null>;
   clearHermesRun: (channelId: string, sessionId: string) => Promise<void>;
   listSessionsPublic: () => Promise<SessionSummary[]>;
-  createSessionPublic: (
-    kind?: "chat" | "agent",
-    title?: string,
-  ) => Promise<SessionSummary>;
+  createSessionPublic: (kind?: "chat" | "agent", title?: string) => Promise<SessionSummary>;
   deleteSessionPublic: (sessionId: string) => Promise<void>;
   appendSessionMessagePublic: (
     sessionId: string,
@@ -412,10 +421,9 @@ export type ApiClient = {
       attachments?: HermesAttachment[];
     },
   ) => Promise<ChannelMessage>;
-  uploadSessionAttachmentsPublic: (
-    sessionId: string,
-    files: File[],
-  ) => Promise<HermesAttachment[]>;
+  uploadSessionAttachmentsPublic: (sessionId: string, files: File[]) => Promise<HermesAttachment[]>;
+  speechInputConfig: () => Promise<SpeechInputConfig>;
+  transcribeSpeechInput: (file: Blob & { name?: string }) => Promise<SpeechTranscription>;
   subscribeSessionEventsPublic: (
     sessionId: string,
     onEvent: (event: ChannelSessionEvent) => void,
@@ -469,10 +477,11 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   if (!response.ok) {
     const payload: ApiErrorPayload = await response
       .json()
-      .then((value): ApiErrorPayload =>
-        value && typeof value === "object"
-          ? (value as ApiErrorPayload)
-          : { message: response.statusText },
+      .then(
+        (value): ApiErrorPayload =>
+          value && typeof value === "object"
+            ? (value as ApiErrorPayload)
+            : { message: response.statusText },
       )
       .catch((): ApiErrorPayload => ({ message: response.statusText }));
     const message = payload.message ?? payload.error ?? response.statusText;
@@ -496,10 +505,11 @@ async function requestForm<T>(path: string, form: FormData): Promise<T> {
   if (!response.ok) {
     const payload: ApiErrorPayload = await response
       .json()
-      .then((value): ApiErrorPayload =>
-        value && typeof value === "object"
-          ? (value as ApiErrorPayload)
-          : { message: response.statusText },
+      .then(
+        (value): ApiErrorPayload =>
+          value && typeof value === "object"
+            ? (value as ApiErrorPayload)
+            : { message: response.statusText },
       )
       .catch((): ApiErrorPayload => ({ message: response.statusText }));
     const message = payload.message ?? payload.error ?? response.statusText;
@@ -633,7 +643,10 @@ function isManagedSkillZipFile(file: File): boolean {
 }
 
 function hasHiddenManagedSkillSegment(path: string): boolean {
-  return path.split("/").filter(Boolean).some((segment) => segment.startsWith("."));
+  return path
+    .split("/")
+    .filter(Boolean)
+    .some((segment) => segment.startsWith("."));
 }
 
 export function defaultOidcSettings(): OidcSettings {
@@ -669,9 +682,16 @@ export function defaultLdapSettings(): LdapSettings {
   };
 }
 
-type SystemSettingsPayload = Partial<Omit<SystemSettings, "oidc" | "ldap">> & {
+export function defaultSpeechInputSettings(): SpeechInputSettings {
+  return {
+    enabled: false,
+  };
+}
+
+type SystemSettingsPayload = Partial<Omit<SystemSettings, "oidc" | "ldap" | "speech_input">> & {
   oidc?: Partial<OidcSettings> | null;
   ldap?: Partial<LdapSettings> | null;
+  speech_input?: Partial<SpeechInputSettings> | null;
 };
 
 function systemSettingsFromPayload(settings: SystemSettingsPayload): SystemSettings {
@@ -682,8 +702,26 @@ function systemSettingsFromPayload(settings: SystemSettingsPayload): SystemSetti
       200 * 1024 * 1024,
     ),
     attachment_retention_days: positiveNumberOrDefault(settings.attachment_retention_days, 7),
+    speech_input: {
+      ...defaultSpeechInputSettings(),
+      ...(settings.speech_input ?? {}),
+    },
     oidc: { ...defaultOidcSettings(), ...(settings.oidc ?? {}) },
     ldap: { ...defaultLdapSettings(), ...(settings.ldap ?? {}) },
+  };
+}
+
+function speechInputConfigFromPayload(payload: {
+  enabled?: boolean;
+  runtime_available?: boolean;
+  max_audio_seconds?: number;
+  max_upload_bytes?: number;
+}): SpeechInputConfig {
+  return {
+    enabled: Boolean(payload.enabled),
+    runtime_available: Boolean(payload.runtime_available),
+    max_audio_seconds: positiveNumberOrDefault(payload.max_audio_seconds, 60),
+    max_upload_bytes: positiveNumberOrDefault(payload.max_upload_bytes, 25 * 1024 * 1024),
   };
 }
 
@@ -748,17 +786,15 @@ export function createApiClient(): ApiClient {
       return payload.users;
     },
     async disableUser(userId) {
-      const payload = await request<{ user: User }>(
-        `/api/admin/users/${userId}/disable`,
-        { method: "POST" },
-      );
+      const payload = await request<{ user: User }>(`/api/admin/users/${userId}/disable`, {
+        method: "POST",
+      });
       return payload.user;
     },
     async enableUser(userId) {
-      const payload = await request<{ user: User }>(
-        `/api/admin/users/${userId}/enable`,
-        { method: "POST" },
-      );
+      const payload = await request<{ user: User }>(`/api/admin/users/${userId}/enable`, {
+        method: "POST",
+      });
       return payload.user;
     },
     async listInvites() {
@@ -772,10 +808,9 @@ export function createApiClient(): ApiClient {
       });
     },
     async revokeInvite(inviteId) {
-      const payload = await request<{ invite: Invite }>(
-        `/api/invites/${inviteId}/revoke`,
-        { method: "POST" },
-      );
+      const payload = await request<{ invite: Invite }>(`/api/invites/${inviteId}/revoke`, {
+        method: "POST",
+      });
       return payload.invite;
     },
     async listHermesInstances() {
@@ -826,10 +861,7 @@ export function createApiClient(): ApiClient {
       }
       // 兼容后端字段名小幅调整，避免只读页因为包裹 key 不一致而整体空白。
       return (
-        payload.hermes_scheduler_snapshots ??
-        payload.scheduler_snapshots ??
-        payload.snapshots ??
-        []
+        payload.hermes_scheduler_snapshots ?? payload.scheduler_snapshots ?? payload.snapshots ?? []
       );
     },
     async workspaceHermesSchedulerSnapshot() {
@@ -909,14 +941,11 @@ export function createApiClient(): ApiClient {
         form.append("file", file, file.name);
       }
 
-      const response = await fetch(
-        `/api/channels/${channelId}/sessions/${sessionId}/attachments`,
-        {
-          method: "POST",
-          credentials: "include",
-          body: form,
-        },
-      );
+      const response = await fetch(`/api/channels/${channelId}/sessions/${sessionId}/attachments`, {
+        method: "POST",
+        credentials: "include",
+        body: form,
+      });
 
       if (!response.ok) {
         const message = await response
@@ -926,7 +955,9 @@ export function createApiClient(): ApiClient {
         throw new Error(String(message));
       }
 
-      const payload = (await response.json()) as { attachments: HermesAttachment[] };
+      const payload = (await response.json()) as {
+        attachments: HermesAttachment[];
+      };
       return payload.attachments;
     },
     async createChannelRun(channelId, sessionId, input) {
@@ -967,9 +998,7 @@ export function createApiClient(): ApiClient {
       return payload.model_config;
     },
     async modelConfigStatus() {
-      const payload = await request<ModelConfigStatus>(
-        "/api/admin/model-config",
-      );
+      const payload = await request<ModelConfigStatus>("/api/admin/model-config");
       const modelConfigs = (payload.model_configs ?? [payload.model_config]).map(
         modelConfigFromPayload,
       );
@@ -978,8 +1007,7 @@ export function createApiClient(): ApiClient {
         model_config: modelConfigFromPayload(payload.model_config),
         model_configs: modelConfigs,
         required_models_ready: payload.required_models_ready ?? false,
-        missing_required_model_config_kinds:
-          payload.missing_required_model_config_kinds ?? [],
+        missing_required_model_config_kinds: payload.missing_required_model_config_kinds ?? [],
       };
     },
     async modelConfigs() {
@@ -996,13 +1024,10 @@ export function createApiClient(): ApiClient {
       }
     },
     async testModelConfig(config) {
-      return request<ModelConfigTestResult>(
-        `/api/admin/model-config/${config.config_kind}/test`,
-        {
-          method: "POST",
-          body: normalizedModelConfig(config),
-        },
-      );
+      return request<ModelConfigTestResult>(`/api/admin/model-config/${config.config_kind}/test`, {
+        method: "POST",
+        body: normalizedModelConfig(config),
+      });
     },
     async testModelFallbackConfig(config) {
       return request<ModelConfigTestResult>(
@@ -1088,10 +1113,9 @@ export function createApiClient(): ApiClient {
       return payload.active_run;
     },
     subscribeSessionEvents(channelId, sessionId, onEvent, onError) {
-      const source = new EventSource(
-        `/api/channels/${channelId}/sessions/${sessionId}/events`,
-        { withCredentials: true },
-      );
+      const source = new EventSource(`/api/channels/${channelId}/sessions/${sessionId}/events`, {
+        withCredentials: true,
+      });
       const eventNames = [
         "messages_snapshot",
         "message_created",
@@ -1199,8 +1223,21 @@ export function createApiClient(): ApiClient {
         throw new Error(String(message));
       }
 
-      const payload = (await response.json()) as { attachments: HermesAttachment[] };
+      const payload = (await response.json()) as {
+        attachments: HermesAttachment[];
+      };
       return payload.attachments;
+    },
+    async speechInputConfig() {
+      const payload = await request<{ speech_input: SpeechInputConfig }>(
+        "/api/speech-input/config",
+      );
+      return speechInputConfigFromPayload(payload.speech_input);
+    },
+    async transcribeSpeechInput(file) {
+      const form = new FormData();
+      form.append("file", file, file.name ?? "speech-input.webm");
+      return requestForm<SpeechTranscription>("/api/speech-input/transcriptions", form);
     },
     subscribeSessionEventsPublic(sessionId, onEvent, onError) {
       const source = new EventSource(`/api/sessions/${sessionId}/events`, {
@@ -1281,11 +1318,7 @@ function withMockMessageKind(message: ChannelMessage): ChannelMessage {
   }
   return {
     ...message,
-    message_kind: inferMockMessageKind(
-      message.role,
-      message.client_message_key,
-      message.content,
-    ),
+    message_kind: inferMockMessageKind(message.role, message.client_message_key, message.content),
   };
 }
 
@@ -1296,8 +1329,7 @@ function inferMockMessageKind(
 ): ChannelMessage["message_kind"] {
   if (
     role === "assistant" &&
-    (clientMessageKey?.startsWith("hermes-execution:") ||
-      isMockExecutionProtocolMessage(content))
+    (clientMessageKey?.startsWith("hermes-execution:") || isMockExecutionProtocolMessage(content))
   ) {
     return "execution";
   }
@@ -1331,12 +1363,15 @@ function isMockLegacyExecutionLine(line: string) {
 
 export function createMockApiClient(options: MockApiClientOptions = {}): ApiClient {
   let hasAnyUser = options.bootstrapOpen === true ? false : true;
-  let currentUser: User | null = "initialUser" in options ? options.initialUser! : {
-    id: "user-1",
-    email: "admin@example.com",
-    role: "admin",
-    status: "active",
-  };
+  let currentUser: User | null =
+    "initialUser" in options
+      ? options.initialUser!
+      : {
+          id: "user-1",
+          email: "admin@example.com",
+          role: "admin",
+          status: "active",
+        };
   const usersByEmail = new Map<string, User>();
   if (currentUser) {
     usersByEmail.set(currentUser.email.toLowerCase(), currentUser);
@@ -1372,18 +1407,21 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     Set<(event: ChannelSessionEvent) => void>
   > = {};
   let invites: Invite[] = [];
-  let instance: HermesInstance | null = "initialInstance" in options ? options.initialInstance! : {
-    id: "instance-1",
-    user_id: "user-1",
-    kind: "managed_docker",
-    status: "running",
-    runtime_image: "ghcr.io/yiiilin/hermes-hub-hermes:latest",
-    runtime_version: null,
-    last_user_activity_at: null,
-    last_started_at: null,
-    last_stopped_at: null,
-    stopped_reason: null,
-  };
+  let instance: HermesInstance | null =
+    "initialInstance" in options
+      ? options.initialInstance!
+      : {
+          id: "instance-1",
+          user_id: "user-1",
+          kind: "managed_docker",
+          status: "running",
+          runtime_image: "ghcr.io/yiiilin/hermes-hub-hermes:latest",
+          runtime_version: null,
+          last_user_activity_at: null,
+          last_started_at: null,
+          last_stopped_at: null,
+          stopped_reason: null,
+        };
   let modelConfig: ModelConfig = {
     config_kind: "llm",
     provider_name: "openai-compatible",
@@ -1426,6 +1464,7 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     max_sessions_per_user: 20,
     max_attachment_upload_bytes: 200 * 1024 * 1024,
     attachment_retention_days: 7,
+    speech_input: defaultSpeechInputSettings(),
     oidc: defaultOidcSettings(),
     ldap: defaultLdapSettings(),
   };
@@ -1534,17 +1573,21 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       return { bootstrap_open: !hasAnyUser };
     },
     async oidcConfig() {
-      return options.oidcPublicConfig ?? {
-        enabled: systemSettings.oidc.enabled,
-        display_name: systemSettings.oidc.display_name,
-        allow_password_login: systemSettings.oidc.allow_password_login,
-      };
+      return (
+        options.oidcPublicConfig ?? {
+          enabled: systemSettings.oidc.enabled,
+          display_name: systemSettings.oidc.display_name,
+          allow_password_login: systemSettings.oidc.allow_password_login,
+        }
+      );
     },
     async ldapConfig() {
-      return options.ldapPublicConfig ?? {
-        enabled: systemSettings.ldap.enabled,
-        display_name: systemSettings.ldap.display_name,
-      };
+      return (
+        options.ldapPublicConfig ?? {
+          enabled: systemSettings.ldap.enabled,
+          display_name: systemSettings.ldap.display_name,
+        }
+      );
     },
     async login(email) {
       return authenticateUserByEmail(email, "admin");
@@ -1575,7 +1618,11 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       return currentUser ? [currentUser] : [];
     },
     async disableUser(userId) {
-      currentUser = { ...(currentUser as User), id: userId, status: "disabled" };
+      currentUser = {
+        ...(currentUser as User),
+        id: userId,
+        status: "disabled",
+      };
       return currentUser;
     },
     async enableUser(userId) {
@@ -1658,15 +1705,18 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
         return null;
       }
       return (
-        hermesSchedulerSnapshots.find((snapshot) => snapshot.user_id === currentUserId) ??
-        null
+        hermesSchedulerSnapshots.find((snapshot) => snapshot.user_id === currentUserId) ?? null
       );
     },
     async listChannels() {
       return channels;
     },
     async createChannel(name, description) {
-      const channel = { id: `channel-${channels.length + 1}`, name, description };
+      const channel = {
+        id: `channel-${channels.length + 1}`,
+        name,
+        description,
+      };
       channels = [channel, ...channels];
       return channel;
     },
@@ -1700,7 +1750,10 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       );
       delete messagesBySessionId[sessionId];
       delete activeRunsBySessionId[sessionId];
-      emitSessionEvent(sessionId, { type: "session_deleted", session_id: sessionId });
+      emitSessionEvent(sessionId, {
+        type: "session_deleted",
+        session_id: sessionId,
+      });
     },
     async listSessionMessages(_channelId, sessionId) {
       return messagesBySessionId[sessionId] ?? [];
@@ -1757,7 +1810,10 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       sessions = sessions.map((session) =>
         session.id === sessionId ? { ...session, updated_at: Date.now() } : session,
       );
-      emitSessionEvent(sessionId, { type: "message_updated", message: nextMessage });
+      emitSessionEvent(sessionId, {
+        type: "message_updated",
+        message: nextMessage,
+      });
       return nextMessage;
     },
     async uploadSessionAttachments(_channelId, sessionId, files) {
@@ -1812,13 +1868,21 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
         updated_at: Date.now(),
       };
       messagesBySessionId[sessionId] = [...(messagesBySessionId[sessionId] ?? []), assistant];
-      emitSessionEvent(sessionId, { type: "message_created", message: assistant });
+      emitSessionEvent(sessionId, {
+        type: "message_created",
+        message: assistant,
+      });
       delete activeRunsBySessionId[sessionId];
-      emitSessionEvent(sessionId, { type: "run_cleared", session_id: sessionId });
+      emitSessionEvent(sessionId, {
+        type: "run_cleared",
+        session_id: sessionId,
+      });
       return { message, run };
     },
     async generateSessionTitle(channelId, sessionId, prompt) {
-      const session = sessions.find((item) => item.id === sessionId && item.channel_id === channelId);
+      const session = sessions.find(
+        (item) => item.id === sessionId && item.channel_id === channelId,
+      );
       if (!session) {
         throw new Error("session not found");
       }
@@ -1849,8 +1913,7 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
         model_config: modelConfig,
         model_configs: modelConfigs,
         required_models_ready: options.requiredModelsReady ?? true,
-        missing_required_model_config_kinds:
-          options.missingRequiredModelConfigKinds ?? [],
+        missing_required_model_config_kinds: options.missingRequiredModelConfigKinds ?? [],
       };
     },
     async modelConfigs() {
@@ -1859,12 +1922,9 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     async updateModelConfig(config) {
       const normalized = normalizedModelConfig(config);
       modelConfigs = modelConfigs.map((existing) =>
-        existing.config_kind === config.config_kind
-          ? normalized
-          : existing,
+        existing.config_kind === config.config_kind ? normalized : existing,
       );
-      modelConfig =
-        modelConfigs.find((existing) => existing.config_kind === "llm") ?? modelConfig;
+      modelConfig = modelConfigs.find((existing) => existing.config_kind === "llm") ?? modelConfig;
     },
     async updateModelConfigs(configs) {
       for (const config of configs) {
@@ -1994,12 +2054,18 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
         return options.stopHermesRun(channelId, sessionId);
       }
       delete activeRunsBySessionId[sessionId];
-      emitSessionEvent(sessionId, { type: "run_cleared", session_id: sessionId });
+      emitSessionEvent(sessionId, {
+        type: "run_cleared",
+        session_id: sessionId,
+      });
       return null;
     },
     async clearHermesRun(_channelId, sessionId) {
       delete activeRunsBySessionId[sessionId];
-      emitSessionEvent(sessionId, { type: "run_cleared", session_id: sessionId });
+      emitSessionEvent(sessionId, {
+        type: "run_cleared",
+        session_id: sessionId,
+      });
     },
     async listSessionsPublic() {
       return sessions
@@ -2042,6 +2108,17 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     },
     async uploadSessionAttachmentsPublic(sessionId, files) {
       return this.uploadSessionAttachments("channel-1", sessionId, files);
+    },
+    async speechInputConfig() {
+      return {
+        enabled: false,
+        runtime_available: false,
+        max_audio_seconds: 60,
+        max_upload_bytes: 25 * 1024 * 1024,
+      };
+    },
+    async transcribeSpeechInput() {
+      throw new Error("speech input is disabled");
     },
     subscribeSessionEventsPublic(sessionId, onEvent, onError) {
       return this.subscribeSessionEvents("channel-1", sessionId, onEvent, onError);
