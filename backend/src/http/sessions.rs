@@ -1,5 +1,5 @@
 use axum::{
-    extract::{DefaultBodyLimit, Multipart, Path, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -34,12 +34,14 @@ use crate::{
         workspace::ensure_managed_hermes_for_user,
         ApiError,
     },
+    public_platform,
     storage::ObjectStorageError,
     title_generation::model_generated_title,
     AppState,
 };
 
 const PUBLIC_SESSION_COOKIE_NAME: &str = "hermes_hub_public_session";
+const PUBLIC_SESSION_TOKEN_HEADER: &str = "x-hermes-hub-public-session";
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -94,11 +96,15 @@ struct PublicSessionSummary {
 #[derive(Serialize)]
 struct SessionListResponse {
     sessions: Vec<PublicSessionSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    public_token: Option<String>,
 }
 
 #[derive(Serialize)]
 struct SessionResponse {
     session: PublicSessionSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    public_token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -109,6 +115,11 @@ struct MessageResponse {
 #[derive(Serialize)]
 struct AttachmentListResponse {
     attachments: Vec<ChannelAttachment>,
+}
+
+#[derive(Deserialize)]
+struct ListSessionsQuery {
+    session_id: Option<String>,
 }
 
 enum SessionAccess {
@@ -139,15 +150,27 @@ impl SessionAccess {
 async fn list_sessions(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<ListSessionsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let is_authenticated = current_user(&state, &headers).await.is_ok();
     ensure_public_platform_enabled_for_anonymous(&state, is_authenticated).await?;
-    let public_token = public_session_token_from_headers(&headers);
-    if !is_authenticated && public_token.is_none() {
-        return Ok(Json(SessionListResponse { sessions: vec![] }));
-    }
+    let mut public_token = if is_authenticated {
+        None
+    } else {
+        public_session_token_for_request(&state, &headers, query.session_id.as_deref()).await?
+    };
     if !is_authenticated {
         cleanup_expired_public_sessions(&state).await?;
+        if let Some(session_id) = normalize_public_session_token(query.session_id.as_deref()) {
+            if let Some(token) =
+                grant_public_session_path_access(&state, public_token.clone(), &session_id).await?
+            {
+                public_token = Some(token);
+            }
+        }
+        if public_token.is_none() {
+            return session_list_response(&headers, vec![], None);
+        }
         if let Some(token) = &public_token {
             if state
                 .store
@@ -156,11 +179,18 @@ async fn list_sessions(
                 .map_err(|_| ApiError::Internal)?
                 .is_empty()
             {
-                return Ok(Json(SessionListResponse { sessions: vec![] }));
+                return session_list_response(&headers, vec![], public_token.clone());
             }
         }
     }
-    let access = session_access(&state, &headers).await?;
+    let access = if is_authenticated {
+        session_access(&state, &headers).await?
+    } else {
+        SessionAccess::Public {
+            owner_user_id: public_platform_owner_user_id(&state).await?,
+            token: public_token.clone(),
+        }
+    };
     if let SessionAccess::Public {
         token: Some(token), ..
     } = &access
@@ -172,12 +202,12 @@ async fn list_sessions(
             .map_err(|_| ApiError::Internal)?
             .is_empty()
         {
-            return Ok(Json(SessionListResponse { sessions: vec![] }));
+            return session_list_response(&headers, vec![], public_token.clone());
         }
         ensure_managed_hermes_for_user(&state, access.user_id()).await?;
     }
     let Some(channel) = ensure_channel_for_access(&state, &access).await? else {
-        return Ok(Json(SessionListResponse { sessions: vec![] }));
+        return session_list_response(&headers, vec![], public_token.clone());
     };
     let sessions = state
         .channel_store
@@ -194,10 +224,11 @@ async fn list_sessions(
         }
         summaries.push(public_session_summary_for_access(&state, &access, session).await?);
     }
+    if !is_authenticated && summaries.is_empty() {
+        return session_list_response(&headers, summaries, None);
+    }
 
-    Ok(Json(SessionListResponse {
-        sessions: summaries,
-    }))
+    session_list_response(&headers, summaries, public_token)
 }
 
 async fn create_session(
@@ -256,7 +287,15 @@ async fn create_session(
     }
     let session = public_session_summary_for_create(&state, is_public_session, session).await?;
 
-    let mut response = (StatusCode::CREATED, Json(SessionResponse { session })).into_response();
+    let public_token = access.token.clone();
+    let mut response = (
+        StatusCode::CREATED,
+        Json(SessionResponse {
+            session,
+            public_token,
+        }),
+    )
+        .into_response();
     if let Some(cookie) = access.set_cookie {
         response.headers_mut().insert(
             header::SET_COOKIE,
@@ -288,13 +327,10 @@ async fn delete_session(
         .delete_session(access.user_id(), &channel.id, &session_id)
         .await
         .map_err(map_channel_error)?;
-    if let SessionAccess::Public {
-        token: Some(token), ..
-    } = &access
-    {
+    if matches!(access, SessionAccess::Public { .. }) {
         state
             .store
-            .revoke_public_session_access(token, &session_id)
+            .delete_public_session_access_for_session(&session_id)
             .await
             .map_err(|_| ApiError::Internal)?;
     }
@@ -703,7 +739,7 @@ async fn session_access(state: &AppState, headers: &HeaderMap) -> Result<Session
 
     Ok(SessionAccess::Public {
         owner_user_id,
-        token: public_session_token_from_headers(headers),
+        token: public_session_token_for_request(state, headers, None).await?,
     })
 }
 
@@ -721,13 +757,10 @@ async fn session_create_access(
     ensure_public_platform_enabled_for_anonymous(state, false).await?;
 
     let owner_user_id = public_platform_owner_user_id(state).await?;
-    let existing_token = public_session_token_from_headers(headers);
-    let token = existing_token
-        .clone()
+    let token = public_session_token_for_request(state, headers, None)
+        .await?
         .unwrap_or_else(generate_public_session_token);
-    let set_cookie = existing_token
-        .is_none()
-        .then(|| public_session_cookie(&token));
+    let set_cookie = public_session_cookie_refresh(headers, &token);
 
     Ok(PublicCreateAccess {
         owner_user_id,
@@ -741,28 +774,24 @@ async fn session_access_requiring_session(
     headers: &HeaderMap,
     session_id: &str,
 ) -> Result<SessionAccess, ApiError> {
-    let access = session_access(state, headers).await?;
-    if let SessionAccess::Public { token, .. } = &access {
-        let Some(token) = token else {
-            return Err(ApiError::Unauthorized);
-        };
-        if Uuid::parse_str(session_id).is_err() {
-            return Err(ApiError::Unauthorized);
-        }
-        cleanup_expired_public_sessions(state).await?;
-        if cleanup_public_session_if_recycled(state, session_id).await? {
-            return Err(ApiError::Unauthorized);
-        }
-        let allowed = state
-            .store
-            .public_token_can_access_session(token, session_id)
-            .await
-            .map_err(|_| ApiError::Internal)?;
-        if !allowed {
-            return Err(ApiError::Unauthorized);
-        }
+    if let Ok(user) = current_user(state, headers).await {
+        return Ok(SessionAccess::Authenticated { user_id: user.id });
     }
-    Ok(access)
+    ensure_public_platform_enabled_for_anonymous(state, false).await?;
+    if Uuid::parse_str(session_id).is_err() {
+        return Err(ApiError::Unauthorized);
+    }
+    cleanup_expired_public_sessions(state).await?;
+    if cleanup_public_session_if_recycled(state, session_id).await? {
+        return Err(ApiError::Unauthorized);
+    }
+    let token = public_session_token_for_session(state, headers, session_id)
+        .await?
+        .ok_or(ApiError::Unauthorized)?;
+    Ok(SessionAccess::Public {
+        owner_user_id: public_platform_owner_user_id(state).await?,
+        token: Some(token),
+    })
 }
 
 async fn ensure_channel_for_access(
@@ -801,9 +830,137 @@ async fn filter_sessions_for_access(
         .collect())
 }
 
-fn public_session_token_from_headers(headers: &HeaderMap) -> Option<String> {
-    cookie_value_from_headers(headers, PUBLIC_SESSION_COOKIE_NAME)
-        .filter(|token| !token.trim().is_empty())
+async fn grant_public_session_path_access(
+    state: &AppState,
+    current_token: Option<String>,
+    session_id: &str,
+) -> Result<Option<String>, ApiError> {
+    if Uuid::parse_str(session_id).is_err() {
+        return Ok(current_token);
+    }
+    let owner_user_id = public_platform_owner_user_id(state).await?;
+    let channel = ensure_public_channel(state, &owner_user_id).await?;
+    let session = match state
+        .channel_store
+        .get_session(&owner_user_id, &channel.id, session_id)
+        .await
+    {
+        Ok(session) => session,
+        Err(_) => return Ok(current_token),
+    };
+    if cleanup_public_session_if_recycled(state, session_id).await? {
+        return Ok(current_token);
+    }
+    let token = current_token.unwrap_or_else(generate_public_session_token);
+    let expires_at = public_session_recycle_at(state, &session).await?;
+    state
+        .store
+        .grant_public_session_access_until(&token, session_id, expires_at)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    Ok(Some(token))
+}
+
+pub(crate) async fn public_session_token_for_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    requested_session_id: Option<&str>,
+) -> Result<Option<String>, ApiError> {
+    let cookie_token = public_session_cookie_token(headers);
+    let header_token = public_session_header_token(headers);
+    if let Some(session_id) =
+        requested_session_id.and_then(|value| normalize_public_session_token(Some(value)))
+    {
+        if let Some(token) = cookie_token.as_deref() {
+            if public_token_can_access_session(state, token, &session_id).await? {
+                return Ok(cookie_token);
+            }
+        }
+        if let Some(token) = header_token.as_deref() {
+            if public_token_can_access_session(state, token, &session_id).await? {
+                return Ok(header_token);
+            }
+        }
+    }
+    if let Some(token) = cookie_token.as_deref() {
+        if public_token_has_sessions(state, token).await? {
+            return Ok(cookie_token);
+        }
+    }
+    if let Some(token) = header_token.as_deref() {
+        if public_token_has_sessions(state, token).await? {
+            return Ok(header_token);
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) async fn public_session_token_for_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    session_id: &str,
+) -> Result<Option<String>, ApiError> {
+    let cookie_token = public_session_cookie_token(headers);
+    if let Some(token) = cookie_token.as_deref() {
+        if public_token_can_access_session(state, token, session_id).await? {
+            return Ok(cookie_token);
+        }
+    }
+    let header_token = public_session_header_token(headers);
+    if let Some(token) = header_token.as_deref() {
+        if public_token_can_access_session(state, token, session_id).await? {
+            return Ok(header_token);
+        }
+    }
+    Ok(None)
+}
+
+async fn public_token_has_sessions(state: &AppState, token: &str) -> Result<bool, ApiError> {
+    Ok(!state
+        .store
+        .public_session_ids_for_token(token)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .is_empty())
+}
+
+async fn public_token_can_access_session(
+    state: &AppState,
+    token: &str,
+    session_id: &str,
+) -> Result<bool, ApiError> {
+    state
+        .store
+        .public_token_can_access_session(token, session_id)
+        .await
+        .map_err(|_| ApiError::Internal)
+}
+
+fn public_session_header_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(PUBLIC_SESSION_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| normalize_public_session_token(Some(value)))
+}
+
+fn public_session_cookie_token(headers: &HeaderMap) -> Option<String> {
+    normalize_public_session_token(
+        cookie_value_from_headers(headers, PUBLIC_SESSION_COOKIE_NAME).as_deref(),
+    )
+}
+
+fn normalize_public_session_token(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn public_session_cookie_refresh(headers: &HeaderMap, token: &str) -> Option<String> {
+    if public_session_cookie_token(headers).as_deref() == Some(token) {
+        return None;
+    }
+    Some(public_session_cookie(token))
 }
 
 fn generate_public_session_token() -> String {
@@ -814,6 +971,27 @@ fn public_session_cookie(public_token: &str) -> String {
     format!("{PUBLIC_SESSION_COOKIE_NAME}={public_token}; HttpOnly; SameSite=Lax; Path=/")
 }
 
+fn session_list_response(
+    headers: &HeaderMap,
+    sessions: Vec<PublicSessionSummary>,
+    public_token: Option<String>,
+) -> Result<Response, ApiError> {
+    let mut response = Json(SessionListResponse {
+        sessions,
+        public_token: public_token.clone(),
+    })
+    .into_response();
+    if let Some(token) = public_token {
+        if let Some(cookie) = public_session_cookie_refresh(headers, &token) {
+            response.headers_mut().insert(
+                header::SET_COOKIE,
+                HeaderValue::from_str(&cookie).map_err(|_| ApiError::Internal)?,
+            );
+        }
+    }
+    Ok(response)
+}
+
 async fn ensure_public_platform_enabled_for_anonymous(
     state: &AppState,
     is_authenticated: bool,
@@ -821,34 +999,18 @@ async fn ensure_public_platform_enabled_for_anonymous(
     if is_authenticated {
         return Ok(());
     }
-    // 匿名公共平台是否开放由部署环境决定，避免多环境共享数据库时互相改写。
-    let enabled = state.config.public_platform_enabled;
-    if enabled {
+    let readiness = public_platform::public_hermes_readiness(state).await?;
+    if readiness.ready {
         Ok(())
+    } else if readiness.configured_enabled {
+        Err(ApiError::ServiceUnavailable("public platform is not ready"))
     } else {
         Err(ApiError::NotFound("public platform is disabled"))
     }
 }
 
 async fn public_platform_owner_user_id(state: &AppState) -> Result<String, ApiError> {
-    let has_active_admin = state
-        .store
-        .first_active_admin_user_id()
-        .await
-        .map_err(|_| ApiError::Internal)?
-        .is_some();
-    if !has_active_admin {
-        return Err(ApiError::Unauthorized);
-    }
-
-    // 匿名公共平台会话使用隐藏系统用户承载，避免污染管理员的会话、
-    // workspace 和会话数量限制。
-    let public_user = state
-        .store
-        .ensure_public_platform_user()
-        .await
-        .map_err(|_| ApiError::Internal)?;
-    Ok(public_user.id)
+    public_platform::ensure_public_owner_user_id(state).await
 }
 
 async fn ensure_public_channel(

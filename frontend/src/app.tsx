@@ -39,37 +39,26 @@ function AppContent({ apiClient }: Required<AppProps>) {
   });
   useHermesActivityPrewarm(user, apiClient);
 
+  async function fetchPublicPlatformEnabled() {
+    try {
+      const status = await apiClient.bootstrapStatus();
+      return Boolean(status.public_platform_enabled);
+    } catch {
+      return false;
+    }
+  }
+
   useEffect(() => {
     let alive = true;
-    void apiClient
-      .bootstrapStatus()
-      .then((status) => {
+    void Promise.all([fetchPublicPlatformEnabled(), apiClient.me().catch(() => null)]).then(
+      ([nextPublicPlatformEnabled, nextUser]) => {
         if (alive) {
-          setPublicPlatformEnabled(Boolean(status.public_platform_enabled));
-        }
-      })
-      .catch(() => {
-        if (alive) {
-          setPublicPlatformEnabled(false);
-        }
-      });
-    void apiClient
-      .me()
-      .then((nextUser) => {
-        if (alive) {
+          setPublicPlatformEnabled(nextPublicPlatformEnabled);
           setUser(nextUser);
-        }
-      })
-      .catch(() => {
-        if (alive) {
-          setUser(null);
-        }
-      })
-      .finally(() => {
-        if (alive) {
           setLoadingUser(false);
         }
-      });
+      },
+    );
 
     return () => {
       alive = false;
@@ -81,6 +70,9 @@ function AppContent({ apiClient }: Required<AppProps>) {
     setUser(null);
     setActiveView("chat");
     setShowLogin(false);
+    setLoadingUser(true);
+    setPublicPlatformEnabled(await fetchPublicPlatformEnabled());
+    setLoadingUser(false);
   }
 
   if (loadingUser) {
@@ -89,44 +81,58 @@ function AppContent({ apiClient }: Required<AppProps>) {
 
   if (!user) {
     const showPublicChat = !showLogin && publicPlatformEnabled;
-    return (
-      <Layout
-        user={null}
-        activeView={showPublicChat ? "chat" : "login"}
-        onNavigate={() => setShowLogin(false)}
-        onLogin={showPublicChat ? () => setShowLogin(true) : undefined}
-      >
-        {showPublicChat ? (
+    if (showPublicChat) {
+      return (
+        <Layout
+          key="public"
+          user={null}
+          activeView="chat"
+          onNavigate={() => setShowLogin(false)}
+          onLogin={() => setShowLogin(true)}
+        >
           <ChannelSessionRoute
+            key="public"
             active
             apiClient={apiClient}
             onOpenChat={() => setShowLogin(false)}
+            publicMode
           />
-        ) : (
-          <LoginRoute
-            apiClient={apiClient}
-            embedded
-            onAuthenticated={(nextUser) => {
-              setUser(nextUser);
-              setShowLogin(false);
-            }}
-          />
-        )}
-      </Layout>
+        </Layout>
+      );
+    }
+
+    return (
+      <LoginRoute
+        apiClient={apiClient}
+        onAuthenticated={(nextUser) => {
+          setUser(nextUser);
+          setShowLogin(false);
+        }}
+        onBackToPublicPlatform={
+          publicPlatformEnabled && !showLogin
+            ? undefined
+            : publicPlatformEnabled
+              ? () => setShowLogin(false)
+              : undefined
+        }
+      />
     );
   }
 
   return (
     <Layout
+      key={`user:${user.id}`}
       user={user}
       activeView={activeView}
       onNavigate={setActiveView}
       onLogout={logout}
     >
       <ChannelSessionRoute
+        key={`user:${user.id}`}
         active={activeView === "chat"}
         apiClient={apiClient}
         onOpenChat={() => setActiveView("chat")}
+        publicMode={false}
       />
       {user.role === "admin" && activeView === "admin-settings" ? (
         <Suspense fallback={<main className="auth-shell">{t("common.loading")}</main>}>

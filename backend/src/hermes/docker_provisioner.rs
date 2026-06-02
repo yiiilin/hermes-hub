@@ -31,7 +31,7 @@ use super::{
 
 /// Hub 托管 Hermes 容器规格版本。只要 env、挂载、工作目录或安全策略有变化，
 /// 就提升这个值，确保已存在的旧容器会被重建并拿到新行为。
-const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-05-30-bundled-platform-plugin";
+const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-06-02-public-sandbox-split";
 const MANAGED_CONTAINER_SPEC_LABEL: &str = "hermes_hub_spec_version";
 const HUB_INBOX_PATH: &str = "/internal/channel/v1/inbox";
 const HUB_INBOX_TIMEOUT_SECONDS: u16 = 25;
@@ -39,7 +39,8 @@ const HUB_INBOX_LIMIT: u16 = 4;
 const HUB_NFS_CONTAINER_DIR: &str = "/nfs";
 const MANAGED_SKILLS_EXTERNAL_DIR: &str = "/nfs/skills";
 const MANAGED_PROFILE_SOUL_FILE: &str = "SOUL.md";
-const HERMES_MEDIA_ALLOW_DIRS: &str = "/workspace:/sandbox:/opt/data:/config/cache";
+const HERMES_BASE_MEDIA_ALLOW_DIRS: &str = "/workspace:/config/cache";
+const HERMES_PUBLIC_MEDIA_ALLOW_DIRS: &str = "/workspace:/sandbox:/opt/data:/config/cache";
 const DOCKER_DAEMON_SOCKET: &str = "/var/run/docker.sock";
 /// Docker 托管 Hermes 的运行配置。
 #[derive(Clone, Debug, PartialEq)]
@@ -435,7 +436,24 @@ impl DockerProvisioner {
     }
 
     pub fn prepare_instance(&self, user_id: &str) -> HermesInstance {
-        self.build_instance(user_id)
+        self.build_instance(user_id, false)
+    }
+
+    pub fn prepare_instance_with_sandbox(
+        &self,
+        user_id: &str,
+        sandbox_enabled: bool,
+    ) -> HermesInstance {
+        self.build_instance(user_id, sandbox_enabled)
+    }
+
+    pub fn apply_sandbox_policy(&self, instance: &mut HermesInstance, sandbox_enabled: bool) {
+        let user_root = self.config.data_root.join(&instance.user_id);
+        // workspace/config 也按当前 data_root 归一化，避免旧部署路径继续残留在 DB 里。
+        instance.host_workspace_path = Some(path_to_string(user_root.join("workspace")));
+        instance.host_config_path = Some(path_to_string(user_root.join("config")));
+        instance.host_sandbox_path =
+            sandbox_enabled.then(|| path_to_string(user_root.join("sandbox")));
     }
 
     pub fn container_spec_for(
@@ -446,10 +464,6 @@ impl DockerProvisioner {
             .host_workspace_path
             .clone()
             .ok_or(ProvisionerError::InvalidManagedInstance)?;
-        let sandbox = instance
-            .host_sandbox_path
-            .clone()
-            .ok_or(ProvisionerError::InvalidManagedInstance)?;
         let config = instance
             .host_config_path
             .clone()
@@ -458,13 +472,16 @@ impl DockerProvisioner {
 
         let mut mounts = vec![
             ContainerMount::bind(workspace, "/workspace", false),
-            ContainerMount::bind(sandbox.clone(), "/sandbox", false),
-            ContainerMount::bind(sandbox, "/opt/data", false),
             ContainerMount::bind(config, "/config", false),
             // Hermes 运行态目录保持可写，但 Hub 生成的配置文件本身必须只读挂载，
             // 这样管理员配置只能从 Hub/S3 更新，不会被容器内进程意外覆盖。
             ContainerMount::bind(config_file, "/config/config.yaml", true),
         ];
+        if let Some(sandbox) = instance.host_sandbox_path.clone() {
+            // 公共平台 Hermes 通过独立 sandbox 暴露临时会话数据目录；普通用户不挂载这组路径。
+            mounts.insert(1, ContainerMount::bind(sandbox.clone(), "/sandbox", false));
+            mounts.insert(2, ContainerMount::bind(sandbox, "/opt/data", false));
+        }
         if let Some(managed_skills) = &self.config.managed_skills {
             mounts.push(ContainerMount::nfs_volume(
                 managed_skills,
@@ -503,7 +520,10 @@ impl DockerProvisioner {
             format!("HERMES_HUB_INBOX_PATH={HUB_INBOX_PATH}"),
             format!("HERMES_HUB_INBOX_TIMEOUT_SECONDS={HUB_INBOX_TIMEOUT_SECONDS}"),
             format!("HERMES_HUB_INBOX_LIMIT={HUB_INBOX_LIMIT}"),
-            format!("HERMES_MEDIA_ALLOW_DIRS={HERMES_MEDIA_ALLOW_DIRS}"),
+            format!(
+                "HERMES_MEDIA_ALLOW_DIRS={}",
+                media_allow_dirs_for_instance(instance)
+            ),
             format!("OPENAI_MODEL={}", self.config.default_model),
             format!("HERMES_RUNTIME_IMAGE={}", self.config.image),
             format!(
@@ -689,7 +709,7 @@ impl DockerProvisioner {
         provisioner.rebuild_instance(instance, llm_api_key).await
     }
 
-    fn build_instance(&self, user_id: &str) -> HermesInstance {
+    fn build_instance(&self, user_id: &str, sandbox_enabled: bool) -> HermesInstance {
         let user_root = self.config.data_root.join(user_id);
         let workspace = user_root.join("workspace");
         let sandbox = user_root.join("sandbox");
@@ -698,7 +718,7 @@ impl DockerProvisioner {
         let mut instance = HermesInstance::managed_docker(
             user_id,
             path_to_string(workspace),
-            path_to_string(sandbox),
+            sandbox_enabled.then(|| path_to_string(sandbox)),
             path_to_string(config),
         );
         apply_runtime_image(&mut instance, &self.config.image);
@@ -987,6 +1007,7 @@ impl DockerProvisioner {
         let api_mode = yaml_string(normalize_hermes_api_mode(&self.config.api_mode))?;
         let instance_id = yaml_string(&instance.id)?;
         let user_id = yaml_string(&instance.user_id)?;
+        let media_allow_dirs_section = media_allow_dirs_yaml_section(instance)?;
         let managed_skills_section = self
             .config
             .managed_skills
@@ -1037,11 +1058,7 @@ impl DockerProvisioner {
              \x20\x20\x20\x20timeout: 60\n\
              \x20\x20\x20\x20max_concurrency: 1\n\
              gateway:\n\
-             \x20\x20media_delivery_allow_dirs:\n\
-             \x20\x20\x20\x20- \"/workspace\"\n\
-             \x20\x20\x20\x20- \"/sandbox\"\n\
-             \x20\x20\x20\x20- \"/opt/data\"\n\
-             \x20\x20\x20\x20- \"/config/cache\"\n\
+             {media_allow_dirs_section}\
              \x20\x20platforms:\n\
              \x20\x20\x20\x20hermes_hub:\n\
              \x20\x20\x20\x20\x20\x20enabled: true\n\
@@ -1091,6 +1108,30 @@ fn user_config_object_key(user_id: &str) -> String {
         .map(|ch| if ch == '/' || ch == '\\' { '_' } else { ch })
         .collect::<String>();
     format!("config/users/{safe_user_id}/config.yaml")
+}
+
+fn media_allow_dirs_for_instance(instance: &HermesInstance) -> &'static str {
+    if instance.host_sandbox_path.is_some() {
+        HERMES_PUBLIC_MEDIA_ALLOW_DIRS
+    } else {
+        HERMES_BASE_MEDIA_ALLOW_DIRS
+    }
+}
+
+fn media_allow_dirs_yaml_section(instance: &HermesInstance) -> Result<String, ProvisionerError> {
+    let mut dirs = vec!["/workspace"];
+    if instance.host_sandbox_path.is_some() {
+        // 公共平台临时会话的 sandbox 允许 Hermes 把产物回传给 Hub；普通用户不暴露这组路径。
+        dirs.push("/sandbox");
+        dirs.push("/opt/data");
+    }
+    dirs.push("/config/cache");
+
+    let mut section = "  media_delivery_allow_dirs:\n".to_string();
+    for dir in dirs {
+        section.push_str(&format!("    - {}\n", yaml_string(dir)?));
+    }
+    Ok(section)
 }
 
 fn parse_container_inspection(raw: &str) -> Option<ContainerInspection> {
@@ -1243,7 +1284,7 @@ impl HermesProvisioner for DockerProvisioner {
         user_id: &str,
         llm_api_key: &str,
     ) -> Result<HermesInstance, ProvisionerError> {
-        let instance = self.build_instance(user_id);
+        let instance = self.build_instance(user_id, false);
         self.ensure_container(&instance, llm_api_key).await
     }
 

@@ -37,6 +37,7 @@ use crate::{
         CHAT_COMPLETIONS_API_TYPE, DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS,
         DEFAULT_TEMPERATURE, IMAGE_MODEL_CONFIG_KIND, LLM_MODEL_CONFIG_KIND, RESPONSES_API_TYPE,
     },
+    public_platform,
     session::store::{HermesSchedulerSnapshot, SystemSettings},
     skills_fs::normalize_skills_path,
     storage::ObjectStorageError,
@@ -53,6 +54,14 @@ pub fn router() -> Router<AppState> {
         .route("/api/admin/users/{user_id}/disable", post(disable_user))
         .route("/api/admin/users/{user_id}/enable", post(enable_user))
         .route("/api/admin/hermes-instances", get(list_hermes_instances))
+        .route(
+            "/api/admin/public-platform/hermes-instance",
+            get(get_public_platform_hermes_instance),
+        )
+        .route(
+            "/api/admin/public-platform/hermes-instance/rebuild",
+            post(rebuild_public_platform_hermes_instance),
+        )
         .route(
             "/api/admin/hermes-scheduler-snapshots",
             get(list_hermes_scheduler_snapshots),
@@ -132,6 +141,13 @@ struct HermesInstancesResponse {
 #[derive(Serialize)]
 struct HermesInstanceResponse {
     hermes_instance: HermesInstance,
+}
+
+#[derive(Serialize)]
+struct PublicPlatformHermesInstanceResponse {
+    enabled: bool,
+    ready: bool,
+    hermes_instance: Option<HermesInstance>,
 }
 
 #[derive(Serialize)]
@@ -276,6 +292,7 @@ async fn disable_user(
     Path(user_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let admin = require_admin(&state, &headers).await?;
+    ensure_not_public_platform_user(&state, &user_id).await?;
     if admin.id == user_id {
         return Err(ApiError::Conflict("admin cannot disable own account"));
     }
@@ -296,6 +313,7 @@ async fn enable_user(
     Path(user_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
+    ensure_not_public_platform_user(&state, &user_id).await?;
     let user = state
         .store
         .enable_user(&user_id)
@@ -311,6 +329,7 @@ async fn list_hermes_instances(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
+    let public_user_id = public_platform::public_user_id(&state).await?;
     let hermes_instances = state
         .store
         .list_hermes_instances()
@@ -318,6 +337,10 @@ async fn list_hermes_instances(
         .map_err(|_| ApiError::Internal)?;
     let mut refreshed_instances = Vec::with_capacity(hermes_instances.len());
     for instance in hermes_instances {
+        if public_user_id.as_deref() == Some(instance.user_id.as_str()) {
+            // 公共 Hermes 是平台级常驻资源，使用独立管理入口，避免混入普通用户实例列表后被误停。
+            continue;
+        }
         // 管理员列表是运维入口，返回前主动同步 Docker 真实状态，避免 stale running 误导排障。
         refreshed_instances.push(refresh_managed_hermes_status(&state, instance).await?);
     }
@@ -326,16 +349,122 @@ async fn list_hermes_instances(
     }))
 }
 
+async fn get_public_platform_hermes_instance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    if public_platform::configured_enabled(&state).await? {
+        // 管理员打开公共平台配置页时顺手补一次预启动；模型未就绪时只展示 not ready，不阻断页面。
+        if let Err(error) = public_platform::ensure_public_hermes_if_enabled(&state).await {
+            tracing::warn!(
+                ?error,
+                "public platform Hermes could not be ensured for admin status"
+            );
+        }
+    }
+    let readiness = public_platform::public_hermes_readiness(&state).await?;
+
+    Ok(Json(PublicPlatformHermesInstanceResponse {
+        enabled: readiness.configured_enabled,
+        ready: readiness.ready,
+        hermes_instance: readiness.hermes_instance,
+    }))
+}
+
+async fn rebuild_public_platform_hermes_instance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    ensure_required_model_configs(&state).await?;
+    if !public_platform::configured_enabled(&state).await? {
+        return Err(ApiError::Conflict("public platform is disabled"));
+    }
+    let public_user_id = public_platform::ensure_public_owner_user_id(&state).await?;
+    let mut instance = match state.store.hermes_instance_for_user(&public_user_id).await {
+        Ok(instance) => instance,
+        Err(_) => {
+            let instance = ensure_managed_hermes_for_user(&state, &public_user_id).await?;
+            return Ok(Json(HermesInstanceResponse {
+                hermes_instance: instance,
+            }));
+        }
+    };
+    ensure_hub_managed_instance(&instance)?;
+    // 公共 Hermes 永远不能获得全局 skills 写权限，但必须保留公共 sandbox。
+    instance.global_skills_write_enabled = false;
+    state
+        .docker_provisioner
+        .apply_sandbox_policy(&mut instance, true);
+    state
+        .model_registry
+        .revoke_instance_tokens_for_instance(&instance.id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let llm_api_key = state
+        .model_registry
+        .issue_instance_token_for_instance(&instance.id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let llm_config = state
+        .model_registry
+        .active_config()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let image_config = state
+        .model_registry
+        .config_for_kind(IMAGE_MODEL_CONFIG_KIND)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let image_model = image_config
+        .enabled
+        .then_some(image_config.default_model.as_str());
+    let instance = state
+        .docker_provisioner
+        .rebuild_instance_with_default_model(
+            &instance,
+            &llm_api_key,
+            &runtime_model_settings(&llm_config),
+            image_model,
+        )
+        .await
+        .map_err(map_provisioner_error)?;
+    state
+        .store
+        .bind_hermes_instance(instance.clone())
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    state
+        .channel_store
+        .bind_hub_channel_to_instance(&public_user_id, &instance.id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let instance = state
+        .store
+        .hermes_instance_for_user(&public_user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    Ok(Json(HermesInstanceResponse {
+        hermes_instance: instance,
+    }))
+}
+
 async fn list_hermes_scheduler_snapshots(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
+    let public_user_id = public_platform::public_user_id(&state).await?;
     let snapshots = state
         .store
         .list_hermes_scheduler_snapshots()
         .await
-        .map_err(|_| ApiError::Internal)?;
+        .map_err(|_| ApiError::Internal)?
+        .into_iter()
+        .filter(|snapshot| public_user_id.as_deref() != Some(snapshot.user_id.as_str()))
+        .collect();
 
     Ok(Json(HermesSchedulerSnapshotsResponse {
         hermes_scheduler_snapshots: snapshots,
@@ -349,6 +478,7 @@ async fn create_managed_hermes_instance(
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
     ensure_required_model_configs(&state).await?;
+    ensure_not_public_platform_user(&state, &user_id).await?;
     ensure_user_exists(&state, &user_id).await?;
 
     // 管理员补建和用户工作区 ensure 共用同一条幂等编排路径，避免两套 Docker 创建逻辑漂移。
@@ -372,6 +502,15 @@ async fn ensure_user_exists(state: &AppState, user_id: &str) -> Result<(), ApiEr
     }
 }
 
+async fn ensure_not_public_platform_user(state: &AppState, user_id: &str) -> Result<(), ApiError> {
+    if public_platform::is_public_user_id(state, user_id).await? {
+        // 公共平台系统用户只允许通过公共 Hermes 专用接口管理，普通用户接口对它保持不可见。
+        return Err(ApiError::NotFound("user not found"));
+    }
+
+    Ok(())
+}
+
 async fn rebuild_managed_hermes_instance(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -379,12 +518,16 @@ async fn rebuild_managed_hermes_instance(
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
     ensure_required_model_configs(&state).await?;
+    ensure_not_public_platform_user(&state, &user_id).await?;
     let mut instance = state
         .store
         .hermes_instance_for_user(&user_id)
         .await
         .map_err(|_| ApiError::NotFound("hermes instance not found"))?;
     ensure_hub_managed_instance(&instance)?;
+    state
+        .docker_provisioner
+        .apply_sandbox_policy(&mut instance, false);
     // store 中不持久化全局 skills 写权限；管理员重建前必须按用户角色恢复，避免管理员实例被只读挂载。
     instance.global_skills_write_enabled =
         user_has_global_skills_write_access_for_rebuild(&state, &user_id).await?;
@@ -463,6 +606,7 @@ async fn stop_managed_hermes_instance(
     Path(user_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
+    ensure_not_public_platform_user(&state, &user_id).await?;
     let instance = state
         .store
         .hermes_instance_for_user(&user_id)
@@ -496,6 +640,7 @@ async fn start_managed_hermes_instance(
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
     ensure_required_model_configs(&state).await?;
+    ensure_not_public_platform_user(&state, &user_id).await?;
     let instance = state
         .store
         .hermes_instance_for_user(&user_id)
@@ -654,12 +799,22 @@ async fn update_system_settings(
         ));
     }
 
+    let should_ensure_public_hermes = payload.public_platform.enabled;
+
     state
         .store
         .update_system_settings(payload)
         .await
         .map_err(|_| ApiError::BadRequest("invalid system settings"))?;
     refresh_managed_hermes_configs(&state).await?;
+    if should_ensure_public_hermes {
+        if let Err(error) = public_platform::ensure_public_hermes_if_enabled(&state).await {
+            tracing::warn!(
+                ?error,
+                "public platform Hermes could not be ensured after settings save"
+            );
+        }
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -735,11 +890,27 @@ async fn refresh_managed_hermes_configs(state: &AppState) -> Result<(), ApiError
         .enabled
         .then_some(image_config.default_model.as_str());
     let model_settings = runtime_model_settings(&llm_config);
+    let public_user_id = public_platform::public_user_id(state).await?;
+    let public_platform_enabled = public_platform::configured_enabled(state).await?;
 
     for mut instance in instances {
         if instance.kind != HermesInstanceKind::ManagedDocker {
             continue;
         }
+        if !public_platform_enabled && public_user_id.as_deref() == Some(instance.user_id.as_str())
+        {
+            // 公共平台关闭时，保存模型/系统配置不能间接重建隐藏公共 Hermes。
+            continue;
+        }
+        let original_instance = instance.clone();
+        let sandbox_enabled = public_platform::is_public_user_id(state, &instance.user_id).await?;
+        state
+            .docker_provisioner
+            .apply_sandbox_policy(&mut instance, sandbox_enabled);
+        let path_policy_changed = instance.host_workspace_path
+            != original_instance.host_workspace_path
+            || instance.host_config_path != original_instance.host_config_path
+            || instance.host_sandbox_path != original_instance.host_sandbox_path;
         let llm_api_key = match instance.api_token_secret_ref.clone() {
             Some(existing_token) => {
                 state
@@ -756,14 +927,35 @@ async fn refresh_managed_hermes_configs(state: &AppState) -> Result<(), ApiError
                     .await
                     .map_err(|_| ApiError::Internal)?;
                 instance.api_token_secret_ref = Some(token.clone());
-                state
-                    .store
-                    .bind_hermes_instance(instance.clone())
-                    .await
-                    .map_err(|_| ApiError::Internal)?;
                 token
             }
         };
+        if path_policy_changed {
+            // 只更新 config 无法移除旧容器里已经存在的 bind mount；路径策略变化必须立即重建容器。
+            let rebuilt = state
+                .docker_provisioner
+                .rebuild_instance_with_default_model(
+                    &instance,
+                    &llm_api_key,
+                    &model_settings,
+                    image_model,
+                )
+                .await
+                .map_err(map_provisioner_error)?;
+            state
+                .store
+                .bind_hermes_instance(rebuilt)
+                .await
+                .map_err(|_| ApiError::Internal)?;
+            continue;
+        }
+        if instance.api_token_secret_ref != original_instance.api_token_secret_ref {
+            state
+                .store
+                .bind_hermes_instance(instance.clone())
+                .await
+                .map_err(|_| ApiError::Internal)?;
+        }
         let changed = state
             .docker_provisioner
             .write_config_with_default_model(&instance, &llm_api_key, &model_settings, image_model)

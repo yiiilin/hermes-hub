@@ -55,6 +55,7 @@ import {
   type ChannelRun,
   type ChannelSessionEvent,
   type HermesActiveRun,
+  type HermesInstance,
   type HermesVerboseEvent,
 } from "./api/client";
 import { createClientMessageId } from "./routes/channel-session";
@@ -140,6 +141,23 @@ describe("App", () => {
       hour: "2-digit",
       minute: "2-digit",
     }).format(new Date(timestampSeconds * 1000));
+  }
+
+  function publicHermesInstance(overrides: Partial<HermesInstance> = {}): HermesInstance {
+    return {
+      id: "public-instance-1",
+      user_id: "public-user-1",
+      kind: "managed_docker",
+      status: "running",
+      health_status: "healthy",
+      runtime_image: "ghcr.io/yiiilin/hermes-hub-hermes:v2026.5.29.2",
+      runtime_version: "v2026.5.29.2",
+      last_user_activity_at: null,
+      last_started_at: 1_735_689_600,
+      last_stopped_at: null,
+      stopped_reason: null,
+      ...overrides,
+    };
   }
 
   function installMediaRecorderMock(
@@ -597,23 +615,430 @@ describe("App", () => {
     const client = createMockApiClient({
       initialUser: null,
       publicPlatformSettings: { enabled: true },
+      publicPlatformInstance: publicHermesInstance(),
     });
 
     render(<App apiClient={client} />);
 
     expect(await screen.findByRole("button", { name: "New chat" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Primary")).toBeInTheDocument();
     expect(screen.getByLabelText("Message")).toBeInTheDocument();
     expect(screen.queryByLabelText("Email")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
 
     expect(await screen.findByLabelText("Email")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Primary")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Back to public platform" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Back to public platform" }));
+
+    expect(await screen.findByLabelText("Message")).toBeInTheDocument();
+    expect(screen.getByLabelText("Primary")).toBeInTheDocument();
+  });
+
+  it("stores the public session token in localStorage and only reuses it for public requests", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            session: {
+              id: "public-session-1",
+              title: "Persistent public session",
+              created_at: 1_767_225_600,
+              updated_at: 1_767_225_600,
+            },
+            public_token: "public-token-1",
+          }),
+          {
+            status: 201,
+            headers: { "Content-Type": "application/json" },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ sessions: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ sessions: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    const client = createApiClient();
+
+    await client.createSessionPublic("agent", "Persistent public session", {
+      includePublicToken: true,
+    });
+
+    expect(localStorage.getItem("hermes-hub-public-session-token")).toBe("public-token-1");
+
+    await client.listSessionsPublic();
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/sessions",
+      expect.objectContaining({
+        headers: undefined,
+      }),
+    );
+
+    await client.listSessionsPublic({ includePublicToken: true });
+
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "/api/sessions",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          "X-Hermes-Hub-Public-Session": "public-token-1",
+        }),
+      }),
+    );
+  });
+
+  it("clears the stored public token when a public session refresh no longer returns one", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify({ sessions: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    localStorage.setItem("hermes-hub-public-session-token", "stale-public-token");
+
+    await createApiClient().listSessionsPublic({ includePublicToken: true });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          "X-Hermes-Hub-Public-Session": "stale-public-token",
+        }),
+      }),
+    );
+    expect(localStorage.getItem("hermes-hub-public-session-token")).toBeNull();
+  });
+
+  it("keeps the stored public token when creating a non-public session", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          session: {
+            id: "private-session-1",
+            title: "Private session",
+            created_at: 1_767_225_600,
+            updated_at: 1_767_225_600,
+          },
+        }),
+        {
+          status: 201,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+    localStorage.setItem("hermes-hub-public-session-token", "public-token-to-keep");
+
+    await createApiClient().createSessionPublic("agent", "Private session");
+
+    expect(localStorage.getItem("hermes-hub-public-session-token")).toBe("public-token-to-keep");
+  });
+
+  it("clears the stored public token when public attachment upload is unauthorized", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify({ message: "unauthorized" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    localStorage.setItem("hermes-hub-public-session-token", "expired-public-token");
+
+    await expect(
+      createApiClient().uploadSessionAttachmentsPublic(
+        "public-session-1",
+        [new File(["content"], "public.txt", { type: "text/plain" })],
+        { includePublicToken: true },
+      ),
+    ).rejects.toThrow("unauthorized");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/public-session-1/attachments",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          "X-Hermes-Hub-Public-Session": "expired-public-token",
+        }),
+      }),
+    );
+    expect(localStorage.getItem("hermes-hub-public-session-token")).toBeNull();
+  });
+
+  it("keeps the public token out of the EventSource URL", () => {
+    const openedUrls: string[] = [];
+    class MockEventSource {
+      onerror: (() => void) | null = null;
+
+      constructor(url: string) {
+        openedUrls.push(url);
+      }
+
+      addEventListener() {}
+      removeEventListener() {}
+      close() {}
+    }
+    const originalEventSource = globalThis.EventSource;
+    vi.stubGlobal("EventSource", MockEventSource);
+    localStorage.setItem("hermes-hub-public-session-token", "public-token-1");
+
+    try {
+      const unsubscribe = createApiClient().subscribeSessionEventsPublic(
+        "public-session-1",
+        vi.fn(),
+        vi.fn(),
+        { includePublicToken: true },
+      );
+      unsubscribe();
+    } finally {
+      if (originalEventSource) {
+        vi.stubGlobal("EventSource", originalEventSource);
+      } else {
+        vi.unstubAllGlobals();
+      }
+    }
+
+    expect(openedUrls).toEqual(["/api/sessions/public-session-1/events"]);
+  });
+
+  it("opens the public session from the session id path and follows browser navigation", async () => {
+    window.history.pushState({}, "", "/public/sessions/public-session-2?stale=1#old");
+    const client = createMockApiClient({
+      initialUser: null,
+      publicPlatformSettings: { enabled: true },
+      publicPlatformInstance: publicHermesInstance(),
+    });
+    client.listSessionsPublic = vi.fn(async () => [
+      {
+        id: "public-session-1",
+        title: "First public session",
+        created_at: 1_767_225_600,
+        updated_at: 1_767_225_600,
+      } as unknown as Awaited<ReturnType<ApiClient["listSessionsPublic"]>>[number],
+      {
+        id: "public-session-2",
+        title: "Target public session",
+        created_at: 1_767_225_700,
+        updated_at: 1_767_225_700,
+      } as unknown as Awaited<ReturnType<ApiClient["listSessionsPublic"]>>[number],
+    ]);
+
+    render(<App apiClient={client} />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Target public session" }),
+    ).toBeInTheDocument();
+    expect(client.listSessionsPublic).toHaveBeenCalledWith({
+      includePublicToken: true,
+      sessionId: "public-session-2",
+    });
+    expect(window.location.pathname).toBe("/public/sessions/public-session-2");
+    expect(window.location.search).toBe("");
+    expect(window.location.hash).toBe("");
+
+    fireEvent.click(await screen.findByRole("button", { name: "First public session" }));
+
+    expect(await screen.findByRole("heading", { name: "First public session" })).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/public/sessions/public-session-1");
+    expect(window.location.search).toBe("");
+    expect(window.location.hash).toBe("");
+
+    window.history.pushState({}, "", "/public/sessions/public-session-2");
+    window.dispatchEvent(new PopStateEvent("popstate"));
+
+    expect(
+      await screen.findByRole("heading", { name: "Target public session" }),
+    ).toBeInTheDocument();
+    expect(client.listSessionsPublic).toHaveBeenLastCalledWith({
+      includePublicToken: true,
+      sessionId: "public-session-2",
+    });
+
+    window.history.pushState({}, "", "/public");
+    window.dispatchEvent(new PopStateEvent("popstate"));
+
+    expect(await screen.findByRole("heading", { name: "First public session" })).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/public");
+    expect(client.listSessionsPublic).toHaveBeenLastCalledWith({
+      includePublicToken: true,
+      sessionId: null,
+    });
+  });
+
+  it("waits for public platform status before showing the anonymous landing route", async () => {
+    const client = createMockApiClient();
+    const meDeferred = createDeferred<Awaited<ReturnType<ApiClient["me"]>>>();
+    const bootstrapStatusDeferred =
+      createDeferred<Awaited<ReturnType<ApiClient["bootstrapStatus"]>>>();
+    client.me = vi.fn(async () => meDeferred.promise);
+    client.bootstrapStatus = vi.fn(async () => bootstrapStatusDeferred.promise);
+    client.listSessionsPublic = vi.fn(async () => [
+      {
+        id: "public-session-after-bootstrap",
+        title: "Public after bootstrap",
+        created_at: 1_767_225_600,
+        updated_at: 1_767_225_600,
+      } as unknown as Awaited<ReturnType<ApiClient["listSessionsPublic"]>>[number],
+    ]);
+
+    render(<App apiClient={client} />);
+
+    expect(screen.getByText("Loading")).toBeInTheDocument();
+    await act(async () => {
+      meDeferred.resolve(null);
+      await meDeferred.promise;
+    });
+    expect(screen.getByText("Loading")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Email")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "New chat" })).not.toBeInTheDocument();
+
+    await act(async () => {
+      bootstrapStatusDeferred.resolve({
+        bootstrap_open: false,
+        public_platform_enabled: true,
+      });
+      await bootstrapStatusDeferred.promise;
+    });
+
+    expect(
+      await screen.findByRole("button", { name: "Public after bootstrap" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText("Email")).not.toBeInTheDocument();
+  });
+
+  it("clears authenticated chat sessions after signing out to the public platform", async () => {
+    const client = createMockApiClient({
+      publicPlatformSettings: { enabled: true },
+      publicPlatformInstance: publicHermesInstance(),
+      initialMessagesBySessionId: {
+        "private-session-1": [
+          {
+            id: "private-message-1",
+            session_id: "private-session-1",
+            role: "user",
+            content: "private message should disappear",
+            attachments: [],
+            created_at: 1_767_225_600,
+          },
+        ],
+      },
+    });
+    let authenticated = true;
+    const originalLogout = client.logout.bind(client);
+    const publicSessions = [
+      {
+        id: "public-session-1",
+        title: "Public session",
+        created_at: 1_767_225_600,
+        updated_at: 1_767_225_600,
+        recycle_at: 1_767_312_000,
+      } as unknown as Awaited<ReturnType<ApiClient["listSessionsPublic"]>>[number],
+    ];
+    const publicSessionsDeferred =
+      createDeferred<Awaited<ReturnType<ApiClient["listSessionsPublic"]>>>();
+    client.logout = vi.fn(async () => {
+      authenticated = false;
+      await originalLogout();
+    });
+    client.listSessionsPublic = vi.fn(async () => {
+      if (!authenticated) {
+        return publicSessionsDeferred.promise;
+      }
+      return [
+        {
+          id: "private-session-1",
+          title: "Private session",
+          created_at: 1_767_225_600,
+          updated_at: 1_767_225_600,
+        } as unknown as Awaited<ReturnType<ApiClient["listSessionsPublic"]>>[number],
+      ];
+    });
+
+    render(<App apiClient={client} />);
+
+    expect(await screen.findByRole("button", { name: "Private session" })).toBeInTheDocument();
+    expect(await screen.findByText("private message should disappear")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+
+    await waitFor(() => expect(client.logout).toHaveBeenCalled());
+    expect(screen.getByRole("button", { name: "Sign in" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Private session" })).not.toBeInTheDocument();
+    expect(screen.queryByText("private message should disappear")).not.toBeInTheDocument();
+
+    await act(async () => {
+      publicSessionsDeferred.resolve(publicSessions);
+      await publicSessionsDeferred.promise;
+    });
+
+    expect(await screen.findByRole("button", { name: "Public session" })).toBeInTheDocument();
+  });
+
+  it("refreshes public platform availability when signing out", async () => {
+    const client = createMockApiClient();
+    let publicPlatformEnabled = false;
+    let signedOut = false;
+    const originalLogout = client.logout.bind(client);
+    const logoutBootstrapStatus =
+      createDeferred<Awaited<ReturnType<ApiClient["bootstrapStatus"]>>>();
+    client.bootstrapStatus = vi.fn(async () => ({
+      ...(publicPlatformEnabled
+        ? await logoutBootstrapStatus.promise
+        : { bootstrap_open: false, public_platform_enabled: false }),
+    }));
+    client.logout = vi.fn(async () => {
+      signedOut = true;
+      await originalLogout();
+    });
+    client.listSessionsPublic = vi.fn(async () => [
+      signedOut
+        ? ({
+            id: "public-session-after-logout",
+            title: "Public after logout",
+            created_at: 1_767_225_600,
+            updated_at: 1_767_225_600,
+          } as unknown as Awaited<ReturnType<ApiClient["listSessionsPublic"]>>[number])
+        : ({
+            id: "private-session-before-logout",
+            title: "Private before logout",
+            created_at: 1_767_225_600,
+            updated_at: 1_767_225_600,
+          } as unknown as Awaited<ReturnType<ApiClient["listSessionsPublic"]>>[number]),
+    ]);
+
+    render(<App apiClient={client} />);
+
+    expect(await screen.findByRole("button", { name: "Private before logout" })).toBeInTheDocument();
+    publicPlatformEnabled = true;
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+
+    await waitFor(() => expect(client.logout).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: "Private before logout" })).not.toBeInTheDocument();
+
+    await act(async () => {
+      logoutBootstrapStatus.resolve({
+        bootstrap_open: false,
+        public_platform_enabled: true,
+      });
+      await logoutBootstrapStatus.promise;
+    });
+
+    expect(await screen.findByRole("button", { name: "Public after logout" })).toBeInTheDocument();
+    expect(screen.queryByLabelText("Email")).not.toBeInTheDocument();
   });
 
   it("shows public session recycle time in the chat header", async () => {
     const client = createMockApiClient({
       initialUser: null,
       publicPlatformSettings: { enabled: true },
+      publicPlatformInstance: publicHermesInstance(),
     });
     client.listSessionsPublic = vi.fn(async () => [
       {
@@ -636,6 +1061,7 @@ describe("App", () => {
     const client = createMockApiClient({
       initialUser: null,
       publicPlatformSettings: { enabled: true },
+      publicPlatformInstance: publicHermesInstance(),
     });
     client.listSessionsPublic = vi.fn(async () => [
       {
@@ -653,12 +1079,13 @@ describe("App", () => {
     expect(screen.getByText(/回收时间/)).toBeInTheDocument();
   });
 
-  it("shows the embedded login page when public platform is disabled", async () => {
+  it("shows the standalone login page when public platform is disabled", async () => {
     const client = createMockApiClient({ initialUser: null });
 
     render(<App apiClient={client} />);
 
     expect(await screen.findByLabelText("Email")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Primary")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "New chat" })).not.toBeInTheDocument();
   });
 
@@ -3217,6 +3644,7 @@ describe("App", () => {
 
     const settingsTabs = await openSettingsTab("Public platform");
     fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Public platform" }));
+    expect(screen.getByRole("button", { name: "Rebuild public Hermes" })).toBeDisabled();
 
     fireEvent.change(await screen.findByLabelText("Temporary session retention (hours)"), {
       target: { value: "48" },
@@ -3228,6 +3656,65 @@ describe("App", () => {
       public_platform: {
         temporary_session_retention_hours: 48,
       },
+    });
+  });
+
+  it("shows public platform Hermes status and rebuild feedback", async () => {
+    const deferred = createDeferred<void>();
+    const client = createMockApiClient({
+      publicPlatformSettings: {
+        enabled: true,
+      },
+      publicPlatformInstance: {
+        id: "public-instance-1",
+        user_id: "public-user-1",
+        kind: "managed_docker",
+        status: "running",
+        health_status: "healthy",
+        runtime_image: "ghcr.io/yiiilin/hermes-hub-hermes:v2026.5.29.2",
+        runtime_version: "v2026.5.29.2",
+        last_user_activity_at: null,
+        last_started_at: 1_735_689_600,
+        last_stopped_at: null,
+        stopped_reason: null,
+      },
+    });
+    const rebuildPublicPlatformHermesInstance = vi.fn(async () => {
+      await deferred.promise;
+      return {
+        id: "public-instance-1",
+        user_id: "public-user-1",
+        kind: "managed_docker",
+        status: "running",
+        health_status: "starting",
+        runtime_image: "ghcr.io/yiiilin/hermes-hub-hermes:v2026.5.29.2",
+        runtime_version: "v2026.5.29.2",
+        last_user_activity_at: null,
+        last_started_at: 1_735_689_700,
+        last_stopped_at: null,
+        stopped_reason: null,
+      } satisfies HermesInstance;
+    });
+    client.rebuildPublicPlatformHermesInstance = rebuildPublicPlatformHermesInstance;
+
+    render(<App apiClient={client} />);
+
+    const settingsTabs = await openSettingsTab("Public platform");
+    fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Public platform" }));
+
+    expect(await screen.findByText("Public Hermes")).toBeInTheDocument();
+    expect(screen.getByText("Ready")).toBeInTheDocument();
+    expect(screen.getByText("Yes")).toBeInTheDocument();
+    expect(screen.getByText("healthy")).toBeInTheDocument();
+    expect(screen.getByText("v2026.5.29.2")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Rebuild public Hermes" }));
+    expect(await screen.findByRole("button", { name: "Rebuilding..." })).toBeDisabled();
+    expect(rebuildPublicPlatformHermesInstance).toHaveBeenCalledTimes(1);
+
+    deferred.resolve();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Rebuild public Hermes" })).toBeInTheDocument();
     });
   });
 
@@ -3356,7 +3843,7 @@ describe("App", () => {
 
     expect(await screen.findByRole("button", { name: "Create account" })).toBeInTheDocument();
     expect(screen.getByLabelText("Confirm password")).toBeInTheDocument();
-    expect(screen.getByLabelText("Primary")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Primary")).not.toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Email"), {
       target: { value: "admin@example.com" },
@@ -3385,6 +3872,7 @@ describe("App", () => {
 
     expect(await screen.findByRole("button", { name: "Create account" })).toBeInTheDocument();
     expect(screen.getByLabelText("Confirm password")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Primary")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Invite token")).not.toBeInTheDocument();
     expect(screen.queryByDisplayValue("secret-invite-token")).not.toBeInTheDocument();
     expect(screen.queryByText("secret-invite-token")).not.toBeInTheDocument();

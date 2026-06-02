@@ -11,6 +11,7 @@ import type {
   ModelConfig,
   ModelFallbackConfig,
   ModelConfigKind,
+  PublicPlatformHermesStatus,
   ReasoningEffort,
   SpeechInputConfig,
   SystemSettings,
@@ -473,6 +474,12 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     max_audio_seconds: 60,
     max_upload_bytes: 25 * 1024 * 1024,
   });
+  const [publicPlatformHermesStatus, setPublicPlatformHermesStatus] =
+    useState<PublicPlatformHermesStatus>({
+      enabled: false,
+      ready: false,
+      hermes_instance: null,
+    });
   const [settingsSaved, setSettingsSaved] = useState(false);
   const [inviteHours, setInviteHours] = useState(defaultInviteHours);
   const [inviteMaxUses, setInviteMaxUses] = useState(1);
@@ -486,6 +493,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     userId: string;
     action: HermesAction;
   } | null>(null);
+  const [publicHermesRebuilding, setPublicHermesRebuilding] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const instancesByUserId = useMemo(
@@ -538,6 +546,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
         nextSchedulerSnapshots,
         nextHermesProfile,
         nextSpeechInputRuntimeConfig,
+        nextPublicPlatformHermesStatus,
       ] = await Promise.all([
         apiClient.listUsers(),
         apiClient.listInvites(),
@@ -551,6 +560,9 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
           : Promise.resolve(null),
         activeTab === "profile" ? apiClient.hermesProfile() : Promise.resolve(null),
         activeTab === "system" ? apiClient.speechInputConfig() : Promise.resolve(null),
+        activeTab === "public-platform"
+          ? apiClient.publicPlatformHermesInstance()
+          : Promise.resolve(null),
       ]);
       setUsers(nextUsers);
       setInvites(nextInvites);
@@ -569,6 +581,9 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
       }
       if (nextSpeechInputRuntimeConfig) {
         setSpeechInputRuntimeConfig(nextSpeechInputRuntimeConfig);
+      }
+      if (nextPublicPlatformHermesStatus) {
+        setPublicPlatformHermesStatus(nextPublicPlatformHermesStatus);
       }
       if (activeTab === "skills") {
         await refreshManagedSkills();
@@ -768,9 +783,30 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     try {
       await apiClient.updateSystemSettings(systemSettings);
       setSystemSettings(await apiClient.systemSettings());
+      if (activeTab === "public-platform") {
+        setPublicPlatformHermesStatus(await apiClient.publicPlatformHermesInstance());
+      }
       setSettingsSaved(true);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("admin.settingsSaveFailed"));
+    }
+  }
+
+  async function rebuildPublicPlatformHermes() {
+    if (!requiredModelsReady) {
+      setError(modelGateMessage);
+      return;
+    }
+    setPublicHermesRebuilding(true);
+    setError(null);
+    try {
+      await apiClient.rebuildPublicPlatformHermesInstance();
+      setPublicPlatformHermesStatus(await apiClient.publicPlatformHermesInstance());
+      await refresh();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("chat.requestFailed"));
+    } finally {
+      setPublicHermesRebuilding(false);
     }
   }
 
@@ -1836,6 +1872,70 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
               required
             />
           </label>
+          <div className="public-hermes-status" aria-label={t("admin.publicHermes")}>
+            <div className="section-heading-row">
+              <strong>{t("admin.publicHermes")}</strong>
+              <button
+                type="button"
+                className="secondary"
+                disabled={
+                  !requiredModelsReady ||
+                  !publicPlatformHermesStatus.enabled ||
+                  publicHermesRebuilding
+                }
+                onClick={() => void rebuildPublicPlatformHermes()}
+              >
+                {publicHermesRebuilding
+                  ? t("admin.rebuilding")
+                  : t("admin.rebuildPublicHermes")}
+              </button>
+            </div>
+            {!requiredModelsReady ? <p className="notice">{modelGateMessage}</p> : null}
+            <dl className="settings-detail-list">
+              <div>
+                <dt>{t("admin.enabled")}</dt>
+                <dd>{publicPlatformHermesStatus.enabled ? t("admin.enabled") : t("admin.disabled")}</dd>
+              </div>
+              <div>
+                <dt>{t("admin.ready")}</dt>
+                <dd>{publicPlatformHermesStatus.ready ? t("admin.yes") : t("admin.no")}</dd>
+              </div>
+              <div>
+                <dt>{t("admin.status")}</dt>
+                <dd>
+                  {(() => {
+                    const instance = publicPlatformHermesStatus.hermes_instance ?? undefined;
+                    const statusDisplay = hermesInstanceStatusDisplay(instance);
+                    return (
+                      <span className="status-cell">
+                        <span>{statusDisplay.label}</span>
+                        {statusDisplay.detail ? (
+                          <span className="status-detail">{statusDisplay.detail}</span>
+                        ) : null}
+                      </span>
+                    );
+                  })()}
+                </dd>
+              </div>
+              <div>
+                <dt>{t("admin.startedAt")}</dt>
+                <dd>
+                  {formatHermesStartedAt(
+                    publicPlatformHermesStatus.hermes_instance ?? undefined,
+                    language,
+                  )}
+                </dd>
+              </div>
+              <div>
+                <dt>{t("admin.version")}</dt>
+                <dd title={publicPlatformHermesStatus.hermes_instance?.runtime_image ?? undefined}>
+                  {formatHermesRuntimeVersion(
+                    publicPlatformHermesStatus.hermes_instance ?? undefined,
+                  )}
+                </dd>
+              </div>
+            </dl>
+          </div>
           <div className="button-row">
             <button type="submit">{t("admin.saveSettings")}</button>
           </div>

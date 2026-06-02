@@ -1238,7 +1238,7 @@ async fn postgres_can_bind_stopped_hermes_instance_without_activity_timestamp() 
     let mut instance = HermesInstance::managed_docker(
         &user.id,
         "/tmp/hermes-hub-test/workspace".to_string(),
-        "/tmp/hermes-hub-test/sandbox".to_string(),
+        Some("/tmp/hermes-hub-test/sandbox".to_string()),
         "/tmp/hermes-hub-test/config".to_string(),
     );
     instance.status = HermesInstanceStatus::Stopped;

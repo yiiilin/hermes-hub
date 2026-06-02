@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     domain::user::{PublicUser, User, UserRole},
+    public_platform,
     session::store::StoreError,
     AppState,
 };
@@ -67,9 +68,9 @@ async fn bootstrap_status(State(state): State<AppState>) -> Result<impl IntoResp
         .bootstrap_open()
         .await
         .map_err(|_| ApiError::Internal)?;
-    // 公共平台开关按部署环境即时生效，不能回写数据库，否则多个环境共享数据库时
-    // 会互相覆盖对方的配置。
-    let public_platform_enabled = state.config.public_platform_enabled;
+    let public_platform_enabled = public_platform::public_hermes_readiness(&state)
+        .await?
+        .ready;
 
     Ok(Json(BootstrapStatusResponse {
         bootstrap_open,
@@ -298,5 +299,123 @@ fn map_update_password_error(error: StoreError) -> ApiError {
         StoreError::Unauthorized => ApiError::Unauthorized,
         StoreError::PasswordFailed => ApiError::BadRequest("password could not be stored"),
         _ => ApiError::Internal,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        asr,
+        channel::{events::SessionEventHub, service::ChannelStore},
+        docker_config_from_app,
+        hermes::docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
+        ldap::DefaultLdapAuthenticator,
+        llm_proxy::InMemoryLlmProviderClient,
+        model_config::ModelRegistry,
+        session::store::SessionStore,
+        storage::object_storage_from_config,
+        AppConfig, AppState,
+    };
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use serde_json::Value;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn system_setting_opens_public_platform_only_after_public_hermes_is_ready() {
+        let mut config = AppConfig::for_tests();
+        config.initial_model_config.provider_base_url = "https://ready-provider.example/v1".into();
+        config.initial_model_config.provider_api_key = "ready-provider-key".into();
+        let store = SessionStore::default();
+        store
+            .create_bootstrap_admin("admin@example.com", "admin-password-123")
+            .await
+            .expect("admin can be created");
+        let mut settings = store
+            .system_settings()
+            .await
+            .expect("system settings can be read");
+        settings.public_platform.enabled = true;
+        store
+            .update_system_settings(settings)
+            .await
+            .expect("public platform setting can be saved");
+        let state = test_state(config, store);
+        let app = crate::build_router_with_state(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/bootstrap-status")
+                    .body(Body::empty())
+                    .expect("request can be built"),
+            )
+            .await
+            .expect("bootstrap status request succeeds");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bootstrap status body can be read");
+        let payload: Value = serde_json::from_slice(&body).expect("bootstrap status is json");
+        assert_eq!(payload["public_platform_enabled"], false);
+
+        crate::public_platform::ensure_public_hermes_if_enabled(&state)
+            .await
+            .expect("public Hermes can be prestarted")
+            .expect("public Hermes is enabled");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/bootstrap-status")
+                    .body(Body::empty())
+                    .expect("request can be built"),
+            )
+            .await
+            .expect("bootstrap status request succeeds after prestart");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bootstrap status body can be read");
+        let payload: Value = serde_json::from_slice(&body).expect("bootstrap status is json");
+        assert_eq!(payload["public_platform_enabled"], true);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .expect("request can be built"),
+            )
+            .await
+            .expect("anonymous sessions request succeeds");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    fn test_state(config: AppConfig, store: SessionStore) -> AppState {
+        let object_storage = object_storage_from_config(&config.object_storage);
+        let docker_provisioner = DockerProvisioner::new_with_runtime_and_object_storage(
+            docker_config_from_app(&config, &config.initial_model_config),
+            Arc::new(NoopDockerRuntime),
+            object_storage.clone(),
+        );
+        let asr_client = asr::default_asr_client(&config.speech_input);
+        AppState {
+            model_registry: ModelRegistry::new(config.initial_model_config.clone()),
+            config,
+            store,
+            channel_store: ChannelStore::default(),
+            llm_provider: InMemoryLlmProviderClient::default().shared(),
+            ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
+            docker_provisioner,
+            object_storage,
+            session_events: SessionEventHub::default(),
+            asr_client,
+        }
     }
 }

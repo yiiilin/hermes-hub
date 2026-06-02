@@ -19,16 +19,13 @@ use crate::{
         ChannelAttachment, ChannelAttachmentDirection, ChannelAttachmentKind, ChannelStoreError,
         NewChannelAttachment,
     },
-    http::{
-        auth::{cookie_value_from_headers, current_user},
-        ApiError,
-    },
+    http::{auth::current_user, ApiError},
+    public_platform,
     storage::{session_object_key, ObjectStorageError},
     AppState,
 };
 
 const INTERNAL_ATTACHMENT_METADATA_MAX_BYTES: usize = 64 * 1024;
-const PUBLIC_SESSION_COOKIE_NAME: &str = "hermes_hub_public_session";
 
 pub fn router() -> Router<AppState> {
     Router::new().route(
@@ -422,9 +419,10 @@ async fn public_attachment_for_cookie(
     headers: &HeaderMap,
     attachment_id: &str,
 ) -> Result<ChannelAttachment, ApiError> {
-    let token = cookie_value_from_headers(headers, PUBLIC_SESSION_COOKIE_NAME)
-        .filter(|token| !token.trim().is_empty())
-        .ok_or(ApiError::Unauthorized)?;
+    if !public_platform::public_hermes_readiness(state).await?.ready {
+        // 匿名公共能力统一由公共 Hermes readiness 门禁控制，旧 cookie 不能绕过已关闭的平台。
+        return Err(ApiError::ServiceUnavailable("public platform is not ready"));
+    }
     let public_user_id = state
         .store
         .public_platform_user_id()
@@ -441,6 +439,14 @@ async fn public_attachment_for_cookie(
     {
         return Err(ApiError::Unauthorized);
     }
+
+    let token = crate::http::sessions::public_session_token_for_session(
+        state,
+        headers,
+        &attachment.session_id,
+    )
+    .await?
+    .ok_or(ApiError::Unauthorized)?;
     let allowed = state
         .store
         .public_token_can_access_session(&token, &attachment.session_id)

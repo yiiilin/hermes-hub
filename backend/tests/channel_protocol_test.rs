@@ -32,24 +32,7 @@ fn test_state(store: SessionStore) -> AppState {
 }
 
 fn test_state_with_channel_store(store: SessionStore, channel_store: ChannelStore) -> AppState {
-    test_state_with_channel_store_and_public_platform(store, channel_store, false)
-}
-
-fn test_state_with_public_platform(store: SessionStore, public_platform_enabled: bool) -> AppState {
-    test_state_with_channel_store_and_public_platform(
-        store,
-        ChannelStore::default(),
-        public_platform_enabled,
-    )
-}
-
-fn test_state_with_channel_store_and_public_platform(
-    store: SessionStore,
-    channel_store: ChannelStore,
-    public_platform_enabled: bool,
-) -> AppState {
-    let mut config = AppConfig::for_tests();
-    config.public_platform_enabled = public_platform_enabled;
+    let config = AppConfig::for_tests();
     let asr_client = hermes_hub_backend::asr::default_asr_client(&config.speech_input);
     AppState {
         docker_provisioner: DockerProvisioner::new_with_runtime(
@@ -107,6 +90,13 @@ async fn enable_public_platform(store: &SessionStore) {
         .expect("public platform can be enabled for tests");
 }
 
+async fn ensure_public_platform_ready_for_tests(state: &AppState) {
+    hermes_hub_backend::public_platform::ensure_public_hermes_if_enabled(state)
+        .await
+        .expect("public platform Hermes can be prestarted in tests")
+        .expect("public platform is enabled in this test");
+}
+
 async fn request_json(
     app: &Router,
     method: Method,
@@ -133,6 +123,50 @@ async fn request_json(
         .expect("router responds")
 }
 
+async fn request_json_with_public_token(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    body: Value,
+    public_token: &str,
+) -> Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-hermes-hub-public-session", public_token)
+                .body(Body::from(body.to_string()))
+                .expect("request can be built"),
+        )
+        .await
+        .expect("router responds")
+}
+
+async fn request_json_with_cookie_and_public_token(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    body: Value,
+    cookie: &str,
+    public_token: &str,
+) -> Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, cookie)
+                .header("x-hermes-hub-public-session", public_token)
+                .body(Body::from(body.to_string()))
+                .expect("request can be built"),
+        )
+        .await
+        .expect("router responds")
+}
+
 async fn request_empty(
     app: &Router,
     method: Method,
@@ -147,6 +181,46 @@ async fn request_empty(
 
     app.clone()
         .oneshot(builder.body(Body::empty()).expect("request can be built"))
+        .await
+        .expect("router responds")
+}
+
+async fn request_empty_with_public_token(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    public_token: &str,
+) -> Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("x-hermes-hub-public-session", public_token)
+                .body(Body::empty())
+                .expect("request can be built"),
+        )
+        .await
+        .expect("router responds")
+}
+
+async fn request_empty_with_cookie_and_public_token(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    cookie: &str,
+    public_token: &str,
+) -> Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::COOKIE, cookie)
+                .header("x-hermes-hub-public-session", public_token)
+                .body(Body::empty())
+                .expect("request can be built"),
+        )
         .await
         .expect("router responds")
 }
@@ -176,6 +250,28 @@ async fn request_raw(
     app.clone()
         .oneshot(
             builder
+                .body(Body::from(body))
+                .expect("request can be built"),
+        )
+        .await
+        .expect("router responds")
+}
+
+async fn request_raw_with_public_token(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    content_type: &str,
+    body: Vec<u8>,
+    public_token: &str,
+) -> Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, content_type)
+                .header("x-hermes-hub-public-session", public_token)
                 .body(Body::from(body))
                 .expect("request can be built"),
         )
@@ -1282,9 +1378,10 @@ async fn public_session_events_stream_session_title_updates() {
 async fn unauthenticated_public_sessions_are_scoped_by_public_cookie() {
     let store = SessionStore::default();
     enable_public_platform(&store).await;
-    let state = test_state_with_public_platform(store.clone(), true);
+    let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
     let admin_cookie = bootstrap_and_login(&app).await;
+    ensure_public_platform_ready_for_tests(&state).await;
     let admin_id = store
         .user_by_session_cookie(&admin_cookie, "hermes_hub_session")
         .await
@@ -1397,12 +1494,257 @@ async fn unauthenticated_public_sessions_are_scoped_by_public_cookie() {
 }
 
 #[tokio::test]
+async fn public_session_token_header_restores_public_session_without_cookie() {
+    let store = SessionStore::default();
+    enable_public_platform(&store).await;
+    let state = test_state(store.clone());
+    let app = build_router_with_state(state.clone());
+    let _admin_cookie = bootstrap_and_login(&app).await;
+    ensure_public_platform_ready_for_tests(&state).await;
+
+    let created = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent", "title": "bookmarkable public session" }),
+        None,
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let (_, created_body) = response_json(created).await;
+    let session_id = created_body["session"]["id"].as_str().expect("session id");
+    let public_token = created_body["public_token"]
+        .as_str()
+        .expect("public create response returns token for localStorage");
+
+    let listed =
+        request_empty_with_public_token(&app, Method::GET, "/api/sessions", public_token).await;
+    assert!(
+        listed.headers().get(header::SET_COOKIE).is_some(),
+        "header-based restore refreshes the browser cookie for EventSource and downloads"
+    );
+    let (status, listed_body) = response_json(listed).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed_body["sessions"][0]["id"], session_id);
+
+    let appended = request_json_with_public_token(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{session_id}/messages"),
+        json!({
+            "role": "user",
+            "content": "restored with localStorage token",
+            "attachments": []
+        }),
+        public_token,
+    )
+    .await;
+    assert_eq!(appended.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn public_session_list_chooses_valid_token_between_cookie_and_header() {
+    let store = SessionStore::default();
+    enable_public_platform(&store).await;
+    let state = test_state(store.clone());
+    let app = build_router_with_state(state.clone());
+    let _admin_cookie = bootstrap_and_login(&app).await;
+    ensure_public_platform_ready_for_tests(&state).await;
+
+    let created = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent", "title": "token priority public session" }),
+        None,
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let public_cookie = cookie_from(&created);
+    let (_, created_body) = response_json(created).await;
+    let session_id = created_body["session"]["id"].as_str().expect("session id");
+    let public_token = created_body["public_token"].as_str().expect("public token");
+
+    let valid_cookie_stale_header = request_empty_with_cookie_and_public_token(
+        &app,
+        Method::GET,
+        "/api/sessions",
+        &public_cookie,
+        "stale-localstorage-token",
+    )
+    .await;
+    assert!(
+        valid_cookie_stale_header
+            .headers()
+            .get(header::SET_COOKIE)
+            .is_none(),
+        "stale localStorage header must not overwrite an effective cookie"
+    );
+    let (status, body) = response_json(valid_cookie_stale_header).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["sessions"][0]["id"], session_id);
+    assert_eq!(body["public_token"], public_token);
+
+    let stale_cookie_valid_header = request_empty_with_cookie_and_public_token(
+        &app,
+        Method::GET,
+        "/api/sessions",
+        "hermes_hub_public_session=stale-cookie-token",
+        public_token,
+    )
+    .await;
+    assert!(
+        stale_cookie_valid_header
+            .headers()
+            .get(header::SET_COOKIE)
+            .is_some(),
+        "effective localStorage header should repair a stale public cookie"
+    );
+    let (status, body) = response_json(stale_cookie_valid_header).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["sessions"][0]["id"], session_id);
+    assert_eq!(body["public_token"], public_token);
+
+    let stale_cookie_valid_header_append = request_json_with_cookie_and_public_token(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{session_id}/messages"),
+        json!({
+            "role": "user",
+            "content": "valid header should win over stale cookie",
+            "attachments": []
+        }),
+        "hermes_hub_public_session=stale-cookie-token",
+        public_token,
+    )
+    .await;
+    assert_eq!(
+        stale_cookie_valid_header_append.status(),
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn public_session_id_path_claims_public_session_for_new_browser() {
+    let store = SessionStore::default();
+    enable_public_platform(&store).await;
+    let state = test_state(store.clone());
+    let app = build_router_with_state(state.clone());
+    let _admin_cookie = bootstrap_and_login(&app).await;
+    ensure_public_platform_ready_for_tests(&state).await;
+
+    let created = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent", "title": "copyable public session" }),
+        None,
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let (_, created_body) = response_json(created).await;
+    let session_id = created_body["session"]["id"].as_str().expect("session id");
+
+    let claimed = request_empty(
+        &app,
+        Method::GET,
+        &format!("/api/sessions?session_id={session_id}"),
+        None,
+    )
+    .await;
+    assert!(
+        claimed.headers().get(header::SET_COOKIE).is_some(),
+        "path-based claim issues a public cookie for the new browser"
+    );
+    let (status, claimed_body) = response_json(claimed).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(claimed_body["sessions"][0]["id"], session_id);
+    let public_token = claimed_body["public_token"]
+        .as_str()
+        .expect("path-based claim returns token for localStorage");
+
+    let appended = request_json_with_public_token(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{session_id}/messages"),
+        json!({
+            "role": "user",
+            "content": "entered from copied public path",
+            "attachments": []
+        }),
+        public_token,
+    )
+    .await;
+    assert_eq!(appended.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn deleting_public_session_revokes_all_tokens_for_that_session() {
+    let store = SessionStore::default();
+    enable_public_platform(&store).await;
+    let state = test_state(store.clone());
+    let app = build_router_with_state(state.clone());
+    let _admin_cookie = bootstrap_and_login(&app).await;
+    ensure_public_platform_ready_for_tests(&state).await;
+
+    let created = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent", "title": "shared public session" }),
+        None,
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let (_, created_body) = response_json(created).await;
+    let session_id = created_body["session"]["id"].as_str().expect("session id");
+    let original_token = created_body["public_token"].as_str().expect("public token");
+
+    let claimed = request_empty(
+        &app,
+        Method::GET,
+        &format!("/api/sessions?session_id={session_id}"),
+        None,
+    )
+    .await;
+    let (status, claimed_body) = response_json(claimed).await;
+    assert_eq!(status, StatusCode::OK);
+    let path_token = claimed_body["public_token"]
+        .as_str()
+        .expect("path-based claim returns token");
+    assert_ne!(path_token, original_token);
+
+    let deleted = request_empty_with_public_token(
+        &app,
+        Method::DELETE,
+        &format!("/api/sessions/{session_id}"),
+        original_token,
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+
+    let orphan_list =
+        request_empty_with_public_token(&app, Method::GET, "/api/sessions", path_token).await;
+    let (status, body) = response_json(orphan_list).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["sessions"].as_array().expect("sessions array").len(),
+        0
+    );
+    assert!(
+        body.get("public_token").is_none(),
+        "orphaned public access must not be written back to localStorage"
+    );
+}
+
+#[tokio::test]
 async fn public_session_recycle_at_tracks_latest_message_time() {
     let store = SessionStore::default();
     enable_public_platform(&store).await;
-    let state = test_state_with_public_platform(store.clone(), true);
+    let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
     let _admin_cookie = bootstrap_and_login(&app).await;
+    ensure_public_platform_ready_for_tests(&state).await;
     let retention_seconds = store
         .system_settings()
         .await
@@ -1483,9 +1825,10 @@ async fn public_session_recycle_at_tracks_latest_message_time() {
 async fn public_sessions_do_not_consume_admin_session_limit() {
     let store = SessionStore::default();
     enable_public_platform(&store).await;
-    let state = test_state_with_public_platform(store.clone(), true);
+    let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
     let admin_cookie = bootstrap_and_login(&app).await;
+    ensure_public_platform_ready_for_tests(&state).await;
     let mut settings = store.system_settings().await.expect("settings can be read");
     settings.max_sessions_per_user = 1;
     store
@@ -1529,8 +1872,10 @@ async fn public_sessions_do_not_consume_admin_session_limit() {
 async fn invalid_public_session_cookie_lists_empty_without_creating_public_user() {
     let store = SessionStore::default();
     enable_public_platform(&store).await;
-    let app = build_router_with_state(test_state_with_public_platform(store.clone(), true));
+    let state = test_state(store.clone());
+    let app = build_router_with_state(state.clone());
     let _admin_cookie = bootstrap_and_login(&app).await;
+    ensure_public_platform_ready_for_tests(&state).await;
 
     let listed = request_empty(
         &app,
@@ -1545,20 +1890,24 @@ async fn invalid_public_session_cookie_lists_empty_without_creating_public_user(
         body["sessions"].as_array().expect("sessions array").len(),
         0
     );
-    assert!(store
-        .public_platform_user_id()
-        .await
-        .expect("public platform user lookup succeeds")
-        .is_none());
+    assert!(
+        store
+            .public_platform_user_id()
+            .await
+            .expect("public platform user lookup succeeds")
+            .is_some(),
+        "ready public platform has already created the hidden public user"
+    );
 }
 
 #[tokio::test]
 async fn public_session_attachment_download_uses_public_cookie() {
     let store = SessionStore::default();
     enable_public_platform(&store).await;
-    let state = test_state_with_public_platform(store.clone(), true);
+    let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
     let _admin_cookie = bootstrap_and_login(&app).await;
+    ensure_public_platform_ready_for_tests(&state).await;
 
     let created = request_json(
         &app,
@@ -1572,6 +1921,7 @@ async fn public_session_attachment_download_uses_public_cookie() {
     let public_cookie = cookie_from(&created);
     let (_, created_body) = response_json(created).await;
     let session_id = created_body["session"]["id"].as_str().expect("session id");
+    let public_token = created_body["public_token"].as_str().expect("public token");
 
     let boundary = "hermes-public-attachment-boundary";
     let upload_body = format!(
@@ -1597,6 +1947,15 @@ async fn public_session_attachment_download_uses_public_cookie() {
     let attachment_id = upload_body["attachments"][0]["id"]
         .as_str()
         .expect("attachment id");
+
+    let header_only_download = request_empty_with_public_token(
+        &app,
+        Method::GET,
+        &format!("/api/attachments/{attachment_id}/download"),
+        public_token,
+    )
+    .await;
+    assert_eq!(header_only_download.status(), StatusCode::OK);
 
     let anonymous_download = request_empty(
         &app,
@@ -1647,6 +2006,125 @@ async fn public_session_attachment_download_uses_public_cookie() {
         .await
         .expect("download body can be read");
     assert_eq!(&bytes[..], b"public attachment");
+
+    let mut settings = store.system_settings().await.expect("settings can be read");
+    settings.public_platform.enabled = false;
+    store
+        .update_system_settings(settings)
+        .await
+        .expect("public platform can be disabled");
+    let disabled_download = request_empty(
+        &app,
+        Method::GET,
+        &format!("/api/attachments/{attachment_id}/download"),
+        Some(&public_cookie),
+    )
+    .await;
+    assert_eq!(disabled_download.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn public_attachment_download_prefers_valid_header_over_stale_cookie() {
+    let store = SessionStore::default();
+    enable_public_platform(&store).await;
+    let state = test_state(store.clone());
+    let app = build_router_with_state(state.clone());
+    let _admin_cookie = bootstrap_and_login(&app).await;
+    ensure_public_platform_ready_for_tests(&state).await;
+
+    let created = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent", "title": "public stale cookie download" }),
+        None,
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let public_cookie = cookie_from(&created);
+    let (_, created_body) = response_json(created).await;
+    let session_id = created_body["session"]["id"].as_str().expect("session id");
+    let public_token = created_body["public_token"].as_str().expect("public token");
+
+    let boundary = "hermes-public-stale-cookie-download-boundary";
+    let upload_body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"header-wins.txt\"\r\n\
+         Content-Type: text/plain\r\n\r\n\
+         download by valid header\r\n\
+         --{boundary}--\r\n"
+    )
+    .into_bytes();
+    let upload = request_raw(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{session_id}/attachments"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload_body,
+        Some(&public_cookie),
+        None,
+    )
+    .await;
+    let (status, upload_body) = response_json(upload).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let attachment_id = upload_body["attachments"][0]["id"]
+        .as_str()
+        .expect("attachment id");
+
+    let download = request_empty_with_cookie_and_public_token(
+        &app,
+        Method::GET,
+        &format!("/api/attachments/{attachment_id}/download"),
+        "hermes_hub_public_session=stale-cookie-token",
+        public_token,
+    )
+    .await;
+    assert_eq!(download.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn public_session_attachment_upload_accepts_public_token_header() {
+    let store = SessionStore::default();
+    enable_public_platform(&store).await;
+    let state = test_state(store.clone());
+    let app = build_router_with_state(state.clone());
+    let _admin_cookie = bootstrap_and_login(&app).await;
+    ensure_public_platform_ready_for_tests(&state).await;
+
+    let created = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent", "title": "public header upload session" }),
+        None,
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let (_, created_body) = response_json(created).await;
+    let session_id = created_body["session"]["id"].as_str().expect("session id");
+    let public_token = created_body["public_token"].as_str().expect("public token");
+
+    let boundary = "hermes-public-header-upload-boundary";
+    let upload_body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"header.txt\"\r\n\
+         Content-Type: text/plain\r\n\r\n\
+         public header attachment\r\n\
+         --{boundary}--\r\n"
+    )
+    .into_bytes();
+    let upload = request_raw_with_public_token(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{session_id}/attachments"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload_body,
+        public_token,
+    )
+    .await;
+    let (status, upload_body) = response_json(upload).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(upload_body["attachments"][0]["name"], "header.txt");
 }
 
 #[tokio::test]

@@ -57,6 +57,7 @@ type ChannelSessionRouteProps = {
   active?: boolean;
   apiClient: ApiClient;
   onOpenChat?: () => void;
+  publicMode?: boolean;
 };
 
 type BrowserCrypto = {
@@ -86,6 +87,7 @@ export function ChannelSessionRoute({
   active = true,
   apiClient,
   onOpenChat,
+  publicMode = false,
 }: ChannelSessionRouteProps) {
   const { t, language } = useI18n();
   const setChatSidebar = useChatSidebar();
@@ -114,14 +116,28 @@ export function ChannelSessionRoute({
   const verboseEventsRef = useRef<Record<string, ExecutionHistoryEntry[]>>({});
   const executionPersistQueueRef = useRef<Record<string, Promise<ChannelMessage | null>>>({});
   const selectedSessionIdRef = useRef<string | null>(null);
+  const seenSessionUpdatesRef = useRef<Record<string, number>>({});
   const activeRunRef = useRef<HermesActiveRun | null>(null);
   const messagesRef = useRef<ChannelMessage[]>([]);
   const pendingAssistantMessageIdRef = useRef<string | null>(null);
   const pendingAssistantSessionIdRef = useRef<string | null>(null);
 
+  function publicRequestOptions(sessionId?: string | null) {
+    return publicMode
+      ? {
+          includePublicToken: true,
+          sessionId,
+        }
+      : undefined;
+  }
+
   useEffect(() => {
     selectedSessionIdRef.current = selectedSession?.id ?? null;
   }, [selectedSession?.id]);
+
+  useEffect(() => {
+    seenSessionUpdatesRef.current = seenSessionUpdates;
+  }, [seenSessionUpdates]);
 
   useEffect(() => {
     activeRunRef.current = activeRun;
@@ -147,17 +163,20 @@ export function ChannelSessionRoute({
     setPendingAssistantSessionId(null);
   }
 
-  async function refreshSessions() {
+  const refreshSessions = useCallback(async () => {
     setError(null);
     try {
-      const nextSessions = await apiClient.listSessionsPublic();
-      const selectedSessionId = selectedSession?.id;
+      const pathSessionId = publicMode ? publicSessionIdFromPath() : null;
+      const selectedSessionId = publicMode ? pathSessionId : selectedSessionIdRef.current;
+      const nextSessions = await apiClient.listSessionsPublic(
+        publicRequestOptions(selectedSessionId),
+      );
       const nextSessionIds = new Set(nextSessions.map((session) => session.id));
       setSessions(nextSessions);
       setUnreadSessionIds((current) => {
         const next = new Set(current);
         for (const session of nextSessions) {
-          const lastSeen = seenSessionUpdates[session.id];
+          const lastSeen = seenSessionUpdatesRef.current[session.id];
           if (
             lastSeen !== undefined &&
             sessionUpdatedAt(session) > lastSeen &&
@@ -189,6 +208,9 @@ export function ChannelSessionRoute({
         : (nextSessions[0] ?? null);
       selectedSessionIdRef.current = nextSelected?.id ?? null;
       setSelectedSession(nextSelected);
+      if (publicMode && pathSessionId) {
+        replacePublicSessionPath(nextSelected?.id ?? null);
+      }
       if (!nextSelected) {
         setMessages([]);
         setActiveRun(null);
@@ -198,11 +220,24 @@ export function ChannelSessionRoute({
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("chat.workspaceLoadFailed"));
     }
-  }
+  }, [apiClient, publicMode, t]);
 
   useEffect(() => {
     void refreshSessions();
-  }, []);
+  }, [refreshSessions]);
+
+  useEffect(() => {
+    if (!publicMode) {
+      return undefined;
+    }
+
+    function handlePopState() {
+      void refreshSessions();
+    }
+
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, [publicMode]);
 
   useEffect(() => {
     let activeRequest = true;
@@ -238,6 +273,7 @@ export function ChannelSessionRoute({
       () => {
         // EventSource 会自动重连。这里不设置页面错误，避免切后台/刷新造成 load failed 假错误。
       },
+      publicRequestOptions(),
     );
   }, [active, apiClient, selectedSession?.id]);
 
@@ -287,7 +323,7 @@ export function ChannelSessionRoute({
   }, [sessions, selectedSession, setChatSidebar, sidebarCollapsed, t, unreadSessionIds]);
 
   async function createSession() {
-    const session = await apiClient.createSessionPublic("agent");
+    const session = await apiClient.createSessionPublic("agent", undefined, publicRequestOptions());
     setSessions((current) => [session, ...current]);
     selectedSessionIdRef.current = session.id;
     setSelectedSession(session);
@@ -302,6 +338,9 @@ export function ChannelSessionRoute({
     resetVerboseEvents();
     clearExecutionHistory(session.id);
     stickToBottomRef.current = true;
+    if (publicMode) {
+      pushPublicSessionPath(session.id);
+    }
     return session;
   }
 
@@ -335,6 +374,9 @@ export function ChannelSessionRoute({
 
     selectedSessionIdRef.current = session.id;
     setSelectedSession(session);
+    if (publicMode) {
+      pushPublicSessionPath(session.id);
+    }
     clearPendingAssistantMessage();
     setActiveRun(null);
     resetVerboseEvents();
@@ -576,11 +618,15 @@ export function ChannelSessionRoute({
     }
 
     const executionMessage = await persistExecutionHistoryMessage(sessionId, run.run_id);
-    const assistantMessage = await apiClient.appendSessionMessagePublic(sessionId, {
-      role: "assistant",
-      content,
-      attachments: [],
-    });
+    const assistantMessage = await apiClient.appendSessionMessagePublic(
+      sessionId,
+      {
+        role: "assistant",
+        content,
+        attachments: [],
+      },
+      publicRequestOptions(),
+    );
     updateMessagesForSession(sessionId, (current) =>
       completePendingRunMessages(
         current,
@@ -628,12 +674,16 @@ export function ChannelSessionRoute({
           created_at: Date.now(),
         },
       ]);
-      const userMessage = await apiClient.appendSessionMessagePublic(session.id, {
-        role: "user",
-        content: text,
-        attachments: nextAttachments,
-        clientMessageKey: userMessageKey,
-      });
+      const userMessage = await apiClient.appendSessionMessagePublic(
+        session.id,
+        {
+          role: "user",
+          content: text,
+          attachments: nextAttachments,
+          clientMessageKey: userMessageKey,
+        },
+        publicRequestOptions(),
+      );
       updateMessagesForSession(session.id, (current) => upsertLiveMessage(current, userMessage));
     } catch (cause) {
       const message = hermesRunErrorMessage(cause, t("chat.requestFailed"), t);
@@ -660,11 +710,15 @@ export function ChannelSessionRoute({
       sessionId,
       activeRunRef.current?.run_id,
     );
-    const assistantMessage = await apiClient.appendSessionMessagePublic(sessionId, {
-      role: "assistant",
-      content,
-      attachments: [],
-    });
+    const assistantMessage = await apiClient.appendSessionMessagePublic(
+      sessionId,
+      {
+        role: "assistant",
+        content,
+        attachments: [],
+      },
+      publicRequestOptions(),
+    );
     updateMessagesForSession(sessionId, (current) =>
       completePendingRunMessages(current, assistantMessageId, executionMessage, assistantMessage),
     );
@@ -784,16 +838,25 @@ export function ChannelSessionRoute({
         )
       : null;
     const message = existingMessage
-      ? await apiClient.updateSessionMessagePublic(sessionId, existingMessage.id, {
-          content,
-          attachments: [],
-        })
-      : await apiClient.appendSessionMessagePublic(sessionId, {
-          role: "assistant",
-          content,
-          attachments: [],
-          clientMessageKey,
-        });
+      ? await apiClient.updateSessionMessagePublic(
+          sessionId,
+          existingMessage.id,
+          {
+            content,
+            attachments: [],
+          },
+          publicRequestOptions(),
+        )
+      : await apiClient.appendSessionMessagePublic(
+          sessionId,
+          {
+            role: "assistant",
+            content,
+            attachments: [],
+            clientMessageKey,
+          },
+          publicRequestOptions(),
+        );
 
     updateMessagesForSession(sessionId, (current) => upsertExecutionMessage(current, message));
     return message;
@@ -807,18 +870,22 @@ export function ChannelSessionRoute({
     setError(null);
     try {
       const sessionId = selectedSession.id;
-      await apiClient.stopSessionRunPublic(sessionId);
+      await apiClient.stopSessionRunPublic(sessionId, publicRequestOptions());
       const pendingId = pendingAssistantMessageId;
       const pendingMessage = pendingId
         ? messages.find((message) => message.id === pendingId)
         : undefined;
       if (pendingId && pendingMessage?.content.trim()) {
         const executionMessage = await persistExecutionHistoryMessage(sessionId, activeRun.run_id);
-        const assistantMessage = await apiClient.appendSessionMessagePublic(sessionId, {
-          role: "assistant",
-          content: pendingMessage.content,
-          attachments: [],
-        });
+        const assistantMessage = await apiClient.appendSessionMessagePublic(
+          sessionId,
+          {
+            role: "assistant",
+            content: pendingMessage.content,
+            attachments: [],
+          },
+          publicRequestOptions(),
+        );
         updateMessagesForSession(sessionId, (current) =>
           completePendingRunMessages(current, pendingId, executionMessage, assistantMessage),
         );
@@ -847,7 +914,7 @@ export function ChannelSessionRoute({
   async function deleteSidebarSession(session: SessionSummary) {
     setError(null);
     try {
-      await apiClient.deleteSessionPublic(session.id);
+      await apiClient.deleteSessionPublic(session.id, publicRequestOptions());
       const nextSessions = sessions.filter((item) => item.id !== session.id);
       setSessions(nextSessions);
       setSeenSessionUpdates((current) => {
@@ -860,6 +927,9 @@ export function ChannelSessionRoute({
         const nextSelected = nextSessions[0] ?? null;
         selectedSessionIdRef.current = nextSelected?.id ?? null;
         setSelectedSession(nextSelected);
+        if (publicMode) {
+          replacePublicSessionPath(nextSelected?.id ?? null);
+        }
         setMessages([]);
         clearPendingAssistantMessage();
         setActiveRun(null);
@@ -881,7 +951,11 @@ export function ChannelSessionRoute({
       if (!session) {
         throw new Error(t("chat.sessionCreateFailed"));
       }
-      return await apiClient.uploadSessionAttachmentsPublic(session.id, files);
+      return await apiClient.uploadSessionAttachmentsPublic(
+        session.id,
+        files,
+        publicRequestOptions(),
+      );
     } catch (cause) {
       setError(userFacingErrorMessage(cause, t("chat.attachmentUploadFailed"), t));
       return [];
@@ -2342,6 +2416,42 @@ function ChatSidebar({
 
 function sessionUpdatedAt(session: SessionSummary) {
   return session.updated_at ?? session.created_at ?? 0;
+}
+
+function publicSessionIdFromPath() {
+  const prefix = "/public/sessions/";
+  if (!window.location.pathname.startsWith(prefix)) {
+    return null;
+  }
+  const rawSessionId = window.location.pathname.slice(prefix.length).split("/")[0];
+  if (!rawSessionId) {
+    return null;
+  }
+  try {
+    return decodeURIComponent(rawSessionId);
+  } catch {
+    return rawSessionId;
+  }
+}
+
+function pushPublicSessionPath(sessionId: string) {
+  setPublicSessionPath(sessionId, "push");
+}
+
+function replacePublicSessionPath(sessionId: string | null) {
+  setPublicSessionPath(sessionId, "replace");
+}
+
+function setPublicSessionPath(sessionId: string | null, mode: "push" | "replace") {
+  const nextPath = sessionId ? `/public/sessions/${encodeURIComponent(sessionId)}` : "/public";
+  if (window.location.pathname === nextPath && !window.location.search && !window.location.hash) {
+    return;
+  }
+  if (mode === "push") {
+    window.history.pushState({}, "", nextPath);
+  } else {
+    window.history.replaceState({}, "", nextPath);
+  }
 }
 
 function upsertSessionSummary(sessions: SessionSummary[], updatedSession: SessionSummary) {

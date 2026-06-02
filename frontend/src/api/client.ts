@@ -81,6 +81,12 @@ export type HermesInstance = {
   stopped_reason?: string | null;
 };
 
+export type PublicPlatformHermesStatus = {
+  enabled: boolean;
+  ready: boolean;
+  hermes_instance?: HermesInstance | null;
+};
+
 export type HermesScheduledTaskSnapshot = {
   id: string;
   name: string;
@@ -309,6 +315,11 @@ export type CreateInviteInput = {
   max_uses: number;
 };
 
+export type PublicSessionRequestOptions = {
+  includePublicToken?: boolean;
+  sessionId?: string | null;
+};
+
 export type ApiClient = {
   me: () => Promise<User | null>;
   bootstrapStatus: () => Promise<{ bootstrap_open: boolean; public_platform_enabled: boolean }>;
@@ -331,6 +342,8 @@ export type ApiClient = {
   startHermesInstance: (userId: string) => Promise<HermesInstance>;
   stopHermesInstance: (userId: string) => Promise<HermesInstance>;
   rebuildHermesInstance: (userId: string) => Promise<HermesInstance>;
+  publicPlatformHermesInstance: () => Promise<PublicPlatformHermesStatus>;
+  rebuildPublicPlatformHermesInstance: () => Promise<HermesInstance>;
   listHermesSchedulerSnapshots: () => Promise<HermesSchedulerSnapshot[]>;
   workspaceHermesSchedulerSnapshot: () => Promise<HermesSchedulerSnapshot | null>;
   listChannels: () => Promise<Channel[]>;
@@ -410,9 +423,13 @@ export type ApiClient = {
   ) => () => void;
   stopHermesRun: (channelId: string, sessionId: string) => Promise<HermesActiveRun | null>;
   clearHermesRun: (channelId: string, sessionId: string) => Promise<void>;
-  listSessionsPublic: () => Promise<SessionSummary[]>;
-  createSessionPublic: (kind?: "chat" | "agent", title?: string) => Promise<SessionSummary>;
-  deleteSessionPublic: (sessionId: string) => Promise<void>;
+  listSessionsPublic: (options?: PublicSessionRequestOptions) => Promise<SessionSummary[]>;
+  createSessionPublic: (
+    kind?: "chat" | "agent",
+    title?: string,
+    options?: PublicSessionRequestOptions,
+  ) => Promise<SessionSummary>;
+  deleteSessionPublic: (sessionId: string, options?: PublicSessionRequestOptions) => Promise<void>;
   appendSessionMessagePublic: (
     sessionId: string,
     input: {
@@ -421,6 +438,7 @@ export type ApiClient = {
       attachments?: HermesAttachment[];
       clientMessageKey?: string;
     },
+    options?: PublicSessionRequestOptions,
   ) => Promise<ChannelMessage>;
   updateSessionMessagePublic: (
     sessionId: string,
@@ -429,22 +447,29 @@ export type ApiClient = {
       content: string;
       attachments?: HermesAttachment[];
     },
+    options?: PublicSessionRequestOptions,
   ) => Promise<ChannelMessage>;
-  uploadSessionAttachmentsPublic: (sessionId: string, files: File[]) => Promise<HermesAttachment[]>;
+  uploadSessionAttachmentsPublic: (
+    sessionId: string,
+    files: File[],
+    options?: PublicSessionRequestOptions,
+  ) => Promise<HermesAttachment[]>;
   speechInputConfig: () => Promise<SpeechInputConfig>;
   transcribeSpeechInput: (file: Blob & { name?: string }) => Promise<SpeechTranscription>;
   subscribeSessionEventsPublic: (
     sessionId: string,
     onEvent: (event: ChannelSessionEvent) => void,
     onError?: (error: Error) => void,
+    options?: PublicSessionRequestOptions,
   ) => () => void;
-  stopSessionRunPublic: (sessionId: string) => Promise<void>;
+  stopSessionRunPublic: (sessionId: string, options?: PublicSessionRequestOptions) => Promise<void>;
 };
 
 type RequestOptions = {
   method?: "GET" | "POST" | "PUT" | "DELETE";
   body?: unknown;
   allowUnauthorized?: boolean;
+  publicSessionToken?: boolean;
 };
 
 type ApiErrorPayload = {
@@ -452,6 +477,9 @@ type ApiErrorPayload = {
   message?: string;
   max_sessions_per_user?: number;
 };
+
+const PUBLIC_SESSION_TOKEN_STORAGE_KEY = "hermes-hub-public-session-token";
+const PUBLIC_SESSION_TOKEN_HEADER = "X-Hermes-Hub-Public-Session";
 
 // 保留后端错误码和参数，页面才能按当前语言生成用户可读提示。
 export class ApiRequestError extends Error {
@@ -467,15 +495,11 @@ export class ApiRequestError extends Error {
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  const headers = requestHeaders(options);
   const response = await fetch(path, {
     method: options.method ?? "GET",
     credentials: "include",
-    headers:
-      options.body === undefined
-        ? undefined
-        : {
-            "Content-Type": "application/json",
-          },
+    headers,
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
   });
 
@@ -484,6 +508,9 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   }
 
   if (!response.ok) {
+    if (response.status === 401 && options.publicSessionToken) {
+      clearPublicSessionToken();
+    }
     const payload: ApiErrorPayload = await response
       .json()
       .then(
@@ -526,6 +553,50 @@ async function requestForm<T>(path: string, form: FormData): Promise<T> {
   }
 
   return response.json() as Promise<T>;
+}
+
+function requestHeaders(options: RequestOptions): Record<string, string> | undefined {
+  const headers: Record<string, string> = {};
+  if (options.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+  }
+  if (options.publicSessionToken) {
+    const token = readPublicSessionToken();
+    if (token) {
+      headers[PUBLIC_SESSION_TOKEN_HEADER] = token;
+    }
+  }
+  return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
+function readPublicSessionToken(): string | null {
+  try {
+    const token = globalThis.localStorage?.getItem(PUBLIC_SESSION_TOKEN_STORAGE_KEY)?.trim();
+    return token || null;
+  } catch {
+    return null;
+  }
+}
+
+function writePublicSessionToken(token: string | null | undefined) {
+  const normalized = token?.trim();
+  try {
+    if (normalized) {
+      globalThis.localStorage?.setItem(PUBLIC_SESSION_TOKEN_STORAGE_KEY, normalized);
+    } else {
+      globalThis.localStorage?.removeItem(PUBLIC_SESSION_TOKEN_STORAGE_KEY);
+    }
+  } catch {
+    // localStorage 可能被浏览器策略禁用，保留 cookie 兼容路径即可。
+  }
+}
+
+function clearPublicSessionToken() {
+  try {
+    globalThis.localStorage?.removeItem(PUBLIC_SESSION_TOKEN_STORAGE_KEY);
+  } catch {
+    // 忽略存储异常，401 本身会继续按 API 错误抛出。
+  }
 }
 
 async function updateModelConfigRequest(config: ModelConfig): Promise<void> {
@@ -872,6 +943,16 @@ export function createApiClient(): ApiClient {
       );
       return payload.hermes_instance;
     },
+    async publicPlatformHermesInstance() {
+      return request<PublicPlatformHermesStatus>("/api/admin/public-platform/hermes-instance");
+    },
+    async rebuildPublicPlatformHermesInstance() {
+      const payload = await request<{ hermes_instance: HermesInstance }>(
+        "/api/admin/public-platform/hermes-instance/rebuild",
+        { method: "POST" },
+      );
+      return payload.hermes_instance;
+    },
     async listHermesSchedulerSnapshots() {
       const payload = await request<
         | HermesSchedulerSnapshot[]
@@ -1184,27 +1265,44 @@ export function createApiClient(): ApiClient {
         method: "DELETE",
       });
     },
-    async listSessionsPublic() {
-      const payload = await request<{ sessions: SessionSummary[] }>("/api/sessions");
+    async listSessionsPublic(options) {
+      const payload = await request<{ sessions: SessionSummary[]; public_token?: string }>(
+        publicSessionsPath(options),
+        {
+          publicSessionToken: options?.includePublicToken === true,
+        },
+      );
+      if (options?.includePublicToken === true || payload.public_token !== undefined) {
+        writePublicSessionToken(payload.public_token ?? null);
+      }
       return payload.sessions;
     },
-    async createSessionPublic(kind = "agent", title) {
-      const payload = await request<{ session: SessionSummary }>("/api/sessions", {
-        method: "POST",
-        body: { kind, title },
-      });
+    async createSessionPublic(kind = "agent", title, options) {
+      const payload = await request<{ session: SessionSummary; public_token?: string }>(
+        "/api/sessions",
+        {
+          method: "POST",
+          body: { kind, title },
+          publicSessionToken: options?.includePublicToken === true,
+        },
+      );
+      if (options?.includePublicToken === true || payload.public_token !== undefined) {
+        writePublicSessionToken(payload.public_token ?? null);
+      }
       return payload.session;
     },
-    async deleteSessionPublic(sessionId) {
+    async deleteSessionPublic(sessionId, options) {
       await request<void>(`/api/sessions/${sessionId}`, {
         method: "DELETE",
+        publicSessionToken: options?.includePublicToken === true,
       });
     },
-    async appendSessionMessagePublic(sessionId, input) {
+    async appendSessionMessagePublic(sessionId, input, options) {
       const payload = await request<{ message: ChannelMessage }>(
         `/api/sessions/${sessionId}/messages`,
         {
           method: "POST",
+          publicSessionToken: options?.includePublicToken === true,
           body: {
             role: input.role,
             content: input.content,
@@ -1215,11 +1313,12 @@ export function createApiClient(): ApiClient {
       );
       return payload.message;
     },
-    async updateSessionMessagePublic(sessionId, messageId, input) {
+    async updateSessionMessagePublic(sessionId, messageId, input, options) {
       const payload = await request<{ message: ChannelMessage }>(
         `/api/sessions/${sessionId}/messages/${messageId}`,
         {
           method: "PUT",
+          publicSessionToken: options?.includePublicToken === true,
           body: {
             content: input.content,
             attachments: stripAttachmentPreviews(input.attachments ?? []),
@@ -1228,19 +1327,24 @@ export function createApiClient(): ApiClient {
       );
       return payload.message;
     },
-    async uploadSessionAttachmentsPublic(sessionId, files) {
+    async uploadSessionAttachmentsPublic(sessionId, files, options) {
       const form = new FormData();
       for (const file of files) {
         form.append("file", file, file.name);
       }
+      const publicToken = options?.includePublicToken === true ? readPublicSessionToken() : null;
 
       const response = await fetch(`/api/sessions/${sessionId}/attachments`, {
         method: "POST",
         credentials: "include",
+        headers: publicToken ? { [PUBLIC_SESSION_TOKEN_HEADER]: publicToken } : undefined,
         body: form,
       });
 
       if (!response.ok) {
+        if (response.status === 401 && options?.includePublicToken === true) {
+          clearPublicSessionToken();
+        }
         const message = await response
           .json()
           .then((value) => value.message ?? value.error ?? response.statusText)
@@ -1298,12 +1402,18 @@ export function createApiClient(): ApiClient {
         source.close();
       };
     },
-    async stopSessionRunPublic(sessionId) {
+    async stopSessionRunPublic(sessionId, options) {
       await request<void>(`/api/sessions/${sessionId}/stop`, {
         method: "POST",
+        publicSessionToken: options?.includePublicToken === true,
       });
     },
   };
+}
+
+function publicSessionsPath(options: PublicSessionRequestOptions | undefined) {
+  const sessionId = options?.sessionId?.trim();
+  return sessionId ? `/api/sessions?session_id=${encodeURIComponent(sessionId)}` : "/api/sessions";
 }
 
 function stripAttachmentPreviews(attachments: HermesAttachment[]): HermesAttachment[] {
@@ -1319,6 +1429,7 @@ type MockApiClientOptions = {
   requiredModelsReady?: boolean;
   missingRequiredModelConfigKinds?: ModelConfigKind[];
   initialInstance?: HermesInstance | null;
+  publicPlatformInstance?: HermesInstance | null;
   initialMessagesBySessionId?: Record<string, ChannelMessage[]>;
   createChannelRun?: ApiClient["createChannelRun"];
   activeRunsBySessionId?: Record<string, HermesActiveRun>;
@@ -1448,6 +1559,8 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
           last_stopped_at: null,
           stopped_reason: null,
         };
+  let publicPlatformInstance: HermesInstance | null =
+    "publicPlatformInstance" in options ? options.publicPlatformInstance! : null;
   let modelConfig: ModelConfig = {
     config_kind: "llm",
     provider_name: "openai-compatible",
@@ -1529,6 +1642,12 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     return user;
   }
 
+  function isMockPublicPlatformReady() {
+    return Boolean(
+      systemSettings.public_platform.enabled && publicPlatformInstance?.status === "running",
+    );
+  }
+
   function managedSkillTreeFromState(): ManagedSkillTreeNode {
     const root: ManagedSkillTreeNode = {
       name: "",
@@ -1602,7 +1721,7 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     async bootstrapStatus() {
       return {
         bootstrap_open: !hasAnyUser,
-        public_platform_enabled: systemSettings.public_platform.enabled,
+        public_platform_enabled: isMockPublicPlatformReady(),
       };
     },
     async oidcConfig() {
@@ -1728,6 +1847,32 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
         stopped_reason: null,
       };
       return instance;
+    },
+    async publicPlatformHermesInstance() {
+      return {
+        enabled: systemSettings.public_platform.enabled,
+        ready: isMockPublicPlatformReady(),
+        hermes_instance: publicPlatformInstance,
+      };
+    },
+    async rebuildPublicPlatformHermesInstance() {
+      const now = Date.now() / 1000;
+      publicPlatformInstance = {
+        ...(publicPlatformInstance ?? {
+          id: "public-instance-1",
+          user_id: "public-user-1",
+          kind: "managed_docker",
+          runtime_image: "ghcr.io/yiiilin/hermes-hub-hermes:latest",
+          runtime_version: null,
+          last_user_activity_at: null,
+          last_stopped_at: null,
+          stopped_reason: null,
+        }),
+        status: "running",
+        health_status: "starting",
+        last_started_at: now,
+      };
+      return publicPlatformInstance;
     },
     async listHermesSchedulerSnapshots() {
       return hermesSchedulerSnapshots;

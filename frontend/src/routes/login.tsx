@@ -7,11 +7,17 @@ type LoginRouteProps = {
   apiClient: ApiClient;
   embedded?: boolean;
   onAuthenticated: (user: User) => void;
+  onBackToPublicPlatform?: () => void;
 };
 
 type AuthMode = "login" | "bootstrap" | "invite";
 
-export function LoginRoute({ apiClient, embedded = false, onAuthenticated }: LoginRouteProps) {
+export function LoginRoute({
+  apiClient,
+  embedded = false,
+  onAuthenticated,
+  onBackToPublicPlatform,
+}: LoginRouteProps) {
   const { t } = useI18n();
   const inviteFromUrl = useMemo(() => {
     const params = new URLSearchParams(window.location.search);
@@ -199,6 +205,11 @@ export function LoginRoute({ apiClient, embedded = false, onAuthenticated }: Log
             }}
           >
             {isRegistering ? t("auth.accountExists") : t("auth.bootstrapHint")}
+          </button>
+        ) : null}
+        {!inviteToken && !isRegistering && onBackToPublicPlatform ? (
+          <button type="button" className="text-button" onClick={onBackToPublicPlatform}>
+            {t("auth.backToPublicPlatform")}
           </button>
         ) : null}
       </section>

@@ -8,6 +8,7 @@ pub mod ldap;
 pub mod llm_proxy;
 pub mod model_config;
 pub mod model_registry;
+pub mod public_platform;
 pub mod security;
 pub mod skills_fs;
 pub mod storage;

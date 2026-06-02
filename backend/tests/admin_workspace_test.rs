@@ -33,6 +33,13 @@ fn test_app() -> Router {
 #[derive(Clone, Default)]
 struct RecordingDockerRuntime {
     calls: Arc<Mutex<Vec<Vec<String>>>>,
+    fail_next_create: Arc<Mutex<bool>>,
+}
+
+impl RecordingDockerRuntime {
+    fn fail_next_create(&self) {
+        *self.fail_next_create.lock().expect("fail flag lock") = true;
+    }
 }
 
 #[async_trait::async_trait]
@@ -62,6 +69,15 @@ impl DockerRuntime for RecordingDockerRuntime {
             });
         }
         if args.get(0).map(String::as_str) == Some("create") {
+            let mut fail_next_create = self.fail_next_create.lock().expect("fail flag lock");
+            if *fail_next_create {
+                *fail_next_create = false;
+                return Err(
+                    hermes_hub_backend::hermes::provisioner::ProvisionerError::DockerRuntime(
+                        "create failed once".to_string(),
+                    ),
+                );
+            }
             return Ok(DockerRuntimeOutput {
                 success: true,
                 stdout: "container-created".to_string(),
@@ -235,6 +251,249 @@ async fn admin_model_config_update_refreshes_managed_config_and_queues_gateway_r
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["items"][0]["type"], "control");
     assert_eq!(body["items"][0]["action"], "restart_gateway");
+}
+
+#[tokio::test]
+async fn model_config_refresh_rebuilds_ordinary_container_when_legacy_sandbox_policy_changes() {
+    let (state, runtime) = app_state_with_recording_docker_runtime().await;
+    let app = build_router_with_state(state.clone());
+    let admin_cookie = bootstrap_admin(&app).await;
+    let admin = state
+        .store
+        .user_by_session_cookie(&admin_cookie, "hermes_hub_session")
+        .await
+        .expect("admin can be read from session");
+
+    let created = request_empty(
+        &app,
+        Method::POST,
+        "/api/workspace/ensure-hermes",
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let mut legacy_instance = state
+        .store
+        .hermes_instance_for_user(&admin.id)
+        .await
+        .expect("managed instance exists");
+    legacy_instance.host_sandbox_path = Some("/tmp/hermes-hub-legacy-sandbox".to_string());
+    state
+        .store
+        .bind_hermes_instance(legacy_instance)
+        .await
+        .expect("legacy sandbox instance can be rebound");
+
+    runtime.calls.lock().expect("calls lock").clear();
+    let update = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/model-config",
+        json!({
+            "provider_name": "custom",
+            "provider_base_url": "https://models.example/v1",
+            "provider_api_key": "secret-v2",
+            "default_model": "gpt-4.1",
+            "allowed_models": ["gpt-4.1"],
+            "api_type": "chat_completions",
+            "allow_streaming": true,
+            "request_timeout_seconds": 30,
+            "context_window_tokens": 200000,
+            "max_output_tokens": 8192,
+            "temperature": 0.3,
+            "supports_parallel_tools": true
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+
+    let stored_after_update = state
+        .store
+        .hermes_instance_for_user(&admin.id)
+        .await
+        .expect("managed instance remains stored");
+    assert_eq!(
+        stored_after_update.host_sandbox_path, None,
+        "model config refresh must remove legacy public sandbox paths from ordinary instances"
+    );
+    let config_key = format!("config/users/{}/config.yaml", admin.id);
+    let after = state
+        .object_storage
+        .get(&config_key)
+        .await
+        .expect("updated managed config is written");
+    let content = String::from_utf8(after.to_vec()).expect("config is utf-8");
+    assert!(!content.contains("- \"/sandbox\""));
+    assert!(!content.contains("- \"/opt/data\""));
+
+    let calls = runtime.calls.lock().expect("calls lock").clone();
+    assert!(
+        calls.iter().any(|args| {
+            args.first().map(String::as_str) == Some("create")
+                && args.windows(2).all(|pair| {
+                    pair[0] != "--mount"
+                        || (!pair[1].contains("dst=/sandbox") && !pair[1].contains("dst=/opt/data"))
+                })
+        }),
+        "path policy changes must rebuild the ordinary container without public sandbox mounts"
+    );
+}
+
+#[tokio::test]
+async fn model_config_refresh_retries_legacy_sandbox_rebuild_after_transient_failure() {
+    let (state, runtime) = app_state_with_recording_docker_runtime().await;
+    let app = build_router_with_state(state.clone());
+    let admin_cookie = bootstrap_admin(&app).await;
+    let admin = state
+        .store
+        .user_by_session_cookie(&admin_cookie, "hermes_hub_session")
+        .await
+        .expect("admin can be read from session");
+
+    let created = request_empty(
+        &app,
+        Method::POST,
+        "/api/workspace/ensure-hermes",
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let mut legacy_instance = state
+        .store
+        .hermes_instance_for_user(&admin.id)
+        .await
+        .expect("managed instance exists");
+    legacy_instance.host_sandbox_path = Some("/tmp/hermes-hub-legacy-sandbox".to_string());
+    state
+        .store
+        .bind_hermes_instance(legacy_instance)
+        .await
+        .expect("legacy sandbox instance can be rebound");
+
+    runtime.calls.lock().expect("calls lock").clear();
+    runtime.fail_next_create();
+    let failed_update = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/model-config",
+        json!({
+            "provider_name": "custom",
+            "provider_base_url": "https://models.example/v1",
+            "provider_api_key": "secret-v2",
+            "default_model": "gpt-4.1",
+            "allowed_models": ["gpt-4.1"],
+            "api_type": "chat_completions",
+            "allow_streaming": true,
+            "request_timeout_seconds": 30,
+            "context_window_tokens": 200000,
+            "max_output_tokens": 8192,
+            "temperature": 0.3,
+            "supports_parallel_tools": true
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(failed_update.status(), StatusCode::BAD_GATEWAY);
+    let stored_after_failure = state
+        .store
+        .hermes_instance_for_user(&admin.id)
+        .await
+        .expect("managed instance remains stored");
+    assert!(
+        stored_after_failure.host_sandbox_path.is_some(),
+        "failed rebuild must not clear legacy sandbox in storage before Docker has converged"
+    );
+
+    runtime.calls.lock().expect("calls lock").clear();
+    let retried_update = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/model-config",
+        json!({
+            "provider_name": "custom",
+            "provider_base_url": "https://models.example/v1",
+            "provider_api_key": "secret-v2",
+            "default_model": "gpt-4.1",
+            "allowed_models": ["gpt-4.1"],
+            "api_type": "chat_completions",
+            "allow_streaming": true,
+            "request_timeout_seconds": 30,
+            "context_window_tokens": 200000,
+            "max_output_tokens": 8192,
+            "temperature": 0.3,
+            "supports_parallel_tools": true
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(retried_update.status(), StatusCode::NO_CONTENT);
+    let stored_after_retry = state
+        .store
+        .hermes_instance_for_user(&admin.id)
+        .await
+        .expect("managed instance remains stored");
+    assert_eq!(stored_after_retry.host_sandbox_path, None);
+    let calls = runtime.calls.lock().expect("calls lock").clone();
+    assert!(
+        calls.iter().any(|args| {
+            args.first().map(String::as_str) == Some("create")
+                && args.windows(2).all(|pair| {
+                    pair[0] != "--mount"
+                        || (!pair[1].contains("dst=/sandbox") && !pair[1].contains("dst=/opt/data"))
+                })
+        }),
+        "retry must still rebuild the ordinary container without public sandbox mounts"
+    );
+}
+
+#[tokio::test]
+async fn model_config_refresh_skips_disabled_public_platform_instance() {
+    let (state, runtime) = app_state_with_recording_docker_runtime().await;
+    let app = build_router_with_state(state.clone());
+    let admin_cookie = bootstrap_admin(&app).await;
+    let public_user = state
+        .store
+        .ensure_public_platform_user()
+        .await
+        .expect("public platform user can be created");
+    let public_instance = state.docker_provisioner.prepare_instance(&public_user.id);
+    state
+        .store
+        .bind_hermes_instance(public_instance)
+        .await
+        .expect("disabled public instance can be stored");
+
+    runtime.calls.lock().expect("calls lock").clear();
+    let update = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/model-config",
+        json!({
+            "provider_name": "custom",
+            "provider_base_url": "https://models.example/v1",
+            "provider_api_key": "secret-v2",
+            "default_model": "gpt-4.1",
+            "allowed_models": ["gpt-4.1"],
+            "api_type": "chat_completions",
+            "allow_streaming": true,
+            "request_timeout_seconds": 30,
+            "context_window_tokens": 200000,
+            "max_output_tokens": 8192,
+            "temperature": 0.3,
+            "supports_parallel_tools": true
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+    let calls = runtime.calls.lock().expect("calls lock").clone();
+    assert!(
+        calls
+            .iter()
+            .all(|args| args.first().map(String::as_str) != Some("create")),
+        "disabled public platform instances must not be rebuilt by config refresh"
+    );
 }
 
 async fn request_json(
@@ -705,7 +964,8 @@ async fn admin_rebuild_managed_hermes_keeps_global_skills_writable() {
 
 #[tokio::test]
 async fn regular_user_rebuild_managed_hermes_keeps_global_skills_readonly() {
-    let (app, runtime) = app_with_recording_docker_runtime().await;
+    let (state, runtime) = app_state_with_recording_docker_runtime().await;
+    let app = build_router_with_state(state.clone());
     let admin_cookie = bootstrap_admin(&app).await;
 
     let invite = request_json(
@@ -745,6 +1005,18 @@ async fn regular_user_rebuild_managed_hermes_keeps_global_skills_readonly() {
         .and_then(|user| user["id"].as_str())
         .expect("regular user id");
 
+    let mut legacy_instance = state
+        .store
+        .hermes_instance_for_user(user_id)
+        .await
+        .expect("regular Hermes instance exists");
+    legacy_instance.host_sandbox_path = Some("/tmp/hermes-hub-legacy-sandbox".to_string());
+    state
+        .store
+        .bind_hermes_instance(legacy_instance)
+        .await
+        .expect("legacy instance can be rebound");
+
     runtime.calls.lock().expect("calls lock").clear();
     let rebuilt = request_empty(
         &app,
@@ -755,7 +1027,36 @@ async fn regular_user_rebuild_managed_hermes_keeps_global_skills_readonly() {
     .await;
     assert_eq!(rebuilt.status(), StatusCode::OK);
 
+    let stored_after_rebuild = state
+        .store
+        .hermes_instance_for_user(user_id)
+        .await
+        .expect("rebuilt regular Hermes instance exists");
+    assert_eq!(
+        stored_after_rebuild.host_sandbox_path, None,
+        "ordinary user rebuild must remove legacy public sandbox paths from storage"
+    );
+    let config_key = format!("config/users/{user_id}/config.yaml");
+    let managed_config = state
+        .object_storage
+        .get(&config_key)
+        .await
+        .expect("rebuilt managed config is written");
+    let managed_config = String::from_utf8(managed_config.to_vec()).expect("config is utf-8");
+    assert!(!managed_config.contains("- \"/sandbox\""));
+    assert!(!managed_config.contains("- \"/opt/data\""));
+
     let calls = runtime.calls.lock().expect("calls lock").clone();
+    assert!(
+        calls.iter().all(|args| {
+            args.first().map(String::as_str) != Some("create")
+                || args.windows(2).all(|pair| {
+                    pair[0] != "--mount"
+                        || (!pair[1].contains("dst=/sandbox") && !pair[1].contains("dst=/opt/data"))
+                })
+        }),
+        "ordinary user rebuild must not mount public sandbox paths"
+    );
     assert!(
         calls.iter().any(|args| {
             args.first().map(String::as_str) == Some("create")

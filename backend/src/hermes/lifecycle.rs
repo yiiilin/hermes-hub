@@ -6,6 +6,7 @@ use crate::{
         provisioner::HermesProvisioner,
     },
     http::{map_provisioner_error, workspace::ensure_managed_hermes_for_user_without_activity},
+    public_platform,
     session::store::{
         HermesLifecycleCandidate, HermesScheduledTaskSnapshot, HermesSchedulerSnapshot,
     },
@@ -16,6 +17,7 @@ pub const DEFAULT_IDLE_STOP_AFTER_SECONDS: u64 = 30 * 60;
 pub const DEFAULT_WAKE_MARGIN_SECONDS: u64 = 5 * 60;
 pub const DEFAULT_SWEEP_INTERVAL_SECONDS: u64 = 60;
 const IDLE_STOP_REASON: &str = "idle";
+const PUBLIC_PLATFORM_DISABLED_STOP_REASON: &str = "public_platform_disabled";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HermesLifecycleDecisionSettings {
@@ -107,6 +109,11 @@ pub async fn sweep_hermes_lifecycle_once(
     state: &AppState,
     now: u64,
 ) -> Result<(), crate::http::ApiError> {
+    if let Err(error) = public_platform::ensure_public_hermes_if_enabled(state).await {
+        tracing::warn!(?error, "failed to keep public platform Hermes running");
+    }
+    let public_user_id = public_platform::public_user_id(state).await?;
+    let public_platform_enabled = public_platform::configured_enabled(state).await?;
     let settings = HermesLifecycleDecisionSettings::default();
     let candidates = state
         .store
@@ -115,6 +122,43 @@ pub async fn sweep_hermes_lifecycle_once(
         .map_err(|_| crate::http::ApiError::Internal)?;
 
     for candidate in candidates {
+        if public_user_id.as_deref() == Some(candidate.instance.user_id.as_str()) {
+            if public_platform_enabled {
+                if !public_platform::is_public_hermes_instance_ready(&candidate.instance) {
+                    if let Err(error) = ensure_managed_hermes_for_user_without_activity(
+                        state,
+                        &candidate.instance.user_id,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            ?error,
+                            instance_id = %candidate.instance.id,
+                            "failed to restart public platform Hermes instance"
+                        );
+                    }
+                }
+            } else if matches!(
+                candidate.instance.status,
+                HermesInstanceStatus::Running | HermesInstanceStatus::Provisioning
+            ) {
+                if let Err(error) = stop_instance_with_reason(
+                    state,
+                    &candidate.instance,
+                    PUBLIC_PLATFORM_DISABLED_STOP_REASON,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        ?error,
+                        instance_id = %candidate.instance.id,
+                        "failed to stop disabled public platform Hermes instance"
+                    );
+                }
+            }
+            // 公共 Hermes 不参与普通用户 idle stop / scheduler wake；关闭时也不能被调度重新唤醒。
+            continue;
+        }
         let has_active_runs = state
             .channel_store
             .instance_has_active_runs(&candidate.instance.id)
@@ -210,6 +254,14 @@ async fn stop_idle_instance(
     state: &AppState,
     instance: &HermesInstance,
 ) -> Result<(), crate::http::ApiError> {
+    stop_instance_with_reason(state, instance, IDLE_STOP_REASON).await
+}
+
+async fn stop_instance_with_reason(
+    state: &AppState,
+    instance: &HermesInstance,
+    reason: &str,
+) -> Result<(), crate::http::ApiError> {
     let stopped = state
         .docker_provisioner
         .stop_instance(instance)
@@ -222,7 +274,7 @@ async fn stop_idle_instance(
         .map_err(|_| crate::http::ApiError::Internal)?;
     state
         .store
-        .set_hermes_instance_stopped_reason(&stopped.id, IDLE_STOP_REASON)
+        .set_hermes_instance_stopped_reason(&stopped.id, reason)
         .await
         .map_err(|_| crate::http::ApiError::Internal)?;
     Ok(())

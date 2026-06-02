@@ -51,7 +51,7 @@ impl HermesInstance {
     pub fn managed_docker(
         user_id: &str,
         host_workspace_path: String,
-        host_sandbox_path: String,
+        host_sandbox_path: Option<String>,
         host_config_path: String,
     ) -> Self {
         Self {
@@ -64,7 +64,7 @@ impl HermesInstance {
             llm_api_key: None,
             container_id: None,
             host_workspace_path: Some(host_workspace_path),
-            host_sandbox_path: Some(host_sandbox_path),
+            host_sandbox_path,
             host_config_path: Some(host_config_path),
             health_status: "unknown".to_string(),
             status_message: None,

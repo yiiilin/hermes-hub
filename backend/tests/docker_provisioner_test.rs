@@ -958,6 +958,52 @@ async fn docker_provisioner_refreshes_status_from_docker_health() {
 }
 
 #[tokio::test]
+async fn docker_provisioner_mounts_sandbox_only_for_public_platform_instances() {
+    let runtime = FakeDockerRuntime::default();
+    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime));
+
+    let instance = provisioner.prepare_instance_with_sandbox("public-platform-user", true);
+    let created = provisioner
+        .ensure_container(&instance, "instance-token")
+        .await
+        .expect("public platform instance can be created");
+    let spec = provisioner
+        .container_spec_for(&created)
+        .expect("container spec can be rendered");
+
+    assert_eq!(
+        created.host_sandbox_path.as_deref(),
+        Some("/tmp/hermes-hub-test/users/public-platform-user/sandbox")
+    );
+    assert!(spec.env.iter().any(
+        |entry| entry == "HERMES_MEDIA_ALLOW_DIRS=/workspace:/sandbox:/opt/data:/config/cache"
+    ));
+    assert!(spec.mounts.iter().any(|mount| matches!(
+        mount,
+        ContainerMount::Bind(bind)
+            if bind.container_path == "/sandbox"
+                && bind.host_path == "/tmp/hermes-hub-test/users/public-platform-user/sandbox"
+                && !bind.read_only
+    )));
+    assert!(spec.mounts.iter().any(|mount| matches!(
+        mount,
+        ContainerMount::Bind(bind)
+            if bind.container_path == "/opt/data"
+                && bind.host_path == "/tmp/hermes-hub-test/users/public-platform-user/sandbox"
+                && !bind.read_only
+    )));
+
+    let managed_config = std::fs::read_to_string(
+        "/tmp/hermes-hub-test/users/public-platform-user/config/config.yaml",
+    )
+    .expect("managed Hermes config is written");
+    assert!(managed_config.contains("- \"/workspace\""));
+    assert!(managed_config.contains("- \"/sandbox\""));
+    assert!(managed_config.contains("- \"/opt/data\""));
+    assert!(managed_config.contains("- \"/config/cache\""));
+}
+
+#[tokio::test]
 async fn docker_provisioner_test() {
     let runtime = FakeDockerRuntime::default();
     let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime.clone()));
@@ -984,10 +1030,7 @@ async fn docker_provisioner_test() {
         instance.host_workspace_path.as_deref(),
         Some("/tmp/hermes-hub-test/users/user-123/workspace")
     );
-    assert_eq!(
-        instance.host_sandbox_path.as_deref(),
-        Some("/tmp/hermes-hub-test/users/user-123/sandbox")
-    );
+    assert_eq!(instance.host_sandbox_path, None);
     assert_eq!(
         instance.host_config_path.as_deref(),
         Some("/tmp/hermes-hub-test/users/user-123/config")
@@ -997,18 +1040,12 @@ async fn docker_provisioner_test() {
         .permissions()
         .mode()
         & 0o777;
-    let sandbox_mode = std::fs::metadata("/tmp/hermes-hub-test/users/user-123/sandbox")
-        .expect("sandbox exists")
-        .permissions()
-        .mode()
-        & 0o777;
     let config_mode = std::fs::metadata("/tmp/hermes-hub-test/users/user-123/config")
         .expect("config exists")
         .permissions()
         .mode()
         & 0o777;
     assert_eq!(workspace_mode, 0o777);
-    assert_eq!(sandbox_mode, 0o777);
     assert_eq!(config_mode, 0o777);
 
     let spec = provisioner
@@ -1089,25 +1126,23 @@ async fn docker_provisioner_test() {
         .env
         .iter()
         .any(|entry| entry == "HERMES_ACCEPT_HOOKS=1"));
-    assert!(spec.env.iter().any(
-        |entry| entry == "HERMES_MEDIA_ALLOW_DIRS=/workspace:/sandbox:/opt/data:/config/cache"
-    ));
+    assert!(spec
+        .env
+        .iter()
+        .any(|entry| entry == "HERMES_MEDIA_ALLOW_DIRS=/workspace:/config/cache"));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version" && value == "2026-05-30-bundled-platform-plugin"
+        key == "hermes_hub_spec_version" && value == "2026-06-02-public-sandbox-split"
     }));
     assert!(spec
         .mounts
         .iter()
         .any(|mount| mount.container_path() == "/config" && !mount.read_only()));
-    assert!(spec.mounts.iter().any(|mount| {
-        matches!(
-            mount,
-            ContainerMount::Bind(bind)
-                if bind.container_path == "/opt/data"
-                    && bind.host_path == "/tmp/hermes-hub-test/users/user-123/sandbox"
-                    && !bind.read_only
-        )
-    }));
+    assert!(
+        spec.mounts.iter().all(|mount| {
+            mount.container_path() != "/sandbox" && mount.container_path() != "/opt/data"
+        }),
+        "ordinary managed Hermes containers must not mount the public sandbox paths"
+    );
     assert_eq!(instance.container_id.as_deref(), Some("container-created"));
     assert_eq!(
         instance.api_token_secret_ref.as_deref(),
@@ -1141,8 +1176,8 @@ async fn docker_provisioner_test() {
     assert!(managed_config.contains("gateway:"));
     assert!(managed_config.contains("media_delivery_allow_dirs:"));
     assert!(managed_config.contains("- \"/workspace\""));
-    assert!(managed_config.contains("- \"/sandbox\""));
-    assert!(managed_config.contains("- \"/opt/data\""));
+    assert!(!managed_config.contains("- \"/sandbox\""));
+    assert!(!managed_config.contains("- \"/opt/data\""));
     assert!(managed_config.contains("- \"/config/cache\""));
     assert!(managed_config.contains("platforms:"));
     assert!(managed_config.contains("hermes_hub:"));
@@ -1327,7 +1362,7 @@ async fn docker_provisioner_test() {
     assert!(
         create_call.windows(2).any(|args| {
             args[0] == "--label"
-                && args[1] == "hermes_hub_spec_version=2026-05-30-bundled-platform-plugin"
+                && args[1] == "hermes_hub_spec_version=2026-06-02-public-sandbox-split"
         }),
         "managed Hermes containers must carry the current spec label"
     );
@@ -1346,16 +1381,13 @@ async fn docker_provisioner_test() {
         "managed Hermes healthcheck interval must be stable"
     );
     assert!(
-        create_call.windows(2).any(|args| {
-            args[0] == "--mount"
-                && args[1]
-                    == "type=bind,src=/tmp/hermes-hub-test/users/user-123/sandbox,dst=/opt/data"
-        }),
-        "managed Hermes must expose /opt/data through a Hub-owned host directory"
+        create_call
+            .windows(2)
+            .all(|args| args[0] != "--mount" || !args[1].contains("dst=/opt/data")),
+        "ordinary managed Hermes must not expose the public sandbox as /opt/data"
     );
     for path in [
         "/tmp/hermes-hub-test/users/user-123/workspace",
-        "/tmp/hermes-hub-test/users/user-123/sandbox",
         "/tmp/hermes-hub-test/users/user-123/config",
     ] {
         let mode = std::fs::metadata(path)

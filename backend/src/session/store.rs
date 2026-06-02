@@ -2132,8 +2132,18 @@ impl SessionStore {
         session_id: &str,
         retention_hours: u32,
     ) -> Result<(), StoreError> {
-        let token_hash = hash_token(public_token);
         let expires_at = unix_now().saturating_add(u64::from(retention_hours) * 60 * 60);
+        self.grant_public_session_access_until(public_token, session_id, expires_at)
+            .await
+    }
+
+    pub async fn grant_public_session_access_until(
+        &self,
+        public_token: &str,
+        session_id: &str,
+        expires_at: u64,
+    ) -> Result<(), StoreError> {
+        let token_hash = hash_token(public_token);
         match &self.backend {
             SessionStoreBackend::Memory(inner) => {
                 let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;

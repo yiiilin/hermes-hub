@@ -148,6 +148,7 @@ export function Layout({ children, user, activeView, onNavigate, onLogin, onLogo
             </button>
           </div>
           <div className="sidebar-chat">{chatSidebar}</div>
+          <div className="sidebar-section-divider" aria-hidden="true" />
           <nav className="sidebar-bottom">
             {user?.role === "admin" ? (
               <div className="nav-group">

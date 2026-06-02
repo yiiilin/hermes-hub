@@ -15,6 +15,7 @@ use crate::{
     },
     http::{auth::current_user, map_provisioner_error, ApiError},
     model_config::IMAGE_MODEL_CONFIG_KIND,
+    public_platform,
     session::store::HermesSchedulerSnapshot,
     AppState,
 };
@@ -111,10 +112,14 @@ pub async fn ensure_managed_hermes_for_user_without_activity(
     user_id: &str,
 ) -> Result<HermesInstance, ApiError> {
     let global_skills_write_enabled = user_has_global_skills_write_access(state, user_id).await?;
+    let sandbox_enabled = public_platform::is_public_user_id(state, user_id).await?;
     if let Ok(instance) = state.store.hermes_instance_for_user(user_id).await {
         if instance.kind == HermesInstanceKind::ManagedDocker {
             let mut instance = instance;
             instance.global_skills_write_enabled = global_skills_write_enabled;
+            state
+                .docker_provisioner
+                .apply_sandbox_policy(&mut instance, sandbox_enabled);
             ensure_required_model_configs(state).await?;
             let llm_config = state
                 .model_registry
@@ -188,7 +193,9 @@ pub async fn ensure_managed_hermes_for_user_without_activity(
     let image_model = image_config
         .enabled
         .then_some(image_config.default_model.as_str());
-    let mut instance = state.docker_provisioner.prepare_instance(user_id);
+    let mut instance = state
+        .docker_provisioner
+        .prepare_instance_with_sandbox(user_id, sandbox_enabled);
     instance.global_skills_write_enabled = global_skills_write_enabled;
     state
         .store
@@ -237,13 +244,7 @@ async fn user_has_global_skills_write_access(
     state: &AppState,
     user_id: &str,
 ) -> Result<bool, ApiError> {
-    if state
-        .store
-        .public_platform_user_id()
-        .await
-        .map_err(|_| ApiError::Internal)?
-        .is_some_and(|public_user_id| public_user_id == user_id)
-    {
+    if public_platform::is_public_user_id(state, user_id).await? {
         return Ok(false);
     }
 

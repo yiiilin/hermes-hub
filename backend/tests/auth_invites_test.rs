@@ -318,6 +318,170 @@ async fn ldap_auto_created_user_can_set_local_password_by_same_email() {
 }
 
 #[tokio::test]
+async fn public_platform_admin_status_and_rebuild_manage_the_public_hermes_instance() {
+    let app = test_app();
+    bootstrap_admin(&app).await;
+    let admin_cookie = login(&app, "admin@example.com", "admin-password-123").await;
+    configure_required_model_configs(&app, &admin_cookie).await;
+
+    let initial = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/public-platform/hermes-instance",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, initial_body) = response_json(initial).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(initial_body["enabled"], false);
+    assert_eq!(initial_body["ready"], false);
+    assert_eq!(initial_body["hermes_instance"], Value::Null);
+
+    let disabled_rebuild = request_empty(
+        &app,
+        Method::POST,
+        "/api/admin/public-platform/hermes-instance/rebuild",
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(disabled_rebuild.status(), StatusCode::CONFLICT);
+
+    let update_settings = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/system-settings",
+        json!({
+            "max_sessions_per_user": 20,
+            "public_platform": {
+                "enabled": true,
+                "temporary_session_retention_hours": 24
+            }
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update_settings.status(), StatusCode::NO_CONTENT);
+
+    let enabled_status = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/public-platform/hermes-instance",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, enabled_body) = response_json(enabled_status).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(enabled_body["enabled"], true);
+    assert_eq!(enabled_body["ready"], true);
+    assert_eq!(enabled_body["hermes_instance"]["status"], "running");
+    assert_eq!(enabled_body["hermes_instance"]["health_status"], "running");
+    let public_user_id = enabled_body["hermes_instance"]["user_id"]
+        .as_str()
+        .expect("public Hermes user id exists")
+        .to_string();
+    assert!(enabled_body["hermes_instance"]["host_sandbox_path"]
+        .as_str()
+        .expect("public Hermes has sandbox")
+        .ends_with("/sandbox"));
+
+    let ordinary_instances = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/hermes-instances",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, ordinary_instances_body) = response_json(ordinary_instances).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        ordinary_instances_body["hermes_instances"]
+            .as_array()
+            .expect("ordinary instance list")
+            .iter()
+            .all(|instance| instance["user_id"] != public_user_id),
+        "public Hermes must stay out of the ordinary managed instance list"
+    );
+
+    let ordinary_stop = request_empty(
+        &app,
+        Method::POST,
+        &format!("/api/admin/users/{public_user_id}/hermes-instance/stop"),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(ordinary_stop.status(), StatusCode::NOT_FOUND);
+    let ordinary_disable = request_empty(
+        &app,
+        Method::POST,
+        &format!("/api/admin/users/{public_user_id}/disable"),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(ordinary_disable.status(), StatusCode::NOT_FOUND);
+    let ordinary_enable = request_empty(
+        &app,
+        Method::POST,
+        &format!("/api/admin/users/{public_user_id}/enable"),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(ordinary_enable.status(), StatusCode::NOT_FOUND);
+
+    let bootstrap = request_empty(&app, Method::GET, "/api/auth/bootstrap-status", None).await;
+    let (status, bootstrap_body) = response_json(bootstrap).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bootstrap_body["public_platform_enabled"], true);
+
+    let rebuilt = request_empty(
+        &app,
+        Method::POST,
+        "/api/admin/public-platform/hermes-instance/rebuild",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, rebuilt_body) = response_json(rebuilt).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rebuilt_body["hermes_instance"]["status"], "running");
+    assert!(rebuilt_body["hermes_instance"]["host_sandbox_path"]
+        .as_str()
+        .expect("rebuilt public Hermes has sandbox")
+        .ends_with("/sandbox"));
+}
+
+#[tokio::test]
+async fn anonymous_public_sessions_wait_until_public_hermes_is_ready() {
+    let app = test_app();
+    bootstrap_admin(&app).await;
+    let admin_cookie = login(&app, "admin@example.com", "admin-password-123").await;
+
+    let update_settings = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/system-settings",
+        json!({
+            "max_sessions_per_user": 20,
+            "public_platform": {
+                "enabled": true,
+                "temporary_session_retention_hours": 24
+            }
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update_settings.status(), StatusCode::NO_CONTENT);
+
+    let bootstrap = request_empty(&app, Method::GET, "/api/auth/bootstrap-status", None).await;
+    let (status, bootstrap_body) = response_json(bootstrap).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bootstrap_body["public_platform_enabled"], false);
+
+    let list_sessions = request_empty(&app, Method::GET, "/api/sessions", None).await;
+    let (status, body) = response_json(list_sessions).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["message"], "public platform is not ready");
+}
+
+#[tokio::test]
 async fn oidc_start_redirects_with_configured_authorization_parameters() {
     let app = test_app();
     bootstrap_admin(&app).await;
