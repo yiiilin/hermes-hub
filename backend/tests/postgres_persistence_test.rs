@@ -1292,6 +1292,7 @@ async fn postgres_system_settings_persist_session_limit() {
             max_sessions_per_user: 7,
             max_attachment_upload_bytes: 128 * 1024 * 1024,
             attachment_retention_days: 14,
+            empty_chat_prompt: "Ask Hermes anything".to_string(),
             speech_input: SpeechInputSettings { enabled: true },
             public_platform: PublicPlatformSettings {
                 enabled: true,
@@ -1352,6 +1353,7 @@ async fn postgres_system_settings_persist_session_limit() {
     assert_eq!(reloaded.max_sessions_per_user, 7);
     assert_eq!(reloaded.max_attachment_upload_bytes, 128 * 1024 * 1024);
     assert_eq!(reloaded.attachment_retention_days, 14);
+    assert_eq!(reloaded.empty_chat_prompt, "Ask Hermes anything");
     assert!(reloaded.speech_input.enabled);
     assert_eq!(
         reloaded.public_platform.temporary_session_retention_hours,

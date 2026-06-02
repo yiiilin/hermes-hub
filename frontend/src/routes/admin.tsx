@@ -463,6 +463,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     max_sessions_per_user: 20,
     max_attachment_upload_bytes: 200 * 1024 * 1024,
     attachment_retention_days: 7,
+    empty_chat_prompt: "",
     speech_input: defaultSpeechInputSettings(),
     public_platform: defaultPublicPlatformSettings(),
     oidc: defaultOidcSettings(),
@@ -781,8 +782,14 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     setSettingsSaved(false);
     setError(null);
     try {
+      const submittedEmptyChatPrompt = systemSettings.empty_chat_prompt.trim();
       await apiClient.updateSystemSettings(systemSettings);
-      setSystemSettings(await apiClient.systemSettings());
+      const reloadedSettings = await apiClient.systemSettings();
+      setSystemSettings({
+        ...reloadedSettings,
+        // 老版本后端或短暂回读缺字段时，不要把管理员刚保存的非空文案清空。
+        empty_chat_prompt: reloadedSettings.empty_chat_prompt || submittedEmptyChatPrompt,
+      });
       if (activeTab === "public-platform") {
         setPublicPlatformHermesStatus(await apiClient.publicPlatformHermesInstance());
       }
@@ -1750,6 +1757,20 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
           </div>
           {error ? <p className="error">{error}</p> : null}
           {settingsSaved ? <p className="copy-line">{t("admin.settingsSaved")}</p> : null}
+          <label>
+            {t("admin.emptyChatPrompt")}
+            <textarea
+              rows={3}
+              value={systemSettings.empty_chat_prompt}
+              placeholder={t("chat.empty")}
+              onChange={(event) =>
+                setSystemSettings({
+                  ...systemSettings,
+                  empty_chat_prompt: event.target.value,
+                })
+              }
+            />
+          </label>
           <label>
             {t("admin.maxSessionsPerUser")}
             <input

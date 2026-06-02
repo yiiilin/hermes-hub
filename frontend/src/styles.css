@@ -534,9 +534,11 @@ button:disabled {
   border: 1px solid #d8e3e7;
   border-radius: 8px;
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 4px;
+  overflow-x: auto;
   padding: 4px;
+  scrollbar-width: thin;
 }
 
 .settings-tabs button {
@@ -545,10 +547,11 @@ button:disabled {
   border-radius: 6px;
   box-shadow: none;
   color: #536a74;
-  flex: 1 1 136px;
+  flex: 0 0 auto;
   justify-content: center;
   min-height: 36px;
   padding: 8px 12px;
+  white-space: nowrap;
 }
 
 .settings-tabs button.active,
@@ -1171,6 +1174,11 @@ td {
   justify-self: center;
   padding: 28px;
   width: min(100%, 320px);
+}
+
+.empty-chat strong {
+  text-align: center;
+  white-space: pre-wrap;
 }
 
 .message-bubble {

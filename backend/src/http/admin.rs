@@ -780,7 +780,7 @@ async fn get_system_settings(
 async fn update_system_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(payload): Json<UpdateSystemSettingsRequest>,
+    Json(mut payload): Json<UpdateSystemSettingsRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_admin(&state, &headers).await?;
     if payload.max_sessions_per_user == 0 {
@@ -799,6 +799,8 @@ async fn update_system_settings(
         ));
     }
 
+    // 空会话提示允许不配置；空值会在前端回退到当前语言的默认文案。
+    payload.empty_chat_prompt = payload.empty_chat_prompt.trim().to_string();
     let should_ensure_public_hermes = payload.public_platform.enabled;
 
     state

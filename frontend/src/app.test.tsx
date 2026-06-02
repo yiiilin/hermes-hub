@@ -873,6 +873,23 @@ describe("App", () => {
     });
   });
 
+  it("clears public session URLs when authenticated private chat is active", async () => {
+    window.history.pushState({}, "", "/public/sessions/public-session-2?from=public#stale");
+
+    render(<App apiClient={createMockApiClient()} />);
+
+    expect(await screen.findByRole("button", { name: "Session" })).toBeInTheDocument();
+    await waitFor(() => {
+      expect(window.location.pathname).toBe("/");
+    });
+    expect(window.location.search).toBe("");
+    expect(window.location.hash).toBe("");
+
+    window.history.pushState({}, "", "/public/sessions/stale-public-session");
+    fireEvent.click(screen.getByRole("button", { name: "Session" }));
+    expect(window.location.pathname).toBe("/");
+  });
+
   it("waits for public platform status before showing the anonymous landing route", async () => {
     const client = createMockApiClient();
     const meDeferred = createDeferred<Awaited<ReturnType<ApiClient["me"]>>>();
@@ -1313,6 +1330,7 @@ describe("App", () => {
     expect(await screen.findByLabelText("Max sessions per user")).toBeInTheDocument();
     expect(await screen.findByLabelText("Max attachment upload size (MB)")).toBeInTheDocument();
     expect(screen.getByLabelText("Attachment retention (days)")).toBeInTheDocument();
+    expect(screen.getByLabelText("Empty chat prompt")).toBeInTheDocument();
 
     fireEvent.click(
       within(settingsTabs).getByRole("tab", {
@@ -1325,6 +1343,77 @@ describe("App", () => {
     expect(
       screen.queryByRole("heading", { name: "Authentication settings" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("saves the empty chat prompt in system parameters and renders it in chat", async () => {
+    const client = createMockApiClient();
+    const updateSystemSettings = client.updateSystemSettings.bind(client);
+    const systemSettings = client.systemSettings.bind(client);
+    let savedSettings: unknown = null;
+    let dropPromptOnReload = false;
+    client.updateSystemSettings = vi.fn(async (settings) => {
+      savedSettings = settings;
+      await updateSystemSettings(settings);
+      dropPromptOnReload = true;
+    });
+    client.systemSettings = vi.fn(async () => {
+      const settings = await systemSettings();
+      if (!dropPromptOnReload) {
+        return settings;
+      }
+      dropPromptOnReload = false;
+      return {
+        ...settings,
+        empty_chat_prompt: "",
+      };
+    });
+
+    render(<App apiClient={client} />);
+
+    const prompt = "Ask Hermes\nfrom the shared hub";
+    await openSettingsTab("System parameters");
+    fireEvent.change(await screen.findByLabelText("Empty chat prompt"), {
+      target: { value: prompt },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+
+    expect(await screen.findByText("Settings saved")).toBeInTheDocument();
+    expect(savedSettings).toMatchObject({
+      empty_chat_prompt: prompt,
+    });
+    expect(screen.getByLabelText("Empty chat prompt")).toHaveValue(prompt);
+
+    fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+    const emptyPrompt = await screen.findByText((content, element) => {
+      return element?.tagName.toLowerCase() === "strong" && content.includes("Ask Hermes");
+    });
+    expect(emptyPrompt.textContent).toBe(prompt);
+  });
+
+  it("shows the empty state when a session only has hidden empty messages", async () => {
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialMessagesBySessionId: {
+            "session-1": [
+              {
+                id: "hidden-empty-assistant",
+                session_id: "session-1",
+                role: "assistant",
+                message_kind: "text",
+                client_message_key: null,
+                content: "",
+                attachments: [],
+                created_at: 1_767_225_600,
+              },
+            ],
+          },
+        })}
+      />,
+    );
+
+    expect(await screen.findByText("Start a Hermes conversation")).toBeInTheDocument();
+    expect(document.querySelector(".message-list.empty")).toBeInTheDocument();
   });
 
   it("lets admins edit and save only SOUL.md with Vditor's Markdown WYSIWYG editor", async () => {

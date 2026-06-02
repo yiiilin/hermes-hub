@@ -35,6 +35,7 @@ const MAX_ATTACHMENT_UPLOAD_BYTES_KEY: &str = "max_attachment_upload_bytes";
 const ATTACHMENT_RETENTION_DAYS_KEY: &str = "attachment_retention_days";
 const SPEECH_INPUT_SETTINGS_KEY: &str = "speech_input";
 const PUBLIC_PLATFORM_SETTINGS_KEY: &str = "public_platform";
+const EMPTY_CHAT_PROMPT_KEY: &str = "empty_chat_prompt";
 const OIDC_SETTINGS_KEY: &str = "oidc";
 const LDAP_SETTINGS_KEY: &str = "ldap";
 pub const PUBLIC_PLATFORM_USER_EMAIL: &str = "public-platform@hermes-hub.local";
@@ -101,6 +102,8 @@ pub struct SystemSettings {
     pub max_attachment_upload_bytes: usize,
     #[serde(default = "default_attachment_retention_days")]
     pub attachment_retention_days: u32,
+    #[serde(default)]
+    pub empty_chat_prompt: String,
     #[serde(default)]
     pub speech_input: SpeechInputSettings,
     #[serde(default)]
@@ -184,6 +187,7 @@ impl Default for SystemSettings {
             max_sessions_per_user: DEFAULT_MAX_SESSIONS_PER_USER,
             max_attachment_upload_bytes: DEFAULT_MAX_ATTACHMENT_UPLOAD_BYTES,
             attachment_retention_days: DEFAULT_ATTACHMENT_RETENTION_DAYS,
+            empty_chat_prompt: String::new(),
             speech_input: SpeechInputSettings::default(),
             public_platform: PublicPlatformSettings::default(),
             oidc: OidcSettings::default(),
@@ -1907,6 +1911,15 @@ impl SessionStore {
                     .transpose()?
                     .unwrap_or_default();
 
+                let empty_chat_prompt =
+                    sqlx::query("select value from system_settings where key = $1")
+                        .bind(EMPTY_CHAT_PROMPT_KEY)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(|_| StoreError::DatabaseFailed)?
+                        .and_then(|row| row.try_get::<String, _>("value").ok())
+                        .unwrap_or_default();
+
                 let public_platform =
                     sqlx::query("select value from system_settings where key = $1")
                         .bind(PUBLIC_PLATFORM_SETTINGS_KEY)
@@ -1953,6 +1966,7 @@ impl SessionStore {
                     max_sessions_per_user: value,
                     max_attachment_upload_bytes,
                     attachment_retention_days,
+                    empty_chat_prompt,
                     speech_input,
                     public_platform,
                     oidc,
@@ -1987,6 +2001,21 @@ impl SessionStore {
                 )
                 .bind(MAX_SESSIONS_PER_USER_KEY)
                 .bind(settings.max_sessions_per_user.to_string())
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+
+                sqlx::query(
+                    r#"
+                    insert into system_settings (key, value, updated_at)
+                    values ($1, $2, now())
+                    on conflict (key) do update set
+                        value = excluded.value,
+                        updated_at = now()
+                    "#,
+                )
+                .bind(EMPTY_CHAT_PROMPT_KEY)
+                .bind(settings.empty_chat_prompt.clone())
                 .execute(pool)
                 .await
                 .map_err(|_| StoreError::DatabaseFailed)?;

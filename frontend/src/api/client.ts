@@ -168,6 +168,7 @@ export type SystemSettings = {
   max_sessions_per_user: number;
   max_attachment_upload_bytes: number;
   attachment_retention_days: number;
+  empty_chat_prompt: string;
   speech_input: SpeechInputSettings;
   public_platform: PublicPlatformSettings;
   oidc: OidcSettings;
@@ -320,9 +321,15 @@ export type PublicSessionRequestOptions = {
   sessionId?: string | null;
 };
 
+export type BootstrapStatus = {
+  bootstrap_open: boolean;
+  public_platform_enabled: boolean;
+  empty_chat_prompt?: string | null;
+};
+
 export type ApiClient = {
   me: () => Promise<User | null>;
-  bootstrapStatus: () => Promise<{ bootstrap_open: boolean; public_platform_enabled: boolean }>;
+  bootstrapStatus: () => Promise<BootstrapStatus>;
   oidcConfig: () => Promise<OidcPublicConfig>;
   ldapConfig: () => Promise<LdapPublicConfig>;
   login: (email: string, password: string) => Promise<User>;
@@ -792,6 +799,8 @@ function systemSettingsFromPayload(settings: SystemSettingsPayload): SystemSetti
       200 * 1024 * 1024,
     ),
     attachment_retention_days: positiveNumberOrDefault(settings.attachment_retention_days, 7),
+    empty_chat_prompt:
+      typeof settings.empty_chat_prompt === "string" ? settings.empty_chat_prompt : "",
     speech_input: {
       ...defaultSpeechInputSettings(),
       ...(settings.speech_input ?? {}),
@@ -828,9 +837,7 @@ export function createApiClient(): ApiClient {
       return payload?.user ?? null;
     },
     async bootstrapStatus() {
-      return request<{ bootstrap_open: boolean; public_platform_enabled: boolean }>(
-        "/api/auth/bootstrap-status",
-      );
+      return request<BootstrapStatus>("/api/auth/bootstrap-status");
     },
     async oidcConfig() {
       const payload = await request<{ oidc: OidcPublicConfig }>("/api/auth/oidc/config");
@@ -1603,6 +1610,7 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     max_sessions_per_user: 20,
     max_attachment_upload_bytes: 200 * 1024 * 1024,
     attachment_retention_days: 7,
+    empty_chat_prompt: "",
     speech_input: defaultSpeechInputSettings(),
     public_platform: {
       ...defaultPublicPlatformSettings(),
@@ -1722,6 +1730,7 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       return {
         bootstrap_open: !hasAnyUser,
         public_platform_enabled: isMockPublicPlatformReady(),
+        empty_chat_prompt: systemSettings.empty_chat_prompt,
       };
     },
     async oidcConfig() {

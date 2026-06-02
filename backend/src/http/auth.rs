@@ -60,12 +60,18 @@ struct UserResponse {
 struct BootstrapStatusResponse {
     bootstrap_open: bool,
     public_platform_enabled: bool,
+    empty_chat_prompt: String,
 }
 
 async fn bootstrap_status(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
     let bootstrap_open = state
         .store
         .bootstrap_open()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let settings = state
+        .store
+        .system_settings()
         .await
         .map_err(|_| ApiError::Internal)?;
     let public_platform_enabled = public_platform::public_hermes_readiness(&state)
@@ -75,6 +81,7 @@ async fn bootstrap_status(State(state): State<AppState>) -> Result<impl IntoResp
     Ok(Json(BootstrapStatusResponse {
         bootstrap_open,
         public_platform_enabled,
+        empty_chat_prompt: settings.empty_chat_prompt,
     }))
 }
 
@@ -339,6 +346,7 @@ mod tests {
             .await
             .expect("system settings can be read");
         settings.public_platform.enabled = true;
+        settings.empty_chat_prompt = "Ask Hermes anything".into();
         store
             .update_system_settings(settings)
             .await
@@ -362,6 +370,7 @@ mod tests {
             .expect("bootstrap status body can be read");
         let payload: Value = serde_json::from_slice(&body).expect("bootstrap status is json");
         assert_eq!(payload["public_platform_enabled"], false);
+        assert_eq!(payload["empty_chat_prompt"], "Ask Hermes anything");
 
         crate::public_platform::ensure_public_hermes_if_enabled(&state)
             .await

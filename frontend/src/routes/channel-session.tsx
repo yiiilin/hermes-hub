@@ -108,6 +108,7 @@ export function ChannelSessionRoute({
     max_audio_seconds: 60,
     max_upload_bytes: 25 * 1024 * 1024,
   });
+  const [configuredEmptyChatPrompt, setConfiguredEmptyChatPrompt] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const messageListRef = useRef<HTMLDivElement | null>(null);
@@ -130,6 +131,36 @@ export function ChannelSessionRoute({
         }
       : undefined;
   }
+
+  useEffect(() => {
+    if (active && !publicMode) {
+      clearPublicSessionRoute();
+    }
+  }, [active, publicMode]);
+
+  useEffect(() => {
+    if (!active) {
+      return;
+    }
+
+    let alive = true;
+    void apiClient
+      .bootstrapStatus()
+      .then((status) => {
+        if (alive) {
+          setConfiguredEmptyChatPrompt(status.empty_chat_prompt?.trim() ?? "");
+        }
+      })
+      .catch(() => {
+        if (alive) {
+          setConfiguredEmptyChatPrompt("");
+        }
+      });
+
+    return () => {
+      alive = false;
+    };
+  }, [active, apiClient]);
 
   useEffect(() => {
     selectedSessionIdRef.current = selectedSession?.id ?? null;
@@ -345,6 +376,9 @@ export function ChannelSessionRoute({
   }
 
   async function createSidebarSession() {
+    if (!publicMode) {
+      clearPublicSessionRoute();
+    }
     onOpenChat?.();
     try {
       setError(null);
@@ -390,6 +424,9 @@ export function ChannelSessionRoute({
   }
 
   async function selectSidebarSession(session: SessionSummary) {
+    if (!publicMode) {
+      clearPublicSessionRoute();
+    }
     onOpenChat?.();
     await selectSession(session);
   }
@@ -1014,6 +1051,7 @@ export function ChannelSessionRoute({
 
         <MessageList
           activeExecutionMessageId={activeExecutionMessage?.id ?? null}
+          emptyChatPrompt={configuredEmptyChatPrompt}
           historyKey={selectedSession?.id ?? "empty"}
           language={language}
           liveExecutionVisible={liveExecutionVisible}
@@ -1273,6 +1311,7 @@ export function createClientMessageId(source: BrowserCrypto | undefined = global
 
 const MessageList = memo(function MessageList({
   activeExecutionMessageId,
+  emptyChatPrompt,
   historyKey,
   language,
   liveExecutionVisible,
@@ -1285,6 +1324,7 @@ const MessageList = memo(function MessageList({
   verboseEvents,
 }: {
   activeExecutionMessageId: string | null;
+  emptyChatPrompt: string;
   historyKey: string;
   language: Language;
   liveExecutionVisible: boolean;
@@ -1444,17 +1484,17 @@ const MessageList = memo(function MessageList({
   return (
     <div
       className={[
-        messages.length === 0 ? "message-list empty" : "message-list",
+        renderableMessages.length === 0 ? "message-list empty" : "message-list",
         virtualized ? "virtualized" : "",
       ]
         .filter(Boolean)
         .join(" ")}
       ref={messageListRef}
     >
-      {messages.length === 0 ? (
+      {renderableMessages.length === 0 ? (
         <div className="empty-chat">
           <Bot aria-hidden="true" size={30} />
-          <strong>{t("chat.empty")}</strong>
+          <strong>{emptyChatPrompt || t("chat.empty")}</strong>
         </div>
       ) : virtualized ? (
         <div
@@ -2440,6 +2480,13 @@ function pushPublicSessionPath(sessionId: string) {
 
 function replacePublicSessionPath(sessionId: string | null) {
   setPublicSessionPath(sessionId, "replace");
+}
+
+function clearPublicSessionRoute() {
+  const path = window.location.pathname;
+  if (path === "/public" || path.startsWith("/public/")) {
+    window.history.replaceState({}, "", "/");
+  }
 }
 
 function setPublicSessionPath(sessionId: string | null, mode: "push" | "replace") {
