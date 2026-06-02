@@ -163,6 +163,99 @@ fn hermes_send_message_patch_applies_to_target_image_when_docker_is_available() 
 }
 
 #[test]
+fn hermes_hub_adapter_extracts_unquoted_arbitrary_media_when_docker_is_available() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("backend crate lives under repo root");
+    let dockerfile = std::fs::read_to_string(repo_root.join("docker/hermes/Dockerfile"))
+        .expect("Hermes wrapper Dockerfile is present");
+    let pinned_hermes_agent_image = hermes_agent_image_from_dockerfile(&dockerfile);
+    let adapter_path = repo_root
+        .join("docker/hermes/plugins/platforms/hermes_hub/adapter.py")
+        .canonicalize()
+        .expect("Hermes Hub adapter is present");
+    let image = std::env::var("HERMES_HUB_HERMES_TEST_IMAGE")
+        .unwrap_or_else(|_| pinned_hermes_agent_image.to_string());
+
+    let docker_available = Command::new("docker")
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !docker_available {
+        eprintln!(
+            "skipping Hermes Hub adapter behavior verification because Docker is unavailable"
+        );
+        return;
+    }
+
+    let image_available = Command::new("docker")
+        .args(["image", "inspect", &image])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !image_available {
+        eprintln!(
+            "skipping Hermes Hub adapter behavior verification because {image} is unavailable"
+        );
+        return;
+    }
+
+    let mount = format!("{}:/tmp/hermes_hub_adapter.py:ro", adapter_path.display());
+    let script = r#"
+PYTHONPATH=/opt/hermes /opt/hermes/.venv/bin/python - <<'PY'
+import importlib.util
+from gateway.platforms.base import BasePlatformAdapter
+
+spec = importlib.util.spec_from_file_location("hermes_hub_adapter", "/tmp/hermes_hub_adapter.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+content = "caption\nMEDIA:/workspace/start_ntp.sh"
+base_media, base_cleaned = BasePlatformAdapter.extract_media(content)
+assert base_media == [], (base_media, base_cleaned)
+assert base_cleaned == content, (base_media, base_cleaned)
+
+media, cleaned = module.HermesHubAdapter.extract_media(content)
+assert media == [("/workspace/start_ntp.sh", False)], (media, cleaned)
+assert cleaned == "caption", (media, cleaned)
+
+voice_media, voice_cleaned = module.HermesHubAdapter.extract_media(
+    "[[audio_as_voice]]\nMEDIA:/workspace/clip.custom"
+)
+assert voice_media == [("/workspace/clip.custom", True)], (voice_media, voice_cleaned)
+assert voice_cleaned == "", (voice_media, voice_cleaned)
+
+paths, caption = module.HermesHubAdapter._extract_hub_media_directives(
+    "x\nMEDIA:'/workspace/a.sh'\nMEDIA:`/workspace/b.noext`"
+)
+assert paths == ["/workspace/a.sh", "/workspace/b.noext"], (paths, caption)
+assert caption == "x", (paths, caption)
+PY
+"#;
+    let output = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--entrypoint",
+            "sh",
+            "-v",
+            &mount,
+            &image,
+            "-lc",
+            script,
+        ])
+        .output()
+        .expect("docker can run Hermes Hub adapter behavior verification");
+    assert!(
+        output.status.success(),
+        "Hermes Hub adapter must extract arbitrary MEDIA lines on {image}: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn hermes_wrapper_exposes_standard_hub_adapter_surface() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -176,6 +269,12 @@ fn hermes_wrapper_exposes_standard_hub_adapter_surface() {
 
     assert!(adapter.contains("async def send_document("));
     assert!(adapter.contains("async def send_image_file("));
+    assert!(adapter.contains("def extract_media(content: str):"));
+    assert!(adapter.contains("HUB_MEDIA_DIRECTIVE_RE"));
+    assert!(adapter.contains("BasePlatformAdapter.extract_media(content)"));
+    assert!(adapter.contains("async def _send_media_directives("));
+    assert!(adapter.contains("def _media_directives_from_content("));
+    assert!(adapter.contains("def _extract_hub_media_directives("));
     assert!(adapter.contains("async def send_image("));
     assert!(adapter.contains("async def send_multiple_images("));
     assert!(adapter.contains("async def send_typing("));
@@ -188,6 +287,7 @@ fn hermes_wrapper_exposes_standard_hub_adapter_surface() {
     assert!(adapter.contains("file_path=audio_path"));
     assert!(adapter.contains("file_path=video_path"));
     assert!(adapter.contains("image_url=animation_url"));
+    assert!(!adapter.contains("outside allowed media directories"));
     assert!(adapter.contains("return await super().send_clarify("));
     assert!(adapter.contains("item_metadata[\"media_sequence\"] = index"));
     assert!(adapter.contains("media_metadata.setdefault(\"media_source_url\", raw_url)"));
@@ -199,7 +299,7 @@ fn hermes_wrapper_exposes_standard_hub_adapter_surface() {
     assert!(adapter.contains("if explicit_client_message_key and media_sequence is None:"));
     assert!(adapter.contains("\"remote\""));
     assert!(adapter.contains("\"local\""));
-    assert!(adapter.contains("MEDIA:/workspace/report.pdf"));
+    assert!(!adapter.contains("platform_hint="));
     assert!(!adapter.contains("attachments=['/workspace/report.pdf']"));
     assert!(!adapter.contains("send_message_with_attachments"));
     assert!(!adapter.contains("platform_name == \"origin\""));

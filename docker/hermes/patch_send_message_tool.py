@@ -4,8 +4,10 @@ from pathlib import Path
 tool_path = Path("/opt/hermes/tools/send_message_tool.py")
 source = tool_path.read_text()
 
-if "Hermes Hub plugin media bridge" in source:
-    raise SystemExit(0)
+def replace_once(source: str, old: str, new: str, label: str) -> str:
+    if old not in source:
+        raise SystemExit(f"{label} not found")
+    return source.replace(old, new, 1)
 
 old_live_adapter = """        if adapter is not None:
             try:
@@ -160,14 +162,12 @@ new_plugin_call = """            result = await _send_via_adapter(
             )
 """
 
-for old, new, label in [
-    (old_live_adapter, new_live_adapter, "send_message live adapter block"),
-    (old_media_guard, new_media_guard, "send_message media guard block"),
-    (old_generic_loop, new_generic_loop, "send_message generic chunk loop"),
-    (old_plugin_call, new_plugin_call, "send_message plugin media call"),
-]:
-    if old not in source:
-        raise SystemExit(f"{label} not found")
-    source = source.replace(old, new, 1)
-
-tool_path.write_text(source)
+if "Hermes Hub plugin media bridge" not in source:
+    for old, new, label in [
+        (old_live_adapter, new_live_adapter, "send_message live adapter block"),
+        (old_media_guard, new_media_guard, "send_message media guard block"),
+        (old_generic_loop, new_generic_loop, "send_message generic chunk loop"),
+        (old_plugin_call, new_plugin_call, "send_message plugin media call"),
+    ]:
+        source = replace_once(source, old, new, label)
+    tool_path.write_text(source)

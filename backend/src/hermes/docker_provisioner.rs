@@ -31,7 +31,7 @@ use super::{
 
 /// Hub 托管 Hermes 容器规格版本。只要 env、挂载、工作目录或安全策略有变化，
 /// 就提升这个值，确保已存在的旧容器会被重建并拿到新行为。
-const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-06-02-public-sandbox-split";
+const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-06-02-unrestricted-media-any-file";
 const MANAGED_CONTAINER_SPEC_LABEL: &str = "hermes_hub_spec_version";
 const HUB_INBOX_PATH: &str = "/internal/channel/v1/inbox";
 const HUB_INBOX_TIMEOUT_SECONDS: u16 = 25;
@@ -39,8 +39,7 @@ const HUB_INBOX_LIMIT: u16 = 4;
 const HUB_NFS_CONTAINER_DIR: &str = "/nfs";
 const MANAGED_SKILLS_EXTERNAL_DIR: &str = "/nfs/skills";
 const MANAGED_PROFILE_SOUL_FILE: &str = "SOUL.md";
-const HERMES_BASE_MEDIA_ALLOW_DIRS: &str = "/workspace:/config/cache";
-const HERMES_PUBLIC_MEDIA_ALLOW_DIRS: &str = "/workspace:/sandbox:/opt/data:/config/cache";
+const HERMES_MEDIA_ALLOW_DIRS: &str = "/";
 const DOCKER_DAEMON_SOCKET: &str = "/var/run/docker.sock";
 /// Docker 托管 Hermes 的运行配置。
 #[derive(Clone, Debug, PartialEq)]
@@ -591,24 +590,63 @@ impl DockerProvisioner {
         next.llm_api_key = Some(llm_api_key.to_string());
         next.api_token_secret_ref = Some(llm_api_key.to_string());
         self.create_host_directories(&next)?;
-        let config_changed = self.write_managed_config(&next).await?;
 
-        if let Some(inspection) = self.inspect_container(&next.name).await? {
+        let existing_inspection = self.inspect_container(&next.name).await?;
+        let mut runtime_repair_only = false;
+        if let Some(inspection) = existing_inspection.as_ref() {
+            let config_changed = self.managed_config_changed(&next)?;
+            let runtime_state_needs_repair = self.managed_runtime_state_needs_repair(&next)?;
+            let current_container_usable = inspection.running
+                && inspection.health_status.as_deref() != Some("unhealthy")
+                && inspection.spec_version.as_deref() == Some(MANAGED_CONTAINER_SPEC_VERSION);
             if inspection.running
                 && inspection.health_status.as_deref() != Some("unhealthy")
                 && !config_changed
+                && !runtime_state_needs_repair
                 && inspection.spec_version.as_deref() == Some(MANAGED_CONTAINER_SPEC_VERSION)
             {
                 apply_inspection_status(&mut next, &inspection);
                 self.remember(next.clone())?;
                 return Ok(next);
             }
+            runtime_repair_only =
+                current_container_usable && !config_changed && runtime_state_needs_repair;
+        }
 
+        let was_running = existing_inspection
+            .as_ref()
+            .map(|inspection| inspection.running)
+            .unwrap_or(false);
+        if was_running {
+            self.run_required(vec!["stop".to_string(), next.name.clone()])
+                .await?;
+        }
+        let write_result = self.write_managed_config(&next).await;
+        if write_result.is_err() {
+            if was_running {
+                let _ = self
+                    .run_required(vec!["start".to_string(), next.name.clone()])
+                    .await;
+            }
+            return write_result.map(|_| next);
+        }
+        if runtime_repair_only {
+            if was_running {
+                self.run_required(vec!["start".to_string(), next.name.clone()])
+                    .await?;
+            }
+            if let Some(inspection) = existing_inspection.as_ref() {
+                apply_inspection_status(&mut next, inspection);
+            }
+            next.health_status = "starting".to_string();
+            self.remember(next.clone())?;
+            return Ok(next);
+        }
+        if existing_inspection.is_some() {
             // 旧版本可能创建了交互式 CLI、只读 /config 或发布宿主机端口的容器；
             // 模型配置变化时也需要重建，保证 gateway 读取 Hub 管理的 config.yaml。
             self.remove_container_if_exists(&next.name).await?;
         }
-
         let container_id = self.create_container(&next).await?;
         self.run_required(vec!["start".to_string(), next.name.clone()])
             .await?;
@@ -665,8 +703,35 @@ impl DockerProvisioner {
         next.llm_api_key = Some(llm_api_key.to_string());
         next.api_token_secret_ref = Some(llm_api_key.to_string());
         provisioner.create_host_directories(&next)?;
-        // 只刷新 Hub 管理的配置文件，不重建 Docker 容器；gateway 由 adapter 控制项重启。
-        provisioner.write_managed_config(&next).await
+        let config_changed = provisioner.managed_config_changed(&next)?;
+        let runtime_state_needs_repair = provisioner.managed_runtime_state_needs_repair(&next)?;
+        if !config_changed && !runtime_state_needs_repair {
+            return Ok(false);
+        }
+        // 只刷新 Hub 管理的配置文件，不重建 Docker 容器；写入期间先停 gateway，
+        // 避免运行中的容器进程并发替换 /config 下的路径。
+        let was_running = provisioner
+            .inspect_container(&next.name)
+            .await?
+            .map(|inspection| inspection.running)
+            .unwrap_or(false);
+        if was_running {
+            provisioner
+                .run_required(vec!["stop".to_string(), next.name.clone()])
+                .await?;
+        }
+        let write_result = provisioner.write_managed_config(&next).await;
+        if was_running {
+            let start_result = provisioner
+                .run_required(vec!["start".to_string(), next.name.clone()])
+                .await;
+            if write_result.is_ok() {
+                start_result?;
+            } else {
+                let _ = start_result;
+            }
+        }
+        write_result.map(|_| false)
     }
 
     pub async fn refresh_instance_status(
@@ -983,11 +1048,71 @@ impl DockerProvisioner {
         &self,
         instance: &HermesInstance,
     ) -> Result<bool, ProvisionerError> {
-        let config_path = instance
-            .host_config_path
-            .as_ref()
-            .ok_or(ProvisionerError::InvalidManagedInstance)?;
-        let config_path = PathBuf::from(config_path);
+        let config_path = managed_config_path(instance)?;
+        let content = self.render_managed_config(instance)?;
+        prepare_hermes_hub_pairing_paths(&config_path)?;
+        let config_file = config_path.join("config.yaml");
+        remove_symlink_if_exists(&config_file)?;
+        let mut changed = write_file_if_changed(&config_file, &content)?;
+        if let Some(object_storage) = &self.object_storage {
+            object_storage
+                .put(
+                    &user_config_object_key(&instance.user_id),
+                    Bytes::from(content.clone()),
+                )
+                .await
+                .map_err(|error| ProvisionerError::ObjectStorage(error.to_string()))?;
+        }
+        // Hub adapter 现在随 wrapper 镜像作为 bundled platform plugin 提供；
+        // 清理旧版写入 /config 的用户插件，避免它覆盖 /opt/hermes/plugins 下的新实现。
+        changed |= remove_path_if_exists(&config_path.join("plugins/platforms/hermes_hub"))?;
+        // pairing 是 Hermes gateway 的运行态授权数据，不属于容器规格。
+        // 写入失败必须阻断编排；写入成功不需要为了状态文件变化而重建正在运行的容器。
+        ensure_hermes_hub_pairing(&config_path, &instance.user_id)?;
+        Ok(changed)
+    }
+
+    fn managed_config_changed(&self, instance: &HermesInstance) -> Result<bool, ProvisionerError> {
+        let config_path = managed_config_path(instance)?;
+        let config_file = config_path.join("config.yaml");
+        if std::fs::symlink_metadata(&config_file)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Ok(true);
+        }
+        let content = self.render_managed_config(instance)?;
+        Ok(std::fs::read_to_string(&config_file).ok().as_deref() != Some(content.as_str()))
+    }
+
+    fn managed_runtime_state_needs_repair(
+        &self,
+        instance: &HermesInstance,
+    ) -> Result<bool, ProvisionerError> {
+        let config_path = managed_config_path(instance)?;
+        if std::fs::symlink_metadata(config_path.join("plugins/platforms/hermes_hub")).is_ok() {
+            return Ok(true);
+        }
+        for pairing_dir in [
+            config_path.join("pairing"),
+            config_path.join("platforms/pairing"),
+        ] {
+            if pairing_directory_needs_repair(&config_path, &pairing_dir)? {
+                return Ok(true);
+            }
+            let approved_path = pairing_dir.join("hermes_hub-approved.json");
+            if pairing_approved_file_needs_repair(&approved_path, &instance.user_id)? {
+                return Ok(true);
+            }
+            let pending_path = pairing_dir.join("hermes_hub-pending.json");
+            if pairing_pending_file_needs_repair(&pending_path, &instance.user_id)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn render_managed_config(&self, instance: &HermesInstance) -> Result<String, ProvisionerError> {
         let model = yaml_string(&self.config.default_model)?;
         let image_gen_section = if self.config.image_model_enabled {
             let image_model = yaml_string(&self.config.image_model)?;
@@ -1020,7 +1145,7 @@ impl DockerProvisioner {
             })
             .transpose()?
             .unwrap_or_default();
-        let content = format!(
+        Ok(format!(
             "# Managed by Hermes Hub. Do not edit model settings inside this container.\n\
              {managed_skills_section}\
              memory:\n\
@@ -1079,25 +1204,7 @@ impl DockerProvisioner {
             max_output_tokens = self.config.max_output_tokens,
             temperature = self.config.temperature,
             parallel_tool_calls = self.config.supports_parallel_tools,
-        );
-        let config_file = config_path.join("config.yaml");
-        let mut changed = write_file_if_changed(&config_file, &content)?;
-        if let Some(object_storage) = &self.object_storage {
-            object_storage
-                .put(
-                    &user_config_object_key(&instance.user_id),
-                    Bytes::from(content.clone()),
-                )
-                .await
-                .map_err(|error| ProvisionerError::ObjectStorage(error.to_string()))?;
-        }
-        // Hub adapter 现在随 wrapper 镜像作为 bundled platform plugin 提供；
-        // 清理旧版写入 /config 的用户插件，避免它覆盖 /opt/hermes/plugins 下的新实现。
-        changed |= remove_path_if_exists(&config_path.join("plugins/platforms/hermes_hub"))?;
-        // pairing 是 Hermes gateway 的运行态授权数据，不属于容器规格。
-        // 写入失败必须阻断编排；写入成功不需要为了状态文件变化而重建正在运行的容器。
-        ensure_hermes_hub_pairing(&config_path, &instance.user_id)?;
-        Ok(changed)
+        ))
     }
 }
 
@@ -1111,21 +1218,14 @@ fn user_config_object_key(user_id: &str) -> String {
 }
 
 fn media_allow_dirs_for_instance(instance: &HermesInstance) -> &'static str {
-    if instance.host_sandbox_path.is_some() {
-        HERMES_PUBLIC_MEDIA_ALLOW_DIRS
-    } else {
-        HERMES_BASE_MEDIA_ALLOW_DIRS
-    }
+    let _ = instance;
+    // Hermes 已经能读取容器内文件；这里保持附件发送能力与读文件能力一致。
+    HERMES_MEDIA_ALLOW_DIRS
 }
 
 fn media_allow_dirs_yaml_section(instance: &HermesInstance) -> Result<String, ProvisionerError> {
-    let mut dirs = vec!["/workspace"];
-    if instance.host_sandbox_path.is_some() {
-        // 公共平台临时会话的 sandbox 允许 Hermes 把产物回传给 Hub；普通用户不暴露这组路径。
-        dirs.push("/sandbox");
-        dirs.push("/opt/data");
-    }
-    dirs.push("/config/cache");
+    let _ = instance;
+    let dirs = [HERMES_MEDIA_ALLOW_DIRS];
 
     let mut section = "  media_delivery_allow_dirs:\n".to_string();
     for dir in dirs {
@@ -1340,8 +1440,27 @@ impl HermesProvisioner for DockerProvisioner {
         next.llm_api_key = Some(llm_api_key.to_string());
         next.api_token_secret_ref = Some(llm_api_key.to_string());
         self.create_host_directories(&next)?;
-        self.write_managed_config(&next).await?;
-        self.remove_container_if_exists(&next.name).await?;
+        let existing_inspection = self.inspect_container(&next.name).await?;
+        let was_running = existing_inspection
+            .as_ref()
+            .map(|inspection| inspection.running)
+            .unwrap_or(false);
+        if was_running {
+            self.run_required(vec!["stop".to_string(), next.name.clone()])
+                .await?;
+        }
+        let write_result = self.write_managed_config(&next).await;
+        if write_result.is_err() {
+            if was_running {
+                let _ = self
+                    .run_required(vec!["start".to_string(), next.name.clone()])
+                    .await;
+            }
+            return write_result.map(|_| next);
+        }
+        if existing_inspection.is_some() {
+            self.remove_container_if_exists(&next.name).await?;
+        }
         let container_id = self.create_container(&next).await?;
         self.run_required(vec!["start".to_string(), next.name.clone()])
             .await?;
@@ -1477,6 +1596,25 @@ fn write_file_if_changed(path: &Path, content: &str) -> Result<bool, Provisioner
     Ok(true)
 }
 
+fn managed_config_path(instance: &HermesInstance) -> Result<PathBuf, ProvisionerError> {
+    instance
+        .host_config_path
+        .as_ref()
+        .map(PathBuf::from)
+        .ok_or(ProvisionerError::InvalidManagedInstance)
+}
+
+fn remove_symlink_if_exists(path: &Path) -> Result<bool, ProvisionerError> {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return Ok(false);
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    std::fs::remove_file(path).map_err(|error| ProvisionerError::Filesystem(error.to_string()))?;
+    Ok(true)
+}
+
 fn remove_path_if_exists(path: &Path) -> Result<bool, ProvisionerError> {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return Ok(false);
@@ -1504,14 +1642,29 @@ fn ensure_hermes_hub_pairing(config_path: &Path, user_id: &str) -> Result<(), Pr
         config_path.join("pairing"),
         config_path.join("platforms/pairing"),
     ] {
-        ensure_approved_pairing(
-            &pairing_dir.join("hermes_hub-approved.json"),
-            user_id,
-            approved_at,
-        )?;
-        clear_pending_pairing_for_user(&pairing_dir.join("hermes_hub-pending.json"), user_id)?;
+        let approved_path = pairing_dir.join("hermes_hub-approved.json");
+        let pending_path = pairing_dir.join("hermes_hub-pending.json");
+        ensure_pairing_directory_tree(config_path, &pairing_dir)?;
+        ensure_pairing_file_path(&approved_path)?;
+        ensure_pairing_file_path(&pending_path)?;
+        ensure_approved_pairing(&approved_path, user_id, approved_at)?;
+        ensure_pairing_permissions_for_container(config_path, &pairing_dir, &approved_path)?;
+        clear_pending_pairing_for_user(&pending_path, user_id)?;
+        set_pairing_file_mode_for_container(&pending_path)?;
     }
 
+    Ok(())
+}
+
+fn prepare_hermes_hub_pairing_paths(config_path: &Path) -> Result<(), ProvisionerError> {
+    for pairing_dir in [
+        config_path.join("pairing"),
+        config_path.join("platforms/pairing"),
+    ] {
+        ensure_pairing_directory_tree(config_path, &pairing_dir)?;
+        ensure_pairing_file_path(&pairing_dir.join("hermes_hub-approved.json"))?;
+        ensure_pairing_file_path(&pairing_dir.join("hermes_hub-pending.json"))?;
+    }
     Ok(())
 }
 
@@ -1580,6 +1733,210 @@ fn write_json_object_if_changed(
     let content = serde_json::to_string_pretty(object)
         .map_err(|error| ProvisionerError::Filesystem(error.to_string()))?;
     write_file_if_changed(path, &content)
+}
+
+#[cfg(unix)]
+fn set_pairing_directory_mode_for_container(path: &Path) -> Result<(), ProvisionerError> {
+    // pairing 相关目录由 Hub 在宿主机上创建；即便 approved JSON 是 0644，
+    // 任意一层父目录如果保持 root:root 0700，Hermes gateway 进程也无法进入读取。
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| ProvisionerError::Filesystem(error.to_string()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ProvisionerError::Filesystem(format!(
+            "pairing path is not a real directory: {}",
+            path.display()
+        )));
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .map_err(|error| ProvisionerError::Filesystem(error.to_string()))
+}
+
+#[cfg(not(unix))]
+fn set_pairing_directory_mode_for_container(_path: &Path) -> Result<(), ProvisionerError> {
+    Ok(())
+}
+
+fn ensure_pairing_permissions_for_container(
+    config_path: &Path,
+    pairing_dir: &Path,
+    approved_path: &Path,
+) -> Result<(), ProvisionerError> {
+    ensure_path_within_config(config_path, pairing_dir)?;
+    if let Some(parent) = pairing_dir.parent() {
+        if parent != config_path {
+            ensure_path_within_config(config_path, parent)?;
+            set_pairing_directory_mode_for_container(parent)?;
+        }
+    }
+    ensure_path_within_config(config_path, approved_path)?;
+    set_pairing_directory_mode_for_container(pairing_dir)?;
+    set_pairing_file_mode_for_container(approved_path)
+}
+
+fn ensure_pairing_directory_tree(
+    config_path: &Path,
+    pairing_dir: &Path,
+) -> Result<(), ProvisionerError> {
+    ensure_real_directory(config_path)?;
+    if let Some(parent) = pairing_dir.parent() {
+        if parent != config_path {
+            ensure_real_directory(parent)?;
+            ensure_path_within_config(config_path, parent)?;
+        }
+    }
+    ensure_real_directory(pairing_dir)?;
+    ensure_path_within_config(config_path, pairing_dir)
+}
+
+fn ensure_real_directory(path: &Path) -> Result<(), ProvisionerError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(ProvisionerError::Filesystem(format!(
+                "pairing path is not a real directory: {}",
+                path.display()
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path)
+                .map_err(|error| ProvisionerError::Filesystem(error.to_string()))?;
+            ensure_real_directory(path)
+        }
+        Err(error) => Err(ProvisionerError::Filesystem(error.to_string())),
+    }
+}
+
+fn ensure_pairing_file_path(path: &Path) -> Result<(), ProvisionerError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err(ProvisionerError::Filesystem(format!(
+                "pairing path is not a real file: {}",
+                path.display()
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ProvisionerError::Filesystem(error.to_string())),
+    }
+}
+
+fn ensure_path_within_config(config_path: &Path, path: &Path) -> Result<(), ProvisionerError> {
+    let config_root = std::fs::canonicalize(config_path)
+        .map_err(|error| ProvisionerError::Filesystem(error.to_string()))?;
+    let resolved = std::fs::canonicalize(path)
+        .map_err(|error| ProvisionerError::Filesystem(error.to_string()))?;
+    if !resolved.starts_with(&config_root) {
+        return Err(ProvisionerError::Filesystem(format!(
+            "pairing path escapes config directory: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn pairing_directory_needs_repair(
+    config_path: &Path,
+    pairing_dir: &Path,
+) -> Result<bool, ProvisionerError> {
+    let Some(parent) = pairing_dir.parent() else {
+        return Ok(true);
+    };
+    if parent != config_path && real_directory_needs_repair(config_path, parent, 0o755)? {
+        return Ok(true);
+    }
+    real_directory_needs_repair(config_path, pairing_dir, 0o755)
+}
+
+fn real_directory_needs_repair(
+    config_path: &Path,
+    path: &Path,
+    expected_mode: u32,
+) -> Result<bool, ProvisionerError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(ProvisionerError::Filesystem(error.to_string())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(true);
+    }
+    ensure_path_within_config(config_path, path)?;
+    Ok(unix_mode_needs_repair(&metadata, expected_mode))
+}
+
+fn pairing_approved_file_needs_repair(
+    path: &Path,
+    user_id: &str,
+) -> Result<bool, ProvisionerError> {
+    if real_file_needs_repair(path, 0o644)? {
+        return Ok(true);
+    }
+    let approved = read_json_object(path)?;
+    Ok(!approved.contains_key(user_id))
+}
+
+fn pairing_pending_file_needs_repair(path: &Path, user_id: &str) -> Result<bool, ProvisionerError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(ProvisionerError::Filesystem(error.to_string())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(true);
+    }
+    if unix_mode_needs_repair(&metadata, 0o644) {
+        return Ok(true);
+    }
+    let pending = read_json_object(path)?;
+    Ok(pending
+        .values()
+        .any(|entry| entry.get("user_id").and_then(Value::as_str) == Some(user_id)))
+}
+
+fn real_file_needs_repair(path: &Path, expected_mode: u32) -> Result<bool, ProvisionerError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(ProvisionerError::Filesystem(error.to_string())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(true);
+    }
+    Ok(unix_mode_needs_repair(&metadata, expected_mode))
+}
+
+#[cfg(unix)]
+fn unix_mode_needs_repair(metadata: &std::fs::Metadata, expected_mode: u32) -> bool {
+    metadata.permissions().mode() & 0o777 != expected_mode
+}
+
+#[cfg(not(unix))]
+fn unix_mode_needs_repair(_metadata: &std::fs::Metadata, _expected_mode: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn set_pairing_file_mode_for_container(path: &Path) -> Result<(), ProvisionerError> {
+    // approved/pending 文件可能来自旧版 Hermes 或 Hub，不能假设已有权限可被
+    // gateway 用户读取；这里只放开读取，不授予额外写权限。
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(ProvisionerError::Filesystem(error.to_string())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ProvisionerError::Filesystem(format!(
+            "pairing path is not a real file: {}",
+            path.display()
+        )));
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+        .map_err(|error| ProvisionerError::Filesystem(error.to_string()))
+}
+
+#[cfg(not(unix))]
+fn set_pairing_file_mode_for_container(_path: &Path) -> Result<(), ProvisionerError> {
+    Ok(())
 }
 
 #[cfg(unix)]

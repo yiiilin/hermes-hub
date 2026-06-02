@@ -1,15 +1,15 @@
 use hermes_hub_backend::hermes::{
     docker_provisioner::{
         ContainerMount, DockerProvisioner, DockerProvisionerConfig, DockerRuntime,
-        DockerRuntimeOutput, ManagedProfileConfig, ManagedSkillsMountConfig,
+        DockerRuntimeOutput, ManagedProfileConfig, ManagedSkillsMountConfig, RuntimeModelSettings,
     },
     instance::{HermesInstanceKind, HermesInstanceStatus},
     provisioner::HermesProvisioner,
 };
 use hermes_hub_backend::storage::{HubObjectStorage, InMemoryObjectStorage};
 use std::{
-    os::unix::fs::PermissionsExt,
-    path::PathBuf,
+    os::unix::fs::{symlink, PermissionsExt},
+    path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
 };
@@ -25,6 +25,14 @@ struct FakeDockerRuntime {
     health_output: Arc<Mutex<Option<String>>>,
     spec_version: Arc<Mutex<Option<String>>>,
     image: Arc<Mutex<Option<String>>>,
+}
+
+fn filesystem_mode(path: &Path) -> u32 {
+    std::fs::metadata(path)
+        .expect("filesystem metadata is readable")
+        .permissions()
+        .mode()
+        & 0o777
 }
 
 #[async_trait::async_trait]
@@ -633,7 +641,26 @@ async fn docker_provisioner_pre_approves_hermes_hub_pairing_for_managed_users() 
             user_entry["approved_at"].as_f64().unwrap_or_default() > 0.0,
             "Hermes pairing store expects an approval timestamp"
         );
+        assert_eq!(
+            filesystem_mode(
+                approved_path
+                    .parent()
+                    .expect("approved pairing file has a parent directory"),
+            ),
+            0o755,
+            "Hermes gateway must be able to traverse the pre-approved pairing directory"
+        );
+        assert_eq!(
+            filesystem_mode(&approved_path),
+            0o644,
+            "Hermes gateway must be able to read the pre-approved pairing file"
+        );
     }
+    assert_eq!(
+        filesystem_mode(&config_path.join("platforms")),
+        0o755,
+        "Hermes gateway must be able to traverse the platforms parent directory"
+    );
 }
 
 #[tokio::test]
@@ -649,53 +676,109 @@ async fn docker_provisioner_preserves_approved_pairing_and_clears_stale_pending_
             .expect("managed config path is set"),
     );
     let pairing_dir = config_path.join("pairing");
+    let platforms_dir = config_path.join("platforms");
+    let platform_pairing_dir = platforms_dir.join("pairing");
     std::fs::create_dir_all(&pairing_dir).expect("pairing directory can be created");
-    let approved_path = pairing_dir.join("hermes_hub-approved.json");
-    let pending_path = pairing_dir.join("hermes_hub-pending.json");
+    std::fs::create_dir_all(&platform_pairing_dir)
+        .expect("platform pairing directory can be created");
+    std::fs::set_permissions(&pairing_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("fixture can simulate a root-only pairing directory");
+    std::fs::set_permissions(&platforms_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("fixture can simulate a root-only platforms parent directory");
+    std::fs::set_permissions(
+        &platform_pairing_dir,
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("fixture can simulate a root-only platform pairing directory");
+    let approved_paths = [
+        pairing_dir.join("hermes_hub-approved.json"),
+        platform_pairing_dir.join("hermes_hub-approved.json"),
+    ];
+    let pending_paths = [
+        pairing_dir.join("hermes_hub-pending.json"),
+        platform_pairing_dir.join("hermes_hub-pending.json"),
+    ];
 
     // Hermes 自己的 pairing store 以 platform 分文件保存状态。Hub 重写托管配置时
     // 不能刷新既有 approved_at，否则升级/重建容器会造成无意义状态漂移。
-    std::fs::write(
-        &approved_path,
-        format!(
-            r#"{{
-                "{user_id}": {{"user_name": "Existing Hub user", "approved_at": 12345.0}},
-                "other-user": {{"user_name": "Other", "approved_at": 67890.0}}
-            }}"#
-        ),
-    )
-    .expect("approved pairing fixture can be written");
-    std::fs::write(
-        &pending_path,
-        format!(
-            r#"{{
-                "STALE": {{"user_id": "{user_id}", "user_name": "Hub user", "created_at": 1.0}},
-                "KEEP": {{"user_id": "other-user", "user_name": "Other", "created_at": 2.0}}
-            }}"#
-        ),
-    )
-    .expect("pending pairing fixture can be written");
+    for approved_path in &approved_paths {
+        std::fs::write(
+            approved_path,
+            format!(
+                r#"{{
+                    "{user_id}": {{"user_name": "Existing Hub user", "approved_at": 12345.0}},
+                    "other-user": {{"user_name": "Other", "approved_at": 67890.0}}
+                }}"#
+            ),
+        )
+        .expect("approved pairing fixture can be written");
+        std::fs::set_permissions(approved_path, std::fs::Permissions::from_mode(0o600))
+            .expect("fixture can simulate a private approved pairing file");
+    }
+    for pending_path in &pending_paths {
+        std::fs::write(
+            pending_path,
+            format!(
+                r#"{{
+                    "STALE": {{"user_id": "{user_id}", "user_name": "Hub user", "created_at": 1.0}},
+                    "KEEP": {{"user_id": "other-user", "user_name": "Other", "created_at": 2.0}}
+                }}"#
+            ),
+        )
+        .expect("pending pairing fixture can be written");
+        std::fs::set_permissions(pending_path, std::fs::Permissions::from_mode(0o600))
+            .expect("fixture can simulate a private pending pairing file");
+    }
 
     provisioner
         .ensure_instance(&user_id, "instance-token")
         .await
         .expect("instance can be created");
 
-    let approved: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&approved_path).expect("approved exists"))
-            .expect("approved pairing is valid json");
-    assert_eq!(approved[&user_id]["user_name"], "Existing Hub user");
-    assert_eq!(approved[&user_id]["approved_at"], 12345.0);
-    assert_eq!(approved["other-user"]["approved_at"], 67890.0);
-
-    let pending: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&pending_path).expect("pending exists"))
-            .expect("pending pairing is valid json");
-    assert!(
-        pending.get("STALE").is_none(),
-        "stale pending code for the already approved Hub user must be removed"
+    for approved_path in &approved_paths {
+        let approved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(approved_path).expect("approved exists"))
+                .expect("approved pairing is valid json");
+        assert_eq!(approved[&user_id]["user_name"], "Existing Hub user");
+        assert_eq!(approved[&user_id]["approved_at"], 12345.0);
+        assert_eq!(approved["other-user"]["approved_at"], 67890.0);
+        assert_eq!(
+            filesystem_mode(approved_path),
+            0o644,
+            "existing approved pairing files must be readable without rewriting approvals"
+        );
+    }
+    assert_eq!(
+        filesystem_mode(&pairing_dir),
+        0o755,
+        "existing pairing directories must be made traversable without rewriting approvals"
     );
-    assert_eq!(pending["KEEP"]["user_id"], "other-user");
+    assert_eq!(
+        filesystem_mode(&platforms_dir),
+        0o755,
+        "existing platforms parent directory must be made traversable"
+    );
+    assert_eq!(
+        filesystem_mode(&platform_pairing_dir),
+        0o755,
+        "existing platform pairing directories must be made traversable"
+    );
+
+    for pending_path in &pending_paths {
+        let pending: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(pending_path).expect("pending exists"))
+                .expect("pending pairing is valid json");
+        assert!(
+            pending.get("STALE").is_none(),
+            "stale pending code for the already approved Hub user must be removed"
+        );
+        assert_eq!(pending["KEEP"]["user_id"], "other-user");
+        assert_eq!(
+            filesystem_mode(pending_path),
+            0o644,
+            "remaining pending pairing files must be readable by the gateway user"
+        );
+    }
 }
 
 #[tokio::test]
@@ -958,6 +1041,214 @@ async fn docker_provisioner_refreshes_status_from_docker_health() {
 }
 
 #[tokio::test]
+async fn docker_provisioner_rejects_symlinked_pairing_files() {
+    let runtime = FakeDockerRuntime::default();
+    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime));
+    let user_id = format!("user-pairing-symlink-{}", Uuid::new_v4());
+    let prepared = provisioner.prepare_instance(&user_id);
+    let config_path = PathBuf::from(
+        prepared
+            .host_config_path
+            .as_ref()
+            .expect("managed config path is set"),
+    );
+    let pairing_dir = config_path.join("pairing");
+    std::fs::create_dir_all(&pairing_dir).expect("pairing directory can be created");
+    let outside_path = config_path
+        .parent()
+        .expect("config path has a parent")
+        .join("outside-approved.json");
+    std::fs::write(&outside_path, "{}").expect("outside pairing target can be written");
+    std::fs::set_permissions(&outside_path, std::fs::Permissions::from_mode(0o600))
+        .expect("outside target can simulate a private file");
+    let approved_symlink = pairing_dir.join("hermes_hub-approved.json");
+    symlink(&outside_path, &approved_symlink).expect("fixture can create a pairing symlink");
+
+    let result = provisioner
+        .ensure_instance(&user_id, "instance-token")
+        .await;
+
+    assert!(
+        result.is_err(),
+        "managed pairing repair must reject symlinked approved files"
+    );
+    assert!(
+        std::fs::symlink_metadata(&approved_symlink)
+            .expect("approved symlink still exists")
+            .file_type()
+            .is_symlink(),
+        "the symlink fixture must not be followed and replaced"
+    );
+    assert_eq!(
+        filesystem_mode(&outside_path),
+        0o600,
+        "pairing chmod must not follow symlinks to external files"
+    );
+}
+
+#[tokio::test]
+async fn docker_provisioner_restores_running_container_when_config_write_fails() {
+    let runtime = FakeDockerRuntime::default();
+    *runtime.container_exists.lock().expect("exists lock") = true;
+    *runtime.container_running.lock().expect("running lock") = true;
+    *runtime.health_status.lock().expect("health lock") = Some("healthy".to_string());
+    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime.clone()));
+    let user_id = format!("user-pairing-restore-{}", Uuid::new_v4());
+    let prepared = provisioner.prepare_instance(&user_id);
+    let config_path = PathBuf::from(
+        prepared
+            .host_config_path
+            .as_ref()
+            .expect("managed config path is set"),
+    );
+    let pairing_dir = config_path.join("pairing");
+    std::fs::create_dir_all(&pairing_dir).expect("pairing directory can be created");
+    let outside_path = config_path
+        .parent()
+        .expect("config path has a parent")
+        .join("outside-approved-restore.json");
+    std::fs::write(&outside_path, "{}").expect("outside pairing target can be written");
+    let approved_symlink = pairing_dir.join("hermes_hub-approved.json");
+    symlink(&outside_path, &approved_symlink).expect("fixture can create a pairing symlink");
+
+    let result = provisioner
+        .ensure_instance(&user_id, "instance-token")
+        .await;
+
+    assert!(
+        result.is_err(),
+        "symlinked approved file must still fail managed config write"
+    );
+    let calls = runtime.calls.lock().expect("calls lock");
+    assert!(
+        calls
+            .iter()
+            .any(|args| args.get(0).map(String::as_str) == Some("stop")),
+        "running container should be stopped before writing managed config"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|args| args.get(0).map(String::as_str) == Some("start")),
+        "old container should be restarted when config write fails"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|args| args.get(0).map(String::as_str) == Some("rm")),
+        "old container must not be removed before managed config write succeeds"
+    );
+    assert!(
+        *runtime.container_exists.lock().expect("exists lock"),
+        "old container record should still exist after failed config write"
+    );
+    assert!(
+        *runtime.container_running.lock().expect("running lock"),
+        "old container should be running again after failed config write"
+    );
+}
+
+#[tokio::test]
+async fn docker_provisioner_repairs_pairing_state_even_when_config_is_unchanged() {
+    let runtime = FakeDockerRuntime::default();
+    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime.clone()));
+    let user_id = format!("user-pairing-repair-{}", Uuid::new_v4());
+    let instance = provisioner
+        .ensure_instance(&user_id, "instance-token")
+        .await
+        .expect("initial instance can be created");
+    let config_path = PathBuf::from(
+        instance
+            .host_config_path
+            .as_ref()
+            .expect("managed config path is set"),
+    );
+    let approved_path = config_path.join("pairing/hermes_hub-approved.json");
+    std::fs::remove_file(&approved_path).expect("fixture can remove approved pairing");
+    *runtime.container_exists.lock().expect("exists lock") = true;
+    *runtime.container_running.lock().expect("running lock") = true;
+    *runtime.health_status.lock().expect("health lock") = Some("healthy".to_string());
+    *runtime.spec_version.lock().expect("spec lock") =
+        Some("2026-06-02-unrestricted-media-any-file".to_string());
+    runtime.calls.lock().expect("calls lock").clear();
+
+    provisioner
+        .ensure_container(&instance, "instance-token")
+        .await
+        .expect("runtime pairing repair can rebuild the managed container");
+
+    assert!(
+        approved_path.exists(),
+        "missing approved pairing file must be repaired even when config.yaml is unchanged"
+    );
+    let calls = runtime.calls.lock().expect("calls lock");
+    assert!(
+        calls
+            .iter()
+            .any(|args| args.get(0).map(String::as_str) == Some("stop")),
+        "repair should stop the running container before writing /config"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|args| args.get(0).map(String::as_str) == Some("start")),
+        "repair should restart the same container after repairing managed config state"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|args| args.get(0).map(String::as_str) == Some("rm")),
+        "runtime-only pairing repair should not recreate an otherwise healthy current container"
+    );
+}
+
+#[tokio::test]
+async fn docker_provisioner_skips_noop_model_config_refresh_without_bouncing_container() {
+    let runtime = FakeDockerRuntime::default();
+    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime.clone()));
+    let instance = provisioner
+        .ensure_instance("user-noop-config-refresh", "instance-token")
+        .await
+        .expect("initial instance can be created");
+    runtime.calls.lock().expect("calls lock").clear();
+
+    let changed = provisioner
+        .write_config_with_default_model(
+            &instance,
+            "instance-token",
+            &RuntimeModelSettings {
+                default_model: "gpt-4.1-mini".to_string(),
+                api_mode: "chat_completions".to_string(),
+                context_window_tokens: 128_000,
+                max_output_tokens: 4096,
+                temperature: 0.7,
+                supports_parallel_tools: true,
+            },
+            Some("gpt-image-2-medium"),
+        )
+        .await
+        .expect("noop model config refresh can be checked");
+
+    assert!(
+        !changed,
+        "noop config refresh should not request a gateway restart"
+    );
+    let calls = runtime.calls.lock().expect("calls lock");
+    assert!(
+        !calls
+            .iter()
+            .any(|args| args.get(0).map(String::as_str) == Some("stop")),
+        "noop config refresh must not stop the running container"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|args| args.get(0).map(String::as_str) == Some("start")),
+        "noop config refresh must not start the running container"
+    );
+}
+
+#[tokio::test]
 async fn docker_provisioner_mounts_sandbox_only_for_public_platform_instances() {
     let runtime = FakeDockerRuntime::default();
     let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime));
@@ -975,9 +1266,10 @@ async fn docker_provisioner_mounts_sandbox_only_for_public_platform_instances() 
         created.host_sandbox_path.as_deref(),
         Some("/tmp/hermes-hub-test/users/public-platform-user/sandbox")
     );
-    assert!(spec.env.iter().any(
-        |entry| entry == "HERMES_MEDIA_ALLOW_DIRS=/workspace:/sandbox:/opt/data:/config/cache"
-    ));
+    assert!(spec
+        .env
+        .iter()
+        .any(|entry| entry == "HERMES_MEDIA_ALLOW_DIRS=/"));
     assert!(spec.mounts.iter().any(|mount| matches!(
         mount,
         ContainerMount::Bind(bind)
@@ -997,10 +1289,7 @@ async fn docker_provisioner_mounts_sandbox_only_for_public_platform_instances() 
         "/tmp/hermes-hub-test/users/public-platform-user/config/config.yaml",
     )
     .expect("managed Hermes config is written");
-    assert!(managed_config.contains("- \"/workspace\""));
-    assert!(managed_config.contains("- \"/sandbox\""));
-    assert!(managed_config.contains("- \"/opt/data\""));
-    assert!(managed_config.contains("- \"/config/cache\""));
+    assert!(managed_config.contains("- \"/\""));
 }
 
 #[tokio::test]
@@ -1129,9 +1418,9 @@ async fn docker_provisioner_test() {
     assert!(spec
         .env
         .iter()
-        .any(|entry| entry == "HERMES_MEDIA_ALLOW_DIRS=/workspace:/config/cache"));
+        .any(|entry| entry == "HERMES_MEDIA_ALLOW_DIRS=/"));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version" && value == "2026-06-02-public-sandbox-split"
+        key == "hermes_hub_spec_version" && value == "2026-06-02-unrestricted-media-any-file"
     }));
     assert!(spec
         .mounts
@@ -1175,10 +1464,9 @@ async fn docker_provisioner_test() {
     assert!(managed_config.contains("auto_extract: false"));
     assert!(managed_config.contains("gateway:"));
     assert!(managed_config.contains("media_delivery_allow_dirs:"));
-    assert!(managed_config.contains("- \"/workspace\""));
+    assert!(managed_config.contains("- \"/\""));
     assert!(!managed_config.contains("- \"/sandbox\""));
     assert!(!managed_config.contains("- \"/opt/data\""));
-    assert!(managed_config.contains("- \"/config/cache\""));
     assert!(managed_config.contains("platforms:"));
     assert!(managed_config.contains("hermes_hub:"));
     assert!(managed_config.contains("enabled: true"));
@@ -1300,6 +1588,7 @@ async fn docker_provisioner_test() {
     assert!(plugin_adapter.contains("cache_image_from_url(raw_url, ext=image_ext)"));
     assert!(plugin_adapter.contains("detected_ext = self._image_extension_from_file(cached_path)"));
     assert!(plugin_adapter.contains("os.replace(cached_path, renamed_path)"));
+    assert!(!plugin_adapter.contains("outside allowed media directories"));
     assert!(plugin_adapter.contains("header.startswith(b\"\\x89PNG\\r\\n\\x1a\\n\")"));
     assert!(plugin_adapter.contains("header[8:12] == b\"WEBP\""));
     assert!(plugin_adapter.contains(
@@ -1307,7 +1596,7 @@ async fn docker_provisioner_test() {
     ));
     assert!(plugin_adapter.contains("if explicit_client_message_key and media_sequence is None:"));
     assert!(plugin_adapter.contains("return f\"{key_prefix}:media:{digest}\""));
-    assert!(plugin_adapter.contains("MEDIA:/workspace/report.pdf"));
+    assert!(!plugin_adapter.contains("platform_hint="));
     assert!(!plugin_adapter.contains("attachments=['/workspace/report.pdf']"));
     assert!(!plugin_adapter.contains("send_message_with_attachments"));
     assert!(!plugin_adapter.contains("platform_name == \"origin\""));
@@ -1362,7 +1651,7 @@ async fn docker_provisioner_test() {
     assert!(
         create_call.windows(2).any(|args| {
             args[0] == "--label"
-                && args[1] == "hermes_hub_spec_version=2026-06-02-public-sandbox-split"
+                && args[1] == "hermes_hub_spec_version=2026-06-02-unrestricted-media-any-file"
         }),
         "managed Hermes containers must carry the current spec label"
     );

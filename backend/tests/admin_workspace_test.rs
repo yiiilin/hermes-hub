@@ -151,7 +151,7 @@ async fn app_with_recording_docker_runtime() -> (Router, RecordingDockerRuntime)
 }
 
 #[tokio::test]
-async fn admin_model_config_update_refreshes_managed_config_and_queues_gateway_restart() {
+async fn admin_model_config_update_refreshes_managed_config_without_gateway_restart_control() {
     let (state, _runtime) = app_state_with_recording_docker_runtime().await;
     let app = build_router_with_state(state.clone());
     let admin_cookie = bootstrap_admin(&app).await;
@@ -249,8 +249,11 @@ async fn admin_model_config_update_refreshes_managed_config_and_queues_gateway_r
     .await;
     let (status, body) = response_json(inbox).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["items"][0]["type"], "control");
-    assert_eq!(body["items"][0]["action"], "restart_gateway");
+    assert_eq!(
+        body["items"].as_array().map(Vec::len),
+        Some(0),
+        "Docker-managed config refresh already restarts the container, so no gateway control restart is queued"
+    );
 }
 
 #[tokio::test]

@@ -34,6 +34,10 @@ from gateway.platforms.base import (
 
 logger = logging.getLogger(__name__)
 
+HUB_MEDIA_DIRECTIVE_RE = re.compile(
+    r"""^\s*[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/).+?)\s*[`"']?\s*$"""
+)
+
 
 class AttachmentFileError(Exception):
     pass
@@ -83,6 +87,16 @@ class HermesHubAdapter(BasePlatformAdapter):
     def name(self) -> str:
         return "Hermes Hub"
 
+    @staticmethod
+    def extract_media(content: str):
+        # Hermes core 的最终回答路径会先调用 self.extract_media；这里补齐任意扩展的 MEDIA 行。
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        media_paths, cleaned = HermesHubAdapter._extract_hub_media_directives(cleaned)
+        if media_paths:
+            has_voice_tag = "[[audio_as_voice]]" in str(content or "")
+            media.extend((path, has_voice_tag) for path in media_paths)
+        return media, cleaned
+
     async def connect(self) -> bool:
         if aiohttp is None:
             self._set_fatal_error("missing_dependency", "aiohttp is required", retryable=False)
@@ -126,6 +140,12 @@ class HermesHubAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         del reply_to
+        media_paths, cleaned_content = self._media_directives_from_content(content)
+        if media_paths:
+            return await self._send_media_directives(
+                chat_id, media_paths, cleaned_content, metadata
+            )
+
         session_id = self._session_id(chat_id, metadata)
         run_id = self._run_id(metadata)
         payload = {
@@ -152,6 +172,54 @@ class HermesHubAdapter(BasePlatformAdapter):
         except Exception as error:
             logger.warning("Hermes Hub send failed: %s", error)
             return SendResult(success=False, error=str(error), retryable=True)
+
+    async def _send_media_directives(
+        self,
+        chat_id: str,
+        media_paths: list[str],
+        caption: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        last_result: SendResult | None = None
+        for index, media_path in enumerate(media_paths):
+            media_metadata = dict(metadata or {})
+            media_metadata["media_sequence"] = index
+            last_result = await self._send_media_output(
+                chat_id,
+                media_path,
+                caption if index == 0 else None,
+                media_metadata,
+                None,
+            )
+            if not last_result.success:
+                return last_result
+        return last_result or SendResult(success=True, message_id="")
+
+    def _media_directives_from_content(self, content: str) -> tuple[list[str], str]:
+        return self._extract_hub_media_directives(content)
+
+    @staticmethod
+    def _extract_hub_media_directives(content: str) -> tuple[list[str], str]:
+        media_paths: list[str] = []
+        text_lines: list[str] = []
+        for line in str(content or "").splitlines():
+            match = HUB_MEDIA_DIRECTIVE_RE.match(line)
+            if not match:
+                text_lines.append(line)
+                continue
+            media_path = HermesHubAdapter._clean_media_directive_path(match.group("path"))
+            if media_path:
+                media_paths.append(media_path)
+        return media_paths, "\n".join(text_lines).strip()
+
+    @staticmethod
+    def _clean_media_directive_path(raw_path: str) -> str:
+        media_path = str(raw_path or "").strip()
+        if len(media_path) >= 2 and media_path[0] == media_path[-1] and media_path[0] in "`\"'":
+            media_path = media_path[1:-1].strip()
+        else:
+            media_path = media_path.lstrip("`\"'").rstrip("`\"',.;:)}]")
+        return os.path.expanduser(media_path)
 
     async def edit_message(
         self,
@@ -756,8 +824,6 @@ class HermesHubAdapter(BasePlatformAdapter):
         resolved = os.path.realpath(str(file_path or "").strip())
         if not resolved:
             raise AttachmentFileError("attachment file not found")
-        if not self._media_path_is_allowed(resolved):
-            raise AttachmentFileError("attachment file is outside allowed media directories")
         flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -766,8 +832,6 @@ class HermesHubAdapter(BasePlatformAdapter):
         try:
             fd = os.open(resolved, flags)
             actual_path = self._opened_media_file_path(fd)
-            if not self._media_path_is_allowed(actual_path):
-                raise AttachmentFileError("attachment file is outside allowed media directories")
             file_stat = os.fstat(fd)
             if not stat_module.S_ISREG(file_stat.st_mode):
                 raise AttachmentFileError("attachment path is not a readable file")
@@ -806,18 +870,9 @@ class HermesHubAdapter(BasePlatformAdapter):
                 os.close(fd)
 
     def _media_path_is_allowed(self, resolved: str) -> bool:
-        allow_dirs = [
-            os.path.realpath(path.strip())
-            for path in os.getenv("HERMES_MEDIA_ALLOW_DIRS", "/workspace:/sandbox:/opt/data:/config/cache").split(":")
-            if path.strip()
-        ]
-        for allow_dir in allow_dirs:
-            try:
-                if os.path.commonpath([resolved, allow_dir]) == allow_dir:
-                    return True
-            except ValueError:
-                continue
-        return False
+        del resolved
+        # Hermes 的文件读取能力已经覆盖容器内路径；附件发送保持同一边界。
+        return True
 
     def _opened_media_file_path(self, fd: int) -> str:
         try:
@@ -1119,11 +1174,4 @@ def register(ctx: Any) -> None:
         emoji="",
         pii_safe=True,
         allow_update_command=True,
-        platform_hint=(
-            "You are running inside Hermes Hub. Replies are persisted to the "
-            "Hub session, and files must be sent as attachments rather than "
-            "by referring to container-local paths. To deliver a generated file "
-            "or image, put MEDIA:/workspace/report.pdf on its own line in the "
-            "final response; Hermes gateway will upload it through this adapter."
-        ),
     )
