@@ -12,6 +12,8 @@ import type {
   ModelFallbackConfig,
   ModelConfigKind,
   PublicPlatformHermesStatus,
+  PublicPlatformSessionPage,
+  PublicPlatformSessionSummary,
   ReasoningEffort,
   SpeechInputConfig,
   SystemSettings,
@@ -61,6 +63,7 @@ type HermesSchedulerTaskRow = {
 const defaultInviteHours = 24;
 const bytesPerMegabyte = 1024 * 1024;
 const hermesIdleStopAfterSeconds = 30 * 60;
+const publicSessionsPageSize = 10;
 const modelConfigOrder: ModelConfigKind[] = ["llm", "title", "image"];
 const apiTypeLabels: Record<ModelApiType, string> = {
   chat_completions: "Chat Completions",
@@ -326,6 +329,15 @@ function formatHermesStopTime(
   });
 }
 
+function publicPlatformSessionLink(session: PublicPlatformSessionSummary): string {
+  const publicPath =
+    session.public_url?.trim() || `/public/sessions/${encodeURIComponent(session.id)}`;
+  if (/^https?:\/\//i.test(publicPath)) {
+    return publicPath;
+  }
+  return `${window.location.origin}${publicPath.startsWith("/") ? publicPath : `/${publicPath}`}`;
+}
+
 function parentPath(path: string): string {
   return path.split("/").slice(0, -1).join("/");
 }
@@ -481,6 +493,17 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
       ready: false,
       hermes_instance: null,
     });
+  const [publicSessionsPage, setPublicSessionsPage] = useState<PublicPlatformSessionPage>({
+    sessions: [],
+    page: 1,
+    page_size: publicSessionsPageSize,
+    total: 0,
+    total_pages: 0,
+  });
+  const [publicSessionsLoading, setPublicSessionsLoading] = useState(false);
+  const [forceClearingPublicSessionId, setForceClearingPublicSessionId] = useState<string | null>(
+    null,
+  );
   const [settingsSaved, setSettingsSaved] = useState(false);
   const [inviteHours, setInviteHours] = useState(defaultInviteHours);
   const [inviteMaxUses, setInviteMaxUses] = useState(1);
@@ -535,6 +558,20 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     { key: "auth", label: t("admin.authSettings") },
   ];
 
+  async function fetchPublicPlatformSessionsPage(page: number) {
+    const nextPage = await apiClient.listPublicPlatformSessions({
+      page,
+      pageSize: publicSessionsPageSize,
+    });
+    if (nextPage.sessions.length === 0 && nextPage.total > 0 && nextPage.page > 1) {
+      return apiClient.listPublicPlatformSessions({
+        page: Math.max(nextPage.total_pages, 1),
+        pageSize: publicSessionsPageSize,
+      });
+    }
+    return nextPage;
+  }
+
   async function refresh() {
     setError(null);
     try {
@@ -548,6 +585,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
         nextHermesProfile,
         nextSpeechInputRuntimeConfig,
         nextPublicPlatformHermesStatus,
+        nextPublicSessionsPage,
       ] = await Promise.all([
         apiClient.listUsers(),
         apiClient.listInvites(),
@@ -563,6 +601,9 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
         activeTab === "system" ? apiClient.speechInputConfig() : Promise.resolve(null),
         activeTab === "public-platform"
           ? apiClient.publicPlatformHermesInstance()
+          : Promise.resolve(null),
+        activeTab === "public-platform"
+          ? fetchPublicPlatformSessionsPage(publicSessionsPage.page)
           : Promise.resolve(null),
       ]);
       setUsers(nextUsers);
@@ -585,6 +626,9 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
       }
       if (nextPublicPlatformHermesStatus) {
         setPublicPlatformHermesStatus(nextPublicPlatformHermesStatus);
+      }
+      if (nextPublicSessionsPage) {
+        setPublicSessionsPage(nextPublicSessionsPage);
       }
       if (activeTab === "skills") {
         await refreshManagedSkills();
@@ -791,7 +835,12 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
         empty_chat_prompt: reloadedSettings.empty_chat_prompt || submittedEmptyChatPrompt,
       });
       if (activeTab === "public-platform") {
-        setPublicPlatformHermesStatus(await apiClient.publicPlatformHermesInstance());
+        const [nextPublicPlatformHermesStatus, nextPublicSessionsPage] = await Promise.all([
+          apiClient.publicPlatformHermesInstance(),
+          fetchPublicPlatformSessionsPage(publicSessionsPage.page),
+        ]);
+        setPublicPlatformHermesStatus(nextPublicPlatformHermesStatus);
+        setPublicSessionsPage(nextPublicSessionsPage);
       }
       setSettingsSaved(true);
     } catch (cause) {
@@ -814,6 +863,36 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
       setError(cause instanceof Error ? cause.message : t("chat.requestFailed"));
     } finally {
       setPublicHermesRebuilding(false);
+    }
+  }
+
+  async function loadPublicPlatformSessions(page: number) {
+    setPublicSessionsLoading(true);
+    setError(null);
+    try {
+      const nextPage = await fetchPublicPlatformSessionsPage(page);
+      setPublicSessionsPage(nextPage);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("chat.workspaceLoadFailed"));
+    } finally {
+      setPublicSessionsLoading(false);
+    }
+  }
+
+  async function forceClearPublicSession(session: PublicPlatformSessionSummary) {
+    setForceClearingPublicSessionId(session.id);
+    setError(null);
+    try {
+      await apiClient.forceClearPublicPlatformSession(session.id);
+      const fallbackPage =
+        publicSessionsPage.page > 1 && publicSessionsPage.sessions.length <= 1
+          ? publicSessionsPage.page - 1
+          : publicSessionsPage.page;
+      await loadPublicPlatformSessions(fallbackPage);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("admin.publicSessionClearFailed"));
+    } finally {
+      setForceClearingPublicSessionId(null);
     }
   }
 
@@ -1956,6 +2035,104 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
                 </dd>
               </div>
             </dl>
+          </div>
+          <div className="public-sessions-panel" aria-label={t("admin.publicSessions")}>
+            <div className="section-heading-row">
+              <strong>{t("admin.publicSessions")}</strong>
+              <button
+                type="button"
+                className="secondary"
+                disabled={publicSessionsLoading || Boolean(forceClearingPublicSessionId)}
+                onClick={() => void loadPublicPlatformSessions(publicSessionsPage.page)}
+              >
+                {t("admin.refresh")}
+              </button>
+            </div>
+            {publicSessionsPage.sessions.length === 0 ? (
+              <div className="empty-state">{t("admin.noPublicSessions")}</div>
+            ) : (
+              <div className="table-scroll">
+                <table aria-label={t("admin.publicSessions")}>
+                  <thead>
+                    <tr>
+                      <th scope="col">{t("admin.sessionTitle")}</th>
+                      <th scope="col">{t("admin.createdAt")}</th>
+                      <th scope="col">{t("admin.estimatedClearAt")}</th>
+                      <th scope="col">{t("admin.publicSessionLink")}</th>
+                      <th scope="col">{t("admin.action")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {publicSessionsPage.sessions.map((session) => {
+                      const publicLink = publicPlatformSessionLink(session);
+                      const clearing = forceClearingPublicSessionId === session.id;
+                      return (
+                        <tr key={session.id}>
+                          <td>{session.title?.trim() || t("chat.newConversation")}</td>
+                          <td>{formatSchedulerSnapshotTime(session.created_at, language)}</td>
+                          <td>{formatSchedulerSnapshotTime(session.recycle_at, language)}</td>
+                          <td>
+                            <a
+                              className="public-session-link"
+                              href={publicLink}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              {publicLink}
+                            </a>
+                          </td>
+                          <td>
+                            <button
+                              type="button"
+                              className="secondary danger"
+                              disabled={Boolean(forceClearingPublicSessionId)}
+                              onClick={() => void forceClearPublicSession(session)}
+                            >
+                              {clearing ? t("admin.clearing") : t("admin.forceClear")}
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {publicSessionsPage.total > 0 ? (
+              <div className="pagination-row">
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={
+                    publicSessionsLoading ||
+                    Boolean(forceClearingPublicSessionId) ||
+                    publicSessionsPage.page <= 1
+                  }
+                  onClick={() => void loadPublicPlatformSessions(publicSessionsPage.page - 1)}
+                >
+                  {t("admin.previousPage")}
+                </button>
+                <span aria-live="polite">
+                  {t("admin.pageStatus", {
+                    page: publicSessionsPage.page,
+                    totalPages: Math.max(publicSessionsPage.total_pages, 1),
+                    total: publicSessionsPage.total,
+                  })}
+                </span>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={
+                    publicSessionsLoading ||
+                    Boolean(forceClearingPublicSessionId) ||
+                    publicSessionsPage.page >= Math.max(publicSessionsPage.total_pages, 1)
+                  }
+                  onClick={() => void loadPublicPlatformSessions(publicSessionsPage.page + 1)}
+                >
+                  {t("admin.nextPage")}
+                </button>
+              </div>
+            ) : null}
           </div>
           <div className="button-row">
             <button type="submit">{t("admin.saveSettings")}</button>

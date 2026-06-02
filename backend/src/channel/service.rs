@@ -186,6 +186,12 @@ pub struct ChannelSession {
     pub updated_at: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct ChannelSessionPage {
+    pub sessions: Vec<ChannelSession>,
+    pub total: u64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ChannelMessage {
     pub id: String,
@@ -449,6 +455,44 @@ impl ChannelStore {
     pub async fn list_channels(&self, user_id: &str) -> Result<Vec<Channel>, ChannelStoreError> {
         let channel = self.ensure_hub_channel(user_id).await?;
         Ok(vec![channel])
+    }
+
+    pub async fn hub_channel_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<Channel>, ChannelStoreError> {
+        match &self.backend {
+            ChannelStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
+                Ok(inner
+                    .channels_by_id
+                    .values()
+                    .find(|channel| channel.user_id == user_id && channel.name == HUB_CHANNEL_NAME)
+                    .cloned())
+            }
+            ChannelStoreBackend::Postgres(pool) => block_on_db(async {
+                let row = sqlx::query(
+                    r#"
+                    select id::text as id,
+                           user_id::text as user_id,
+                           name,
+                           description,
+                           extract(epoch from created_at)::bigint as created_at,
+                           extract(epoch from updated_at)::bigint as updated_at
+                    from channels
+                    where user_id = $1::uuid and name = $2
+                    limit 1
+                    "#,
+                )
+                .bind(user_id)
+                .bind(HUB_CHANNEL_NAME)
+                .fetch_optional(pool)
+                .await
+                .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+
+                row.as_ref().map(row_to_channel).transpose()
+            }),
+        }
     }
 
     /// Hub 统一维护每个用户唯一的标准 channel，前端不再暴露创建 channel 的入口。
@@ -793,7 +837,12 @@ impl ChannelStore {
                     .cloned()
                     .collect::<Vec<_>>();
 
-                sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+                sessions.sort_by(|left, right| {
+                    right
+                        .updated_at
+                        .cmp(&left.updated_at)
+                        .then_with(|| right.id.cmp(&left.id))
+                });
                 Ok(sessions)
             }
             ChannelStoreBackend::Postgres(pool) => block_on_db(async {
@@ -819,6 +868,82 @@ impl ChannelStore {
                 .map_err(|_| ChannelStoreError::DatabaseFailed)?;
 
                 rows.iter().map(row_to_session).collect()
+            }),
+        }
+    }
+
+    pub async fn list_sessions_page(
+        &self,
+        user_id: &str,
+        channel_id: &str,
+        limit: u32,
+        offset: u64,
+    ) -> Result<ChannelSessionPage, ChannelStoreError> {
+        self.get_channel(user_id, channel_id).await?;
+
+        match &self.backend {
+            ChannelStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
+                let mut sessions = inner
+                    .sessions_by_id
+                    .values()
+                    .filter(|session| session.channel_id == channel_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+
+                sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+                let total = sessions.len() as u64;
+                let sessions = sessions
+                    .into_iter()
+                    .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+                    .take(limit as usize)
+                    .collect();
+                Ok(ChannelSessionPage { sessions, total })
+            }
+            ChannelStoreBackend::Postgres(pool) => block_on_db(async {
+                let total = sqlx::query(
+                    r#"
+                    select count(*)::bigint as total
+                    from channel_sessions
+                    where channel_id = $1::uuid
+                    "#,
+                )
+                .bind(channel_id)
+                .fetch_one(pool)
+                .await
+                .map_err(|_| ChannelStoreError::DatabaseFailed)?
+                .try_get::<i64, _>("total")
+                .map_err(|_| ChannelStoreError::DatabaseFailed)? as u64;
+
+                let rows = sqlx::query(
+                    r#"
+                    select id::text as id,
+                           channel_id::text as channel_id,
+                           kind,
+                           hermes_session_id,
+                           hermes_response_id,
+                           hermes_run_id,
+                           title,
+                           extract(epoch from created_at)::bigint as created_at,
+                           extract(epoch from updated_at)::bigint as updated_at
+                    from channel_sessions
+                    where channel_id = $1::uuid
+                    order by updated_at desc, id desc
+                    limit $2 offset $3
+                    "#,
+                )
+                .bind(channel_id)
+                .bind(i64::from(limit))
+                .bind(i64::try_from(offset).unwrap_or(i64::MAX))
+                .fetch_all(pool)
+                .await
+                .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+
+                let sessions = rows
+                    .iter()
+                    .map(row_to_session)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(ChannelSessionPage { sessions, total })
             }),
         }
     }

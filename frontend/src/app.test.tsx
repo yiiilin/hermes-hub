@@ -57,6 +57,7 @@ import {
   type HermesActiveRun,
   type HermesInstance,
   type HermesVerboseEvent,
+  type PublicPlatformSessionSummary,
 } from "./api/client";
 import { createClientMessageId } from "./routes/channel-session";
 
@@ -3805,6 +3806,85 @@ describe("App", () => {
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Rebuild public Hermes" })).toBeInTheDocument();
     });
+  });
+
+  it("shows paginated public sessions and force clears a session", async () => {
+    const publicSessions: PublicPlatformSessionSummary[] = Array.from({ length: 12 }, (_, index) => {
+      const number = index + 1;
+      return {
+        id: `public-session-${number}`,
+        title: `Public session ${number}`,
+        created_at: 1_735_600_000 + number,
+        updated_at: 1_735_700_000 - index,
+        recycle_at: 1_735_800_000 + number,
+        public_url: `/public/sessions/public-session-${number}`,
+      };
+    });
+    const client = createMockApiClient({
+      publicPlatformSettings: {
+        enabled: true,
+      },
+      publicPlatformInstance: {
+        id: "public-instance-1",
+        user_id: "public-user-1",
+        kind: "managed_docker",
+        status: "running",
+        health_status: "healthy",
+        runtime_image: "ghcr.io/yiiilin/hermes-hub-hermes:v2026.5.29.2",
+        runtime_version: "v2026.5.29.2",
+        last_user_activity_at: null,
+        last_started_at: 1_735_689_600,
+        last_stopped_at: null,
+        stopped_reason: null,
+      },
+      initialPublicPlatformSessions: publicSessions,
+    });
+    const clearDeferred = createDeferred<void>();
+    const forceClearPublicPlatformSession = client.forceClearPublicPlatformSession.bind(client);
+    client.forceClearPublicPlatformSession = vi.fn(async (sessionId) => {
+      await clearDeferred.promise;
+      await forceClearPublicPlatformSession(sessionId);
+    });
+
+    render(<App apiClient={client} />);
+
+    const settingsTabs = await openSettingsTab("Public platform");
+    fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Public platform" }));
+
+    const table = await screen.findByRole("table", { name: "Public sessions" });
+    expect(within(table).getByText("Public session 1")).toBeInTheDocument();
+    expect(within(table).getByText("Public session 10")).toBeInTheDocument();
+    expect(within(table).queryByText("Public session 11")).not.toBeInTheDocument();
+    expect(screen.getByText("Page 1 of 2, 12 total")).toBeInTheDocument();
+    const firstLink = `${window.location.origin}/public/sessions/public-session-1`;
+    expect(within(table).getByRole("link", { name: firstLink })).toHaveAttribute(
+      "href",
+      firstLink,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(await screen.findByText("Public session 11")).toBeInTheDocument();
+    expect(screen.getByText("Public session 12")).toBeInTheDocument();
+    expect(screen.getByText("Page 2 of 2, 12 total")).toBeInTheDocument();
+
+    const sessionRow = screen.getByText("Public session 11").closest("tr");
+    expect(sessionRow).not.toBeNull();
+    fireEvent.click(
+      within(sessionRow as HTMLTableRowElement).getByRole("button", { name: "Force clear" }),
+    );
+    expect(await screen.findByRole("button", { name: "Clearing..." })).toBeDisabled();
+    expect(client.forceClearPublicPlatformSession).toHaveBeenCalledWith("public-session-11");
+
+    clearDeferred.resolve();
+    await waitFor(() => {
+      expect(screen.queryByText("Public session 11")).not.toBeInTheDocument();
+    });
+    expect(screen.getByText("Public session 12")).toBeInTheDocument();
+    expect(screen.getByText("Page 2 of 2, 11 total")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Previous" }));
+    expect(await screen.findByText("Public session 1")).toBeInTheDocument();
+    expect(screen.getByText("Page 1 of 2, 11 total")).toBeInTheDocument();
   });
 
   it("localizes the configured session limit message in Chinese", async () => {

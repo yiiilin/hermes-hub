@@ -391,6 +391,31 @@ nav,
   padding-top: 14px;
 }
 
+.public-sessions-panel {
+  border-top: 1px solid #dfe5e8;
+  display: grid;
+  gap: 12px;
+  margin-top: 8px;
+  padding-top: 14px;
+}
+
+.public-session-link {
+  overflow-wrap: anywhere;
+}
+
+.pagination-row {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+.danger {
+  border-color: #d8a4a4;
+  color: #8c1d1d;
+}
+
 .section-heading-row {
   align-items: center;
   display: flex;

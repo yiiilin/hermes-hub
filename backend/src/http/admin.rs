@@ -1,15 +1,16 @@
 use axum::{
     body::to_bytes,
-    extract::{DefaultBodyLimit, Multipart, Path, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{HeaderMap, Method, StatusCode},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{collections::BTreeMap, time::Instant};
+use uuid::Uuid;
 
 use crate::{
     domain::user::{PublicUser, UserListItem, UserRole},
@@ -24,7 +25,7 @@ use crate::{
             spool_multipart_file_to_temp_with_limit, SpooledMultipartFile,
         },
         auth::require_admin,
-        map_provisioner_error,
+        map_provisioner_error, sessions,
         workspace::{
             ensure_managed_hermes_for_user, ensure_required_model_configs,
             refresh_managed_hermes_status,
@@ -47,6 +48,8 @@ use crate::{
 const MAX_MANAGED_SKILL_UPLOAD_FILES: usize = 1000;
 const MANAGED_SKILL_DIRECTORY_MARKER: &str = ".hub-directory";
 const HERMES_PROFILE_SOUL_FILE: &str = "SOUL.md";
+const DEFAULT_PUBLIC_SESSION_PAGE_SIZE: u32 = 10;
+const MAX_PUBLIC_SESSION_PAGE_SIZE: u32 = 100;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -61,6 +64,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/admin/public-platform/hermes-instance/rebuild",
             post(rebuild_public_platform_hermes_instance),
+        )
+        .route(
+            "/api/admin/public-platform/sessions",
+            get(list_public_platform_sessions),
+        )
+        .route(
+            "/api/admin/public-platform/sessions/{session_id}",
+            delete(clear_public_platform_session),
         )
         .route(
             "/api/admin/hermes-scheduler-snapshots",
@@ -148,6 +159,43 @@ struct PublicPlatformHermesInstanceResponse {
     enabled: bool,
     ready: bool,
     hermes_instance: Option<HermesInstance>,
+}
+
+#[derive(Deserialize)]
+struct PublicPlatformSessionsQuery {
+    page: Option<u32>,
+    page_size: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct PublicPlatformSessionsResponse {
+    sessions: Vec<PublicPlatformSessionItem>,
+    page: u32,
+    page_size: u32,
+    total: u64,
+    total_pages: u32,
+}
+
+#[derive(Serialize)]
+struct PublicPlatformSessionItem {
+    id: String,
+    title: Option<String>,
+    created_at: u64,
+    updated_at: u64,
+    recycle_at: u64,
+    public_url: String,
+}
+
+impl PublicPlatformSessionsResponse {
+    fn empty(page: u32, page_size: u32) -> Self {
+        Self {
+            sessions: Vec::new(),
+            page,
+            page_size,
+            total: 0,
+            total_pages: 0,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -449,6 +497,84 @@ async fn rebuild_public_platform_hermes_instance(
     Ok(Json(HermesInstanceResponse {
         hermes_instance: instance,
     }))
+}
+
+async fn list_public_platform_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PublicPlatformSessionsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    sessions::cleanup_expired_public_sessions(&state).await?;
+    let (page, page_size, offset) = public_sessions_page_params(query);
+    let Some(public_user_id) = public_platform::public_user_id(&state).await? else {
+        return Ok(Json(PublicPlatformSessionsResponse::empty(page, page_size)));
+    };
+    let Some(channel) = state
+        .channel_store
+        .hub_channel_for_user(&public_user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+    else {
+        return Ok(Json(PublicPlatformSessionsResponse::empty(page, page_size)));
+    };
+    let page_result = state
+        .channel_store
+        .list_sessions_page(&public_user_id, &channel.id, page_size, offset)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let mut items = Vec::with_capacity(page_result.sessions.len());
+    for session in page_result.sessions {
+        let recycle_at = sessions::public_session_recycle_at(&state, &session).await?;
+        items.push(PublicPlatformSessionItem {
+            public_url: format!("/public/sessions/{}", session.id),
+            id: session.id,
+            title: session.title,
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+            recycle_at,
+        });
+    }
+
+    Ok(Json(PublicPlatformSessionsResponse {
+        sessions: items,
+        page,
+        page_size,
+        total: page_result.total,
+        total_pages: total_pages(page_result.total, page_size),
+    }))
+}
+
+async fn clear_public_platform_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    if Uuid::parse_str(&session_id).is_err() {
+        return Err(ApiError::NotFound("public session not found"));
+    }
+    sessions::force_delete_public_session(&state, &session_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn public_sessions_page_params(query: PublicPlatformSessionsQuery) -> (u32, u32, u64) {
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query
+        .page_size
+        .unwrap_or(DEFAULT_PUBLIC_SESSION_PAGE_SIZE)
+        .clamp(1, MAX_PUBLIC_SESSION_PAGE_SIZE);
+    let offset = u64::from(page.saturating_sub(1)).saturating_mul(u64::from(page_size));
+    (page, page_size, offset)
+}
+
+fn total_pages(total: u64, page_size: u32) -> u32 {
+    if total == 0 {
+        return 0;
+    }
+    let page_size = u64::from(page_size.max(1));
+    let pages = total.saturating_add(page_size - 1) / page_size;
+    u32::try_from(pages).unwrap_or(u32::MAX)
 }
 
 async fn list_hermes_scheduler_snapshots(

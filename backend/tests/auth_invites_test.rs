@@ -479,6 +479,175 @@ async fn anonymous_public_sessions_wait_until_public_hermes_is_ready() {
     let (status, body) = response_json(list_sessions).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["message"], "public platform is not ready");
+
+    let admin_public_sessions = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/public-platform/sessions",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, body) = response_json(admin_public_sessions).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"], 0);
+    assert_eq!(
+        body["sessions"]
+            .as_array()
+            .expect("public sessions array")
+            .len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn admin_can_page_and_force_clear_public_platform_sessions() {
+    let app = test_app();
+    bootstrap_admin(&app).await;
+    let admin_cookie = login(&app, "admin@example.com", "admin-password-123").await;
+    configure_required_model_configs(&app, &admin_cookie).await;
+
+    let update_settings = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/system-settings",
+        json!({
+            "max_sessions_per_user": 20,
+            "public_platform": {
+                "enabled": true,
+                "temporary_session_retention_hours": 24
+            }
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(update_settings.status(), StatusCode::NO_CONTENT);
+
+    for index in 0..12 {
+        let created = request_json(
+            &app,
+            Method::POST,
+            "/api/sessions",
+            json!({
+                "kind": "agent",
+                "title": format!("public session {index}")
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+    }
+
+    let first_page = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/public-platform/sessions?page=1&page_size=10",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, first_page_body) = response_json(first_page).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first_page_body["page"], 1);
+    assert_eq!(first_page_body["page_size"], 10);
+    assert_eq!(first_page_body["total"], 12);
+    assert_eq!(first_page_body["total_pages"], 2);
+    assert_eq!(
+        first_page_body["sessions"]
+            .as_array()
+            .expect("first page sessions")
+            .len(),
+        10
+    );
+    assert!(first_page_body["sessions"][0]["public_url"]
+        .as_str()
+        .expect("public url exists")
+        .starts_with("/public/sessions/"));
+    assert!(
+        first_page_body["sessions"][0]["recycle_at"]
+            .as_u64()
+            .expect("recycle_at exists")
+            >= first_page_body["sessions"][0]["created_at"]
+                .as_u64()
+                .expect("created_at exists")
+    );
+
+    let second_page = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/public-platform/sessions?page=2&page_size=10",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, second_page_body) = response_json(second_page).await;
+    assert_eq!(status, StatusCode::OK);
+    let second_page_sessions = second_page_body["sessions"]
+        .as_array()
+        .expect("second page sessions");
+    assert_eq!(second_page_sessions.len(), 2);
+    let clear_session_id = second_page_sessions[0]["id"]
+        .as_str()
+        .expect("session id exists")
+        .to_string();
+
+    let cleared = request_empty(
+        &app,
+        Method::DELETE,
+        &format!("/api/admin/public-platform/sessions/{clear_session_id}"),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(cleared.status(), StatusCode::NO_CONTENT);
+
+    let after_clear = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/public-platform/sessions?page=2&page_size=10",
+        Some(&admin_cookie),
+    )
+    .await;
+    let (status, after_clear_body) = response_json(after_clear).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(after_clear_body["total"], 11);
+    assert_eq!(
+        after_clear_body["sessions"]
+            .as_array()
+            .expect("remaining second page sessions")
+            .len(),
+        1
+    );
+
+    let invalid_clear = request_empty(
+        &app,
+        Method::DELETE,
+        "/api/admin/public-platform/sessions/not-a-uuid",
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(invalid_clear.status(), StatusCode::NOT_FOUND);
+
+    let private_session = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({
+            "kind": "agent",
+            "title": "private admin session"
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(private_session.status(), StatusCode::CREATED);
+    let (_, private_body) = response_json(private_session).await;
+    let private_session_id = private_body["session"]["id"]
+        .as_str()
+        .expect("private session id");
+    let private_clear = request_empty(
+        &app,
+        Method::DELETE,
+        &format!("/api/admin/public-platform/sessions/{private_session_id}"),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(private_clear.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

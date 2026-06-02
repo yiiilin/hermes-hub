@@ -649,7 +649,7 @@ fn public_session_summary(
     }
 }
 
-async fn public_session_recycle_at(
+pub(crate) async fn public_session_recycle_at(
     state: &AppState,
     session: &ChannelSession,
 ) -> Result<u64, ApiError> {
@@ -1159,6 +1159,29 @@ pub(crate) async fn cleanup_public_session_if_recycled(
         unix_now(),
     )
     .await
+}
+
+pub(crate) async fn force_delete_public_session(
+    state: &AppState,
+    session_id: &str,
+) -> Result<(), ApiError> {
+    let Some(public_user_id) = state
+        .store
+        .public_platform_user_id()
+        .await
+        .map_err(|_| ApiError::Internal)?
+    else {
+        return Err(ApiError::NotFound("public session not found"));
+    };
+    let context = state
+        .channel_store
+        .session_context(session_id)
+        .await
+        .map_err(map_channel_error)?;
+    if context.user_id != public_user_id {
+        return Err(ApiError::NotFound("public session not found"));
+    }
+    delete_recycled_public_session(state, &context, session_id).await
 }
 
 async fn cleanup_public_session_if_recycled_with_retention(

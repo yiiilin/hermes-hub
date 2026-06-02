@@ -87,6 +87,28 @@ export type PublicPlatformHermesStatus = {
   hermes_instance?: HermesInstance | null;
 };
 
+export type PublicPlatformSessionSummary = {
+  id: string;
+  title?: string | null;
+  created_at: number;
+  updated_at: number;
+  recycle_at: number;
+  public_url: string;
+};
+
+export type PublicPlatformSessionPage = {
+  sessions: PublicPlatformSessionSummary[];
+  page: number;
+  page_size: number;
+  total: number;
+  total_pages: number;
+};
+
+export type PublicPlatformSessionListInput = {
+  page?: number;
+  pageSize?: number;
+};
+
 export type HermesScheduledTaskSnapshot = {
   id: string;
   name: string;
@@ -351,6 +373,10 @@ export type ApiClient = {
   rebuildHermesInstance: (userId: string) => Promise<HermesInstance>;
   publicPlatformHermesInstance: () => Promise<PublicPlatformHermesStatus>;
   rebuildPublicPlatformHermesInstance: () => Promise<HermesInstance>;
+  listPublicPlatformSessions: (
+    input?: PublicPlatformSessionListInput,
+  ) => Promise<PublicPlatformSessionPage>;
+  forceClearPublicPlatformSession: (sessionId: string) => Promise<void>;
   listHermesSchedulerSnapshots: () => Promise<HermesSchedulerSnapshot[]>;
   workspaceHermesSchedulerSnapshot: () => Promise<HermesSchedulerSnapshot | null>;
   listChannels: () => Promise<Channel[]>;
@@ -960,6 +986,15 @@ export function createApiClient(): ApiClient {
       );
       return payload.hermes_instance;
     },
+    async listPublicPlatformSessions(input) {
+      return request<PublicPlatformSessionPage>(publicPlatformSessionsAdminPath(input));
+    },
+    async forceClearPublicPlatformSession(sessionId) {
+      await request<void>(
+        `/api/admin/public-platform/sessions/${encodeURIComponent(sessionId)}`,
+        { method: "DELETE" },
+      );
+    },
     async listHermesSchedulerSnapshots() {
       const payload = await request<
         | HermesSchedulerSnapshot[]
@@ -1423,6 +1458,20 @@ function publicSessionsPath(options: PublicSessionRequestOptions | undefined) {
   return sessionId ? `/api/sessions?session_id=${encodeURIComponent(sessionId)}` : "/api/sessions";
 }
 
+function publicPlatformSessionsAdminPath(input: PublicPlatformSessionListInput | undefined) {
+  const params = new URLSearchParams();
+  if (input?.page !== undefined) {
+    params.set("page", String(input.page));
+  }
+  if (input?.pageSize !== undefined) {
+    params.set("page_size", String(input.pageSize));
+  }
+  const query = params.toString();
+  return query
+    ? `/api/admin/public-platform/sessions?${query}`
+    : "/api/admin/public-platform/sessions";
+}
+
 function stripAttachmentPreviews(attachments: HermesAttachment[]): HermesAttachment[] {
   return attachments.map(({ data_url: _dataUrl, ...attachment }) => attachment);
 }
@@ -1453,6 +1502,7 @@ type MockApiClientOptions = {
   uploadManagedSkills?: ApiClient["uploadManagedSkills"];
   initialHermesProfile?: HermesProfilePayload;
   initialHermesSchedulerSnapshots?: HermesSchedulerSnapshot[];
+  initialPublicPlatformSessions?: PublicPlatformSessionSummary[];
   publicPlatformSettings?: Partial<PublicPlatformSettings>;
 };
 
@@ -1568,6 +1618,9 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
         };
   let publicPlatformInstance: HermesInstance | null =
     "publicPlatformInstance" in options ? options.publicPlatformInstance! : null;
+  let publicPlatformSessions: PublicPlatformSessionSummary[] = [
+    ...(options.initialPublicPlatformSessions ?? []),
+  ];
   let modelConfig: ModelConfig = {
     config_kind: "llm",
     provider_name: "openai-compatible",
@@ -1654,6 +1707,23 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     return Boolean(
       systemSettings.public_platform.enabled && publicPlatformInstance?.status === "running",
     );
+  }
+
+  function publicPlatformSessionPage(input: PublicPlatformSessionListInput | undefined) {
+    const page = Math.max(1, input?.page ?? 1);
+    const pageSize = Math.max(1, input?.pageSize ?? 10);
+    const sortedSessions = publicPlatformSessions
+      .slice()
+      .sort((left, right) => (right.updated_at ?? 0) - (left.updated_at ?? 0));
+    const start = (page - 1) * pageSize;
+    const total = sortedSessions.length;
+    return {
+      sessions: sortedSessions.slice(start, start + pageSize),
+      page,
+      page_size: pageSize,
+      total,
+      total_pages: total === 0 ? 0 : Math.ceil(total / pageSize),
+    };
   }
 
   function managedSkillTreeFromState(): ManagedSkillTreeNode {
@@ -1882,6 +1952,19 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
         last_started_at: now,
       };
       return publicPlatformInstance;
+    },
+    async listPublicPlatformSessions(input) {
+      return publicPlatformSessionPage(input);
+    },
+    async forceClearPublicPlatformSession(sessionId) {
+      publicPlatformSessions = publicPlatformSessions.filter((session) => session.id !== sessionId);
+      sessions = sessions.filter((session) => session.id !== sessionId);
+      delete messagesBySessionId[sessionId];
+      delete activeRunsBySessionId[sessionId];
+      emitSessionEvent(sessionId, {
+        type: "session_deleted",
+        session_id: sessionId,
+      });
     },
     async listHermesSchedulerSnapshots() {
       return hermesSchedulerSnapshots;
@@ -2270,6 +2353,18 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       const session = options.createSession
         ? await options.createSession("channel-1", kind, title)
         : await this.createSession("channel-1", kind, title);
+      const publicSession = {
+        id: session.id,
+        title: session.title,
+        created_at: session.created_at ?? Date.now(),
+        updated_at: session.updated_at ?? session.created_at ?? Date.now(),
+        recycle_at: session.recycle_at ?? Math.floor(Date.now() / 1000) + 24 * 60 * 60,
+        public_url: `/public/sessions/${encodeURIComponent(session.id)}`,
+      };
+      publicPlatformSessions = [
+        publicSession,
+        ...publicPlatformSessions.filter((item) => item.id !== session.id),
+      ];
       return {
         id: session.id,
         title: session.title,
@@ -2280,6 +2375,7 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     },
     async deleteSessionPublic(sessionId) {
       await this.deleteSession("channel-1", sessionId);
+      publicPlatformSessions = publicPlatformSessions.filter((session) => session.id !== sessionId);
     },
     async appendSessionMessagePublic(sessionId, input) {
       if (input.role === "user") {
