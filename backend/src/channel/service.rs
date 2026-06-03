@@ -182,6 +182,8 @@ pub struct ChannelSession {
     pub hermes_response_id: Option<String>,
     pub hermes_run_id: Option<String>,
     pub title: Option<String>,
+    pub is_home: bool,
+    pub deletable: bool,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -349,6 +351,8 @@ pub enum ChannelStoreError {
     RunNotFound,
     #[error("session limit exceeded")]
     SessionLimitExceeded { max_sessions_per_user: u32 },
+    #[error("protected session")]
+    ProtectedSession,
     #[error("channel store lock failed")]
     LockFailed,
     #[error("database operation failed")]
@@ -664,6 +668,8 @@ impl ChannelStore {
                     hermes_response_id: None,
                     hermes_run_id: None,
                     title,
+                    is_home: false,
+                    deletable: true,
                     created_at: now,
                     updated_at: now,
                 };
@@ -686,6 +692,8 @@ impl ChannelStore {
                               hermes_response_id,
                               hermes_run_id,
                               title,
+                              is_home,
+                              deletable,
                               extract(epoch from created_at)::bigint as created_at,
                               extract(epoch from updated_at)::bigint as updated_at
                     "#,
@@ -726,7 +734,9 @@ impl ChannelStore {
                 let session_count = inner
                     .sessions_by_id
                     .values()
-                    .filter(|session| user_channel_ids.contains(&session.channel_id))
+                    .filter(|session| {
+                        user_channel_ids.contains(&session.channel_id) && !session.is_home
+                    })
                     .count();
                 if session_count >= max_sessions_per_user as usize {
                     return Err(ChannelStoreError::SessionLimitExceeded {
@@ -742,6 +752,8 @@ impl ChannelStore {
                     hermes_response_id: None,
                     hermes_run_id: None,
                     title,
+                    is_home: false,
+                    deletable: true,
                     created_at: now,
                     updated_at: now,
                 };
@@ -772,6 +784,7 @@ impl ChannelStore {
                     from channel_sessions
                     join channels on channels.id = channel_sessions.channel_id
                     where channels.user_id = $1::uuid
+                      and not channel_sessions.is_home
                     "#,
                     )
                     .bind(user_id)
@@ -799,6 +812,8 @@ impl ChannelStore {
                               hermes_response_id,
                               hermes_run_id,
                               title,
+                              is_home,
+                              deletable,
                               extract(epoch from created_at)::bigint as created_at,
                               extract(epoch from updated_at)::bigint as updated_at
                     "#,
@@ -817,6 +832,76 @@ impl ChannelStore {
                     row_to_session(&row)
                 })
             }
+        }
+    }
+
+    pub async fn ensure_home_session(
+        &self,
+        user_id: &str,
+        channel_id: &str,
+    ) -> Result<ChannelSession, ChannelStoreError> {
+        self.get_channel(user_id, channel_id).await?;
+
+        match &self.backend {
+            ChannelStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
+                if let Some(session) = inner
+                    .sessions_by_id
+                    .values()
+                    .find(|session| session.channel_id == channel_id && session.is_home)
+                    .cloned()
+                {
+                    return Ok(session);
+                }
+
+                let now = unix_now();
+                let session = ChannelSession {
+                    id: Uuid::new_v4().to_string(),
+                    channel_id: channel_id.to_string(),
+                    kind: ChannelSessionKind::Agent,
+                    hermes_session_id: None,
+                    hermes_response_id: None,
+                    hermes_run_id: None,
+                    title: None,
+                    // 主会话是 Hermes 的固定 home channel，不能被用户误删，也不占用普通会话额度。
+                    is_home: true,
+                    deletable: false,
+                    created_at: now,
+                    updated_at: now,
+                };
+                inner
+                    .sessions_by_id
+                    .insert(session.id.clone(), session.clone());
+                Ok(session)
+            }
+            ChannelStoreBackend::Postgres(pool) => block_on_db(async {
+                let row = sqlx::query(
+                    r#"
+                    insert into channel_sessions (id, channel_id, kind, title, is_home, deletable)
+                    values ($1::uuid, $2::uuid, 'agent', null, true, false)
+                    on conflict (channel_id) where is_home do update set
+                        is_home = channel_sessions.is_home
+                    returning id::text as id,
+                              channel_id::text as channel_id,
+                              kind,
+                              hermes_session_id,
+                              hermes_response_id,
+                              hermes_run_id,
+                              title,
+                              is_home,
+                              deletable,
+                              extract(epoch from created_at)::bigint as created_at,
+                              extract(epoch from updated_at)::bigint as updated_at
+                    "#,
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(channel_id)
+                .fetch_one(pool)
+                .await
+                .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+
+                row_to_session(&row)
+            }),
         }
     }
 
@@ -839,8 +924,9 @@ impl ChannelStore {
 
                 sessions.sort_by(|left, right| {
                     right
-                        .updated_at
-                        .cmp(&left.updated_at)
+                        .is_home
+                        .cmp(&left.is_home)
+                        .then_with(|| right.updated_at.cmp(&left.updated_at))
                         .then_with(|| right.id.cmp(&left.id))
                 });
                 Ok(sessions)
@@ -855,11 +941,13 @@ impl ChannelStore {
                            hermes_response_id,
                            hermes_run_id,
                            title,
+                           is_home,
+                           deletable,
                            extract(epoch from created_at)::bigint as created_at,
                            extract(epoch from updated_at)::bigint as updated_at
                     from channel_sessions
                     where channel_id = $1::uuid
-                    order by updated_at desc
+                    order by is_home desc, updated_at desc, id desc
                     "#,
                 )
                 .bind(channel_id)
@@ -887,11 +975,17 @@ impl ChannelStore {
                 let mut sessions = inner
                     .sessions_by_id
                     .values()
-                    .filter(|session| session.channel_id == channel_id)
+                    .filter(|session| session.channel_id == channel_id && !session.is_home)
                     .cloned()
                     .collect::<Vec<_>>();
 
-                sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+                sessions.sort_by(|left, right| {
+                    right
+                        .is_home
+                        .cmp(&left.is_home)
+                        .then_with(|| right.updated_at.cmp(&left.updated_at))
+                        .then_with(|| right.id.cmp(&left.id))
+                });
                 let total = sessions.len() as u64;
                 let sessions = sessions
                     .into_iter()
@@ -906,6 +1000,7 @@ impl ChannelStore {
                     select count(*)::bigint as total
                     from channel_sessions
                     where channel_id = $1::uuid
+                      and not is_home
                     "#,
                 )
                 .bind(channel_id)
@@ -924,11 +1019,14 @@ impl ChannelStore {
                            hermes_response_id,
                            hermes_run_id,
                            title,
+                           is_home,
+                           deletable,
                            extract(epoch from created_at)::bigint as created_at,
                            extract(epoch from updated_at)::bigint as updated_at
                     from channel_sessions
                     where channel_id = $1::uuid
-                    order by updated_at desc, id desc
+                      and not is_home
+                    order by is_home desc, updated_at desc, id desc
                     limit $2 offset $3
                     "#,
                 )
@@ -976,6 +1074,8 @@ impl ChannelStore {
                            hermes_response_id,
                            hermes_run_id,
                            title,
+                           is_home,
+                           deletable,
                            extract(epoch from created_at)::bigint as created_at,
                            extract(epoch from updated_at)::bigint as updated_at
                     from channel_sessions
@@ -1028,6 +1128,8 @@ impl ChannelStore {
                               hermes_response_id,
                               hermes_run_id,
                               title,
+                              is_home,
+                              deletable,
                               extract(epoch from created_at)::bigint as created_at,
                               extract(epoch from updated_at)::bigint as updated_at
                     "#,
@@ -1093,6 +1195,8 @@ impl ChannelStore {
                               hermes_response_id,
                               hermes_run_id,
                               title,
+                              is_home,
+                              deletable,
                               extract(epoch from created_at)::bigint as created_at,
                               extract(epoch from updated_at)::bigint as updated_at
                     "#,
@@ -1148,6 +1252,8 @@ impl ChannelStore {
                               hermes_response_id,
                               hermes_run_id,
                               title,
+                              is_home,
+                              deletable,
                               extract(epoch from created_at)::bigint as created_at,
                               extract(epoch from updated_at)::bigint as updated_at
                     "#,
@@ -2528,6 +2634,9 @@ impl ChannelStore {
         session_id: &str,
     ) -> Result<DeletedChannelSession, ChannelStoreError> {
         let session = self.get_session(user_id, channel_id, session_id).await?;
+        if !session.deletable {
+            return Err(ChannelStoreError::ProtectedSession);
+        }
 
         match &self.backend {
             ChannelStoreBackend::Memory(inner) => {
@@ -2695,6 +2804,12 @@ fn row_to_session(row: &sqlx::postgres::PgRow) -> Result<ChannelSession, Channel
             .map_err(|_| ChannelStoreError::DatabaseFailed)?,
         title: row
             .try_get("title")
+            .map_err(|_| ChannelStoreError::DatabaseFailed)?,
+        is_home: row
+            .try_get("is_home")
+            .map_err(|_| ChannelStoreError::DatabaseFailed)?,
+        deletable: row
+            .try_get("deletable")
             .map_err(|_| ChannelStoreError::DatabaseFailed)?,
         created_at: row
             .try_get::<i64, _>("created_at")

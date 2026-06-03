@@ -31,7 +31,7 @@ use super::{
 
 /// Hub 托管 Hermes 容器规格版本。只要 env、挂载、工作目录或安全策略有变化，
 /// 就提升这个值，确保已存在的旧容器会被重建并拿到新行为。
-const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-06-02-unrestricted-media-any-file";
+const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-06-03-home-channel";
 const MANAGED_CONTAINER_SPEC_LABEL: &str = "hermes_hub_spec_version";
 const HUB_INBOX_PATH: &str = "/internal/channel/v1/inbox";
 const HUB_INBOX_TIMEOUT_SECONDS: u16 = 25;
@@ -535,6 +535,11 @@ impl DockerProvisioner {
             "HERMES_YOLO_MODE=1".to_string(),
             "HERMES_ACCEPT_HOOKS=1".to_string(),
         ];
+        if let Some(home_session_id) = instance.home_session_id.as_deref() {
+            // Hermes 官方 send_message 的裸平台目标会落到 home_channel；Hub 固定为系统主会话，
+            // 避免不同会话并发时通过进程级动态变量串到错误目标。
+            env.push(format!("HERMES_HUB_HOME_CHANNEL={home_session_id}"));
+        }
         if self.config.image_model_enabled {
             // 只有管理员显式启用图片模型时，才把图片生成模型暴露给 Hermes。
             env.push(format!("OPENAI_IMAGE_MODEL={}", self.config.image_model));
@@ -570,8 +575,9 @@ impl DockerProvisioner {
                 ),
                 interval: "10s".to_string(),
                 timeout: "6s".to_string(),
-                retries: 3,
-                start_period: "20s".to_string(),
+                retries: 6,
+                // Hermes 冷启动时要初始化 s6、技能和 gateway；远端机器上 20s 容易误判为 unhealthy。
+                start_period: "60s".to_string(),
             }),
             command: hermes_gateway_command(self.config.managed_profile.as_ref()),
         })
@@ -648,8 +654,14 @@ impl DockerProvisioner {
             self.remove_container_if_exists(&next.name).await?;
         }
         let container_id = self.create_container(&next).await?;
-        self.run_required(vec!["start".to_string(), next.name.clone()])
-            .await?;
+        if let Err(error) = self
+            .run_required(vec!["start".to_string(), next.name.clone()])
+            .await
+        {
+            // create 已成功但 start 失败时不能留下 Created 半成品容器，否则后续管理页会显示混乱状态。
+            let _ = self.remove_container_if_exists(&next.name).await;
+            return Err(error);
+        }
         next.container_id = Some(container_id);
         next.status = HermesInstanceStatus::Running;
         next.health_status = "starting".to_string();
@@ -1462,8 +1474,14 @@ impl HermesProvisioner for DockerProvisioner {
             self.remove_container_if_exists(&next.name).await?;
         }
         let container_id = self.create_container(&next).await?;
-        self.run_required(vec!["start".to_string(), next.name.clone()])
-            .await?;
+        if let Err(error) = self
+            .run_required(vec!["start".to_string(), next.name.clone()])
+            .await
+        {
+            // 重建流程里 create/start 不是原子操作；start 失败时主动回收，避免残留 Created 容器。
+            let _ = self.remove_container_if_exists(&next.name).await;
+            return Err(error);
+        }
 
         next.container_id = Some(container_id);
         next.status = HermesInstanceStatus::Running;

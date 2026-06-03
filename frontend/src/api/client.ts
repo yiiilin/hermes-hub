@@ -24,6 +24,8 @@ export type ChannelSession = {
   channel_id: string;
   kind: "chat" | "agent";
   title?: string | null;
+  is_home?: boolean;
+  deletable?: boolean;
   created_at?: number;
   updated_at?: number;
   recycle_at?: number | null;
@@ -32,6 +34,8 @@ export type ChannelSession = {
 export type SessionSummary = {
   id: string;
   title?: string | null;
+  is_home?: boolean;
+  deletable?: boolean;
   created_at?: number;
   updated_at?: number;
   recycle_at?: number | null;
@@ -2340,10 +2344,16 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     async listSessionsPublic() {
       return sessions
         .slice()
-        .sort((left, right) => (right.updated_at ?? 0) - (left.updated_at ?? 0))
-        .map(({ id, title, created_at, updated_at, recycle_at }) => ({
+        .sort(
+          (left, right) =>
+            Number(Boolean(right.is_home)) - Number(Boolean(left.is_home)) ||
+            (right.updated_at ?? 0) - (left.updated_at ?? 0),
+        )
+        .map(({ id, title, is_home, deletable, created_at, updated_at, recycle_at }) => ({
           id,
           title,
+          is_home,
+          deletable,
           created_at,
           updated_at,
           recycle_at,
@@ -2368,12 +2378,17 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       return {
         id: session.id,
         title: session.title,
+        is_home: session.is_home,
+        deletable: session.deletable,
         created_at: session.created_at,
         updated_at: session.updated_at,
         recycle_at: session.recycle_at,
       };
     },
     async deleteSessionPublic(sessionId) {
+      if (sessions.find((session) => session.id === sessionId)?.deletable === false) {
+        throw new Error("session is protected");
+      }
       await this.deleteSession("channel-1", sessionId);
       publicPlatformSessions = publicPlatformSessions.filter((session) => session.id !== sessionId);
     },

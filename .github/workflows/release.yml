@@ -30,6 +30,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Runtime image date tag
+        id: runtime_tag
+        run: |
+          set -euo pipefail
+
+          # Hermes wrapper 和 ASR 是运行时镜像，用类似官方 Hermes 的日期 tag 管理，避免 latest 缓存漂移。
+          tag="$(date -u +v%Y.%-m.%-d).${GITHUB_RUN_NUMBER}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -47,10 +56,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}-hermes
           tags: |
-            type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            type=raw,value=${{ steps.runtime_tag.outputs.tag }}
 
       - name: ASR metadata
         id: asr_meta
@@ -58,10 +64,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}-asr
           tags: |
-            type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            type=raw,value=${{ steps.runtime_tag.outputs.tag }}
 
       - name: Build and push Hub image
         uses: docker/build-push-action@v6

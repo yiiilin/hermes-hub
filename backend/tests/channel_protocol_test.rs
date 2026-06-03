@@ -306,6 +306,15 @@ fn cookie_from(response: &Response<Body>) -> String {
         .to_string()
 }
 
+fn find_session_summary<'a>(body: &'a Value, session_id: &str) -> &'a Value {
+    body["sessions"]
+        .as_array()
+        .expect("sessions array")
+        .iter()
+        .find(|session| session["id"].as_str() == Some(session_id))
+        .expect("target session appears in session list")
+}
+
 async fn bootstrap_and_login(app: &Router) -> String {
     let response = request_json(
         app,
@@ -344,6 +353,7 @@ fn managed_instance_for(user_id: &str) -> HermesInstance {
         name: "hermes-user-admin".to_string(),
         api_token_secret_ref: Some("hermes-secret-token".to_string()),
         llm_api_key: None,
+        home_session_id: None,
         container_id: Some("container-1".to_string()),
         host_workspace_path: Some("/tmp/hermes/admin/workspace".to_string()),
         host_sandbox_path: Some("/tmp/hermes/admin/sandbox".to_string()),
@@ -352,6 +362,7 @@ fn managed_instance_for(user_id: &str) -> HermesInstance {
         status_message: None,
         runtime_image: Some("ghcr.io/yiiilin/hermes-hub-hermes:1.2.3".to_string()),
         runtime_version: Some("1.2.3".to_string()),
+        adapter_last_seen_at: None,
         last_user_activity_at: None,
         last_started_at: None,
         last_stopped_at: None,
@@ -1426,7 +1437,18 @@ async fn unauthenticated_public_sessions_are_scoped_by_public_cookie() {
     let visible = request_empty(&app, Method::GET, "/api/sessions", Some(&public_cookie)).await;
     let (status, visible_body) = response_json(visible).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(visible_body["sessions"][0]["id"], session_id);
+    assert_eq!(
+        visible_body["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .len(),
+        1
+    );
+    assert_eq!(visible_body["sessions"][0]["is_home"], false);
+    assert_eq!(
+        find_session_summary(&visible_body, session_id)["id"],
+        session_id
+    );
 
     let isolated = request_empty(&app, Method::GET, "/api/sessions", None).await;
     let (status, isolated_body) = response_json(isolated).await;
@@ -1447,8 +1469,9 @@ async fn unauthenticated_public_sessions_are_scoped_by_public_cookie() {
             .as_array()
             .expect("admin sessions array")
             .len(),
-        0
+        1
     );
+    assert_eq!(admin_visible_body["sessions"][0]["is_home"], true);
 
     let appended = request_json(
         &app,
@@ -1525,7 +1548,11 @@ async fn public_session_token_header_restores_public_session_without_cookie() {
     );
     let (status, listed_body) = response_json(listed).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(listed_body["sessions"][0]["id"], session_id);
+    assert_eq!(listed_body["sessions"][0]["is_home"], false);
+    assert_eq!(
+        find_session_summary(&listed_body, session_id)["id"],
+        session_id
+    );
 
     let appended = request_json_with_public_token(
         &app,
@@ -1582,7 +1609,8 @@ async fn public_session_list_chooses_valid_token_between_cookie_and_header() {
     );
     let (status, body) = response_json(valid_cookie_stale_header).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["sessions"][0]["id"], session_id);
+    assert_eq!(body["sessions"][0]["is_home"], false);
+    assert_eq!(find_session_summary(&body, session_id)["id"], session_id);
     assert_eq!(body["public_token"], public_token);
 
     let stale_cookie_valid_header = request_empty_with_cookie_and_public_token(
@@ -1602,7 +1630,8 @@ async fn public_session_list_chooses_valid_token_between_cookie_and_header() {
     );
     let (status, body) = response_json(stale_cookie_valid_header).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["sessions"][0]["id"], session_id);
+    assert_eq!(body["sessions"][0]["is_home"], false);
+    assert_eq!(find_session_summary(&body, session_id)["id"], session_id);
     assert_eq!(body["public_token"], public_token);
 
     let stale_cookie_valid_header_append = request_json_with_cookie_and_public_token(
@@ -1658,7 +1687,11 @@ async fn public_session_id_path_claims_public_session_for_new_browser() {
     );
     let (status, claimed_body) = response_json(claimed).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(claimed_body["sessions"][0]["id"], session_id);
+    assert_eq!(claimed_body["sessions"][0]["is_home"], false);
+    assert_eq!(
+        find_session_summary(&claimed_body, session_id)["id"],
+        session_id
+    );
     let public_token = claimed_body["public_token"]
         .as_str()
         .expect("path-based claim returns token for localStorage");
@@ -1676,6 +1709,85 @@ async fn public_session_id_path_claims_public_session_for_new_browser() {
     )
     .await;
     assert_eq!(appended.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn public_home_session_cannot_be_claimed_or_opened() {
+    let store = SessionStore::default();
+    enable_public_platform(&store).await;
+    let state = test_state(store.clone());
+    let app = build_router_with_state(state.clone());
+    let _admin_cookie = bootstrap_and_login(&app).await;
+    ensure_public_platform_ready_for_tests(&state).await;
+
+    let public_user_id = store
+        .public_platform_user_id()
+        .await
+        .expect("public platform user lookup succeeds")
+        .expect("public platform user exists");
+    let public_channel = state
+        .channel_store
+        .list_channels(&public_user_id)
+        .await
+        .expect("public channels can be listed")
+        .into_iter()
+        .find(|channel| channel.name == "hermes-hub")
+        .expect("public hub channel exists");
+    let home_session = state
+        .channel_store
+        .list_sessions(&public_user_id, &public_channel.id)
+        .await
+        .expect("public sessions can be listed")
+        .into_iter()
+        .find(|session| session.is_home)
+        .expect("public home session exists");
+
+    let claimed = request_empty(
+        &app,
+        Method::GET,
+        &format!("/api/sessions?session_id={}", home_session.id),
+        None,
+    )
+    .await;
+    let (status, claimed_body) = response_json(claimed).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        claimed_body["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .len(),
+        0
+    );
+    assert!(
+        claimed_body.get("public_token").is_none(),
+        "hidden public home session must not mint a share token"
+    );
+
+    let created = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent", "title": "ordinary public session" }),
+        None,
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let (_, created_body) = response_json(created).await;
+    let public_token = created_body["public_token"].as_str().expect("public token");
+
+    let opened = request_json_with_public_token(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{}/messages", home_session.id),
+        json!({
+            "role": "user",
+            "content": "should be rejected",
+            "attachments": []
+        }),
+        public_token,
+    )
+    .await;
+    assert_eq!(opened.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -1814,7 +1926,7 @@ async fn public_session_recycle_at_tracks_latest_message_time() {
     let listed = request_empty(&app, Method::GET, "/api/sessions", Some(&public_cookie)).await;
     let (status, listed_body) = response_json(listed).await;
     assert_eq!(status, StatusCode::OK);
-    let recycle_at = listed_body["sessions"][0]["recycle_at"]
+    let recycle_at = find_session_summary(&listed_body, session_id)["recycle_at"]
         .as_u64()
         .expect("listed recycle_at");
     assert_eq!(recycle_at, message_updated_at + retention_seconds);
@@ -3396,6 +3508,58 @@ async fn hermes_adapter_can_report_runtime_version_to_hub() {
         .await
         .expect("reported runtime version is persisted");
     assert_eq!(stored.runtime_version.as_deref(), Some("0.13.7"));
+}
+
+#[tokio::test]
+async fn hermes_adapter_poll_records_heartbeat_and_marks_instance_healthy() {
+    let store = SessionStore::default();
+    let state = test_state(store.clone());
+    let app = build_router_with_state(state.clone());
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    let instance_token = "instance-heartbeat-token";
+    let mut instance = managed_instance_for(&user_id);
+    instance.status = HermesInstanceStatus::Error;
+    instance.health_status = "unhealthy".to_string();
+    instance.status_message = Some("old docker health error".to_string());
+    store
+        .bind_hermes_instance(instance)
+        .await
+        .expect("instance can be bound");
+    state
+        .model_registry
+        .add_instance_token_for_instance("instance-1", instance_token)
+        .await
+        .expect("instance token can be registered");
+
+    let inbox = request_raw(
+        &app,
+        Method::GET,
+        "/internal/channel/v1/inbox?timeout_seconds=0&limit=4",
+        "application/json",
+        Vec::new(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, _) = response_json(inbox).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let stored = store
+        .hermes_instance_for_user(&user_id)
+        .await
+        .expect("heartbeat update is persisted");
+    assert_eq!(stored.status, HermesInstanceStatus::Running);
+    assert_eq!(stored.health_status, "healthy");
+    assert_eq!(stored.status_message, None);
+    assert!(
+        stored.adapter_last_seen_at.is_some(),
+        "adapter poll should update heartbeat timestamp"
+    );
 }
 
 #[tokio::test]

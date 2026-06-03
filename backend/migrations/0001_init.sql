@@ -89,6 +89,8 @@ alter table hermes_instances add column if not exists last_user_activity_at time
 alter table hermes_instances add column if not exists last_started_at timestamptz;
 alter table hermes_instances add column if not exists last_stopped_at timestamptz;
 alter table hermes_instances add column if not exists stopped_reason text;
+-- 该列现在作为 adapter 主动心跳的最近连接时间使用，用来判断 Hermes 是否真实连上 Hub。
+alter table hermes_instances add column if not exists last_health_check_at timestamptz;
 
 create table if not exists hermes_scheduler_snapshots (
     hermes_instance_id uuid primary key references hermes_instances(id) on delete cascade,
@@ -214,9 +216,17 @@ create table if not exists channel_sessions (
     hermes_response_id text,
     hermes_run_id text,
     title text,
+    is_home boolean not null default false,
+    deletable boolean not null default true,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
+
+alter table channel_sessions add column if not exists is_home boolean not null default false;
+alter table channel_sessions add column if not exists deletable boolean not null default true;
+create unique index if not exists channel_sessions_one_home_per_channel
+    on channel_sessions(channel_id)
+    where is_home;
 
 create table if not exists public_session_access (
     id uuid primary key,

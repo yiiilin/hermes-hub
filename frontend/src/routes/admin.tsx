@@ -26,25 +26,17 @@ import {
   defaultSpeechInputSettings,
 } from "../api/client";
 import { useI18n } from "../i18n";
+import type { AdminSettingsTab } from "../navigation";
 import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { FilePlus2, FileText, Folder, FolderPlus, Upload } from "lucide-react";
 import Vditor from "vditor";
 import "vditor/dist/index.css";
 
-type AdminSettingsTab =
-  | "users"
-  | "models"
-  | "hermes"
-  | "profile"
-  | "scheduler"
-  | "skills"
-  | "system"
-  | "public-platform"
-  | "auth";
-
 type AdminRouteProps = {
+  activeTab: AdminSettingsTab;
   apiClient: ApiClient;
   currentUser: User;
+  onTabChange: (tab: AdminSettingsTab) => void;
 };
 
 type SelectedSkillNode = {
@@ -449,9 +441,8 @@ function managedSkillTreeFromList(skills: ManagedSkill[]): ManagedSkillTreeNode 
   return root;
 }
 
-export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
+export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: AdminRouteProps) {
   const { language, t } = useI18n();
-  const [activeTab, setActiveTab] = useState<AdminSettingsTab>("users");
   const [users, setUsers] = useState<User[]>([]);
   const [invites, setInvites] = useState<Invite[]>([]);
   const [instances, setInstances] = useState<HermesInstance[]>([]);
@@ -648,7 +639,7 @@ export function AdminRoute({ apiClient, currentUser }: AdminRouteProps) {
     setSettingsSaved(false);
     setSkillSaved(false);
     setHermesProfileSaved(false);
-    setActiveTab(tab);
+    onTabChange(tab);
   }
 
   async function refreshManagedSkills() {

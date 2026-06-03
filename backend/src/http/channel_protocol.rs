@@ -1314,11 +1314,24 @@ async fn verify_instance_token(
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or(ApiError::Unauthorized)?;
 
-    state
+    let token_context = state
         .model_registry
         .instance_token_context(token)
         .await
-        .ok_or(ApiError::Unauthorized)
+        .ok_or(ApiError::Unauthorized)?;
+
+    if let Some(instance_id) = token_context.hermes_instance_id.as_deref() {
+        match state
+            .store
+            .record_hermes_instance_adapter_heartbeat(instance_id)
+            .await
+        {
+            Ok(_) | Err(StoreError::InviteNotFound) => {}
+            Err(_) => return Err(ApiError::Internal),
+        }
+    }
+
+    Ok(token_context)
 }
 
 fn ensure_token_can_access_session(

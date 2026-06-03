@@ -25,6 +25,7 @@ struct FakeDockerRuntime {
     health_output: Arc<Mutex<Option<String>>>,
     spec_version: Arc<Mutex<Option<String>>>,
     image: Arc<Mutex<Option<String>>>,
+    fail_start: Arc<Mutex<bool>>,
 }
 
 fn filesystem_mode(path: &Path) -> u32 {
@@ -155,6 +156,13 @@ impl DockerRuntime for FakeDockerRuntime {
         }
 
         if args.get(0).map(String::as_str) == Some("start") {
+            if *self.fail_start.lock().expect("fail start lock") {
+                return Ok(DockerRuntimeOutput {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "simulated start failure".to_string(),
+                });
+            }
             *self.container_running.lock().expect("running lock") = true;
         }
 
@@ -578,6 +586,43 @@ async fn docker_provisioner_pulls_missing_runtime_image_before_create() {
 
     assert!(inspect_index < pull_index);
     assert!(pull_index < create_index);
+}
+
+#[tokio::test]
+async fn docker_provisioner_cleans_created_container_when_start_fails() {
+    let runtime = FakeDockerRuntime::default();
+    *runtime.fail_start.lock().expect("fail start lock") = true;
+    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime.clone()));
+
+    let error = provisioner
+        .ensure_instance("user-start-fails", "instance-token")
+        .await
+        .expect_err("docker start failure is surfaced");
+
+    assert!(
+        error.to_string().contains("simulated start failure"),
+        "start failure should keep the original docker error visible"
+    );
+    assert!(
+        !*runtime.container_exists.lock().expect("exists lock"),
+        "create 成功但 start 失败时必须清理 Created 半成品容器"
+    );
+    let calls = runtime.calls.lock().expect("calls lock").clone();
+    let create_index = calls
+        .iter()
+        .position(|args| args.get(0).map(String::as_str) == Some("create"))
+        .expect("container create is attempted");
+    let start_index = calls
+        .iter()
+        .position(|args| args.get(0).map(String::as_str) == Some("start"))
+        .expect("container start is attempted");
+    let remove_index = calls
+        .iter()
+        .position(|args| args.get(0).map(String::as_str) == Some("rm"))
+        .expect("failed container is removed");
+
+    assert!(create_index < start_index);
+    assert!(start_index < remove_index);
 }
 
 #[tokio::test]
@@ -1168,8 +1213,7 @@ async fn docker_provisioner_repairs_pairing_state_even_when_config_is_unchanged(
     *runtime.container_exists.lock().expect("exists lock") = true;
     *runtime.container_running.lock().expect("running lock") = true;
     *runtime.health_status.lock().expect("health lock") = Some("healthy".to_string());
-    *runtime.spec_version.lock().expect("spec lock") =
-        Some("2026-06-02-unrestricted-media-any-file".to_string());
+    *runtime.spec_version.lock().expect("spec lock") = Some("2026-06-03-home-channel".to_string());
     runtime.calls.lock().expect("calls lock").clear();
 
     provisioner
@@ -1311,6 +1355,8 @@ async fn docker_provisioner_test() {
         .ensure_instance("user-123", "instance-token")
         .await
         .expect("instance can be created");
+    let mut instance = instance;
+    instance.home_session_id = Some("home-session-123".to_string());
 
     assert_eq!(instance.user_id, "user-123");
     assert_eq!(instance.kind, HermesInstanceKind::ManagedDocker);
@@ -1385,6 +1431,10 @@ async fn docker_provisioner_test() {
     assert!(spec
         .env
         .iter()
+        .any(|entry| entry == "HERMES_HUB_HOME_CHANNEL=home-session-123"));
+    assert!(spec
+        .env
+        .iter()
         .any(|entry| entry == &format!("HERMES_HUB_INSTANCE_ID={}", instance.id)));
     assert!(spec
         .env
@@ -1420,7 +1470,7 @@ async fn docker_provisioner_test() {
         .iter()
         .any(|entry| entry == "HERMES_MEDIA_ALLOW_DIRS=/"));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version" && value == "2026-06-02-unrestricted-media-any-file"
+        key == "hermes_hub_spec_version" && value == "2026-06-03-home-channel"
     }));
     assert!(spec
         .mounts
@@ -1650,8 +1700,7 @@ async fn docker_provisioner_test() {
     );
     assert!(
         create_call.windows(2).any(|args| {
-            args[0] == "--label"
-                && args[1] == "hermes_hub_spec_version=2026-06-02-unrestricted-media-any-file"
+            args[0] == "--label" && args[1] == "hermes_hub_spec_version=2026-06-03-home-channel"
         }),
         "managed Hermes containers must carry the current spec label"
     );
@@ -1668,6 +1717,18 @@ async fn docker_provisioner_test() {
             .windows(2)
             .any(|args| args[0] == "--health-interval" && args[1] == "10s"),
         "managed Hermes healthcheck interval must be stable"
+    );
+    assert!(
+        create_call
+            .windows(2)
+            .any(|args| args[0] == "--health-retries" && args[1] == "6"),
+        "managed Hermes healthcheck retries must tolerate slow gateway startup"
+    );
+    assert!(
+        create_call
+            .windows(2)
+            .any(|args| args[0] == "--health-start-period" && args[1] == "60s"),
+        "managed Hermes healthcheck start period must tolerate cold startup"
     );
     assert!(
         create_call

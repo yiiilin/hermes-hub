@@ -56,8 +56,9 @@ import {
 type ChannelSessionRouteProps = {
   active?: boolean;
   apiClient: ApiClient;
-  onOpenChat?: () => void;
+  onSessionRouteChange?: (sessionId: string | null, mode: "push" | "replace") => void;
   publicMode?: boolean;
+  routeSessionId?: string | null;
 };
 
 type BrowserCrypto = {
@@ -86,8 +87,9 @@ const MESSAGE_HISTORY_LOAD_TOP_PX = 48;
 export function ChannelSessionRoute({
   active = true,
   apiClient,
-  onOpenChat,
+  onSessionRouteChange,
   publicMode = false,
+  routeSessionId,
 }: ChannelSessionRouteProps) {
   const { t, language } = useI18n();
   const setChatSidebar = useChatSidebar();
@@ -131,12 +133,6 @@ export function ChannelSessionRoute({
         }
       : undefined;
   }
-
-  useEffect(() => {
-    if (active && !publicMode) {
-      clearPublicSessionRoute();
-    }
-  }, [active, publicMode]);
 
   useEffect(() => {
     if (!active) {
@@ -197,11 +193,11 @@ export function ChannelSessionRoute({
   const refreshSessions = useCallback(async () => {
     setError(null);
     try {
-      const pathSessionId = publicMode ? publicSessionIdFromPath() : null;
-      const selectedSessionId = publicMode ? pathSessionId : selectedSessionIdRef.current;
-      const nextSessions = await apiClient.listSessionsPublic(
+      const selectedSessionId =
+        routeSessionId !== undefined ? routeSessionId : selectedSessionIdRef.current;
+      const nextSessions = (await apiClient.listSessionsPublic(
         publicRequestOptions(selectedSessionId),
-      );
+      )).filter((session) => !(publicMode && session.is_home));
       const nextSessionIds = new Set(nextSessions.map((session) => session.id));
       setSessions(nextSessions);
       setUnreadSessionIds((current) => {
@@ -239,8 +235,8 @@ export function ChannelSessionRoute({
         : (nextSessions[0] ?? null);
       selectedSessionIdRef.current = nextSelected?.id ?? null;
       setSelectedSession(nextSelected);
-      if (publicMode && pathSessionId) {
-        replacePublicSessionPath(nextSelected?.id ?? null);
+      if (routeSessionId && nextSelected?.id !== routeSessionId) {
+        onSessionRouteChange?.(nextSelected?.id ?? null, "replace");
       }
       if (!nextSelected) {
         setMessages([]);
@@ -251,24 +247,11 @@ export function ChannelSessionRoute({
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("chat.workspaceLoadFailed"));
     }
-  }, [apiClient, publicMode, t]);
+  }, [apiClient, onSessionRouteChange, routeSessionId, t]);
 
   useEffect(() => {
     void refreshSessions();
   }, [refreshSessions]);
-
-  useEffect(() => {
-    if (!publicMode) {
-      return undefined;
-    }
-
-    function handlePopState() {
-      void refreshSessions();
-    }
-
-    window.addEventListener("popstate", handlePopState);
-    return () => window.removeEventListener("popstate", handlePopState);
-  }, [publicMode]);
 
   useEffect(() => {
     let activeRequest = true;
@@ -343,6 +326,7 @@ export function ChannelSessionRoute({
         sessions={sessions}
         selectedSession={selectedSession}
         collapsed={sidebarCollapsed}
+        publicMode={publicMode}
         unreadSessionIds={unreadSessionIds}
         onCreate={() => void createSidebarSession()}
         onSelect={(session) => void selectSidebarSession(session)}
@@ -369,17 +353,11 @@ export function ChannelSessionRoute({
     resetVerboseEvents();
     clearExecutionHistory(session.id);
     stickToBottomRef.current = true;
-    if (publicMode) {
-      pushPublicSessionPath(session.id);
-    }
+    onSessionRouteChange?.(session.id, "push");
     return session;
   }
 
   async function createSidebarSession() {
-    if (!publicMode) {
-      clearPublicSessionRoute();
-    }
-    onOpenChat?.();
     try {
       setError(null);
       const session = await createSession();
@@ -403,14 +381,13 @@ export function ChannelSessionRoute({
         [session.id]: sessionUpdatedAt(session),
       }));
       setUnreadSessionIds((current) => withoutSession(current, session.id));
+      onSessionRouteChange?.(session.id, "push");
       return;
     }
 
     selectedSessionIdRef.current = session.id;
     setSelectedSession(session);
-    if (publicMode) {
-      pushPublicSessionPath(session.id);
-    }
+    onSessionRouteChange?.(session.id, "push");
     clearPendingAssistantMessage();
     setActiveRun(null);
     resetVerboseEvents();
@@ -424,10 +401,6 @@ export function ChannelSessionRoute({
   }
 
   async function selectSidebarSession(session: SessionSummary) {
-    if (!publicMode) {
-      clearPublicSessionRoute();
-    }
-    onOpenChat?.();
     await selectSession(session);
   }
 
@@ -949,6 +922,9 @@ export function ChannelSessionRoute({
   }
 
   async function deleteSidebarSession(session: SessionSummary) {
+    if (session.deletable === false) {
+      return;
+    }
     setError(null);
     try {
       await apiClient.deleteSessionPublic(session.id, publicRequestOptions());
@@ -964,9 +940,7 @@ export function ChannelSessionRoute({
         const nextSelected = nextSessions[0] ?? null;
         selectedSessionIdRef.current = nextSelected?.id ?? null;
         setSelectedSession(nextSelected);
-        if (publicMode) {
-          replacePublicSessionPath(nextSelected?.id ?? null);
-        }
+        onSessionRouteChange?.(nextSelected?.id ?? null, "replace");
         setMessages([]);
         clearPendingAssistantMessage();
         setActiveRun(null);
@@ -1031,7 +1005,7 @@ export function ChannelSessionRoute({
       <main className="chat-panel" aria-labelledby="chat-title">
         <header className="chat-header">
           <div className="chat-title-row">
-            <h2 id="chat-title">{selectedSession?.title ?? t("chat.newConversation")}</h2>
+            <h2 id="chat-title">{sessionDisplayTitle(selectedSession, t)}</h2>
             {recycleHint ? (
               <span className="header-recycle" title={recycleHint} aria-label={recycleHint}>
                 {recycleHint}
@@ -2323,6 +2297,7 @@ function ChatSidebar({
   sessions,
   selectedSession,
   collapsed,
+  publicMode,
   unreadSessionIds,
   onCreate,
   onSelect,
@@ -2331,6 +2306,7 @@ function ChatSidebar({
   sessions: SessionSummary[];
   selectedSession: SessionSummary | null;
   collapsed: boolean;
+  publicMode: boolean;
   unreadSessionIds: Set<string>;
   onCreate: () => void;
   onSelect: (session: SessionSummary) => void;
@@ -2338,6 +2314,8 @@ function ChatSidebar({
 }) {
   const { t } = useI18n();
   const listRef = useRef<HTMLUListElement | null>(null);
+  const mainSession = publicMode ? null : (sessions.find((session) => session.is_home) ?? null);
+  const regularSessions = sessions.filter((session) => !session.is_home);
   const [scrollbar, setScrollbar] = useState({
     visible: false,
     thumbHeight: 0,
@@ -2385,6 +2363,18 @@ function ChatSidebar({
 
   return (
     <div className="chat-sidebar-menu">
+      {mainSession ? (
+        <ul className="session-list session-list-main">
+          <SessionSidebarItem
+            session={mainSession}
+            selectedSession={selectedSession}
+            collapsed={collapsed}
+            unreadSessionIds={unreadSessionIds}
+            onSelect={onSelect}
+            onDelete={onDelete}
+          />
+        </ul>
+      ) : null}
       {/* 频道是固定系统通道，侧栏只保留用户真正操作的会话入口。 */}
       <button type="button" onClick={onCreate} title={t("chat.newChat")}>
         <Plus aria-hidden="true" size={17} />
@@ -2392,50 +2382,16 @@ function ChatSidebar({
       </button>
       <div className="session-list-wrap">
         <ul className="session-list" ref={listRef}>
-          {sessions.map((session) => (
-            <li key={session.id}>
-              {/*
-                非当前会话有新消息时只做视觉提醒，不改变 selectedSession，
-                避免用户正在看的会话被列表刷新抢走。
-              */}
-              <div
-                className={[
-                  "session-row",
-                  selectedSession?.id === session.id ? "active" : "",
-                  unreadSessionIds.has(session.id) ? "unread" : "",
-                ]
-                  .filter(Boolean)
-                  .join(" ")}
-              >
-                <button
-                  type="button"
-                  className={[
-                    "session-select",
-                    selectedSession?.id === session.id ? "active" : "",
-                    unreadSessionIds.has(session.id) ? "unread" : "",
-                  ]
-                    .filter(Boolean)
-                    .join(" ")}
-                  onClick={() => onSelect(session)}
-                  title={session.title ?? t("chat.newConversation")}
-                >
-                  <MessageSquare aria-hidden="true" size={15} />
-                  <span className="session-title">
-                    {session.title ?? t("chat.newConversation")}
-                  </span>
-                </button>
-                {!collapsed ? (
-                  <button
-                    type="button"
-                    className="session-delete"
-                    aria-label={t("chat.deleteSession")}
-                    onClick={() => onDelete(session)}
-                  >
-                    <Trash2 aria-hidden="true" size={15} />
-                  </button>
-                ) : null}
-              </div>
-            </li>
+          {regularSessions.map((session) => (
+            <SessionSidebarItem
+              key={session.id}
+              session={session}
+              selectedSession={selectedSession}
+              collapsed={collapsed}
+              unreadSessionIds={unreadSessionIds}
+              onSelect={onSelect}
+              onDelete={onDelete}
+            />
           ))}
         </ul>
         {scrollbar.visible ? (
@@ -2454,51 +2410,83 @@ function ChatSidebar({
   );
 }
 
+function SessionSidebarItem({
+  session,
+  selectedSession,
+  collapsed,
+  unreadSessionIds,
+  onSelect,
+  onDelete,
+}: {
+  session: SessionSummary;
+  selectedSession: SessionSummary | null;
+  collapsed: boolean;
+  unreadSessionIds: Set<string>;
+  onSelect: (session: SessionSummary) => void;
+  onDelete: (session: SessionSummary) => void;
+}) {
+  const { t } = useI18n();
+  const title = sessionDisplayTitle(session, t);
+  const isUnread = unreadSessionIds.has(session.id);
+
+  return (
+    <li key={session.id}>
+      {/*
+        非当前会话有新消息时只做视觉提醒，不改变 selectedSession，
+        避免用户正在看的会话被列表刷新抢走。
+      */}
+      <div
+        className={[
+          "session-row",
+          selectedSession?.id === session.id ? "active" : "",
+          isUnread ? "unread" : "",
+          session.is_home ? "home" : "",
+        ]
+          .filter(Boolean)
+          .join(" ")}
+      >
+        <button
+          type="button"
+          className={[
+            "session-select",
+            selectedSession?.id === session.id ? "active" : "",
+            isUnread ? "unread" : "",
+          ]
+            .filter(Boolean)
+            .join(" ")}
+          onClick={() => onSelect(session)}
+          title={title}
+        >
+          <MessageSquare aria-hidden="true" size={15} />
+          <span className="session-title">{title}</span>
+        </button>
+        {!collapsed && session.deletable !== false ? (
+          <button
+            type="button"
+            className="session-delete"
+            aria-label={t("chat.deleteSession")}
+            onClick={() => onDelete(session)}
+          >
+            <Trash2 aria-hidden="true" size={15} />
+          </button>
+        ) : null}
+      </div>
+    </li>
+  );
+}
+
+function sessionDisplayTitle(
+  session: SessionSummary | null | undefined,
+  t: (key: "chat.mainSession" | "chat.newConversation") => string,
+) {
+  if (session?.is_home) {
+    return t("chat.mainSession");
+  }
+  return session?.title ?? t("chat.newConversation");
+}
+
 function sessionUpdatedAt(session: SessionSummary) {
   return session.updated_at ?? session.created_at ?? 0;
-}
-
-function publicSessionIdFromPath() {
-  const prefix = "/public/sessions/";
-  if (!window.location.pathname.startsWith(prefix)) {
-    return null;
-  }
-  const rawSessionId = window.location.pathname.slice(prefix.length).split("/")[0];
-  if (!rawSessionId) {
-    return null;
-  }
-  try {
-    return decodeURIComponent(rawSessionId);
-  } catch {
-    return rawSessionId;
-  }
-}
-
-function pushPublicSessionPath(sessionId: string) {
-  setPublicSessionPath(sessionId, "push");
-}
-
-function replacePublicSessionPath(sessionId: string | null) {
-  setPublicSessionPath(sessionId, "replace");
-}
-
-function clearPublicSessionRoute() {
-  const path = window.location.pathname;
-  if (path === "/public" || path.startsWith("/public/")) {
-    window.history.replaceState({}, "", "/");
-  }
-}
-
-function setPublicSessionPath(sessionId: string | null, mode: "push" | "replace") {
-  const nextPath = sessionId ? `/public/sessions/${encodeURIComponent(sessionId)}` : "/public";
-  if (window.location.pathname === nextPath && !window.location.search && !window.location.hash) {
-    return;
-  }
-  if (mode === "push") {
-    window.history.pushState({}, "", nextPath);
-  } else {
-    window.history.replaceState({}, "", nextPath);
-  }
 }
 
 function upsertSessionSummary(sessions: SessionSummary[], updatedSession: SessionSummary) {

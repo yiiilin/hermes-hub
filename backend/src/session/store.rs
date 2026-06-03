@@ -1326,6 +1326,7 @@ impl SessionStore {
                               status_message,
                               runtime_image,
                               runtime_version,
+                              extract(epoch from last_health_check_at)::bigint as adapter_last_seen_at,
                               extract(epoch from last_user_activity_at)::bigint as last_user_activity_at,
                               extract(epoch from last_started_at)::bigint as last_started_at,
                               extract(epoch from last_stopped_at)::bigint as last_stopped_at,
@@ -1393,6 +1394,7 @@ impl SessionStore {
                               status_message,
                               runtime_image,
                               runtime_version,
+                              extract(epoch from last_health_check_at)::bigint as adapter_last_seen_at,
                               extract(epoch from last_user_activity_at)::bigint as last_user_activity_at,
                               extract(epoch from last_started_at)::bigint as last_started_at,
                               extract(epoch from last_stopped_at)::bigint as last_stopped_at,
@@ -1402,6 +1404,77 @@ impl SessionStore {
                 .bind(instance_id)
                 .bind(runtime_image)
                 .bind(runtime_version)
+                .fetch_optional(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?
+                .ok_or(StoreError::InviteNotFound)?;
+
+                row_to_hermes_instance(&row, cipher)
+            }),
+        }
+    }
+
+    pub async fn record_hermes_instance_adapter_heartbeat(
+        &self,
+        instance_id: &str,
+    ) -> Result<HermesInstance, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let instance = inner
+                    .hermes_instances_by_user_id
+                    .values_mut()
+                    .find(|instance| instance.id == instance_id)
+                    .ok_or(StoreError::InviteNotFound)?;
+                // adapter 能完成一次 Hub 认证请求，说明 gateway、adapter 和 Hub 链路都可用。
+                instance.status = HermesInstanceStatus::Running;
+                instance.health_status = "healthy".to_string();
+                instance.status_message = None;
+                instance.adapter_last_seen_at = Some(unix_now());
+                if instance.last_started_at.is_none() {
+                    instance.last_started_at = instance.adapter_last_seen_at;
+                }
+                instance.stopped_reason = None;
+                let instance = instance.clone();
+                Ok(instance_with_lifecycle(
+                    instance,
+                    inner.hermes_lifecycle_by_instance_id.get(instance_id),
+                ))
+            }
+            SessionStoreBackend::Postgres { pool, cipher } => block_on_db(async {
+                let row = sqlx::query(
+                    r#"
+                    update hermes_instances
+                    set status = 'running',
+                        health_status = 'healthy',
+                        status_message = null,
+                        last_health_check_at = now(),
+                        last_started_at = coalesce(last_started_at, now()),
+                        stopped_reason = null,
+                        updated_at = now()
+                    where id = $1::uuid
+                    returning id::text as id,
+                              user_id::text as user_id,
+                              kind,
+                              status,
+                              name,
+                              api_token_secret_ref,
+                              container_id,
+                              host_workspace_path,
+                              host_sandbox_path,
+                              host_config_path,
+                              health_status,
+                              status_message,
+                              runtime_image,
+                              runtime_version,
+                              extract(epoch from last_health_check_at)::bigint as adapter_last_seen_at,
+                              extract(epoch from last_user_activity_at)::bigint as last_user_activity_at,
+                              extract(epoch from last_started_at)::bigint as last_started_at,
+                              extract(epoch from last_stopped_at)::bigint as last_stopped_at,
+                              stopped_reason
+                    "#,
+                )
+                .bind(instance_id)
                 .fetch_optional(pool)
                 .await
                 .map_err(|_| StoreError::DatabaseFailed)?
@@ -2956,6 +3029,7 @@ fn hermes_instance_select(prefix: &str, filter: &str, suffix: &str) -> String {
            status_message,
            runtime_image,
            runtime_version,
+           extract(epoch from last_health_check_at)::bigint as adapter_last_seen_at,
            extract(epoch from last_user_activity_at)::bigint as last_user_activity_at,
            extract(epoch from last_started_at)::bigint as last_started_at,
            extract(epoch from last_stopped_at)::bigint as last_stopped_at,
@@ -3106,6 +3180,7 @@ fn row_to_hermes_instance(
             .map_err(|_| StoreError::DatabaseFailed)?,
         api_token_secret_ref,
         llm_api_key: None,
+        home_session_id: None,
         container_id: row
             .try_get("container_id")
             .map_err(|_| StoreError::DatabaseFailed)?,
@@ -3130,6 +3205,10 @@ fn row_to_hermes_instance(
         runtime_version: row
             .try_get("runtime_version")
             .map_err(|_| StoreError::DatabaseFailed)?,
+        adapter_last_seen_at: row
+            .try_get::<Option<i64>, _>("adapter_last_seen_at")
+            .map_err(|_| StoreError::DatabaseFailed)?
+            .map(|value| value as u64),
         last_user_activity_at: row
             .try_get::<Option<i64>, _>("last_user_activity_at")
             .map_err(|_| StoreError::DatabaseFailed)?

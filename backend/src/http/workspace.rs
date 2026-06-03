@@ -11,7 +11,7 @@ use crate::{
     domain::user::UserRole,
     hermes::{
         docker_provisioner::RuntimeModelSettings,
-        instance::{HermesInstance, HermesInstanceKind},
+        instance::{HermesInstance, HermesInstanceKind, HermesInstanceStatus},
     },
     http::{auth::current_user, map_provisioner_error, ApiError},
     model_config::IMAGE_MODEL_CONFIG_KIND,
@@ -33,6 +33,9 @@ pub fn router() -> Router<AppState> {
             get(current_scheduler_snapshot),
         )
 }
+
+const ADAPTER_HEARTBEAT_TTL_SECONDS: u64 = 45;
+const HERMES_STARTUP_GRACE_SECONDS: u64 = 120;
 
 #[derive(Serialize)]
 struct WorkspaceStatusResponse {
@@ -120,6 +123,7 @@ pub async fn ensure_managed_hermes_for_user_without_activity(
             state
                 .docker_provisioner
                 .apply_sandbox_policy(&mut instance, sandbox_enabled);
+            ensure_home_session_for_hermes_instance(state, user_id, &mut instance).await?;
             ensure_required_model_configs(state).await?;
             let llm_config = state
                 .model_registry
@@ -165,11 +169,6 @@ pub async fn ensure_managed_hermes_for_user_without_activity(
                 .bind_hermes_instance(ensured.clone())
                 .await
                 .map_err(|_| ApiError::Internal)?;
-            state
-                .channel_store
-                .bind_hub_channel_to_instance(user_id, &ensured.id)
-                .await
-                .map_err(|_| ApiError::Internal)?;
 
             return state
                 .store
@@ -202,11 +201,7 @@ pub async fn ensure_managed_hermes_for_user_without_activity(
         .bind_hermes_instance(instance.clone())
         .await
         .map_err(|_| ApiError::Internal)?;
-    state
-        .channel_store
-        .bind_hub_channel_to_instance(user_id, &instance.id)
-        .await
-        .map_err(|_| ApiError::Internal)?;
+    ensure_home_session_for_hermes_instance(state, user_id, &mut instance).await?;
     let llm_api_key = state
         .model_registry
         .issue_instance_token_for_instance(&instance.id)
@@ -227,17 +222,31 @@ pub async fn ensure_managed_hermes_for_user_without_activity(
         .bind_hermes_instance(instance.clone())
         .await
         .map_err(|_| ApiError::Internal)?;
-    state
-        .channel_store
-        .bind_hub_channel_to_instance(user_id, &instance.id)
-        .await
-        .map_err(|_| ApiError::Internal)?;
 
     state
         .store
         .hermes_instance_for_user(user_id)
         .await
         .map_err(|_| ApiError::Internal)
+}
+
+pub(crate) async fn ensure_home_session_for_hermes_instance(
+    state: &AppState,
+    user_id: &str,
+    instance: &mut HermesInstance,
+) -> Result<String, ApiError> {
+    let channel = state
+        .channel_store
+        .bind_hub_channel_to_instance(user_id, &instance.id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let session = state
+        .channel_store
+        .ensure_home_session(user_id, &channel.id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    instance.home_session_id = Some(session.id.clone());
+    Ok(session.id)
 }
 
 async fn user_has_global_skills_write_access(
@@ -274,6 +283,7 @@ pub async fn refresh_managed_hermes_status(
         .refresh_instance_status(&instance)
         .await
         .map_err(map_provisioner_error)?;
+    let refreshed = apply_adapter_heartbeat_status(refreshed);
     state
         .store
         .bind_hermes_instance(refreshed.clone())
@@ -284,6 +294,118 @@ pub async fn refresh_managed_hermes_status(
         .hermes_instance_for_user(&refreshed.user_id)
         .await
         .map_err(|_| ApiError::Internal)
+}
+
+fn apply_adapter_heartbeat_status(mut instance: HermesInstance) -> HermesInstance {
+    let now = unix_now();
+    let adapter_recent = instance
+        .adapter_last_seen_at
+        .is_some_and(|seen_at| now.saturating_sub(seen_at) <= ADAPTER_HEARTBEAT_TTL_SECONDS);
+    if adapter_recent && matches_docker_process_alive(&instance) {
+        // adapter 能连上 Hub 比 Docker healthcheck 更能证明 Hermes gateway 实际可用。
+        instance.status = HermesInstanceStatus::Running;
+        instance.health_status = "healthy".to_string();
+        instance.status_message = None;
+        return instance;
+    }
+
+    let in_startup_grace = instance
+        .last_started_at
+        .is_some_and(|started_at| now.saturating_sub(started_at) <= HERMES_STARTUP_GRACE_SECONDS);
+    if in_startup_grace
+        && matches!(instance.status, HermesInstanceStatus::Error)
+        && instance.health_status == "unhealthy"
+    {
+        // Hermes 冷启动可能先连续几次 healthcheck 失败；启动宽限期内不要写死为 error。
+        instance.status = HermesInstanceStatus::Provisioning;
+        instance.health_status = "starting".to_string();
+        instance.status_message = None;
+        return instance;
+    }
+
+    if instance.adapter_last_seen_at.is_some()
+        && !adapter_recent
+        && matches_docker_process_alive(&instance)
+    {
+        instance.status = HermesInstanceStatus::Error;
+        instance.health_status = "adapter_offline".to_string();
+        instance.status_message = Some("Adapter heartbeat timed out".to_string());
+    }
+
+    instance
+}
+
+fn matches_docker_process_alive(instance: &HermesInstance) -> bool {
+    !matches!(instance.status, HermesInstanceStatus::Stopped)
+        && !matches!(instance.health_status.as_str(), "missing" | "stopped")
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after unix epoch")
+        .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_instance() -> HermesInstance {
+        HermesInstance::managed_docker(
+            "user-1",
+            "/tmp/hermes/user-1/workspace".to_string(),
+            None,
+            "/tmp/hermes/user-1/config".to_string(),
+        )
+    }
+
+    #[test]
+    fn recent_adapter_heartbeat_overrides_transient_docker_unhealthy() {
+        let mut instance = test_instance();
+        instance.status = HermesInstanceStatus::Error;
+        instance.health_status = "unhealthy".to_string();
+        instance.status_message = Some("curl: connection refused".to_string());
+        instance.adapter_last_seen_at = Some(unix_now());
+
+        let normalized = apply_adapter_heartbeat_status(instance);
+
+        assert_eq!(normalized.status, HermesInstanceStatus::Running);
+        assert_eq!(normalized.health_status, "healthy");
+        assert_eq!(normalized.status_message, None);
+    }
+
+    #[test]
+    fn startup_grace_keeps_transient_unhealthy_as_starting() {
+        let mut instance = test_instance();
+        instance.status = HermesInstanceStatus::Error;
+        instance.health_status = "unhealthy".to_string();
+        instance.status_message = Some("curl: connection refused".to_string());
+        instance.last_started_at = Some(unix_now());
+
+        let normalized = apply_adapter_heartbeat_status(instance);
+
+        assert_eq!(normalized.status, HermesInstanceStatus::Provisioning);
+        assert_eq!(normalized.health_status, "starting");
+        assert_eq!(normalized.status_message, None);
+    }
+
+    #[test]
+    fn stale_adapter_heartbeat_marks_running_container_offline() {
+        let mut instance = test_instance();
+        instance.status = HermesInstanceStatus::Running;
+        instance.health_status = "healthy".to_string();
+        instance.adapter_last_seen_at = Some(unix_now() - ADAPTER_HEARTBEAT_TTL_SECONDS - 1);
+
+        let normalized = apply_adapter_heartbeat_status(instance);
+
+        assert_eq!(normalized.status, HermesInstanceStatus::Error);
+        assert_eq!(normalized.health_status, "adapter_offline");
+        assert_eq!(
+            normalized.status_message.as_deref(),
+            Some("Adapter heartbeat timed out")
+        );
+    }
 }
 
 fn runtime_model_settings(config: &crate::model_config::ModelConfig) -> RuntimeModelSettings {

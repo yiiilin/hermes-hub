@@ -946,6 +946,13 @@ td {
   scrollbar-width: none;
 }
 
+.session-list-main {
+  border-bottom: 1px solid #29424b;
+  flex: 0 0 auto;
+  height: auto;
+  padding: 0 0 10px;
+}
+
 .session-list li {
   flex: 0 0 auto;
 }
@@ -972,6 +979,11 @@ td {
   background: rgba(46, 111, 133, 0.22);
   border-color: rgba(125, 191, 207, 0.72);
   color: #ffffff;
+}
+
+.session-row.home:not(.active) {
+  background: rgba(247, 251, 252, 0.08);
+  border-color: #5f7f89;
 }
 
 .session-list button {

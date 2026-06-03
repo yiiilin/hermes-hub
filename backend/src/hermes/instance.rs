@@ -30,6 +30,8 @@ pub struct HermesInstance {
     pub api_token_secret_ref: Option<String>,
     #[serde(skip_serializing)]
     pub llm_api_key: Option<String>,
+    #[serde(skip_serializing)]
+    pub home_session_id: Option<String>,
     pub container_id: Option<String>,
     pub host_workspace_path: Option<String>,
     pub host_sandbox_path: Option<String>,
@@ -38,6 +40,8 @@ pub struct HermesInstance {
     pub status_message: Option<String>,
     pub runtime_image: Option<String>,
     pub runtime_version: Option<String>,
+    /// adapter 最近一次主动连上 Hub 的时间；用于判断 Hermes 是否真的在线。
+    pub adapter_last_seen_at: Option<u64>,
     pub last_user_activity_at: Option<u64>,
     pub last_started_at: Option<u64>,
     pub last_stopped_at: Option<u64>,
@@ -62,6 +66,7 @@ impl HermesInstance {
             name: format!("hermes-user-{user_id}"),
             api_token_secret_ref: None,
             llm_api_key: None,
+            home_session_id: None,
             container_id: None,
             host_workspace_path: Some(host_workspace_path),
             host_sandbox_path,
@@ -70,6 +75,7 @@ impl HermesInstance {
             status_message: None,
             runtime_image: None,
             runtime_version: None,
+            adapter_last_seen_at: None,
             last_user_activity_at: None,
             last_started_at: None,
             last_stopped_at: None,

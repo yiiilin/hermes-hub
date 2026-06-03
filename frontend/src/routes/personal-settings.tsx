@@ -1,17 +1,22 @@
 import type { ApiClient } from "../api/client";
 import { useI18n, type Language } from "../i18n";
+import type { PersonalSettingsTab } from "../navigation";
 import { FormEvent, useEffect, useState } from "react";
 
 type PersonalSettingsRouteProps = {
   active: boolean;
+  activeTab: PersonalSettingsTab;
   apiClient: ApiClient;
+  onTabChange: (tab: PersonalSettingsTab) => void;
 };
 
-type PersonalSettingsTab = "personalization" | "password";
-
-export function PersonalSettingsRoute({ active, apiClient }: PersonalSettingsRouteProps) {
+export function PersonalSettingsRoute({
+  active,
+  activeTab,
+  apiClient,
+  onTabChange,
+}: PersonalSettingsRouteProps) {
   const { language, setLanguage, t } = useI18n();
-  const [activeTab, setActiveTab] = useState<PersonalSettingsTab>("personalization");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [savingPassword, setSavingPassword] = useState(false);
@@ -76,7 +81,7 @@ export function PersonalSettingsRoute({ active, apiClient }: PersonalSettingsRou
           role="tab"
           aria-selected={activeTab === "personalization"}
           className={activeTab === "personalization" ? "active" : ""}
-          onClick={() => setActiveTab("personalization")}
+          onClick={() => onTabChange("personalization")}
         >
           {t("personal.personalization")}
         </button>
@@ -85,7 +90,7 @@ export function PersonalSettingsRoute({ active, apiClient }: PersonalSettingsRou
           role="tab"
           aria-selected={activeTab === "password"}
           className={activeTab === "password" ? "active" : ""}
-          onClick={() => setActiveTab("password")}
+          onClick={() => onTabChange("password")}
         >
           {t("personal.changePassword")}
         </button>

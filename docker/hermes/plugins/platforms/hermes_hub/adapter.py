@@ -676,10 +676,6 @@ class HermesHubAdapter(BasePlatformAdapter):
         run_id = str(item.get("run_id") or inbox_id or "")
         session_id = str(item.get("session_id") or item.get("channel_session_id") or "")
         content = item.get("content") or item.get("text") or item.get("message") or ""
-        if session_id:
-            # send_message 工具通过 gateway config 读取 home_channel。Hub 会话的
-            # “正确默认目标”是当前正在处理的 session，不能沿用上一次会话。
-            os.environ["HERMES_HUB_HOME_CHANNEL"] = session_id
         run_id = self._normalize_run_id(run_id)
         if run_id:
             # 先把 run 标成 running，再下载用户附件；附件下载较慢时也不会被重复租约消费。
@@ -1154,7 +1150,7 @@ def _env_enablement() -> Optional[dict[str, Any]]:
     home_channel = os.getenv("HERMES_HUB_HOME_CHANNEL", "").strip()
     if home_channel:
         # Hermes 的 send_message 工具只读取 gateway config 里的 home_channel；
-        # adapter 在分发当前 run 前会写入这个环境变量，这里把它桥接成配置对象。
+        # Hub 在容器启动前注入固定主会话，adapter 只把它桥接成平台配置。
         seed["home_channel"] = {
             "chat_id": home_channel,
             "name": "Hermes Hub",

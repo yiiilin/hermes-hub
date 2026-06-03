@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const vditorMock = vi.hoisted(() => {
@@ -63,6 +63,7 @@ import { createClientMessageId } from "./routes/channel-session";
 
 describe("App", () => {
   afterEach(() => {
+    cleanup();
     vditorMock.instances.splice(0);
     vditorMock.Vditor.mockClear();
     vi.restoreAllMocks();
@@ -258,9 +259,13 @@ describe("App", () => {
 
   async function openSettingsTab(tabName: string, settingsName = "System settings") {
     fireEvent.click(await screen.findByRole("button", { name: settingsName }));
-    const settingsTabs = await screen.findByRole("tablist", {
-      name: settingsName,
-    });
+    const settingsTabs = await screen.findByRole(
+      "tablist",
+      {
+        name: settingsName,
+      },
+      { timeout: 3_000 },
+    );
     fireEvent.click(within(settingsTabs).getByRole("tab", { name: tabName }));
     return settingsTabs;
   }
@@ -638,6 +643,38 @@ describe("App", () => {
     expect(screen.getByLabelText("Primary")).toBeInTheDocument();
   });
 
+  it("hides the public main session from the sidebar", async () => {
+    const client = createMockApiClient({
+      initialUser: null,
+      publicPlatformSettings: { enabled: true },
+      publicPlatformInstance: publicHermesInstance(),
+    });
+    client.listSessionsPublic = vi.fn(async () => [
+      {
+        id: "home-session",
+        title: "Generated title should not be shown",
+        is_home: true,
+        deletable: false,
+        created_at: 1,
+        updated_at: 1,
+      },
+      {
+        id: "regular-session",
+        title: "Regular session",
+        is_home: false,
+        deletable: true,
+        created_at: 2,
+        updated_at: 2,
+      },
+    ]);
+
+    render(<App apiClient={client} />);
+
+    expect(screen.queryByRole("button", { name: "Main session" })).not.toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Regular session" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Regular session" })).toBeInTheDocument();
+  });
+
   it("stores the public session token in localStorage and only reuses it for public requests", async () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
@@ -881,14 +918,70 @@ describe("App", () => {
 
     expect(await screen.findByRole("button", { name: "Session" })).toBeInTheDocument();
     await waitFor(() => {
-      expect(window.location.pathname).toBe("/");
+      expect(window.location.pathname).toBe("/chat");
     });
     expect(window.location.search).toBe("");
     expect(window.location.hash).toBe("");
 
     window.history.pushState({}, "", "/public/sessions/stale-public-session");
     fireEvent.click(screen.getByRole("button", { name: "Session" }));
-    expect(window.location.pathname).toBe("/");
+    expect(window.location.pathname).toBe("/chat/sessions/session-1");
+  });
+
+  it("restores authenticated feature pages from URL paths", async () => {
+    window.history.pushState({}, "", "/settings/auth");
+    render(<App apiClient={createMockApiClient()} />);
+
+    const settingsTabs = await screen.findByRole("tablist", {
+      name: "System settings",
+    });
+    expect(within(settingsTabs).getByRole("tab", { name: "Authentication settings" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(await screen.findByLabelText("Enable OIDC")).toBeInTheDocument();
+
+    fireEvent.click(within(settingsTabs).getByRole("tab", { name: "Public platform" }));
+    expect(window.location.pathname).toBe("/settings/public-platform");
+
+    window.history.pushState({}, "", "/personal/password");
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    const personalTabs = await screen.findByRole("tablist", {
+      name: "Personal settings",
+    });
+    expect(within(personalTabs).getByRole("tab", { name: "Change password" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByLabelText("New password")).toBeInTheDocument();
+
+    window.history.pushState({}, "", "/scheduled-tasks");
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    expect(await screen.findByRole("heading", { name: "Scheduled tasks" })).toBeInTheDocument();
+  });
+
+  it("restores authenticated chat sessions from URL paths", async () => {
+    window.history.pushState({}, "", "/chat/sessions/session-1");
+    const client = createMockApiClient({
+      initialMessagesBySessionId: {
+        "session-1": [
+          {
+            id: "message-1",
+            session_id: "session-1",
+            role: "assistant",
+            content: "Restored from URL",
+            attachments: [],
+            created_at: 1_767_225_600,
+          },
+        ],
+      },
+    });
+
+    render(<App apiClient={client} />);
+
+    expect(await screen.findByRole("heading", { name: "Session" })).toBeInTheDocument();
+    expect(await screen.findByText("Restored from URL")).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/chat/sessions/session-1");
   });
 
   it("waits for public platform status before showing the anonymous landing route", async () => {

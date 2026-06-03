@@ -27,8 +27,8 @@ use crate::{
         auth::require_admin,
         map_provisioner_error, sessions,
         workspace::{
-            ensure_managed_hermes_for_user, ensure_required_model_configs,
-            refresh_managed_hermes_status,
+            ensure_home_session_for_hermes_instance, ensure_managed_hermes_for_user,
+            ensure_required_model_configs, refresh_managed_hermes_status,
         },
         ApiError,
     },
@@ -445,6 +445,7 @@ async fn rebuild_public_platform_hermes_instance(
     state
         .docker_provisioner
         .apply_sandbox_policy(&mut instance, true);
+    ensure_home_session_for_hermes_instance(&state, &public_user_id, &mut instance).await?;
     state
         .model_registry
         .revoke_instance_tokens_for_instance(&instance.id)
@@ -481,11 +482,6 @@ async fn rebuild_public_platform_hermes_instance(
     state
         .store
         .bind_hermes_instance(instance.clone())
-        .await
-        .map_err(|_| ApiError::Internal)?;
-    state
-        .channel_store
-        .bind_hub_channel_to_instance(&public_user_id, &instance.id)
         .await
         .map_err(|_| ApiError::Internal)?;
     let instance = state
@@ -657,6 +653,7 @@ async fn rebuild_managed_hermes_instance(
     // store 中不持久化全局 skills 写权限；管理员重建前必须按用户角色恢复，避免管理员实例被只读挂载。
     instance.global_skills_write_enabled =
         user_has_global_skills_write_access_for_rebuild(&state, &user_id).await?;
+    ensure_home_session_for_hermes_instance(&state, &user_id, &mut instance).await?;
     state
         .model_registry
         .revoke_instance_tokens_for_instance(&instance.id)
@@ -693,11 +690,6 @@ async fn rebuild_managed_hermes_instance(
     state
         .store
         .bind_hermes_instance(instance.clone())
-        .await
-        .map_err(|_| ApiError::Internal)?;
-    state
-        .channel_store
-        .bind_hub_channel_to_instance(&user_id, &instance.id)
         .await
         .map_err(|_| ApiError::Internal)?;
     let instance = state
@@ -1035,6 +1027,8 @@ async fn refresh_managed_hermes_configs(state: &AppState) -> Result<(), ApiError
         state
             .docker_provisioner
             .apply_sandbox_policy(&mut instance, sandbox_enabled);
+        let instance_user_id = instance.user_id.clone();
+        ensure_home_session_for_hermes_instance(state, &instance_user_id, &mut instance).await?;
         let path_policy_changed = instance.host_workspace_path
             != original_instance.host_workspace_path
             || instance.host_config_path != original_instance.host_config_path

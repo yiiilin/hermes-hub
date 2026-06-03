@@ -507,6 +507,7 @@ pub fn map_channel_error(error: ChannelStoreError) -> ApiError {
         } => ApiError::SessionLimitExceeded {
             max_sessions_per_user,
         },
+        ChannelStoreError::ProtectedSession => ApiError::Conflict("session is protected"),
         ChannelStoreError::LockFailed | ChannelStoreError::DatabaseFailed => ApiError::Internal,
     }
 }

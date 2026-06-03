@@ -87,6 +87,8 @@ struct UpdateMessageRequest {
 struct PublicSessionSummary {
     id: String,
     title: Option<String>,
+    is_home: bool,
+    deletable: bool,
     created_at: u64,
     updated_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -168,20 +170,6 @@ async fn list_sessions(
                 public_token = Some(token);
             }
         }
-        if public_token.is_none() {
-            return session_list_response(&headers, vec![], None);
-        }
-        if let Some(token) = &public_token {
-            if state
-                .store
-                .public_session_ids_for_token(token)
-                .await
-                .map_err(|_| ApiError::Internal)?
-                .is_empty()
-            {
-                return session_list_response(&headers, vec![], public_token.clone());
-            }
-        }
     }
     let access = if is_authenticated {
         session_access(&state, &headers).await?
@@ -191,19 +179,7 @@ async fn list_sessions(
             token: public_token.clone(),
         }
     };
-    if let SessionAccess::Public {
-        token: Some(token), ..
-    } = &access
-    {
-        if state
-            .store
-            .public_session_ids_for_token(token)
-            .await
-            .map_err(|_| ApiError::Internal)?
-            .is_empty()
-        {
-            return session_list_response(&headers, vec![], public_token.clone());
-        }
+    if matches!(access, SessionAccess::Public { .. }) {
         ensure_managed_hermes_for_user(&state, access.user_id()).await?;
     }
     let Some(channel) = ensure_channel_for_access(&state, &access).await? else {
@@ -409,7 +385,7 @@ async fn append_session_message(
             .session_events
             .publish(SessionEvent::RunUpdated { run: run.clone() });
 
-        if session.title.is_none() && !message.content.trim().is_empty() {
+        if !session.is_home && session.title.is_none() && !message.content.trim().is_empty() {
             let title = model_generated_title(&state, access.user_id(), &message.content).await;
             let updated_session = state
                 .channel_store
@@ -615,7 +591,7 @@ async fn public_session_summary_for_access(
     access: &SessionAccess,
     session: ChannelSession,
 ) -> Result<PublicSessionSummary, ApiError> {
-    let recycle_at = if matches!(access, SessionAccess::Public { .. }) {
+    let recycle_at = if matches!(access, SessionAccess::Public { .. }) && !session.is_home {
         Some(public_session_recycle_at(state, &session).await?)
     } else {
         None
@@ -628,7 +604,7 @@ async fn public_session_summary_for_create(
     is_public_session: bool,
     session: ChannelSession,
 ) -> Result<PublicSessionSummary, ApiError> {
-    let recycle_at = if is_public_session {
+    let recycle_at = if is_public_session && !session.is_home {
         Some(public_session_recycle_at(state, &session).await?)
     } else {
         None
@@ -643,6 +619,8 @@ fn public_session_summary(
     PublicSessionSummary {
         id: session.id,
         title: session.title,
+        is_home: session.is_home,
+        deletable: session.deletable,
         created_at: session.created_at,
         updated_at: session.updated_at,
         recycle_at,
@@ -785,11 +763,16 @@ async fn session_access_requiring_session(
     if cleanup_public_session_if_recycled(state, session_id).await? {
         return Err(ApiError::Unauthorized);
     }
+    let owner_user_id = public_platform_owner_user_id(state).await?;
+    if public_session_is_home(state, &owner_user_id, session_id).await? {
+        // 公共平台的主会话只用于 Hermes 内部 home channel，不对匿名访客暴露。
+        return Err(ApiError::Unauthorized);
+    }
     let token = public_session_token_for_session(state, headers, session_id)
         .await?
         .ok_or(ApiError::Unauthorized)?;
     Ok(SessionAccess::Public {
-        owner_user_id: public_platform_owner_user_id(state).await?,
+        owner_user_id,
         token: Some(token),
     })
 }
@@ -798,9 +781,6 @@ async fn ensure_channel_for_access(
     state: &AppState,
     access: &SessionAccess,
 ) -> Result<Option<crate::channel::service::Channel>, ApiError> {
-    if matches!(access, SessionAccess::Public { token: None, .. }) {
-        return Ok(None);
-    }
     ensure_public_channel(state, access.user_id())
         .await
         .map(Some)
@@ -811,22 +791,23 @@ async fn filter_sessions_for_access(
     access: &SessionAccess,
     sessions: Vec<ChannelSession>,
 ) -> Result<Vec<ChannelSession>, ApiError> {
-    let SessionAccess::Public {
-        token: Some(token), ..
-    } = access
-    else {
+    let SessionAccess::Public { token, .. } = access else {
         return Ok(sessions);
     };
-    let allowed_session_ids = state
-        .store
-        .public_session_ids_for_token(token)
-        .await
-        .map_err(|_| ApiError::Internal)?
-        .into_iter()
-        .collect::<HashSet<_>>();
+    let allowed_session_ids = if let Some(token) = token {
+        state
+            .store
+            .public_session_ids_for_token(token)
+            .await
+            .map_err(|_| ApiError::Internal)?
+            .into_iter()
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
     Ok(sessions
         .into_iter()
-        .filter(|session| allowed_session_ids.contains(&session.id))
+        .filter(|session| !session.is_home && allowed_session_ids.contains(&session.id))
         .collect())
 }
 
@@ -848,6 +829,9 @@ async fn grant_public_session_path_access(
         Ok(session) => session,
         Err(_) => return Ok(current_token),
     };
+    if session.is_home {
+        return Ok(current_token);
+    }
     if cleanup_public_session_if_recycled(state, session_id).await? {
         return Ok(current_token);
     }
@@ -859,6 +843,27 @@ async fn grant_public_session_path_access(
         .await
         .map_err(|_| ApiError::Internal)?;
     Ok(Some(token))
+}
+
+async fn public_session_is_home(
+    state: &AppState,
+    owner_user_id: &str,
+    session_id: &str,
+) -> Result<bool, ApiError> {
+    let context = match state.channel_store.session_context(session_id).await {
+        Ok(context) => context,
+        Err(ChannelStoreError::ChannelNotFound) => return Ok(false),
+        Err(error) => return Err(map_channel_error(error)),
+    };
+    if context.user_id != owner_user_id {
+        return Ok(false);
+    }
+    let session = state
+        .channel_store
+        .get_session(&context.user_id, &context.channel_id, session_id)
+        .await
+        .map_err(map_channel_error)?;
+    Ok(session.is_home)
 }
 
 pub(crate) async fn public_session_token_for_request(
@@ -1211,6 +1216,9 @@ async fn cleanup_public_session_if_recycled_with_retention(
         .get_session(&context.user_id, &context.channel_id, session_id)
         .await
         .map_err(map_channel_error)?;
+    if session.is_home {
+        return Ok(false);
+    }
     let recycle_at =
         public_session_recycle_at_with_retention(state, &session, retention_hours).await?;
     if recycle_at > now {
