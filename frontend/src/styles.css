@@ -957,6 +957,30 @@ td {
   flex: 0 0 auto;
 }
 
+.session-list-loading {
+  align-items: center;
+  border: 1px solid #2c4049;
+  border-radius: 8px;
+  color: #a9c1c8;
+  display: flex;
+  gap: 8px;
+  min-height: 46px;
+  overflow: hidden;
+  padding: 8px 11px;
+}
+
+.session-list-loading svg {
+  animation: loading-chat-spin 1s linear infinite;
+  flex: 0 0 auto;
+}
+
+.session-list-loading span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .session-row {
   align-items: center;
   background: transparent;

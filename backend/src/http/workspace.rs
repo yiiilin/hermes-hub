@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::Serialize;
+use std::time::Instant;
 
 use crate::{
     domain::user::UserRole,
@@ -36,6 +37,10 @@ pub fn router() -> Router<AppState> {
 
 const ADAPTER_HEARTBEAT_TTL_SECONDS: u64 = 45;
 const HERMES_STARTUP_GRACE_SECONDS: u64 = 120;
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
 
 #[derive(Serialize)]
 struct WorkspaceStatusResponse {
@@ -69,8 +74,16 @@ async fn ensure_hermes(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
+    let request_started_at = Instant::now();
     let user = current_user(&state, &headers).await?;
     let instance = ensure_managed_hermes_for_user(&state, &user.id).await?;
+    tracing::info!(
+        user_id = %user.id,
+        instance_id = %instance.id,
+        status = ?instance.status,
+        total_elapsed_ms = elapsed_ms(request_started_at),
+        "workspace ensure Hermes completed"
+    );
 
     Ok(Json(HermesInstanceResponse {
         hermes_instance: instance,
@@ -97,17 +110,34 @@ pub async fn ensure_managed_hermes_for_user(
     state: &AppState,
     user_id: &str,
 ) -> Result<HermesInstance, ApiError> {
+    let request_started_at = Instant::now();
+    let ensure_started_at = Instant::now();
     ensure_managed_hermes_for_user_without_activity(state, user_id).await?;
+    let ensure_elapsed_ms = elapsed_ms(ensure_started_at);
+    let activity_started_at = Instant::now();
     state
         .store
         .record_hermes_user_activity(user_id)
         .await
         .map_err(|_| ApiError::Internal)?;
-    state
+    let activity_elapsed_ms = elapsed_ms(activity_started_at);
+    let fetch_started_at = Instant::now();
+    let instance = state
         .store
         .hermes_instance_for_user(user_id)
         .await
-        .map_err(|_| ApiError::Internal)
+        .map_err(|_| ApiError::Internal)?;
+    tracing::info!(
+        user_id = %user_id,
+        instance_id = %instance.id,
+        status = ?instance.status,
+        ensure_elapsed_ms,
+        activity_elapsed_ms,
+        fetch_elapsed_ms = elapsed_ms(fetch_started_at),
+        total_elapsed_ms = elapsed_ms(request_started_at),
+        "managed Hermes ensure completed"
+    );
+    Ok(instance)
 }
 
 pub async fn ensure_managed_hermes_for_user_without_activity(
@@ -118,6 +148,7 @@ pub async fn ensure_managed_hermes_for_user_without_activity(
     let sandbox_enabled = public_platform::is_public_user_id(state, user_id).await?;
     if let Ok(instance) = state.store.hermes_instance_for_user(user_id).await {
         if instance.kind == HermesInstanceKind::ManagedDocker {
+            let existing_started_at = Instant::now();
             let mut instance = instance;
             instance.global_skills_write_enabled = global_skills_write_enabled;
             state
@@ -154,6 +185,7 @@ pub async fn ensure_managed_hermes_for_user_without_activity(
                     .await
                     .map_err(|_| ApiError::Internal)?,
             };
+            let docker_started_at = Instant::now();
             let ensured = state
                 .docker_provisioner
                 .ensure_container_with_default_model(
@@ -164,20 +196,30 @@ pub async fn ensure_managed_hermes_for_user_without_activity(
                 )
                 .await
                 .map_err(map_provisioner_error)?;
+            let docker_elapsed_ms = elapsed_ms(docker_started_at);
             state
                 .store
                 .bind_hermes_instance(ensured.clone())
                 .await
                 .map_err(|_| ApiError::Internal)?;
-
-            return state
+            let latest = state
                 .store
                 .hermes_instance_for_user(user_id)
                 .await
-                .map_err(|_| ApiError::Internal);
+                .map_err(|_| ApiError::Internal)?;
+            tracing::info!(
+                user_id = %user_id,
+                instance_id = %latest.id,
+                status = ?latest.status,
+                docker_elapsed_ms,
+                total_elapsed_ms = elapsed_ms(existing_started_at),
+                "managed Hermes existing instance ensured"
+            );
+            return Ok(latest);
         }
     }
 
+    let create_started_at = Instant::now();
     ensure_required_model_configs(state).await?;
     let llm_config = state
         .model_registry
@@ -207,6 +249,7 @@ pub async fn ensure_managed_hermes_for_user_without_activity(
         .issue_instance_token_for_instance(&instance.id)
         .await
         .map_err(|_| ApiError::Internal)?;
+    let docker_started_at = Instant::now();
     let instance = state
         .docker_provisioner
         .ensure_container_with_default_model(
@@ -217,17 +260,27 @@ pub async fn ensure_managed_hermes_for_user_without_activity(
         )
         .await
         .map_err(map_provisioner_error)?;
+    let docker_elapsed_ms = elapsed_ms(docker_started_at);
     state
         .store
         .bind_hermes_instance(instance.clone())
         .await
         .map_err(|_| ApiError::Internal)?;
 
-    state
+    let latest = state
         .store
         .hermes_instance_for_user(user_id)
         .await
-        .map_err(|_| ApiError::Internal)
+        .map_err(|_| ApiError::Internal)?;
+    tracing::info!(
+        user_id = %user_id,
+        instance_id = %latest.id,
+        status = ?latest.status,
+        docker_elapsed_ms,
+        total_elapsed_ms = elapsed_ms(create_started_at),
+        "managed Hermes new instance ensured"
+    );
+    Ok(latest)
 }
 
 pub(crate) async fn ensure_home_session_for_hermes_instance(

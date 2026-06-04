@@ -993,6 +993,33 @@ describe("App", () => {
     expect(window.location.pathname).toBe("/chat/sessions/session-1");
   });
 
+  it("shows a sidebar loading state while authenticated session history loads", async () => {
+    const client = createMockApiClient();
+    const sessionsDeferred =
+      createDeferred<Awaited<ReturnType<ApiClient["listSessionsPublic"]>>>();
+    client.listSessionsPublic = vi.fn(async () => sessionsDeferred.promise);
+
+    render(<App apiClient={client} />);
+
+    expect(await screen.findByText("Loading sessions")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Delayed session" })).not.toBeInTheDocument();
+
+    await act(async () => {
+      sessionsDeferred.resolve([
+        {
+          id: "delayed-session",
+          title: "Delayed session",
+          created_at: 1_767_225_600,
+          updated_at: 1_767_225_600,
+        } as unknown as Awaited<ReturnType<ApiClient["listSessionsPublic"]>>[number],
+      ]);
+      await sessionsDeferred.promise;
+    });
+
+    expect(await screen.findByRole("button", { name: "Delayed session" })).toBeInTheDocument();
+    expect(screen.queryByText("Loading sessions")).not.toBeInTheDocument();
+  });
+
   it("waits for public platform status before showing the anonymous landing route", async () => {
     const client = createMockApiClient();
     const meDeferred = createDeferred<Awaited<ReturnType<ApiClient["me"]>>>();

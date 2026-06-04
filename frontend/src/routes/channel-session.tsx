@@ -113,6 +113,7 @@ export function ChannelSessionRoute({
   const [configuredEmptyChatPrompt, setConfiguredEmptyChatPrompt] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [sessionsLoading, setSessionsLoading] = useState(true);
   const [sessionSnapshotLoading, setSessionSnapshotLoading] = useState(false);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
@@ -289,6 +290,7 @@ export function ChannelSessionRoute({
 
   const refreshSessions = useCallback(async () => {
     setError(null);
+    setSessionsLoading(true);
     try {
       const selectedSessionId =
         routeSessionId !== undefined ? routeSessionId : selectedSessionIdRef.current;
@@ -351,6 +353,8 @@ export function ChannelSessionRoute({
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("chat.workspaceLoadFailed"));
+    } finally {
+      setSessionsLoading(false);
     }
   }, [apiClient, onSessionRouteChange, routeSessionId, t]);
 
@@ -432,6 +436,7 @@ export function ChannelSessionRoute({
         selectedSession={selectedSession}
         collapsed={sidebarCollapsed}
         publicMode={publicMode}
+        sessionsLoading={sessionsLoading}
         unreadSessionIds={unreadSessionIds}
         onCreate={() => void createSidebarSession()}
         onSelect={(session) => void selectSidebarSession(session)}
@@ -440,7 +445,15 @@ export function ChannelSessionRoute({
     );
 
     return () => setChatSidebar?.(null);
-  }, [sessions, selectedSession, setChatSidebar, sidebarCollapsed, t, unreadSessionIds]);
+  }, [
+    sessions,
+    selectedSession,
+    setChatSidebar,
+    sidebarCollapsed,
+    sessionsLoading,
+    t,
+    unreadSessionIds,
+  ]);
 
   async function createSession() {
     const session = await apiClient.createSessionPublic("agent", undefined, publicRequestOptions());
@@ -2435,6 +2448,7 @@ function ChatSidebar({
   selectedSession,
   collapsed,
   publicMode,
+  sessionsLoading,
   unreadSessionIds,
   onCreate,
   onSelect,
@@ -2444,6 +2458,7 @@ function ChatSidebar({
   selectedSession: SessionSummary | null;
   collapsed: boolean;
   publicMode: boolean;
+  sessionsLoading: boolean;
   unreadSessionIds: Set<string>;
   onCreate: () => void;
   onSelect: (session: SessionSummary) => void;
@@ -2453,6 +2468,7 @@ function ChatSidebar({
   const listRef = useRef<HTMLUListElement | null>(null);
   const mainSession = publicMode ? null : (sessions.find((session) => session.is_home) ?? null);
   const regularSessions = sessions.filter((session) => !session.is_home);
+  const showSessionLoading = sessionsLoading && sessions.length === 0;
   const [scrollbar, setScrollbar] = useState({
     visible: false,
     thumbHeight: 0,
@@ -2519,6 +2535,12 @@ function ChatSidebar({
       </button>
       <div className="session-list-wrap">
         <ul className="session-list" ref={listRef}>
+          {showSessionLoading ? (
+            <li className="session-list-loading" role="status" aria-live="polite">
+              <RefreshCw aria-hidden="true" size={15} />
+              <span>{t("chat.loadingSessions")}</span>
+            </li>
+          ) : null}
           {regularSessions.map((session) => (
             <SessionSidebarItem
               key={session.id}

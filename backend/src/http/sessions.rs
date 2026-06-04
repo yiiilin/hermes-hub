@@ -15,7 +15,7 @@ use std::{
     collections::HashSet,
     convert::Infallible,
     path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
@@ -42,6 +42,10 @@ use crate::{
 
 const PUBLIC_SESSION_COOKIE_NAME: &str = "hermes_hub_public_session";
 const PUBLIC_SESSION_TOKEN_HEADER: &str = "x-hermes-hub-public-session";
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -154,7 +158,14 @@ async fn list_sessions(
     headers: HeaderMap,
     Query(query): Query<ListSessionsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let is_authenticated = current_user(&state, &headers).await.is_ok();
+    let request_started_at = Instant::now();
+    let auth_started_at = Instant::now();
+    // 列表接口是登录后首屏路径，复用这次鉴权结果，避免同一请求重复查 session cookie。
+    let authenticated_user = current_user(&state, &headers).await.ok();
+    let auth_elapsed_ms = elapsed_ms(auth_started_at);
+    let is_authenticated = authenticated_user.is_some();
+
+    let public_prepare_started_at = Instant::now();
     ensure_public_platform_enabled_for_anonymous(&state, is_authenticated).await?;
     let mut public_token = if is_authenticated {
         None
@@ -171,26 +182,48 @@ async fn list_sessions(
             }
         }
     }
-    let access = if is_authenticated {
-        session_access(&state, &headers).await?
+    let public_prepare_elapsed_ms = elapsed_ms(public_prepare_started_at);
+
+    let access = if let Some(user) = authenticated_user {
+        SessionAccess::Authenticated { user_id: user.id }
     } else {
         SessionAccess::Public {
             owner_user_id: public_platform_owner_user_id(&state).await?,
             token: public_token.clone(),
         }
     };
+    let mut ensure_hermes_elapsed_ms = None;
     if matches!(access, SessionAccess::Public { .. }) {
+        let ensure_hermes_started_at = Instant::now();
         ensure_managed_hermes_for_user(&state, access.user_id()).await?;
+        ensure_hermes_elapsed_ms = Some(elapsed_ms(ensure_hermes_started_at));
     }
+    let channel_started_at = Instant::now();
     let Some(channel) = ensure_channel_for_access(&state, &access).await? else {
+        tracing::info!(
+            authenticated = is_authenticated,
+            auth_elapsed_ms,
+            public_prepare_elapsed_ms,
+            ensure_hermes_elapsed_ms = ?ensure_hermes_elapsed_ms,
+            channel_elapsed_ms = elapsed_ms(channel_started_at),
+            total_elapsed_ms = elapsed_ms(request_started_at),
+            "api sessions list completed without a channel"
+        );
         return session_list_response(&headers, vec![], public_token.clone());
     };
+    let channel_elapsed_ms = elapsed_ms(channel_started_at);
+    let list_started_at = Instant::now();
     let sessions = state
         .channel_store
         .list_sessions(access.user_id(), &channel.id)
         .await
         .map_err(map_channel_error)?;
+    let list_elapsed_ms = elapsed_ms(list_started_at);
+    let raw_session_count = sessions.len();
+    let filter_started_at = Instant::now();
     let sessions = filter_sessions_for_access(&state, &access, sessions).await?;
+    let filter_elapsed_ms = elapsed_ms(filter_started_at);
+    let summary_started_at = Instant::now();
     let mut summaries = Vec::with_capacity(sessions.len());
     for session in sessions {
         if matches!(access, SessionAccess::Public { .. })
@@ -200,6 +233,21 @@ async fn list_sessions(
         }
         summaries.push(public_session_summary_for_access(&state, &access, session).await?);
     }
+    let summary_elapsed_ms = elapsed_ms(summary_started_at);
+    tracing::info!(
+        authenticated = is_authenticated,
+        raw_session_count,
+        session_count = summaries.len(),
+        auth_elapsed_ms,
+        public_prepare_elapsed_ms,
+        ensure_hermes_elapsed_ms = ?ensure_hermes_elapsed_ms,
+        channel_elapsed_ms,
+        list_elapsed_ms,
+        filter_elapsed_ms,
+        summary_elapsed_ms,
+        total_elapsed_ms = elapsed_ms(request_started_at),
+        "api sessions list completed"
+    );
     if !is_authenticated && summaries.is_empty() {
         return session_list_response(&headers, summaries, None);
     }
@@ -709,20 +757,6 @@ pub(crate) async fn refresh_public_session_retention_from_message(
         .await
         .map_err(map_channel_error)?;
     Ok(Some(session))
-}
-
-async fn session_access(state: &AppState, headers: &HeaderMap) -> Result<SessionAccess, ApiError> {
-    if let Ok(user) = current_user(state, headers).await {
-        return Ok(SessionAccess::Authenticated { user_id: user.id });
-    }
-    ensure_public_platform_enabled_for_anonymous(state, false).await?;
-
-    let owner_user_id = public_platform_owner_user_id(state).await?;
-
-    Ok(SessionAccess::Public {
-        owner_user_id,
-        token: public_session_token_for_request(state, headers, None).await?,
-    })
 }
 
 async fn session_create_access(
