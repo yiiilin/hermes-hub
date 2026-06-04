@@ -73,6 +73,8 @@ async fn skills_fs_lists_and_reads_from_prefix() {
     let root_id = fs.root_dir();
     let root = fs.getattr(root_id).await.expect("root has attributes");
     assert_eq!(root.ftype as u32, ftype3::NF3DIR as u32);
+    assert_eq!(root.uid, 10000, "Hermes 运行用户必须拥有 NFS 根目录属性");
+    assert_eq!(root.gid, 10000, "Hermes 运行用户必须拥有 NFS 根目录属性");
     let root_entries = fs
         .readdir(root_id, 0, 16)
         .await
@@ -104,6 +106,18 @@ async fn skills_fs_lists_and_reads_from_prefix() {
         .lookup(root_id, &b"skills".as_slice().into())
         .await
         .expect("skills dir can be looked up");
+    let skills_attr = fs
+        .getattr(skills_id)
+        .await
+        .expect("skills dir has attributes");
+    assert_eq!(
+        skills_attr.uid, 10000,
+        "/skills 必须归 hermes 用户所有，否则管理员 Hermes 的非 root gateway 不能创建文件"
+    );
+    assert_eq!(
+        skills_attr.gid, 10000,
+        "/skills 必须归 hermes 用户所有，否则管理员 Hermes 的非 root gateway 不能创建文件"
+    );
     let skills_entries = fs
         .readdir(skills_id, 0, 16)
         .await

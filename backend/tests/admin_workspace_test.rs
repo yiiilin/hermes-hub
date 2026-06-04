@@ -902,7 +902,7 @@ async fn admin_hermes_gets_writable_global_skills_mount_but_regular_users_do_not
                 && args.windows(2).any(|pair| {
                     pair[0] == "--mount"
                         && pair[1]
-                            == "type=volume,src=hermes-hub-managed-skills-test-live,dst=/nfs,volume-driver=local,readonly"
+                            == "type=volume,src=hermes-hub-managed-skills-test-ro-nosharecache,dst=/nfs,volume-driver=local,readonly"
                 })
         }),
         "regular Hermes must keep global skills readonly"
@@ -958,7 +958,7 @@ async fn admin_rebuild_managed_hermes_keeps_global_skills_writable() {
                 && args.windows(2).any(|pair| {
                     pair[0] == "--mount"
                         && pair[1]
-                            == "type=volume,src=hermes-hub-managed-skills-test-rw-live,dst=/nfs,volume-driver=local"
+                            == "type=volume,src=hermes-hub-managed-skills-test-rw-nosharecache,dst=/nfs,volume-driver=local"
                 })
         }),
         "admin rebuild must preserve writable global skills mount"
@@ -1066,7 +1066,7 @@ async fn regular_user_rebuild_managed_hermes_keeps_global_skills_readonly() {
                 && args.windows(2).any(|pair| {
                     pair[0] == "--mount"
                         && pair[1]
-                            == "type=volume,src=hermes-hub-managed-skills-test-live,dst=/nfs,volume-driver=local,readonly"
+                            == "type=volume,src=hermes-hub-managed-skills-test-ro-nosharecache,dst=/nfs,volume-driver=local,readonly"
                 })
         }),
         "regular user rebuild must keep global skills readonly"

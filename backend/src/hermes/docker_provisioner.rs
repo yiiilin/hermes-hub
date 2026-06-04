@@ -31,7 +31,7 @@ use super::{
 
 /// Hub 托管 Hermes 容器规格版本。只要 env、挂载、工作目录或安全策略有变化，
 /// 就提升这个值，确保已存在的旧容器会被重建并拿到新行为。
-const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-06-03-home-channel";
+const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-06-04-nfs-nosharecache";
 const MANAGED_CONTAINER_SPEC_LABEL: &str = "hermes_hub_spec_version";
 const HUB_INBOX_PATH: &str = "/internal/channel/v1/inbox";
 const HUB_INBOX_TIMEOUT_SECONDS: u16 = 25;
@@ -1592,17 +1592,17 @@ fn nfs_mount_options(addr: &str, read_only: bool) -> String {
     let (host, port) = split_nfs_addr(addr);
     let mode = if read_only { "ro" } else { "rw" };
     format!(
-        "addr={host},port={port},mountport={port},vers=3,tcp,nolock,soft,actimeo=0,lookupcache=none,{mode}"
+        "addr={host},port={port},mountport={port},vers=3,tcp,nolock,soft,actimeo=0,lookupcache=none,nosharecache,{mode}"
     )
 }
 
 fn managed_nfs_volume_name(base_name: &str, read_only: bool) -> String {
     if read_only {
-        // Docker 不会更新已有 volume 的 NFS options；换名确保新容器使用禁缓存挂载。
-        format!("{base_name}-live")
+        // Docker 不会更新已有 volume 的 NFS options；换名确保只读挂载使用独立 NFS superblock。
+        format!("{base_name}-ro-nosharecache")
     } else {
-        // rw 挂载也要独立名称，避免复用普通用户 ro volume 以及旧缓存参数。
-        format!("{base_name}-rw-live")
+        // Linux NFS 默认 sharecache 会复用同 export 的 ro superblock；rw 必须独立挂载。
+        format!("{base_name}-rw-nosharecache")
     }
 }
 

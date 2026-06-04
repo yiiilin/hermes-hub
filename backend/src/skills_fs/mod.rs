@@ -23,6 +23,10 @@ const ROOT_ID: fileid3 = 1;
 const FS_ID: u64 = 0x4848_534b_494c_4c53;
 const DIR_MODE: u32 = 0o755;
 const FILE_MODE: u32 = 0o644;
+// Hermes gateway 在官方运行时里以 hermes:hermes 运行；NFS 属性必须匹配这个用户，
+// 否则管理员容器即使拿到 rw 挂载，也会被客户端权限检查挡在 /nfs/skills 外。
+const HERMES_CONTAINER_UID: uid3 = 10000;
+const HERMES_CONTAINER_GID: gid3 = 10000;
 const HIDDEN_SEGMENTS: [&str; 3] = [".curator_state", ".bundled_manifest", ".hub-directory"];
 const MANAGED_SKILLS_DIR: &str = "skills";
 const MANAGED_PROFILE_FILES: [&str; 1] = ["SOUL.md"];
@@ -1147,8 +1151,8 @@ fn fattr_for_node(node: &SkillsNode) -> fattr3 {
         },
         mode: if node.is_dir { DIR_MODE } else { FILE_MODE },
         nlink: if node.is_dir { 2 } else { 1 },
-        uid: 0 as uid3,
-        gid: 0 as gid3,
+        uid: HERMES_CONTAINER_UID,
+        gid: HERMES_CONTAINER_GID,
         size,
         used: size,
         rdev: specdata3::default(),
