@@ -147,7 +147,28 @@ Hermes wrapper and ASR runtime images use release-generated date tags such as `v
 
 ## Release
 
-Releases are tag-driven. Pushing a release tag triggers the release workflow, builds the Docker image, pushes GHCR tags, and creates a GitHub Release with the commit list.
+Use the release script so the local version bump, verification, commit, annotated tag, push, workflow wait, and GitHub Release publication stay consistent:
+
+```bash
+scripts/release.sh 0.0.23 "Fix admin Hermes managed skills write access"
+```
+
+For multi-line release notes, write a notes file and pass it to the script:
+
+```bash
+scripts/release.sh 0.0.23 --notes-file release-notes.md
+```
+
+The Makefile wrapper is equivalent:
+
+```bash
+make release VERSION=0.0.23 NOTES="Fix admin Hermes managed skills write access"
+make release VERSION=0.0.23 NOTES_FILE=release-notes.md
+```
+
+The script requires a clean `main` branch. It updates `backend/Cargo.toml`, `Cargo.lock`, `frontend/package.json`, and `frontend/package-lock.json`, runs backend tests, frontend tests, and the frontend build, then creates an annotated `vX.Y.Z` tag. The tag message is copied into the GitHub Release notes.
+
+Pushing the tag triggers the release workflow. Each image build is path-diffed against the previous release tag: Hub, Hermes wrapper, and ASR are only build/pushed when their own image inputs changed. Skipped images are marked in the GitHub Release notes and continue using the existing registry image.
 
 ## Security
 

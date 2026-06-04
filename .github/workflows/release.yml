@@ -39,6 +39,71 @@ jobs:
           tag="$(date -u +v%Y.%-m.%-d).${GITHUB_RUN_NUMBER}"
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
 
+      - name: Detect image changes
+        id: image_changes
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          previous_tag="$(git describe --tags --abbrev=0 "${RELEASE_TAG}^" 2>/dev/null || true)"
+          echo "previous_tag=${previous_tag}" >> "${GITHUB_OUTPUT}"
+
+          if [ -z "${previous_tag}" ]; then
+            {
+              echo "hub=true"
+              echo "hermes=true"
+              echo "asr=true"
+            } >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          changed_files="$(git diff --name-only "${previous_tag}" "${RELEASE_TAG}")"
+          {
+            echo "changed_files<<EOF"
+            echo "${changed_files}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+          hub=false
+          hermes=false
+          asr=false
+
+          while IFS= read -r path; do
+            [ -n "${path}" ] || continue
+
+            # Hub 镜像只看会进入最终镜像或影响构建产物的输入，测试文件变更不触发发布镜像。
+            case "${path}" in
+              Cargo.toml|Cargo.lock|backend/Cargo.toml|backend/build.rs|\
+              backend/src/*|backend/migrations/*|\
+              frontend/index.html|frontend/package.json|frontend/package-lock.json|\
+              frontend/public/*|frontend/src/*|frontend/tsconfig*.json|frontend/vite.config.*|\
+              docker/backend/*|.dockerignore)
+                hub=true
+                ;;
+            esac
+
+            # Hermes wrapper 镜像只依赖 wrapper Dockerfile、入口脚本和内置插件。
+            case "${path}" in
+              docker/hermes/*|.dockerignore)
+                hermes=true
+                ;;
+            esac
+
+            # ASR 镜像使用独立 context，只看 sherpa 目录下的构建输入。
+            case "${path}" in
+              deploy/asr/sherpa/*)
+                asr=true
+                ;;
+            esac
+          done <<< "${changed_files}"
+
+          {
+            echo "hub=${hub}"
+            echo "hermes=${hermes}"
+            echo "asr=${asr}"
+          } >> "${GITHUB_OUTPUT}"
+
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -67,10 +132,11 @@ jobs:
             type=raw,value=${{ steps.runtime_tag.outputs.tag }}
 
       - name: Build and push Hub image
+        if: steps.image_changes.outputs.hub == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: docker/backend.Dockerfile
+          file: docker/backend/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -78,6 +144,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Build and push Hermes wrapper image
+        if: steps.image_changes.outputs.hermes == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -89,6 +156,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=hermes-wrapper
 
       - name: Build and push ASR image
+        if: steps.image_changes.outputs.asr == 'true'
         uses: docker/build-push-action@v6
         with:
           context: deploy/asr/sherpa
@@ -104,6 +172,9 @@ jobs:
           IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
           HERMES_IMAGE_TAGS: ${{ steps.hermes_meta.outputs.tags }}
           ASR_IMAGE_TAGS: ${{ steps.asr_meta.outputs.tags }}
+          HUB_IMAGE_BUILT: ${{ steps.image_changes.outputs.hub }}
+          HERMES_IMAGE_BUILT: ${{ steps.image_changes.outputs.hermes }}
+          ASR_IMAGE_BUILT: ${{ steps.image_changes.outputs.asr }}
           RELEASE_TAG: ${{ github.ref_name }}
           RELEASE_SHA: ${{ github.sha }}
         run: |
@@ -118,31 +189,62 @@ jobs:
             changes_title="Release commits"
           fi
 
+          release_content=""
+          if [ "$(git cat-file -t "${RELEASE_TAG}" 2>/dev/null || true)" = "tag" ]; then
+            # 本地发版脚本会创建 annotated tag；tag message 就是人工填写的发版内容。
+            release_content="$(git for-each-ref "refs/tags/${RELEASE_TAG}" --format='%(contents)')"
+          fi
+
           {
             echo "## Release"
             echo
             echo "- Tag: ${RELEASE_TAG}"
             echo "- Commit: ${RELEASE_SHA}"
             echo
+            if [ -n "${release_content}" ]; then
+              echo "## Release notes"
+              echo
+              printf '%s\n' "${release_content}"
+              echo
+            fi
+            echo
             echo "## Container image"
             echo
             echo "Hub:"
             echo
-            echo '```text'
-            echo "${IMAGE_TAGS}"
-            echo '```'
+            if [ "${HUB_IMAGE_BUILT}" = "true" ]; then
+              echo "Built and pushed:"
+              echo
+              echo '```text'
+              echo "${IMAGE_TAGS}"
+              echo '```'
+            else
+              echo "Skipped: no Hub image input changed since ${previous_tag}; reuse the existing registry image."
+            fi
             echo
             echo "Hermes wrapper:"
             echo
-            echo '```text'
-            echo "${HERMES_IMAGE_TAGS}"
-            echo '```'
+            if [ "${HERMES_IMAGE_BUILT}" = "true" ]; then
+              echo "Built and pushed:"
+              echo
+              echo '```text'
+              echo "${HERMES_IMAGE_TAGS}"
+              echo '```'
+            else
+              echo "Skipped: no Hermes wrapper image input changed since ${previous_tag}; reuse the existing registry image."
+            fi
             echo
             echo "ASR:"
             echo
-            echo '```text'
-            echo "${ASR_IMAGE_TAGS}"
-            echo '```'
+            if [ "${ASR_IMAGE_BUILT}" = "true" ]; then
+              echo "Built and pushed:"
+              echo
+              echo '```text'
+              echo "${ASR_IMAGE_TAGS}"
+              echo '```'
+            else
+              echo "Skipped: no ASR image input changed since ${previous_tag}; reuse the existing registry image."
+            fi
             echo
             echo "## ${changes_title}"
             echo

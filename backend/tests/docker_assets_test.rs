@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -29,7 +31,7 @@ fn backend_image_uses_modern_docker_cli_for_host_daemon_compatibility() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("backend crate lives under repo root");
-    let dockerfile = std::fs::read_to_string(repo_root.join("docker/backend.Dockerfile"))
+    let dockerfile = std::fs::read_to_string(repo_root.join("docker/backend/Dockerfile"))
         .expect("backend Dockerfile is present");
 
     // backend 直接连接宿主机 Docker socket，客户端版本必须跟得上新 daemon。
@@ -69,6 +71,74 @@ fn release_workflow_keeps_hub_image_on_numeric_release_tags() {
     assert!(hub_build_step.contains("tags: ${{ steps.meta.outputs.tags }}"));
     assert!(hub_build_step.contains("labels: ${{ steps.meta.outputs.labels }}"));
     assert!(!hub_build_step.contains("steps.runtime_tag.outputs.tag"));
+}
+
+#[test]
+fn release_workflow_skips_unchanged_images_by_path_diff() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("backend crate lives under repo root");
+    let workflow = std::fs::read_to_string(repo_root.join(".github/workflows/release.yml"))
+        .expect("release workflow is present");
+
+    // 发版镜像必须先按路径 diff 判断，避免未变更的运行时镜像被重复 build/push。
+    assert!(workflow.contains("- name: Detect image changes"));
+    assert!(workflow.contains("if: steps.image_changes.outputs.hub == 'true'"));
+    assert!(workflow.contains("if: steps.image_changes.outputs.hermes == 'true'"));
+    assert!(workflow.contains("if: steps.image_changes.outputs.asr == 'true'"));
+
+    // Hub Dockerfile 放在独立目录后，diff 规则可以跟其他镜像一样按目录维护。
+    assert!(workflow.contains("file: docker/backend/Dockerfile"));
+    assert!(workflow.contains("docker/backend/*"));
+    assert!(!workflow.contains("docker/backend.Dockerfile"));
+
+    // Hub 只看会影响最终镜像的源码/构建输入；backend 测试变更不应触发发布镜像。
+    assert!(workflow.contains("backend/src/*"));
+    assert!(workflow.contains("backend/migrations/*"));
+    assert!(!workflow.contains("backend/*|frontend/*"));
+
+    assert!(workflow.contains("docker/hermes/*"));
+    assert!(workflow.contains("deploy/asr/sherpa/*"));
+    assert!(workflow.contains("Skipped: no Hub image input changed"));
+    assert!(workflow.contains("Skipped: no Hermes wrapper image input changed"));
+    assert!(workflow.contains("Skipped: no ASR image input changed"));
+}
+
+#[test]
+fn release_automation_uses_script_and_annotated_tag_notes() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("backend crate lives under repo root");
+    let script_path = repo_root.join("scripts/release.sh");
+    let script = std::fs::read_to_string(&script_path).expect("release script is present");
+    let workflow = std::fs::read_to_string(repo_root.join(".github/workflows/release.yml"))
+        .expect("release workflow is present");
+
+    // 本地脚本负责把“版本号 + 发版内容”转成完整发版动作。
+    assert!(script.contains("npm version"));
+    assert!(script.contains("cargo metadata --format-version 1 --no-deps"));
+    assert!(script.contains("cargo test -p hermes-hub-backend"));
+    assert!(script.contains("npm test"));
+    assert!(script.contains("npm run build"));
+    assert!(script.contains("git tag -a"));
+    assert!(script.contains("gh run watch"));
+    assert!(script.contains("--notes-file"));
+
+    #[cfg(unix)]
+    assert_ne!(
+        std::fs::metadata(&script_path)
+            .expect("release script metadata is readable")
+            .permissions()
+            .mode()
+            & 0o111,
+        0,
+        "release script must be executable"
+    );
+
+    // GitHub Release notes 读取 annotated tag message，避免发版内容只停留在本地。
+    assert!(workflow.contains("git cat-file -t \"${RELEASE_TAG}\""));
+    assert!(workflow.contains("git for-each-ref \"refs/tags/${RELEASE_TAG}\""));
+    assert!(workflow.contains("## Release notes"));
 }
 
 #[test]
