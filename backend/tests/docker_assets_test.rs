@@ -41,6 +41,37 @@ fn backend_image_uses_modern_docker_cli_for_host_daemon_compatibility() {
 }
 
 #[test]
+fn release_workflow_keeps_hub_image_on_numeric_release_tags() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("backend crate lives under repo root");
+    let workflow = std::fs::read_to_string(repo_root.join(".github/workflows/release.yml"))
+        .expect("release workflow is present");
+    let hub_metadata = workflow
+        .split("      - name: Hermes wrapper metadata")
+        .next()
+        .expect("Hub metadata block is present");
+    let hub_build_step = workflow
+        .split("      - name: Build and push Hub image")
+        .nth(1)
+        .expect("Hub build step is present")
+        .split("      - name: Build and push Hermes wrapper image")
+        .next()
+        .expect("Hub build step terminator is present");
+
+    // Hub 主镜像继续走发布 tag / semver，只有 Hermes wrapper 和 ASR 使用日期 tag。
+    assert!(hub_metadata.contains("name: Docker metadata"));
+    assert!(hub_metadata.contains("type=ref,event=tag"));
+    assert!(hub_metadata.contains("type=semver,pattern={{version}}"));
+    assert!(hub_metadata.contains("type=semver,pattern={{major}}.{{minor}}"));
+    assert!(hub_metadata.contains("type=raw,value=latest"));
+    assert!(!hub_metadata.contains("type=raw,value=${{ steps.runtime_tag.outputs.tag }}"));
+    assert!(hub_build_step.contains("tags: ${{ steps.meta.outputs.tags }}"));
+    assert!(hub_build_step.contains("labels: ${{ steps.meta.outputs.labels }}"));
+    assert!(!hub_build_step.contains("steps.runtime_tag.outputs.tag"));
+}
+
+#[test]
 fn hermes_wrapper_image_uses_selected_official_hermes_agent_tag() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
