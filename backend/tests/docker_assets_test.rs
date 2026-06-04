@@ -47,10 +47,14 @@ fn hermes_wrapper_image_uses_selected_official_hermes_agent_tag() {
         .expect("backend crate lives under repo root");
     let dockerfile = std::fs::read_to_string(repo_root.join("docker/hermes/Dockerfile"))
         .expect("Hermes wrapper Dockerfile is present");
-    let patch_path = repo_root.join("docker/hermes/patch_send_message_tool.py");
-    let plugin_root = repo_root.join("docker/hermes/plugins/platforms/hermes_hub");
-    let plugin_yaml = std::fs::read_to_string(plugin_root.join("plugin.yaml"))
+    let platform_plugin_root = repo_root.join("docker/hermes/plugins/platforms/hermes_hub");
+    let platform_plugin_yaml = std::fs::read_to_string(platform_plugin_root.join("plugin.yaml"))
         .expect("Hermes Hub bundled platform plugin manifest is present");
+    let send_plugin_root = repo_root.join("docker/hermes/plugins/hermes_hub_send");
+    let send_plugin_yaml = std::fs::read_to_string(send_plugin_root.join("plugin.yaml"))
+        .expect("Hermes Hub send backend plugin manifest is present");
+    let send_plugin_source = std::fs::read_to_string(send_plugin_root.join("__init__.py"))
+        .expect("Hermes Hub send backend plugin source is present");
     let compose = std::fs::read_to_string(repo_root.join("deploy/compose.yml"))
         .expect("compose file is present");
 
@@ -60,35 +64,39 @@ fn hermes_wrapper_image_uses_selected_official_hermes_agent_tag() {
     assert!(dockerfile.contains("FROM ${HERMES_AGENT_IMAGE}"));
     assert!(!dockerfile.contains("FROM nousresearch/hermes-agent:${HERMES_VERSION}"));
     assert!(dockerfile.contains("COPY docker/hermes/hermes-hub-entrypoint.sh"));
-    assert!(dockerfile.contains("COPY docker/hermes/patch_send_message_tool.py"));
     assert!(dockerfile.contains("COPY docker/hermes/plugins /opt/hermes/plugins"));
-    assert!(dockerfile.contains("RUN python3 /opt/hermes-hub/patch_send_message_tool.py"));
+    assert!(!dockerfile.contains("patch_send_message_tool.py"));
+    assert!(!dockerfile.contains("send_message_tool.py"));
     assert!(dockerfile.contains("ENTRYPOINT [\"/opt/hermes-hub/entrypoint.sh\"]"));
-    assert!(plugin_yaml.contains("kind: platform"));
-    assert!(plugin_yaml.contains("label: Hermes Hub"));
+    assert!(platform_plugin_yaml.contains("kind: platform"));
+    assert!(platform_plugin_yaml.contains("label: Hermes Hub"));
+    assert!(send_plugin_yaml.contains("kind: backend"));
+    assert!(send_plugin_yaml.contains("provides_tools:"));
+    assert!(send_plugin_yaml.contains("hermes_hub_send"));
+    assert!(send_plugin_source.contains("name=\"hermes_hub_send\""));
+    assert!(send_plugin_source.contains("toolset=\"hermes_hub\""));
+    assert!(send_plugin_source.contains("BasePlatformAdapter.extract_media(official_line)"));
     assert!(
-        patch_path.exists(),
-        "Hermes wrapper keeps a minimal MEDIA bridge for plugin send_message delivery"
+        send_plugin_source.contains("BasePlatformAdapter.filter_media_delivery_paths(media_files)")
     );
-    let patch_source =
-        std::fs::read_to_string(&patch_path).expect("send_message MEDIA bridge patch is present");
-    assert!(patch_source.contains("Hermes Hub plugin media bridge"));
-    assert!(patch_source.contains("send_image_file"));
-    assert!(patch_source.contains("send_document"));
-    assert!(patch_source.contains("send_voice"));
-    assert!(patch_source.contains("send_video"));
-    assert!(patch_source.contains("media_sequence"));
-    assert!(patch_source.contains("media_files=media_files if is_last else []"));
-    assert!(!patch_source.contains("attachments=['/workspace/report.pdf']"));
-    assert!(!patch_source.contains("send_message_with_attachments"));
-    assert!(!patch_source.contains("platform_name == \"origin\""));
+    assert!(send_plugin_source.contains("HERMES_SESSION_THREAD_ID"));
+    assert!(send_plugin_source.contains("HERMES_SESSION_CHAT_ID"));
+    assert!(!send_plugin_source.contains("attachments=['/workspace/report.pdf']"));
+    assert!(!send_plugin_source.contains("send_message_with_attachments"));
     let compile_output = Command::new("python3")
-        .args(["-m", "py_compile", patch_path.to_str().expect("utf-8 path")])
+        .args([
+            "-m",
+            "py_compile",
+            send_plugin_root
+                .join("__init__.py")
+                .to_str()
+                .expect("utf-8 path"),
+        ])
         .output()
-        .expect("python3 can compile send_message patch");
+        .expect("python3 can compile Hermes Hub send plugin");
     assert!(
         compile_output.status.success(),
-        "send_message patch must compile: {}",
+        "Hermes Hub send plugin must compile: {}",
         String::from_utf8_lossy(&compile_output.stderr)
     );
     assert!(compose.contains(
@@ -100,17 +108,17 @@ fn hermes_wrapper_image_uses_selected_official_hermes_agent_tag() {
 }
 
 #[test]
-fn hermes_send_message_patch_applies_to_target_image_when_docker_is_available() {
+fn hermes_hub_send_plugin_uses_official_media_policy_when_docker_is_available() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("backend crate lives under repo root");
     let dockerfile = std::fs::read_to_string(repo_root.join("docker/hermes/Dockerfile"))
         .expect("Hermes wrapper Dockerfile is present");
     let pinned_hermes_agent_image = hermes_agent_image_from_dockerfile(&dockerfile);
-    let patch_path = repo_root
-        .join("docker/hermes/patch_send_message_tool.py")
+    let plugin_path = repo_root
+        .join("docker/hermes/plugins/hermes_hub_send/__init__.py")
         .canonicalize()
-        .expect("send_message MEDIA bridge patch is present");
+        .expect("Hermes Hub send plugin source is present");
     let image = std::env::var("HERMES_HUB_HERMES_TEST_IMAGE")
         .unwrap_or_else(|_| pinned_hermes_agent_image.to_string());
 
@@ -120,7 +128,7 @@ fn hermes_send_message_patch_applies_to_target_image_when_docker_is_available() 
         .map(|output| output.status.success())
         .unwrap_or(false);
     if !docker_available {
-        eprintln!("skipping target image patch verification because Docker is unavailable");
+        eprintln!("skipping Hermes Hub send plugin verification because Docker is unavailable");
         return;
     }
 
@@ -130,40 +138,236 @@ fn hermes_send_message_patch_applies_to_target_image_when_docker_is_available() 
         .map(|output| output.status.success())
         .unwrap_or(false);
     if !image_available {
-        eprintln!("skipping target image patch verification because {image} is unavailable");
+        eprintln!("skipping Hermes Hub send plugin verification because {image} is unavailable");
         return;
     }
 
-    let mount = format!(
-        "{}:/tmp/patch_send_message_tool.py:ro",
-        patch_path.display()
-    );
+    let mount = format!("{}:/tmp/hermes_hub_send.py:ro", plugin_path.display());
+    let script = r##"
+PYTHONPATH=/opt/hermes HERMES_MEDIA_ALLOW_DIRS=/ /opt/hermes/.venv/bin/python - <<'PY'
+import importlib.util
+from pathlib import Path
+from gateway.platforms.base import BasePlatformAdapter
+
+Path("/tmp/start_ntp.sh").write_text("#!/bin/sh\ntrue\n", encoding="utf-8")
+Path("/tmp/report.txt").write_text("report\n", encoding="utf-8")
+
+spec = importlib.util.spec_from_file_location("hermes_hub_send", "/tmp/hermes_hub_send.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+media, cleaned = BasePlatformAdapter.extract_media("caption\nMEDIA:/tmp/start_ntp.sh")
+assert media == [], (media, cleaned)
+assert cleaned == "caption\nMEDIA:/tmp/start_ntp.sh", (media, cleaned)
+
+tool_media, tool_cleaned = module._extract_media_with_hub_fallback(
+    "[[as_document]]\nMEDIA:'/tmp/start_ntp.sh'"
+)
+assert tool_media == [("/tmp/start_ntp.sh", False)], (tool_media, tool_cleaned)
+assert tool_cleaned == "", (tool_media, tool_cleaned)
+assert BasePlatformAdapter.filter_media_delivery_paths(tool_media) == [("/tmp/start_ntp.sh", False)]
+
+assert module.HERMES_HUB_SEND_SCHEMA["name"] == "hermes_hub_send"
+assert "MEDIA:<local_path>" in module.HERMES_HUB_SEND_SCHEMA["description"]
+assert module._extract_media_with_hub_fallback("caption\nMEDIA:/tmp/start_ntp.sh") == (
+    [("/tmp/start_ntp.sh", False)],
+    "caption",
+)
+assert module._extract_media_with_hub_fallback("caption\\nMEDIA:/tmp/start_ntp.sh") == (
+    [("/tmp/start_ntp.sh", False)],
+    "caption",
+)
+assert module._extract_media_with_hub_fallback(
+    "caption\nMEDIA:/tmp/start_ntp.sh\nMEDIA:/tmp/report.txt"
+) == (
+    [("/tmp/start_ntp.sh", False), ("/tmp/report.txt", False)],
+    "caption",
+)
+assert module._extract_media_with_hub_fallback(
+    "    indented line\n\nMEDIA:/tmp/start_ntp.sh\n\n  second"
+) == (
+    [("/tmp/start_ntp.sh", False)],
+    "indented line\n\n  second",
+)
+assert module._extract_media_with_hub_fallback(
+    "    indented line\n\nMEDIA:/tmp/report.txt\n\n  second"
+) == (
+    [("/tmp/report.txt", False)],
+    "indented line\n\n  second",
+)
+missing_media, missing_cleaned = module._extract_media_with_hub_fallback("MEDIA:/tmp/missing.sh")
+assert missing_media == [("/tmp/missing.sh", False)], (missing_media, missing_cleaned)
+assert BasePlatformAdapter.filter_media_delivery_paths(missing_media) == []
+assert module._message_chunks(type("A", (), {"MAX_MESSAGE_LENGTH": 8000})(), "ok") == ["ok"]
+PY
+"##;
     let output = Command::new("docker")
         .args([
             "run",
             "--rm",
             "--entrypoint",
             "sh",
-            "-u",
-            "0:0",
             "-v",
             &mount,
             &image,
             "-lc",
-            "python3 /tmp/patch_send_message_tool.py && python3 -m py_compile /opt/hermes/tools/send_message_tool.py && python3 /tmp/patch_send_message_tool.py",
+            script,
         ])
         .output()
-        .expect("docker can run target Hermes image patch verification");
+        .expect("docker can run Hermes Hub send plugin verification");
     assert!(
         output.status.success(),
-        "send_message patch must apply and compile on {image}: stdout={}, stderr={}",
+        "Hermes Hub send plugin must use official media parsing on {image}: stdout={}, stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 }
 
 #[test]
-fn hermes_hub_adapter_extracts_unquoted_arbitrary_media_when_docker_is_available() {
+fn hermes_hub_send_plugin_routes_sh_media_without_docker() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("backend crate lives under repo root");
+    let plugin_path = repo_root
+        .join("docker/hermes/plugins/hermes_hub_send/__init__.py")
+        .canonicalize()
+        .expect("Hermes Hub send plugin source is present");
+    let script = r##"
+import asyncio
+import importlib.util
+import json
+import sys
+import types
+
+plugin_path = sys.argv[1]
+
+gateway = types.ModuleType("gateway")
+platforms = types.ModuleType("gateway.platforms")
+base = types.ModuleType("gateway.platforms.base")
+
+class BasePlatformAdapter:
+    @staticmethod
+    def extract_media(message):
+        # 模拟官方 extract_media：txt 能解析，sh 会漏掉，后者必须靠 Hub fallback。
+        if "MEDIA:/tmp/report.txt" in message:
+            return [("/tmp/report.txt", False)], message.replace("MEDIA:/tmp/report.txt", "").strip()
+        return [], message.replace("[[as_document]]", "").replace("[[audio_as_voice]]", "").strip()
+
+    @staticmethod
+    def filter_media_delivery_paths(media_files):
+        return [item for item in media_files if item[0] != "/tmp/missing.sh"]
+
+    @staticmethod
+    def truncate_message(message, max_length):
+        return [message]
+
+base.BasePlatformAdapter = BasePlatformAdapter
+session_context = types.ModuleType("gateway.session_context")
+session_values = {
+    "HERMES_SESSION_PLATFORM": "hermes_hub",
+    "HERMES_SESSION_THREAD_ID": "session-1",
+    "HERMES_SESSION_CHAT_ID": "session-1",
+}
+session_context.get_session_env = lambda name, default="": session_values.get(name, default)
+
+config = types.ModuleType("gateway.config")
+class Platform(str):
+    def __new__(cls, value):
+        return str.__new__(cls, value)
+config.Platform = Platform
+
+run = types.ModuleType("gateway.run")
+
+class Result:
+    def __init__(self, success=True, message_id="message-1", error=""):
+        self.success = success
+        self.message_id = message_id
+        self.error = error
+
+class Adapter:
+    MAX_MESSAGE_LENGTH = 8000
+    def __init__(self):
+        self.documents = []
+        self.messages = []
+        self._active_run_ids_by_session = {"session-1": "run-1"}
+
+    async def send(self, chat_id, content, metadata=None):
+        self.messages.append((chat_id, content, metadata))
+        return Result(message_id="text-1")
+
+    async def send_document(self, chat_id, file_path, caption=None, metadata=None):
+        self.documents.append((chat_id, file_path, caption, metadata))
+        return Result(message_id="doc-1")
+
+adapter = Adapter()
+runner = types.SimpleNamespace(adapters={Platform("hermes_hub"): adapter})
+run._gateway_runner_ref = lambda: runner
+
+model_tools = types.ModuleType("model_tools")
+model_tools._run_async = lambda coro: asyncio.run(coro)
+
+sys.modules.update({
+    "gateway": gateway,
+    "gateway.platforms": platforms,
+    "gateway.platforms.base": base,
+    "gateway.session_context": session_context,
+    "gateway.config": config,
+    "gateway.run": run,
+    "model_tools": model_tools,
+})
+
+spec = importlib.util.spec_from_file_location("hermes_hub_send", plugin_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+result = json.loads(module.hermes_hub_send_tool({"message": "caption\\nMEDIA:/tmp/start_ntp.sh"}))
+assert result == {"success": True, "message_id": "doc-1"}, result
+assert adapter.documents == [
+    ("session-1", "/tmp/start_ntp.sh", "caption", {
+        "channel_id": "session-1",
+        "thread_id": "session-1",
+        "run_id": "run-1",
+        "media_sequence": 0,
+    })
+], adapter.documents
+adapter.documents.clear()
+
+result = json.loads(module.hermes_hub_send_tool({
+    "message": "caption\nMEDIA:/tmp/start_ntp.sh\nMEDIA:/tmp/report.txt"
+}))
+assert result == {"success": True, "message_id": "doc-1"}, result
+assert adapter.documents == [
+    ("session-1", "/tmp/start_ntp.sh", "caption", {
+        "channel_id": "session-1",
+        "thread_id": "session-1",
+        "run_id": "run-1",
+        "media_sequence": 0,
+    }),
+    ("session-1", "/tmp/report.txt", None, {
+        "channel_id": "session-1",
+        "thread_id": "session-1",
+        "run_id": "run-1",
+        "media_sequence": 1,
+    }),
+], adapter.documents
+
+missing = json.loads(module.hermes_hub_send_tool({"message": "MEDIA:/tmp/missing.sh"}))
+assert missing == {"error": "No deliverable text or media remained after processing MEDIA tags"}, missing
+"##;
+    let output = Command::new("python3")
+        .args(["-c", script, plugin_path.to_str().expect("utf-8 path")])
+        .output()
+        .expect("python3 can run Hermes Hub send plugin stub test");
+    assert!(
+        output.status.success(),
+        "Hermes Hub send plugin must route .sh MEDIA with local stubs: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn hermes_hub_adapter_uses_official_media_extraction_when_docker_is_available() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("backend crate lives under repo root");
@@ -211,26 +415,24 @@ spec = importlib.util.spec_from_file_location("hermes_hub_adapter", "/tmp/hermes
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
-content = "caption\nMEDIA:/workspace/start_ntp.sh"
+content = "caption\nMEDIA:/workspace/report.txt"
 base_media, base_cleaned = BasePlatformAdapter.extract_media(content)
-assert base_media == [], (base_media, base_cleaned)
-assert base_cleaned == content, (base_media, base_cleaned)
+assert base_media == [("/workspace/report.txt", False)], (base_media, base_cleaned)
+assert base_cleaned == "caption", (base_media, base_cleaned)
 
 media, cleaned = module.HermesHubAdapter.extract_media(content)
-assert media == [("/workspace/start_ntp.sh", False)], (media, cleaned)
+assert media == [("/workspace/report.txt", False)], (media, cleaned)
 assert cleaned == "caption", (media, cleaned)
 
 voice_media, voice_cleaned = module.HermesHubAdapter.extract_media(
-    "[[audio_as_voice]]\nMEDIA:/workspace/clip.custom"
+    "[[audio_as_voice]]\nMEDIA:/workspace/clip.ogg"
 )
-assert voice_media == [("/workspace/clip.custom", True)], (voice_media, voice_cleaned)
+assert voice_media == [("/workspace/clip.ogg", True)], (voice_media, voice_cleaned)
 assert voice_cleaned == "", (voice_media, voice_cleaned)
 
-paths, caption = module.HermesHubAdapter._extract_hub_media_directives(
-    "x\nMEDIA:'/workspace/a.sh'\nMEDIA:`/workspace/b.noext`"
-)
-assert paths == ["/workspace/a.sh", "/workspace/b.noext"], (paths, caption)
-assert caption == "x", (paths, caption)
+custom_media, custom_cleaned = module.HermesHubAdapter.extract_media("MEDIA:/workspace/b.noext")
+assert custom_media == [], (custom_media, custom_cleaned)
+assert custom_cleaned == "MEDIA:/workspace/b.noext", (custom_media, custom_cleaned)
 PY
 "#;
     let output = Command::new("docker")
@@ -249,7 +451,103 @@ PY
         .expect("docker can run Hermes Hub adapter behavior verification");
     assert!(
         output.status.success(),
-        "Hermes Hub adapter must extract arbitrary MEDIA lines on {image}: stdout={}, stderr={}",
+        "Hermes Hub adapter must inherit official MEDIA extraction on {image}: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn hermes_hub_adapter_disables_cron_tick_when_public_platform_env_is_set() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("backend crate lives under repo root");
+    let adapter_path = repo_root
+        .join("docker/hermes/plugins/platforms/hermes_hub/adapter.py")
+        .canonicalize()
+        .expect("Hermes Hub adapter is present");
+    let script = r##"
+import importlib.util
+import os
+import sys
+import types
+
+adapter_path = sys.argv[1]
+
+gateway = types.ModuleType("gateway")
+config = types.ModuleType("gateway.config")
+platforms = types.ModuleType("gateway.platforms")
+base = types.ModuleType("gateway.platforms.base")
+
+class Platform(str):
+    def __new__(cls, value):
+        return str.__new__(cls, value)
+
+class BasePlatformAdapter:
+    def __init__(self, *args, **kwargs):
+        pass
+
+class SendResult:
+    def __init__(self, success=True, message_id="", error="", retryable=False):
+        self.success = success
+        self.message_id = message_id
+        self.error = error
+        self.retryable = retryable
+
+config.Platform = Platform
+base.BasePlatformAdapter = BasePlatformAdapter
+base.MessageEvent = object
+base.MessageType = types.SimpleNamespace(TEXT="text", IMAGE="image", FILE="file")
+base.ProcessingOutcome = types.SimpleNamespace(COMPLETED="completed", FAILED="failed")
+base.SendResult = SendResult
+base.cache_document_from_bytes = lambda *args, **kwargs: "/tmp/document"
+base.cache_image_from_bytes = lambda *args, **kwargs: "/tmp/image"
+base.cache_image_from_url = lambda *args, **kwargs: "/tmp/image"
+
+cron = types.ModuleType("cron")
+cron_scheduler = types.ModuleType("cron.scheduler")
+cron_scheduler.tick = lambda *args, **kwargs: "original"
+
+sys.modules.update({
+    "gateway": gateway,
+    "gateway.config": config,
+    "gateway.platforms": platforms,
+    "gateway.platforms.base": base,
+    "cron": cron,
+    "cron.scheduler": cron_scheduler,
+})
+
+spec = importlib.util.spec_from_file_location("hermes_hub_adapter", adapter_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+class Ctx:
+    def __init__(self):
+        self.platforms = []
+
+    def register_platform(self, **kwargs):
+        self.platforms.append(kwargs)
+
+os.environ.pop("HERMES_HUB_DISABLE_CRON", None)
+cron_scheduler.tick = lambda *args, **kwargs: "original"
+module.register(Ctx())
+assert cron_scheduler.tick() == "original"
+
+os.environ["HERMES_HUB_DISABLE_CRON"] = "1"
+cron_scheduler.tick = lambda *args, **kwargs: "original"
+ctx = Ctx()
+module.register(ctx)
+assert len(ctx.platforms) == 1
+assert ctx.platforms[0]["name"] == "hermes_hub"
+assert cron_scheduler.tick("job") is None
+"##;
+    let output = Command::new("python3")
+        .args(["-c", script, adapter_path.to_str().expect("utf-8 path")])
+        .output()
+        .expect("python3 can run Hermes Hub adapter cron hook stub test");
+    assert!(
+        output.status.success(),
+        "Hermes Hub adapter must disable cron tick when requested: stdout={}, stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -269,17 +567,19 @@ fn hermes_wrapper_exposes_standard_hub_adapter_surface() {
 
     assert!(adapter.contains("async def send_document("));
     assert!(adapter.contains("async def send_image_file("));
-    assert!(adapter.contains("def extract_media(content: str):"));
-    assert!(adapter.contains("HUB_MEDIA_DIRECTIVE_RE"));
-    assert!(adapter.contains("BasePlatformAdapter.extract_media(content)"));
-    assert!(adapter.contains("async def _send_media_directives("));
-    assert!(adapter.contains("def _media_directives_from_content("));
-    assert!(adapter.contains("def _extract_hub_media_directives("));
+    assert!(!adapter.contains("HUB_MEDIA_DIRECTIVE_RE"));
+    assert!(!adapter.contains("BasePlatformAdapter.extract_media(content)"));
+    assert!(!adapter.contains("async def _send_media_directives("));
+    assert!(!adapter.contains("def _media_directives_from_content("));
+    assert!(!adapter.contains("def _extract_hub_media_directives("));
     assert!(adapter.contains("async def send_image("));
     assert!(adapter.contains("async def send_multiple_images("));
     assert!(adapter.contains("async def send_typing("));
     assert!(adapter.contains("async def stop_typing("));
     assert!(adapter.contains("async def send_clarify("));
+    assert!(adapter.contains("def _disable_cron_scheduler_if_requested("));
+    assert!(adapter.contains("HERMES_HUB_DISABLE_CRON"));
+    assert!(adapter.contains("cron_scheduler.tick = _disabled_tick"));
     assert!(!adapter.contains("async def send_slash_confirm("));
     assert!(adapter.contains("async def send_voice("));
     assert!(adapter.contains("async def send_video("));

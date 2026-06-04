@@ -124,6 +124,7 @@ export function ChannelSessionRoute({
   const messagesRef = useRef<ChannelMessage[]>([]);
   const pendingAssistantMessageIdRef = useRef<string | null>(null);
   const pendingAssistantSessionIdRef = useRef<string | null>(null);
+  const pendingUserWritesBySessionRef = useRef<Record<string, Set<string>>>({});
 
   function publicRequestOptions(sessionId?: string | null) {
     return publicMode
@@ -190,6 +191,101 @@ export function ChannelSessionRoute({
     setPendingAssistantSessionId(null);
   }
 
+  function setBusyForSelectedSession(sessionId = selectedSessionIdRef.current) {
+    const pendingWrites = sessionId
+      ? pendingUserWritesBySessionRef.current[sessionId]
+      : undefined;
+    setBusy(Boolean(pendingWrites && pendingWrites.size > 0));
+  }
+
+  function markPendingUserWrite(sessionId: string, clientMessageKey: string) {
+    if (!sessionId || !clientMessageKey) {
+      return;
+    }
+    const current = pendingUserWritesBySessionRef.current[sessionId] ?? new Set<string>();
+    if (current.has(clientMessageKey)) {
+      return;
+    }
+    const next = new Set(current);
+    next.add(clientMessageKey);
+    pendingUserWritesBySessionRef.current[sessionId] = next;
+    if (selectedSessionIdRef.current === sessionId) {
+      setBusy(true);
+    }
+  }
+
+  function clearPendingUserWrite(sessionId?: string | null, clientMessageKey?: string | null) {
+    if (!sessionId || !clientMessageKey) {
+      return;
+    }
+    const current = pendingUserWritesBySessionRef.current[sessionId];
+    if (!current?.has(clientMessageKey)) {
+      return;
+    }
+    const next = new Set(current);
+    next.delete(clientMessageKey);
+    if (next.size === 0) {
+      delete pendingUserWritesBySessionRef.current[sessionId];
+    } else {
+      pendingUserWritesBySessionRef.current[sessionId] = next;
+    }
+    if (selectedSessionIdRef.current === sessionId) {
+      setBusyForSelectedSession(sessionId);
+    }
+  }
+
+  function clearPendingUserWritesForSession(sessionId?: string | null) {
+    if (!sessionId) {
+      return;
+    }
+    delete pendingUserWritesBySessionRef.current[sessionId];
+    if (selectedSessionIdRef.current === sessionId) {
+      setBusy(false);
+    }
+  }
+
+  function reconcilePendingUserWritesFromMessages(
+    sessionId: string,
+    sessionMessages: ChannelMessage[],
+  ) {
+    const pendingWrites = pendingUserWritesBySessionRef.current[sessionId];
+    if (!pendingWrites || pendingWrites.size === 0) {
+      return;
+    }
+
+    const echoedUserKeys = new Set(
+      sessionMessages
+        .filter((message) => message.session_id === sessionId && message.role === "user")
+        .map((message) => message.client_message_key ?? "")
+        .filter(Boolean),
+    );
+    if (echoedUserKeys.size === 0) {
+      return;
+    }
+
+    let changed = false;
+    const nextPendingWrites = new Set<string>();
+    for (const clientMessageKey of pendingWrites) {
+      if (echoedUserKeys.has(clientMessageKey)) {
+        changed = true;
+        continue;
+      }
+      nextPendingWrites.add(clientMessageKey);
+    }
+    if (!changed) {
+      return;
+    }
+
+    if (nextPendingWrites.size === 0) {
+      delete pendingUserWritesBySessionRef.current[sessionId];
+    } else {
+      pendingUserWritesBySessionRef.current[sessionId] = nextPendingWrites;
+    }
+    if (selectedSessionIdRef.current === sessionId) {
+      setBusyForSelectedSession(sessionId);
+    }
+  }
+
   const refreshSessions = useCallback(async () => {
     setError(null);
     try {
@@ -235,6 +331,7 @@ export function ChannelSessionRoute({
         : (nextSessions[0] ?? null);
       selectedSessionIdRef.current = nextSelected?.id ?? null;
       setSelectedSession(nextSelected);
+      setBusyForSelectedSession(nextSelected?.id ?? null);
       if (routeSessionId && nextSelected?.id !== routeSessionId) {
         onSessionRouteChange?.(nextSelected?.id ?? null, "replace");
       }
@@ -243,6 +340,7 @@ export function ChannelSessionRoute({
         setActiveRun(null);
         clearPendingAssistantMessage();
         resetVerboseEvents();
+        setBusy(false);
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("chat.workspaceLoadFailed"));
@@ -342,6 +440,7 @@ export function ChannelSessionRoute({
     setSessions((current) => [session, ...current]);
     selectedSessionIdRef.current = session.id;
     setSelectedSession(session);
+    setBusyForSelectedSession(session.id);
     setSeenSessionUpdates((current) => ({
       ...current,
       [session.id]: sessionUpdatedAt(session),
@@ -387,6 +486,7 @@ export function ChannelSessionRoute({
 
     selectedSessionIdRef.current = session.id;
     setSelectedSession(session);
+    setBusyForSelectedSession(session.id);
     onSessionRouteChange?.(session.id, "push");
     clearPendingAssistantMessage();
     setActiveRun(null);
@@ -482,6 +582,7 @@ export function ChannelSessionRoute({
         applySessionUpdate(event.session);
       }
       const nextMessages = sortMessagesForDisplay(event.messages);
+      reconcilePendingUserWritesFromMessages(session.id, nextMessages);
       setMessages(nextMessages);
       hydrateExecutionHistory(session.id, nextMessages, event.active_run);
       await restoreActiveRun(session, nextMessages, event.active_run);
@@ -495,6 +596,11 @@ export function ChannelSessionRoute({
 
     if (event.type === "message_created" || event.type === "message_updated") {
       const message = event.message;
+      if (message.role === "user" && message.client_message_key) {
+        // 用户消息一旦从 SSE 回显，说明 Hub 已经成功写入并创建了这轮输入；
+        // 即使当前 create-run HTTP 还没返回，也不再阻塞下一次发送。
+        clearPendingUserWrite(message.session_id, message.client_message_key);
+      }
       const runId = runIdFromHermesMessageKey(message.client_message_key);
       const pendingId = runId ? pendingAssistantIdsByRunRef.current[runId] : undefined;
       updateMessagesForSession(session.id, (current) => {
@@ -652,6 +758,7 @@ export function ChannelSessionRoute({
       return;
     }
 
+    // 在本轮输入真正回显或请求失败前，先阻止重复提交；如果 SSE 先回显，会提前解锁。
     setBusy(true);
     setError(null);
 
@@ -667,6 +774,9 @@ export function ChannelSessionRoute({
         throw new Error(t("chat.sessionCreateFailed"));
       }
       sessionForRequest = session;
+      // create-run 返回可能慢于 SSE 回显；先按 client_message_key 记一笔待确认输入，
+      // 后续谁先证明“消息已落库”就由谁来解锁 Composer。
+      markPendingUserWrite(session.id, userMessageKey);
       clearExecutionHistory(session.id);
 
       const nextAssistantMessageId = createClientMessageId();
@@ -694,8 +804,13 @@ export function ChannelSessionRoute({
         },
         publicRequestOptions(),
       );
+      clearPendingUserWrite(session.id, userMessageKey);
       updateMessagesForSession(session.id, (current) => upsertLiveMessage(current, userMessage));
     } catch (cause) {
+      clearPendingUserWrite(sessionForRequest?.id ?? null, userMessageKey);
+      if (!sessionForRequest) {
+        setBusy(false);
+      }
       const message = hermesRunErrorMessage(cause, t("chat.requestFailed"), t);
       if (sessionForRequest && assistantMessageId) {
         await appendHermesErrorMessage(sessionForRequest.id, assistantMessageId, message);
@@ -705,8 +820,6 @@ export function ChannelSessionRoute({
           clearPendingAssistantMessage();
         }
       }
-    } finally {
-      setBusy(false);
     }
   }
 
@@ -915,7 +1028,6 @@ export function ChannelSessionRoute({
       }
       delete pendingAssistantIdsByRunRef.current[activeRun.run_id];
       clearExecutionHistory(sessionId);
-      setBusy(false);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("chat.stopFailed"));
     }
@@ -940,12 +1052,14 @@ export function ChannelSessionRoute({
         const nextSelected = nextSessions[0] ?? null;
         selectedSessionIdRef.current = nextSelected?.id ?? null;
         setSelectedSession(nextSelected);
+        setBusyForSelectedSession(nextSelected?.id ?? null);
         onSessionRouteChange?.(nextSelected?.id ?? null, "replace");
         setMessages([]);
         clearPendingAssistantMessage();
         setActiveRun(null);
         resetVerboseEvents();
       }
+      clearPendingUserWritesForSession(session.id);
       clearExecutionHistory(session.id);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("chat.deleteFailed"));

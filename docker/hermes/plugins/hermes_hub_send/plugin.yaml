@@ -1,0 +1,7 @@
+name: hermes-hub-send
+label: Hermes Hub Send
+kind: backend
+version: 1
+description: Hermes Hub 当前会话发送工具。
+provides_tools:
+  - hermes_hub_send

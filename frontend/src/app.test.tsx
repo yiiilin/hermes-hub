@@ -258,14 +258,23 @@ describe("App", () => {
   }
 
   async function openSettingsTab(tabName: string, settingsName = "System settings") {
-    fireEvent.click(await screen.findByRole("button", { name: settingsName }));
-    const settingsTabs = await screen.findByRole(
-      "tablist",
-      {
-        name: settingsName,
-      },
-      { timeout: 3_000 },
-    );
+    const settingsButton = (
+      await screen.findAllByRole(
+        "button",
+        {
+          name: settingsName,
+        },
+        { timeout: 5_000 },
+      )
+    ).find((button) => button.closest("nav.sidebar-bottom"));
+    if (!settingsButton) {
+      throw new Error(`settings button for ${settingsName} was not found in the sidebar nav`);
+    }
+    fireEvent.click(settingsButton);
+    await screen.findByRole("heading", { name: settingsName }, { timeout: 5_000 });
+    const settingsTabs = screen.getByRole("tablist", {
+      name: settingsName,
+    });
     fireEvent.click(within(settingsTabs).getByRole("tab", { name: tabName }));
     return settingsTabs;
   }
@@ -2602,6 +2611,255 @@ describe("App", () => {
     expect(composer).toHaveValue("");
   });
 
+  it("unlocks sending once the echoed user message arrives before create-run resolves", async () => {
+    const firstResponseDeferred = createDeferred<void>();
+    const eventListeners = new Set<(event: ChannelSessionEvent) => void>();
+    let createCount = 0;
+    const client = createMockApiClient();
+
+    client.subscribeSessionEvents = (_channelId, _sessionId, onEvent) => {
+      eventListeners.add(onEvent);
+      queueMicrotask(() => {
+        onEvent({
+          type: "messages_snapshot",
+          messages: [],
+          active_run: null,
+        });
+      });
+      return () => eventListeners.delete(onEvent);
+    };
+
+    client.createChannelRun = async (_channelId, sessionId, input) => {
+      createCount += 1;
+      const userMessage: ChannelMessage = {
+        id: `message-user-${createCount}`,
+        session_id: sessionId,
+        role: "user",
+        client_message_key: input.clientMessageKey,
+        content: input.content,
+        attachments: input.attachments ?? [],
+        created_at: Date.now(),
+      };
+      const run: ChannelRun = {
+        id: `run-storage-id-${createCount}`,
+        run_id: `hub-run-${createCount}`,
+        session_id: sessionId,
+        user_message_id: userMessage.id,
+        status: "running",
+        input: input.content,
+        input_attachments: input.attachments ?? [],
+        created_at: Date.now(),
+        updated_at: Date.now(),
+      };
+
+      if (createCount === 1) {
+        queueMicrotask(() => {
+          for (const listener of eventListeners) {
+            listener({ type: "message_created", message: userMessage });
+            listener({ type: "run_updated", run });
+          }
+        });
+        await firstResponseDeferred.promise;
+      }
+
+      return { message: userMessage, run };
+    };
+
+    render(<App apiClient={client} />);
+
+    const composer = await screen.findByLabelText("Message");
+    const sendButton = screen.getByRole("button", { name: "Send" });
+
+    fireEvent.change(composer, {
+      target: { value: "first prompt" },
+    });
+    fireEvent.click(sendButton);
+
+    fireEvent.change(composer, {
+      target: { value: "second prompt" },
+    });
+    expect(sendButton).toBeDisabled();
+
+    await waitFor(() => {
+      expect(screen.getByText("first prompt")).toBeInTheDocument();
+      expect(sendButton).toBeEnabled();
+    });
+
+    fireEvent.click(sendButton);
+    await waitFor(() => {
+      expect(createCount).toBe(2);
+    });
+
+    await act(async () => {
+      firstResponseDeferred.resolve();
+      await Promise.resolve();
+    });
+  });
+
+  it("reconciles echoed user messages from snapshots before create-run resolves", async () => {
+    const firstResponseDeferred = createDeferred<void>();
+    const eventListeners = new Set<(event: ChannelSessionEvent) => void>();
+    let createCount = 0;
+    const client = createMockApiClient();
+
+    client.subscribeSessionEvents = (_channelId, _sessionId, onEvent) => {
+      eventListeners.add(onEvent);
+      queueMicrotask(() => {
+        onEvent({
+          type: "messages_snapshot",
+          messages: [],
+          active_run: null,
+        });
+      });
+      return () => eventListeners.delete(onEvent);
+    };
+
+    client.createChannelRun = async (_channelId, sessionId, input) => {
+      createCount += 1;
+      const userMessage: ChannelMessage = {
+        id: `message-user-${createCount}`,
+        session_id: sessionId,
+        role: "user",
+        client_message_key: input.clientMessageKey,
+        content: input.content,
+        attachments: input.attachments ?? [],
+        created_at: Date.now(),
+      };
+      const run: ChannelRun = {
+        id: `run-storage-id-${createCount}`,
+        run_id: `hub-run-${createCount}`,
+        session_id: sessionId,
+        user_message_id: userMessage.id,
+        status: "running",
+        input: input.content,
+        input_attachments: input.attachments ?? [],
+        created_at: Date.now(),
+        updated_at: Date.now(),
+      };
+
+      if (createCount === 1) {
+        queueMicrotask(() => {
+          for (const listener of eventListeners) {
+            listener({
+              type: "messages_snapshot",
+              messages: [userMessage],
+              active_run: {
+                run_id: run.run_id,
+                status: "running",
+                created_at: run.created_at,
+                updated_at: run.updated_at,
+              },
+            });
+          }
+        });
+        await firstResponseDeferred.promise;
+      }
+
+      return { message: userMessage, run };
+    };
+
+    render(<App apiClient={client} />);
+
+    const composer = await screen.findByLabelText("Message");
+    const sendButton = screen.getByRole("button", { name: "Send" });
+
+    fireEvent.change(composer, {
+      target: { value: "first prompt" },
+    });
+    fireEvent.click(sendButton);
+
+    fireEvent.change(composer, {
+      target: { value: "second prompt" },
+    });
+    expect(sendButton).toBeDisabled();
+
+    await waitFor(() => {
+      expect(screen.getByText("first prompt")).toBeInTheDocument();
+      expect(sendButton).toBeEnabled();
+    });
+
+    fireEvent.click(sendButton);
+    await waitFor(() => {
+      expect(createCount).toBe(2);
+    });
+
+    await act(async () => {
+      firstResponseDeferred.resolve();
+      await Promise.resolve();
+    });
+  });
+
+  it("does not carry a pending send lock into a newly created session", async () => {
+    const firstResponseDeferred = createDeferred<void>();
+    let createCount = 0;
+    const client = createMockApiClient();
+
+    client.createChannelRun = async (_channelId, sessionId, input) => {
+      createCount += 1;
+      const userMessage: ChannelMessage = {
+        id: `message-user-${createCount}`,
+        session_id: sessionId,
+        role: "user",
+        client_message_key: input.clientMessageKey,
+        content: input.content,
+        attachments: input.attachments ?? [],
+        created_at: Date.now(),
+      };
+      const run: ChannelRun = {
+        id: `run-storage-id-${createCount}`,
+        run_id: `hub-run-${createCount}`,
+        session_id: sessionId,
+        user_message_id: userMessage.id,
+        status: "running",
+        input: input.content,
+        input_attachments: input.attachments ?? [],
+        created_at: Date.now(),
+        updated_at: Date.now(),
+      };
+      if (createCount === 1) {
+        await firstResponseDeferred.promise;
+      }
+      return { message: userMessage, run };
+    };
+
+    render(<App apiClient={client} />);
+
+    const composer = await screen.findByLabelText("Message");
+    const sendButton = screen.getByRole("button", { name: "Send" });
+
+    fireEvent.change(composer, {
+      target: { value: "first prompt" },
+    });
+    fireEvent.click(sendButton);
+
+    await waitFor(() => {
+      expect(sendButton).toBeDisabled();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+
+    await waitFor(() => {
+      expect(screen.queryByText("first prompt")).not.toBeInTheDocument();
+    });
+
+    fireEvent.change(composer, {
+      target: { value: "prompt in new session" },
+    });
+    await waitFor(() => {
+      expect(sendButton).toBeEnabled();
+    });
+
+    fireEvent.click(sendButton);
+    await waitFor(() => {
+      expect(createCount).toBe(2);
+    });
+
+    await act(async () => {
+      firstResponseDeferred.resolve();
+      await Promise.resolve();
+    });
+  });
+
   it("keeps the pending loader on streamed assistant content until the run clears", async () => {
     const eventListeners = new Set<(event: ChannelSessionEvent) => void>();
     const run: ChannelRun = {
@@ -3221,6 +3479,64 @@ describe("App", () => {
     });
   });
 
+  it("renders live hermes_hub_send execution steps that arrive before run state settles", async () => {
+    const eventListeners = new Set<(event: ChannelSessionEvent) => void>();
+    const run: ChannelRun = {
+      id: "run-storage-id-send",
+      run_id: "hub-run-early-send-execution",
+      session_id: "session-1",
+      user_message_id: "message-user-send",
+      status: "running",
+      input: "send file",
+      input_attachments: [],
+      created_at: Date.now(),
+      updated_at: Date.now(),
+    };
+    const client = createMockApiClient({
+      async createChannelRun(_channelId, sessionId, input) {
+        const userMessage: ChannelMessage = {
+          id: "message-user-send",
+          session_id: sessionId,
+          role: "user",
+          client_message_key: input.clientMessageKey,
+          content: input.content,
+          attachments: input.attachments ?? [],
+          created_at: Date.now(),
+        };
+        const execution = executionMessage(
+          [{ kind: "tool.call", tool: "hermes_hub_send", detail: "MEDIA:/workspace/report.txt" }],
+          "message-early-send-execution",
+        );
+        for (const listener of eventListeners) {
+          listener({ type: "message_created", message: execution });
+        }
+        return { message: userMessage, run };
+      },
+    });
+    client.subscribeSessionEvents = (_channelId, _sessionId, onEvent) => {
+      eventListeners.add(onEvent);
+      return () => eventListeners.delete(onEvent);
+    };
+
+    render(<App apiClient={client} />);
+
+    fireEvent.change(await screen.findByLabelText("Message"), {
+      target: { value: "send file" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(
+      await screen.findByText("call hermes_hub_send：MEDIA:/workspace/report.txt"),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      const pendingBubble = document.querySelector(".message-bubble.assistant.pending");
+      expect(pendingBubble?.textContent).toContain(
+        "call hermes_hub_send：MEDIA:/workspace/report.txt",
+      );
+      expect(pendingBubble?.querySelector(".typing-indicator")).toBeInTheDocument();
+    });
+  });
+
   it("keeps the first live Hermes execution entry when multiple entries stream in", async () => {
     const deferred = createDeferred<void>();
     const hubRun = createHubRunMock({
@@ -3357,6 +3673,66 @@ describe("App", () => {
     );
 
     expect(await screen.findAllByText("call terminal：echo 1")).toHaveLength(2);
+  });
+
+  it("renders hermes_hub_send in execution history alongside other tool steps", async () => {
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialMessagesBySessionId: {
+            "session-1": [
+              executionMessage(
+                [
+                  {
+                    kind: "tool.call",
+                    tool: "hermes_hub_send",
+                    detail: "MEDIA:/workspace/report.txt",
+                  },
+                  {
+                    kind: "tool.call",
+                    tool: "terminal",
+                    detail: "echo visible",
+                  },
+                ],
+                "message-hidden-send-tool",
+              ),
+            ],
+          },
+        })}
+      />,
+    );
+
+    expect(
+      await screen.findByText("call hermes_hub_send：MEDIA:/workspace/report.txt"),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("call terminal：echo visible")).toBeInTheDocument();
+  });
+
+  it("renders execution history messages that only contain hermes_hub_send", async () => {
+    render(
+      <App
+        apiClient={createMockApiClient({
+          initialMessagesBySessionId: {
+            "session-1": [
+              executionMessage(
+                [
+                  {
+                    kind: "tool.call",
+                    tool: "hermes_hub_send",
+                    detail: "MEDIA:/workspace/archive.zip",
+                  },
+                ],
+                "message-only-send-tool",
+              ),
+            ],
+          },
+        })}
+      />,
+    );
+
+    expect(
+      await screen.findByText("call hermes_hub_send：MEDIA:/workspace/archive.zip"),
+    ).toBeInTheDocument();
   });
 
   it("does not treat old assistant messages as the current Hub run response", async () => {
@@ -4418,7 +4794,9 @@ describe("App", () => {
 
     fireEvent.click(scheduledTasksNav);
 
-    expect(workspaceHermesSchedulerSnapshot).toHaveBeenCalled();
+    await waitFor(() => {
+      expect(workspaceHermesSchedulerSnapshot).toHaveBeenCalled();
+    });
     const schedulerTable = await screen.findByRole("table", {
       name: "Scheduled tasks",
     });

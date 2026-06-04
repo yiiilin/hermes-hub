@@ -36,6 +36,72 @@ fn filesystem_mode(path: &Path) -> u32 {
         & 0o777
 }
 
+fn yaml_string_list_after_line(config: &str, key_line: &str, item_prefix: &str) -> Vec<String> {
+    let mut in_list = false;
+    let mut items = Vec::new();
+    for line in config.lines() {
+        if !in_list {
+            if line == key_line {
+                in_list = true;
+            }
+            continue;
+        }
+        if let Some(value) = line
+            .strip_prefix(item_prefix)
+            .and_then(|rest| rest.strip_prefix("- "))
+        {
+            items.push(trim_yaml_string_scalar(value));
+            continue;
+        }
+        if !line.trim().is_empty() {
+            break;
+        }
+    }
+    items
+}
+
+fn trim_yaml_string_scalar(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        trimmed[1..trimmed.len() - 1].to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn expected_hermes_hub_toolsets(include_cronjob: bool) -> Vec<String> {
+    let mut toolsets = vec![
+        "web",
+        "browser",
+        "terminal",
+        "file",
+        "code_execution",
+        "vision",
+        "image_gen",
+        "skills",
+        "todo",
+        "memory",
+        "session_search",
+        "clarify",
+        "delegation",
+    ];
+    if include_cronjob {
+        toolsets.push("cronjob");
+    }
+    toolsets.push("hermes_hub");
+    toolsets.into_iter().map(str::to_string).collect()
+}
+
+fn assert_hub_toolsets_hide_official_messaging(toolsets: &[String]) {
+    // Hub 平台只暴露我们声明的 toolset，避免官方 send_message 和 hermes_hub_send 同时出现。
+    for hidden_toolset in ["messaging", "tts", "computer_use"] {
+        assert!(
+            !toolsets.iter().any(|toolset| toolset == hidden_toolset),
+            "Hermes Hub platform_toolsets intentionally hides official {hidden_toolset} toolset"
+        );
+    }
+}
+
 #[async_trait::async_trait]
 impl DockerRuntime for FakeDockerRuntime {
     async fn run(
@@ -1298,6 +1364,10 @@ async fn docker_provisioner_mounts_sandbox_only_for_public_platform_instances() 
     let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime));
 
     let instance = provisioner.prepare_instance_with_sandbox("public-platform-user", true);
+    let stale_cron_dir = "/tmp/hermes-hub-test/users/public-platform-user/config/cron";
+    std::fs::create_dir_all(stale_cron_dir).expect("stale public cron dir can be created");
+    std::fs::write(format!("{stale_cron_dir}/jobs.json"), "[]")
+        .expect("stale public cron jobs can be written");
     let created = provisioner
         .ensure_container(&instance, "instance-token")
         .await
@@ -1314,6 +1384,10 @@ async fn docker_provisioner_mounts_sandbox_only_for_public_platform_instances() 
         .env
         .iter()
         .any(|entry| entry == "HERMES_MEDIA_ALLOW_DIRS=/"));
+    assert!(spec
+        .env
+        .iter()
+        .any(|entry| entry == "HERMES_HUB_DISABLE_CRON=1"));
     assert!(spec.mounts.iter().any(|mount| matches!(
         mount,
         ContainerMount::Bind(bind)
@@ -1333,7 +1407,19 @@ async fn docker_provisioner_mounts_sandbox_only_for_public_platform_instances() 
         "/tmp/hermes-hub-test/users/public-platform-user/config/config.yaml",
     )
     .expect("managed Hermes config is written");
-    assert!(managed_config.contains("- \"/\""));
+    assert!(managed_config.contains("platform_toolsets:"));
+    let hub_toolsets = yaml_string_list_after_line(&managed_config, "  hermes_hub:", "    ");
+    assert_eq!(hub_toolsets, expected_hermes_hub_toolsets(false));
+    assert_hub_toolsets_hide_official_messaging(&hub_toolsets);
+    assert_eq!(
+        yaml_string_list_after_line(&managed_config, "  media_delivery_allow_dirs:", "    "),
+        vec!["/".to_string()]
+    );
+    assert!(managed_config.contains("cron_mode: \"deny\""));
+    assert!(
+        !std::path::Path::new(stale_cron_dir).exists(),
+        "public platform config refresh must remove stale cron jobs"
+    );
 }
 
 #[tokio::test]
@@ -1345,6 +1431,7 @@ async fn docker_provisioner_test() {
         .expect("backend crate lives under repo root")
         .to_path_buf();
     let bundled_plugin_root = repo_root.join("docker/hermes/plugins/platforms/hermes_hub");
+    let bundled_send_plugin_root = repo_root.join("docker/hermes/plugins/hermes_hub_send");
     let stale_plugin_root =
         PathBuf::from("/tmp/hermes-hub-test/users/user-123/config/plugins/platforms/hermes_hub");
     std::fs::create_dir_all(&stale_plugin_root).expect("stale plugin directory can be created");
@@ -1469,6 +1556,10 @@ async fn docker_provisioner_test() {
         .env
         .iter()
         .any(|entry| entry == "HERMES_MEDIA_ALLOW_DIRS=/"));
+    assert!(spec
+        .env
+        .iter()
+        .all(|entry| entry != "HERMES_HUB_DISABLE_CRON=1"));
     assert!(spec.labels.iter().any(|(key, value)| {
         key == "hermes_hub_spec_version" && value == "2026-06-03-home-channel"
     }));
@@ -1496,6 +1587,10 @@ async fn docker_provisioner_test() {
         .expect("hermes_hub bundled platform plugin package marker is present");
     let plugin_adapter = std::fs::read_to_string(bundled_plugin_root.join("adapter.py"))
         .expect("hermes_hub bundled platform adapter is present");
+    let send_plugin_yaml = std::fs::read_to_string(bundled_send_plugin_root.join("plugin.yaml"))
+        .expect("hermes_hub_send bundled backend plugin metadata is present");
+    let send_plugin_init = std::fs::read_to_string(bundled_send_plugin_root.join("__init__.py"))
+        .expect("hermes_hub_send bundled backend plugin source is present");
     assert!(
         !stale_plugin_root.exists(),
         "managed config must remove old user plugin files so bundled adapter wins"
@@ -1512,11 +1607,16 @@ async fn docker_provisioner_test() {
     assert!(managed_config.contains("default_trust: 0.5"));
     assert!(managed_config.contains("hrr_dim: 1024"));
     assert!(managed_config.contains("auto_extract: false"));
+    assert!(managed_config.contains("platform_toolsets:"));
+    let hub_toolsets = yaml_string_list_after_line(&managed_config, "  hermes_hub:", "    ");
+    assert_eq!(hub_toolsets, expected_hermes_hub_toolsets(true));
+    assert_hub_toolsets_hide_official_messaging(&hub_toolsets);
     assert!(managed_config.contains("gateway:"));
     assert!(managed_config.contains("media_delivery_allow_dirs:"));
-    assert!(managed_config.contains("- \"/\""));
-    assert!(!managed_config.contains("- \"/sandbox\""));
-    assert!(!managed_config.contains("- \"/opt/data\""));
+    assert_eq!(
+        yaml_string_list_after_line(&managed_config, "  media_delivery_allow_dirs:", "    "),
+        vec!["/".to_string()]
+    );
     assert!(managed_config.contains("platforms:"));
     assert!(managed_config.contains("hermes_hub:"));
     assert!(managed_config.contains("enabled: true"));
@@ -1553,6 +1653,17 @@ async fn docker_provisioner_test() {
     assert!(plugin_yaml.contains("HERMES_HUB_CHANNEL_TOKEN"));
     assert!(plugin_init.contains("Hermes Hub platform plugin"));
     assert!(plugin_init.contains("from .adapter import register"));
+    assert!(send_plugin_yaml.contains("kind: backend"));
+    assert!(send_plugin_yaml.contains("provides_tools:"));
+    assert!(send_plugin_yaml.contains("hermes_hub_send"));
+    assert!(send_plugin_init.contains("name=\"hermes_hub_send\""));
+    assert!(send_plugin_init.contains("toolset=\"hermes_hub\""));
+    assert!(send_plugin_init.contains("BasePlatformAdapter.extract_media(official_line)"));
+    assert!(
+        send_plugin_init.contains("BasePlatformAdapter.filter_media_delivery_paths(media_files)")
+    );
+    assert!(send_plugin_init.contains("HERMES_SESSION_THREAD_ID"));
+    assert!(send_plugin_init.contains("HERMES_SESSION_CHAT_ID"));
     assert!(plugin_adapter.contains("class HermesHubAdapter"));
     assert!(plugin_adapter.contains("/internal/channel/v1/inbox?timeout_seconds=25&limit=4"));
     assert!(plugin_adapter.contains("async def connect("));
@@ -1579,6 +1690,9 @@ async fn docker_provisioner_test() {
     assert!(plugin_adapter.contains("raw_message[\"run_id\"] = run_id"));
     assert!(plugin_adapter.contains("await self.handle_message(event)"));
     assert!(plugin_adapter.contains("def _env_enablement("));
+    assert!(plugin_adapter.contains("def _disable_cron_scheduler_if_requested("));
+    assert!(plugin_adapter.contains("HERMES_HUB_DISABLE_CRON"));
+    assert!(plugin_adapter.contains("cron_scheduler.tick = _disabled_tick"));
     assert!(plugin_adapter.contains("env_enablement_fn=_env_enablement"));
     assert!(plugin_adapter.contains("async def on_processing_start("));
     assert!(plugin_adapter.contains("async def on_processing_complete("));
@@ -1607,6 +1721,8 @@ async fn docker_provisioner_test() {
     assert!(plugin_adapter.contains("payload[\"run_id\"] = run_id"));
     assert!(plugin_adapter.contains("async def _send_media_output("));
     assert!(plugin_adapter.contains("async def send("));
+    assert!(!plugin_adapter.contains("HUB_MEDIA_DIRECTIVE_RE"));
+    assert!(!plugin_adapter.contains("async def _send_media_directives("));
     assert!(plugin_adapter.contains("async def edit_message("));
     assert!(plugin_adapter.contains("async def send_document("));
     assert!(plugin_adapter.contains("async def send_image_file("));

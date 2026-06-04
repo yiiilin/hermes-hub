@@ -39,6 +39,8 @@ const HUB_INBOX_LIMIT: u16 = 4;
 const HUB_NFS_CONTAINER_DIR: &str = "/nfs";
 const MANAGED_SKILLS_EXTERNAL_DIR: &str = "/nfs/skills";
 const MANAGED_PROFILE_SOUL_FILE: &str = "SOUL.md";
+// Hub 的附件语义是“Hermes 容器内可读文件都可以作为附件发回 Hub”；
+// 容器本身是安全边界，因此这里显式把官方 MEDIA allow dirs 放宽到根目录。
 const HERMES_MEDIA_ALLOW_DIRS: &str = "/";
 const DOCKER_DAEMON_SOCKET: &str = "/var/run/docker.sock";
 /// Docker 托管 Hermes 的运行配置。
@@ -535,6 +537,10 @@ impl DockerProvisioner {
             "HERMES_YOLO_MODE=1".to_string(),
             "HERMES_ACCEPT_HOOKS=1".to_string(),
         ];
+        if public_platform_cron_disabled(instance) {
+            // 公共平台不提供长期定时任务能力；wrapper 内的 platform plugin 会让 cron tick 变为 no-op。
+            env.push("HERMES_HUB_DISABLE_CRON=1".to_string());
+        }
         if let Some(home_session_id) = instance.home_session_id.as_deref() {
             // Hermes 官方 send_message 的裸平台目标会落到 home_channel；Hub 固定为系统主会话，
             // 避免不同会话并发时通过进程级动态变量串到错误目标。
@@ -1078,6 +1084,10 @@ impl DockerProvisioner {
         // Hub adapter 现在随 wrapper 镜像作为 bundled platform plugin 提供；
         // 清理旧版写入 /config 的用户插件，避免它覆盖 /opt/hermes/plugins 下的新实现。
         changed |= remove_path_if_exists(&config_path.join("plugins/platforms/hermes_hub"))?;
+        if public_platform_cron_disabled(instance) {
+            // 公共平台数据可回收；清理旧任务，避免升级前创建的 cron 在禁用前残留。
+            changed |= remove_path_if_exists(&config_path.join("cron"))?;
+        }
         // pairing 是 Hermes gateway 的运行态授权数据，不属于容器规格。
         // 写入失败必须阻断编排；写入成功不需要为了状态文件变化而重建正在运行的容器。
         ensure_hermes_hub_pairing(&config_path, &instance.user_id)?;
@@ -1145,6 +1155,12 @@ impl DockerProvisioner {
         let instance_id = yaml_string(&instance.id)?;
         let user_id = yaml_string(&instance.user_id)?;
         let media_allow_dirs_section = media_allow_dirs_yaml_section(instance)?;
+        let platform_toolsets_section = platform_toolsets_yaml_section(instance)?;
+        let cron_mode = yaml_string(if public_platform_cron_disabled(instance) {
+            "deny"
+        } else {
+            "approve"
+        })?;
         let managed_skills_section = self
             .config
             .managed_skills
@@ -1168,6 +1184,7 @@ impl DockerProvisioner {
              \x20\x20\x20\x20default_trust: 0.5\n\
              \x20\x20\x20\x20hrr_dim: 1024\n\
              \x20\x20\x20\x20auto_extract: false\n\
+             {platform_toolsets_section}\
              model:\n\
              \x20\x20default: {model}\n\
              \x20\x20provider: \"custom\"\n\
@@ -1209,7 +1226,7 @@ impl DockerProvisioner {
              approvals:\n\
              \x20\x20mode: \"off\"\n\
              \x20\x20timeout: 3600\n\
-             \x20\x20cron_mode: \"approve\"\n\
+             \x20\x20cron_mode: {cron_mode}\n\
              \x20\x20mcp_reload_confirm: false\n\
              \x20\x20destructive_slash_confirm: false\n",
             context_window_tokens = self.config.context_window_tokens,
@@ -1242,6 +1259,39 @@ fn media_allow_dirs_yaml_section(instance: &HermesInstance) -> Result<String, Pr
     let mut section = "  media_delivery_allow_dirs:\n".to_string();
     for dir in dirs {
         section.push_str(&format!("    - {}\n", yaml_string(dir)?));
+    }
+    Ok(section)
+}
+
+fn public_platform_cron_disabled(instance: &HermesInstance) -> bool {
+    instance.host_sandbox_path.is_some()
+}
+
+fn platform_toolsets_yaml_section(instance: &HermesInstance) -> Result<String, ProvisionerError> {
+    let mut toolsets = vec![
+        "web",
+        "browser",
+        "terminal",
+        "file",
+        "code_execution",
+        "vision",
+        "image_gen",
+        "skills",
+        "todo",
+        "memory",
+        "session_search",
+        "clarify",
+        "delegation",
+    ];
+    if !public_platform_cron_disabled(instance) {
+        // 普通托管 Hermes 仍保留用户定时任务能力；公共平台会话会被回收，不支持长期任务。
+        toolsets.push("cronjob");
+    }
+    toolsets.push("hermes_hub");
+
+    let mut section = "platform_toolsets:\n  hermes_hub:\n".to_string();
+    for toolset in toolsets {
+        section.push_str(&format!("    - {}\n", yaml_string(toolset)?));
     }
     Ok(section)
 }

@@ -7,7 +7,6 @@ import json
 import logging
 import mimetypes
 import os
-import re
 import stat as stat_module
 import time
 from pathlib import Path
@@ -33,10 +32,6 @@ from gateway.platforms.base import (
 
 
 logger = logging.getLogger(__name__)
-
-HUB_MEDIA_DIRECTIVE_RE = re.compile(
-    r"""^\s*[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/).+?)\s*[`"']?\s*$"""
-)
 
 
 class AttachmentFileError(Exception):
@@ -87,16 +82,6 @@ class HermesHubAdapter(BasePlatformAdapter):
     def name(self) -> str:
         return "Hermes Hub"
 
-    @staticmethod
-    def extract_media(content: str):
-        # Hermes core 的最终回答路径会先调用 self.extract_media；这里补齐任意扩展的 MEDIA 行。
-        media, cleaned = BasePlatformAdapter.extract_media(content)
-        media_paths, cleaned = HermesHubAdapter._extract_hub_media_directives(cleaned)
-        if media_paths:
-            has_voice_tag = "[[audio_as_voice]]" in str(content or "")
-            media.extend((path, has_voice_tag) for path in media_paths)
-        return media, cleaned
-
     async def connect(self) -> bool:
         if aiohttp is None:
             self._set_fatal_error("missing_dependency", "aiohttp is required", retryable=False)
@@ -140,12 +125,6 @@ class HermesHubAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         del reply_to
-        media_paths, cleaned_content = self._media_directives_from_content(content)
-        if media_paths:
-            return await self._send_media_directives(
-                chat_id, media_paths, cleaned_content, metadata
-            )
-
         session_id = self._session_id(chat_id, metadata)
         run_id = self._run_id(metadata)
         payload = {
@@ -172,54 +151,6 @@ class HermesHubAdapter(BasePlatformAdapter):
         except Exception as error:
             logger.warning("Hermes Hub send failed: %s", error)
             return SendResult(success=False, error=str(error), retryable=True)
-
-    async def _send_media_directives(
-        self,
-        chat_id: str,
-        media_paths: list[str],
-        caption: str,
-        metadata: Optional[Dict[str, Any]],
-    ) -> SendResult:
-        last_result: SendResult | None = None
-        for index, media_path in enumerate(media_paths):
-            media_metadata = dict(metadata or {})
-            media_metadata["media_sequence"] = index
-            last_result = await self._send_media_output(
-                chat_id,
-                media_path,
-                caption if index == 0 else None,
-                media_metadata,
-                None,
-            )
-            if not last_result.success:
-                return last_result
-        return last_result or SendResult(success=True, message_id="")
-
-    def _media_directives_from_content(self, content: str) -> tuple[list[str], str]:
-        return self._extract_hub_media_directives(content)
-
-    @staticmethod
-    def _extract_hub_media_directives(content: str) -> tuple[list[str], str]:
-        media_paths: list[str] = []
-        text_lines: list[str] = []
-        for line in str(content or "").splitlines():
-            match = HUB_MEDIA_DIRECTIVE_RE.match(line)
-            if not match:
-                text_lines.append(line)
-                continue
-            media_path = HermesHubAdapter._clean_media_directive_path(match.group("path"))
-            if media_path:
-                media_paths.append(media_path)
-        return media_paths, "\n".join(text_lines).strip()
-
-    @staticmethod
-    def _clean_media_directive_path(raw_path: str) -> str:
-        media_path = str(raw_path or "").strip()
-        if len(media_path) >= 2 and media_path[0] == media_path[-1] and media_path[0] in "`\"'":
-            media_path = media_path[1:-1].strip()
-        else:
-            media_path = media_path.lstrip("`\"'").rstrip("`\"',.;:)}]")
-        return os.path.expanduser(media_path)
 
     async def edit_message(
         self,
@@ -1145,6 +1076,29 @@ def _check_requirements() -> bool:
     return aiohttp is not None
 
 
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _disable_cron_scheduler_if_requested() -> None:
+    if not _env_truthy("HERMES_HUB_DISABLE_CRON"):
+        return
+    try:
+        import cron.scheduler as cron_scheduler
+
+        def _disabled_tick(*args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            # 公共平台不执行 Hermes cron；gateway 的 ticker 仍可启动，但每次 tick 都为空操作。
+            logger.debug("Hermes Hub public platform cron tick skipped")
+            return None
+
+        cron_scheduler.tick = _disabled_tick
+        logger.info("Hermes Hub disabled Hermes cron scheduler for public platform")
+    except Exception as error:
+        # 禁用 cron 失败不能阻止 adapter 注册；Hub 仍通过 toolset 隐藏和 cron 目录清理兜底。
+        logger.warning("Hermes Hub failed to disable cron scheduler: %s", error)
+
+
 def _env_enablement() -> Optional[dict[str, Any]]:
     seed: dict[str, Any] = {}
     home_channel = os.getenv("HERMES_HUB_HOME_CHANNEL", "").strip()
@@ -1159,6 +1113,7 @@ def _env_enablement() -> Optional[dict[str, Any]]:
 
 
 def register(ctx: Any) -> None:
+    _disable_cron_scheduler_if_requested()
     ctx.register_platform(
         name="hermes_hub",
         label="Hermes Hub",
