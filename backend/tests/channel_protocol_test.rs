@@ -1273,6 +1273,20 @@ async fn channel_session_events_stream_snapshot_and_adapter_messages() {
             .and_then(|value| value.to_str().ok()),
         Some("text/event-stream")
     );
+    assert_eq!(
+        stream_response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-cache, no-store, no-transform")
+    );
+    assert_eq!(
+        stream_response
+            .headers()
+            .get("x-accel-buffering")
+            .and_then(|value| value.to_str().ok()),
+        Some("no")
+    );
     let mut body = stream_response.into_body().into_data_stream();
     let snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
         .await
@@ -1347,6 +1361,20 @@ async fn public_session_events_stream_session_title_updates() {
     )
     .await;
     assert_eq!(stream_response.status(), StatusCode::OK);
+    assert_eq!(
+        stream_response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-cache, no-store, no-transform")
+    );
+    assert_eq!(
+        stream_response
+            .headers()
+            .get("x-accel-buffering")
+            .and_then(|value| value.to_str().ok()),
+        Some("no")
+    );
     let mut body = stream_response.into_body().into_data_stream();
     let _snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
         .await

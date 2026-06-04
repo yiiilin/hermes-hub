@@ -1218,6 +1218,20 @@ td {
   white-space: pre-wrap;
 }
 
+.loading-chat {
+  color: #52656d;
+}
+
+.loading-chat-icon {
+  animation: loading-chat-spin 1s linear infinite;
+}
+
+@keyframes loading-chat-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .message-bubble {
   align-items: start;
   align-self: start;

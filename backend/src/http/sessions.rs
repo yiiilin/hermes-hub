@@ -510,11 +510,15 @@ async fn session_events(
         matches!(access, SessionAccess::Public { .. }),
     );
 
-    Ok(Sse::new(snapshot_stream.chain(live_stream)).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    ))
+    let mut response = Sse::new(snapshot_stream.chain(live_stream))
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response();
+    apply_sse_no_buffer_headers(response.headers_mut());
+    Ok(response)
 }
 
 async fn stop_active_run(
@@ -1083,6 +1087,16 @@ fn sse_json_event<T: Serialize>(name: &'static str, payload: &T) -> Result<Event
     let data = serde_json::to_string(payload)
         .unwrap_or_else(|_| json!({"type": "serialization_failed"}).to_string());
     Ok(Event::default().event(name).data(data))
+}
+
+pub(crate) fn apply_sse_no_buffer_headers(headers: &mut HeaderMap) {
+    // SSE 首包必须尽快穿过代理；no-transform 和 X-Accel-Buffering=no
+    // 可以避免代理把空闲流缓存到下一次 keep-alive 才交给浏览器。
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-store, no-transform"),
+    );
+    headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
 }
 
 async fn delete_session_objects(

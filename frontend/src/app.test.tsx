@@ -1519,6 +1519,35 @@ describe("App", () => {
     expect(document.querySelector(".message-list.empty")).toBeInTheDocument();
   });
 
+  it("shows a conversation loading state until the first session snapshot arrives", async () => {
+    let snapshotListener: ((event: ChannelSessionEvent) => void) | null = null;
+    const client = createMockApiClient({
+      subscribeSessionEvents(_channelId, _sessionId, onEvent) {
+        snapshotListener = onEvent;
+        return () => {
+          snapshotListener = null;
+        };
+      },
+    });
+
+    render(<App apiClient={client} />);
+
+    expect(await screen.findByRole("heading", { name: "Session" })).toBeInTheDocument();
+    expect(await screen.findByText("Loading conversation")).toBeInTheDocument();
+    expect(screen.queryByText("Start a Hermes conversation")).not.toBeInTheDocument();
+
+    await act(async () => {
+      snapshotListener?.({
+        type: "messages_snapshot",
+        messages: [],
+        active_run: null,
+      });
+    });
+
+    expect(await screen.findByText("Start a Hermes conversation")).toBeInTheDocument();
+    expect(screen.queryByText("Loading conversation")).not.toBeInTheDocument();
+  });
+
   it("lets admins edit and save only SOUL.md with Vditor's Markdown WYSIWYG editor", async () => {
     const client = createMockApiClient({
       initialHermesProfile: {

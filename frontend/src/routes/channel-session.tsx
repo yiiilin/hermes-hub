@@ -113,6 +113,7 @@ export function ChannelSessionRoute({
   const [configuredEmptyChatPrompt, setConfiguredEmptyChatPrompt] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [sessionSnapshotLoading, setSessionSnapshotLoading] = useState(false);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
   const pendingAssistantIdsByRunRef = useRef<Record<string, string>>({});
@@ -291,6 +292,7 @@ export function ChannelSessionRoute({
     try {
       const selectedSessionId =
         routeSessionId !== undefined ? routeSessionId : selectedSessionIdRef.current;
+      const previousSelectedSessionId = selectedSessionIdRef.current;
       const nextSessions = (await apiClient.listSessionsPublic(
         publicRequestOptions(selectedSessionId),
       )).filter((session) => !(publicMode && session.is_home));
@@ -329,8 +331,12 @@ export function ChannelSessionRoute({
       const nextSelected = selectedSessionId
         ? (nextSessions.find((session) => session.id === selectedSessionId) ?? null)
         : (nextSessions[0] ?? null);
+      const nextSelectedSessionId = nextSelected?.id ?? null;
       selectedSessionIdRef.current = nextSelected?.id ?? null;
       setSelectedSession(nextSelected);
+      if (nextSelectedSessionId !== previousSelectedSessionId) {
+        setSessionSnapshotLoading(Boolean(nextSelected));
+      }
       setBusyForSelectedSession(nextSelected?.id ?? null);
       if (routeSessionId && nextSelected?.id !== routeSessionId) {
         onSessionRouteChange?.(nextSelected?.id ?? null, "replace");
@@ -341,6 +347,7 @@ export function ChannelSessionRoute({
         clearPendingAssistantMessage();
         resetVerboseEvents();
         setBusy(false);
+        setSessionSnapshotLoading(false);
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("chat.workspaceLoadFailed"));
@@ -440,6 +447,7 @@ export function ChannelSessionRoute({
     setSessions((current) => [session, ...current]);
     selectedSessionIdRef.current = session.id;
     setSelectedSession(session);
+    setSessionSnapshotLoading(true);
     setBusyForSelectedSession(session.id);
     setSeenSessionUpdates((current) => ({
       ...current,
@@ -486,6 +494,7 @@ export function ChannelSessionRoute({
 
     selectedSessionIdRef.current = session.id;
     setSelectedSession(session);
+    setSessionSnapshotLoading(true);
     setBusyForSelectedSession(session.id);
     onSessionRouteChange?.(session.id, "push");
     clearPendingAssistantMessage();
@@ -583,6 +592,7 @@ export function ChannelSessionRoute({
       }
       const nextMessages = sortMessagesForDisplay(event.messages);
       reconcilePendingUserWritesFromMessages(session.id, nextMessages);
+      setSessionSnapshotLoading(false);
       setMessages(nextMessages);
       hydrateExecutionHistory(session.id, nextMessages, event.active_run);
       await restoreActiveRun(session, nextMessages, event.active_run);
@@ -1052,6 +1062,7 @@ export function ChannelSessionRoute({
         const nextSelected = nextSessions[0] ?? null;
         selectedSessionIdRef.current = nextSelected?.id ?? null;
         setSelectedSession(nextSelected);
+        setSessionSnapshotLoading(Boolean(nextSelected));
         setBusyForSelectedSession(nextSelected?.id ?? null);
         onSessionRouteChange?.(nextSelected?.id ?? null, "replace");
         setMessages([]);
@@ -1147,6 +1158,7 @@ export function ChannelSessionRoute({
           messages={renderedMessages}
           onPreviewImage={setPreviewAttachment}
           pendingAssistantMessageId={pendingAssistantMessageId}
+          sessionLoading={Boolean(selectedSession && sessionSnapshotLoading)}
           stickToBottomRef={stickToBottomRef}
           t={t}
           verboseEvents={verboseEvents}
@@ -1407,6 +1419,7 @@ const MessageList = memo(function MessageList({
   messages,
   onPreviewImage,
   pendingAssistantMessageId,
+  sessionLoading,
   stickToBottomRef,
   t,
   verboseEvents,
@@ -1420,6 +1433,7 @@ const MessageList = memo(function MessageList({
   messages: ChannelMessage[];
   onPreviewImage: (attachment: HermesAttachment) => void;
   pendingAssistantMessageId: string | null;
+  sessionLoading: boolean;
   stickToBottomRef: { current: boolean };
   t: Translate;
   verboseEvents: ExecutionHistoryEntry[];
@@ -1580,9 +1594,18 @@ const MessageList = memo(function MessageList({
       ref={messageListRef}
     >
       {renderableMessages.length === 0 ? (
-        <div className="empty-chat">
-          <Bot aria-hidden="true" size={30} />
-          <strong>{emptyChatPrompt || t("chat.empty")}</strong>
+        <div
+          className={sessionLoading ? "empty-chat loading-chat" : "empty-chat"}
+          aria-live="polite"
+        >
+          {sessionLoading ? (
+            <RefreshCw aria-hidden="true" className="loading-chat-icon" size={28} />
+          ) : (
+            <Bot aria-hidden="true" size={30} />
+          )}
+          <strong>
+            {sessionLoading ? t("chat.loadingConversation") : emptyChatPrompt || t("chat.empty")}
+          </strong>
         </div>
       ) : virtualized ? (
         <div

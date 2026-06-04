@@ -23,8 +23,10 @@ use crate::{
         },
     },
     http::{
-        attachments::upload_session_attachments, auth::current_user,
-        sessions::delete_managed_cron_jobs_for_session, workspace::ensure_managed_hermes_for_user,
+        attachments::upload_session_attachments,
+        auth::current_user,
+        sessions::{apply_sse_no_buffer_headers, delete_managed_cron_jobs_for_session},
+        workspace::ensure_managed_hermes_for_user,
         ApiError,
     },
     storage::ObjectStorageError,
@@ -481,11 +483,15 @@ async fn session_events(
         stream::once(async move { sse_json_event("messages_snapshot", &snapshot) });
     let live_stream = session_live_event_stream(receiver, session_id);
 
-    Ok(Sse::new(snapshot_stream.chain(live_stream)).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    ))
+    let mut response = Sse::new(snapshot_stream.chain(live_stream))
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response();
+    apply_sse_no_buffer_headers(response.headers_mut());
+    Ok(response)
 }
 
 async fn upload_attachments(
