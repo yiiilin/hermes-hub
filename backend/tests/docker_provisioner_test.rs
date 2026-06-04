@@ -1279,7 +1279,8 @@ async fn docker_provisioner_repairs_pairing_state_even_when_config_is_unchanged(
     *runtime.container_exists.lock().expect("exists lock") = true;
     *runtime.container_running.lock().expect("running lock") = true;
     *runtime.health_status.lock().expect("health lock") = Some("healthy".to_string());
-    *runtime.spec_version.lock().expect("spec lock") = Some("2026-06-04-nfs-nosharecache".to_string());
+    *runtime.spec_version.lock().expect("spec lock") =
+        Some("2026-06-04-nfs-nosharecache".to_string());
     runtime.calls.lock().expect("calls lock").clear();
 
     provisioner
@@ -1309,6 +1310,72 @@ async fn docker_provisioner_repairs_pairing_state_even_when_config_is_unchanged(
             .iter()
             .any(|args| args.get(0).map(String::as_str) == Some("rm")),
         "runtime-only pairing repair should not recreate an otherwise healthy current container"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn docker_provisioner_accepts_hermes_owned_private_pairing_directory_without_bouncing_container(
+) {
+    let runtime = FakeDockerRuntime::default();
+    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime.clone()));
+    let user_id = format!("user-pairing-private-{}", Uuid::new_v4());
+    let instance = provisioner
+        .ensure_instance(&user_id, "instance-token")
+        .await
+        .expect("initial instance can be created");
+    let config_path = PathBuf::from(
+        instance
+            .host_config_path
+            .as_ref()
+            .expect("managed config path is set"),
+    );
+    let pairing_dir = config_path.join("pairing");
+    let approved_path = pairing_dir.join("hermes_hub-approved.json");
+    std::fs::set_permissions(&pairing_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("fixture can set Hermes private pairing directory mode");
+    let chown_status = Command::new("chown")
+        .arg("-R")
+        .arg("10000:10000")
+        .arg(&pairing_dir)
+        .status()
+        .expect("chown command can run");
+    if !chown_status.success() {
+        eprintln!("skipping hermes-owned private pairing directory assertion because chown failed");
+        return;
+    }
+    assert_eq!(filesystem_mode(&pairing_dir), 0o700);
+    assert_eq!(filesystem_mode(&approved_path), 0o644);
+    *runtime.container_exists.lock().expect("exists lock") = true;
+    *runtime.container_running.lock().expect("running lock") = true;
+    *runtime.health_status.lock().expect("health lock") = Some("healthy".to_string());
+    *runtime.spec_version.lock().expect("spec lock") =
+        Some("2026-06-04-nfs-nosharecache".to_string());
+    runtime.calls.lock().expect("calls lock").clear();
+
+    provisioner
+        .ensure_container(&instance, "instance-token")
+        .await
+        .expect("Hermes-owned private pairing directory is already readable by the gateway");
+
+    let calls = runtime.calls.lock().expect("calls lock");
+    assert!(
+        !calls
+            .iter()
+            .any(|args| args.get(0).map(String::as_str) == Some("stop")),
+        "Hermes-owned 0700 pairing directory must not bounce the running container"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|args| args.get(0).map(String::as_str) == Some("start")),
+        "Hermes-owned 0700 pairing directory must not restart the running container"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|args| args.get(0).map(String::as_str) == Some("rm")),
+        "Hermes-owned 0700 pairing directory must not recreate the running container"
     );
 }
 

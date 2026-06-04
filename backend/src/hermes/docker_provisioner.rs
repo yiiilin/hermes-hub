@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::{
     collections::HashMap,
     ffi::OsStr,
@@ -43,6 +43,10 @@ const MANAGED_PROFILE_SOUL_FILE: &str = "SOUL.md";
 // 容器本身是安全边界，因此这里显式把官方 MEDIA allow dirs 放宽到根目录。
 const HERMES_MEDIA_ALLOW_DIRS: &str = "/";
 const DOCKER_DAEMON_SOCKET: &str = "/var/run/docker.sock";
+#[cfg(unix)]
+const HERMES_CONTAINER_UID: u32 = 10000;
+#[cfg(unix)]
+const HERMES_CONTAINER_GID: u32 = 10000;
 /// Docker 托管 Hermes 的运行配置。
 #[derive(Clone, Debug, PartialEq)]
 pub struct DockerProvisionerConfig {
@@ -1929,7 +1933,10 @@ fn real_directory_needs_repair(
         return Ok(true);
     }
     ensure_path_within_config(config_path, path)?;
-    Ok(unix_mode_needs_repair(&metadata, expected_mode))
+    Ok(pairing_directory_mode_needs_repair(
+        &metadata,
+        expected_mode,
+    ))
 }
 
 fn pairing_approved_file_needs_repair(
@@ -1980,6 +1987,29 @@ fn unix_mode_needs_repair(metadata: &std::fs::Metadata, expected_mode: u32) -> b
 
 #[cfg(not(unix))]
 fn unix_mode_needs_repair(_metadata: &std::fs::Metadata, _expected_mode: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn pairing_directory_mode_needs_repair(metadata: &std::fs::Metadata, expected_mode: u32) -> bool {
+    let actual_mode = metadata.permissions().mode() & 0o777;
+    if actual_mode == expected_mode {
+        return false;
+    }
+    // Hermes gateway 会把旧版 /config/pairing 收紧为 hermes:hermes 0700。
+    // 这个状态对 gateway 可读可写，不能被 Hub 当成需要 stop/start 的坏状态。
+    if expected_mode == 0o755
+        && actual_mode == 0o700
+        && metadata.uid() == HERMES_CONTAINER_UID
+        && metadata.gid() == HERMES_CONTAINER_GID
+    {
+        return false;
+    }
+    true
+}
+
+#[cfg(not(unix))]
+fn pairing_directory_mode_needs_repair(_metadata: &std::fs::Metadata, _expected_mode: u32) -> bool {
     false
 }
 
