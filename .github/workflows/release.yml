@@ -32,11 +32,29 @@ jobs:
 
       - name: Runtime image date tag
         id: runtime_tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
-          # Hermes wrapper 和 ASR 是运行时镜像，用类似官方 Hermes 的日期 tag 管理，避免 latest 缓存漂移。
-          tag="$(date -u +v%Y.%-m.%-d).${GITHUB_RUN_NUMBER}"
+          # Hermes wrapper 和 ASR 是运行时镜像，用类似官方 Hermes 的日期 tag 管理。
+          # 当天第一次发版不加序号；第二次起追加当天发版次数，例如 v2026.6.4.2。
+          date_tag="$(date -u +v%Y.%-m.%-d)"
+          date_iso="$(date -u +%Y-%m-%d)"
+          previous_releases_today="$(
+            DATE_ISO="${date_iso}" RELEASE_TAG="${RELEASE_TAG}" \
+              gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
+                --jq '.[] | select(.draft == false) | select(.tag_name != env.RELEASE_TAG) | select(.published_at | startswith(env.DATE_ISO)) | .tag_name' \
+              | wc -l \
+              | tr -d ' '
+          )"
+          release_index=$((previous_releases_today + 1))
+          if [ "${release_index}" -eq 1 ]; then
+            tag="${date_tag}"
+          else
+            tag="${date_tag}.${release_index}"
+          fi
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
 
       - name: Detect image changes

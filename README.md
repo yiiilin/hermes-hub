@@ -137,13 +137,13 @@ Release images are published to GitHub Container Registry:
 
 ```bash
 docker pull ghcr.io/yiiilin/hermes-hub:latest
-docker pull ghcr.io/yiiilin/hermes-hub-hermes:vYYYY.M.D.N
-docker pull ghcr.io/yiiilin/hermes-hub-asr:vYYYY.M.D.N
+docker pull ghcr.io/yiiilin/hermes-hub-hermes:vYYYY.M.D
+docker pull ghcr.io/yiiilin/hermes-hub-asr:vYYYY.M.D
 ```
 
 The Hub image contains the Rust backend and the built React frontend. The `hermes-hub-hermes` image is the Hermes runtime wrapper used by managed per-user containers. The optional `hermes-hub-asr` image wraps sherpa-onnx + SenseVoice for speech input. The service listens on port `8080`.
 
-Hermes wrapper and ASR runtime images use release-generated date tags such as `v2026.6.3.42`; use the exact tag from the GitHub Release notes. The Hermes runtime wrapper uses the selected upstream `nousresearch/hermes-agent:v2026.5.29.2` base image tag. Do not rely on `latest` drift for runtime images; update the Dockerfile `HERMES_AGENT_IMAGE` tag only when intentionally aligning to a newer Hermes Agent base.
+Hermes wrapper and ASR runtime images use release-generated date tags such as `v2026.6.4` for the first UTC release that day and `v2026.6.4.2` for the second release that day; the final number is the daily release count, not a patch version. Use the exact tag from the GitHub Release notes. The Hermes runtime wrapper uses the selected upstream `nousresearch/hermes-agent:v2026.5.29.2` base image tag. Do not rely on `latest` drift for runtime images; update the Dockerfile `HERMES_AGENT_IMAGE` tag only when intentionally aligning to a newer Hermes Agent base.
 
 ## Release
 

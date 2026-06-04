@@ -74,6 +74,30 @@ fn release_workflow_keeps_hub_image_on_numeric_release_tags() {
 }
 
 #[test]
+fn release_workflow_uses_daily_runtime_release_count() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("backend crate lives under repo root");
+    let workflow = std::fs::read_to_string(repo_root.join(".github/workflows/release.yml"))
+        .expect("release workflow is present");
+    let runtime_tag_step = workflow
+        .split("      - name: Runtime image date tag")
+        .nth(1)
+        .expect("runtime tag step is present")
+        .split("      - name: Detect image changes")
+        .next()
+        .expect("runtime tag step terminator is present");
+
+    // 运行时镜像 tag 的尾号是当天第几次发版，不是 GitHub Actions 全局 run number。
+    assert!(runtime_tag_step.contains("previous_releases_today"));
+    assert!(runtime_tag_step.contains("release_index=$((previous_releases_today + 1))"));
+    assert!(runtime_tag_step.contains("tag=\"${date_tag}.${release_index}\""));
+    assert!(runtime_tag_step.contains("gh api --paginate"));
+    assert!(runtime_tag_step.contains("select(.published_at | startswith(env.DATE_ISO))"));
+    assert!(!runtime_tag_step.contains("GITHUB_RUN_NUMBER"));
+}
+
+#[test]
 fn release_workflow_skips_unchanged_images_by_path_diff() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
