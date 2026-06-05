@@ -77,11 +77,9 @@ pub struct ManagedProfileConfig {
 pub struct SpeechInputConfig {
     pub enabled: bool,
     pub asr_endpoint: Option<String>,
-    pub transcribe_path: String,
     pub asr_model: String,
     pub timeout_seconds: u64,
     pub max_audio_seconds: u32,
-    pub max_upload_bytes: usize,
 }
 
 impl SpeechInputConfig {
@@ -319,12 +317,9 @@ pub fn speech_input_config_from_env() -> SpeechInputConfig {
             false,
         ),
         asr_endpoint: optional_env_any(&["HERMES_ASR_ENDPOINT", "HERMES_HUB_ASR_ENDPOINT"]),
-        transcribe_path: std::env::var("HERMES_ASR_TRANSCRIBE_PATH")
-            .or_else(|_| std::env::var("HERMES_HUB_ASR_TRANSCRIBE_PATH"))
-            .unwrap_or_else(|_| "/v1/audio/transcriptions".to_string()),
         asr_model: std::env::var("HERMES_ASR_MODEL")
             .or_else(|_| std::env::var("HERMES_HUB_ASR_MODEL"))
-            .unwrap_or_else(|_| "sensevoice".to_string()),
+            .unwrap_or_else(|_| "sherpa-onnx-streaming-paraformer-bilingual-zh-en".to_string()),
         timeout_seconds: env_u64_any(
             &[
                 "HERMES_ASR_TIMEOUT_SECONDS",
@@ -338,13 +333,6 @@ pub fn speech_input_config_from_env() -> SpeechInputConfig {
                 "HERMES_HUB_ASR_MAX_AUDIO_SECONDS",
             ],
             60,
-        ),
-        max_upload_bytes: env_usize_any(
-            &[
-                "HERMES_ASR_MAX_UPLOAD_BYTES",
-                "HERMES_HUB_ASR_MAX_UPLOAD_BYTES",
-            ],
-            25 * 1024 * 1024,
         ),
     }
 }
@@ -419,11 +407,9 @@ fn default_speech_input_config() -> SpeechInputConfig {
     SpeechInputConfig {
         enabled: false,
         asr_endpoint: None,
-        transcribe_path: "/v1/audio/transcriptions".to_string(),
-        asr_model: "sensevoice".to_string(),
+        asr_model: "sherpa-onnx-streaming-paraformer-bilingual-zh-en".to_string(),
         timeout_seconds: 90,
         max_audio_seconds: 60,
-        max_upload_bytes: 25 * 1024 * 1024,
     }
 }
 
@@ -480,14 +466,6 @@ fn env_u64_any(names: &[&str], default: u64) -> u64 {
         .iter()
         .find_map(|name| std::env::var(name).ok())
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(default)
-}
-
-fn env_usize_any(names: &[&str], default: usize) -> usize {
-    names
-        .iter()
-        .find_map(|name| std::env::var(name).ok())
-        .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default)
 }
 
@@ -686,16 +664,12 @@ mod tests {
             "HERMES_HUB_VOICE_INPUT_ENABLED",
             "HERMES_ASR_ENDPOINT",
             "HERMES_HUB_ASR_ENDPOINT",
-            "HERMES_ASR_TRANSCRIBE_PATH",
-            "HERMES_HUB_ASR_TRANSCRIBE_PATH",
             "HERMES_ASR_MODEL",
             "HERMES_HUB_ASR_MODEL",
             "HERMES_ASR_TIMEOUT_SECONDS",
             "HERMES_HUB_ASR_TIMEOUT_SECONDS",
             "HERMES_ASR_MAX_AUDIO_SECONDS",
             "HERMES_HUB_ASR_MAX_AUDIO_SECONDS",
-            "HERMES_ASR_MAX_UPLOAD_BYTES",
-            "HERMES_HUB_ASR_MAX_UPLOAD_BYTES",
         ];
         let saved = NAMES
             .iter()
@@ -708,25 +682,23 @@ mod tests {
         let disabled = speech_input_config_from_env();
         assert!(!disabled.enabled);
         assert!(disabled.asr_endpoint.is_none());
-        assert_eq!(disabled.transcribe_path, "/v1/audio/transcriptions");
-        assert_eq!(disabled.asr_model, "sensevoice");
+        assert_eq!(
+            disabled.asr_model,
+            "sherpa-onnx-streaming-paraformer-bilingual-zh-en"
+        );
 
         std::env::set_var("HERMES_HUB_SPEECH_INPUT_ENABLED", "true");
         std::env::set_var("HERMES_HUB_ASR_ENDPOINT", "http://asr:8090");
-        std::env::set_var("HERMES_HUB_ASR_TRANSCRIBE_PATH", "/transcribe");
-        std::env::set_var("HERMES_HUB_ASR_MODEL", "whisper-1");
+        std::env::set_var("HERMES_HUB_ASR_MODEL", "streaming-zh");
         std::env::set_var("HERMES_HUB_ASR_TIMEOUT_SECONDS", "45");
         std::env::set_var("HERMES_HUB_ASR_MAX_AUDIO_SECONDS", "90");
-        std::env::set_var("HERMES_HUB_ASR_MAX_UPLOAD_BYTES", "12345");
 
         let enabled = speech_input_config_from_env();
         assert!(enabled.enabled);
         assert_eq!(enabled.asr_endpoint.as_deref(), Some("http://asr:8090"));
-        assert_eq!(enabled.transcribe_path, "/transcribe");
-        assert_eq!(enabled.asr_model, "whisper-1");
+        assert_eq!(enabled.asr_model, "streaming-zh");
         assert_eq!(enabled.timeout_seconds, 45);
         assert_eq!(enabled.max_audio_seconds, 90);
-        assert_eq!(enabled.max_upload_bytes, 12345);
 
         for (name, value) in saved {
             if let Some(value) = value {

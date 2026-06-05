@@ -124,7 +124,6 @@ async fn app_state_with_recording_docker_runtime() -> (AppState, RecordingDocker
         .expect("title model config is ready");
     let runtime = RecordingDockerRuntime::default();
     let object_storage = InMemoryObjectStorage::new(config.object_storage.bucket.clone()).shared();
-    let asr_client = hermes_hub_backend::asr::default_asr_client(&config.speech_input);
     let docker_provisioner = hermes_hub_backend::hermes::docker_provisioner::DockerProvisioner::new_with_runtime_and_object_storage(
         docker_config_from_app(&config, &ready_model_config(LLM_MODEL_CONFIG_KIND)),
         Arc::new(runtime.clone()),
@@ -140,7 +139,6 @@ async fn app_state_with_recording_docker_runtime() -> (AppState, RecordingDocker
         ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
         docker_provisioner,
         session_events: hermes_hub_backend::channel::events::SessionEventHub::default(),
-        asr_client,
     };
     (state, runtime)
 }

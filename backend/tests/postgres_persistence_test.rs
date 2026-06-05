@@ -88,7 +88,6 @@ async fn test_state(pool: PgPool, provider: InMemoryLlmProviderClient) -> AppSta
         .await
         .expect("model registry can be initialized");
 
-    let asr_client = hermes_hub_backend::asr::default_asr_client(&config.speech_input);
     AppState {
         docker_provisioner: DockerProvisioner::new_with_runtime(
             docker_config_from_app(&config, &config.initial_model_config),
@@ -102,7 +101,6 @@ async fn test_state(pool: PgPool, provider: InMemoryLlmProviderClient) -> AppSta
         ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
         object_storage: InMemoryObjectStorage::default().shared(),
         session_events: Default::default(),
-        asr_client,
     }
 }
 

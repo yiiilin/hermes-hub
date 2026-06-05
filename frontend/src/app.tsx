@@ -108,6 +108,11 @@ function AppContent({ apiClient }: Required<AppProps>) {
     if (loadingUser || shouldPreserveInviteUrl(normalizedRoute)) {
       return;
     }
+    // 如果用户已经在当前渲染之后触发了新导航，旧的规范化 effect 不能再覆盖新地址。
+    const currentBrowserPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    if (currentBrowserPath !== browserPathAtRender) {
+      return;
+    }
     const normalizedPath = buildAppPath(normalizedRoute);
     if (browserPathAtRender === normalizedPath && appRoutesEqual(currentRoute, normalizedRoute)) {
       return;

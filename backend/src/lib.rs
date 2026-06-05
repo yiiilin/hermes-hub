@@ -60,7 +60,6 @@ pub struct AppState {
     pub docker_provisioner: DockerProvisioner,
     pub object_storage: DynObjectStorage,
     pub session_events: channel::events::SessionEventHub,
-    pub asr_client: asr::DynAsrClient,
 }
 
 #[derive(Debug, Error)]
@@ -88,7 +87,6 @@ pub fn build_router(config: AppConfig) -> Router {
         Arc::new(NoopDockerRuntime),
         object_storage.clone(),
     );
-    let asr_client = asr::default_asr_client(&config.speech_input);
     let state = AppState {
         model_registry: ModelRegistry::new(config.initial_model_config.clone()),
         config,
@@ -99,7 +97,6 @@ pub fn build_router(config: AppConfig) -> Router {
         docker_provisioner,
         object_storage,
         session_events: channel::events::SessionEventHub::default(),
-        asr_client,
     };
 
     build_router_with_state(state)
@@ -117,7 +114,6 @@ pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppIn
     );
 
     let Some(database_url) = config.database_url.clone() else {
-        let asr_client = asr::default_asr_client(&config.speech_input);
         let state = AppState {
             model_registry: ModelRegistry::new(config.initial_model_config.clone()),
             config,
@@ -128,7 +124,6 @@ pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppIn
             docker_provisioner,
             object_storage,
             session_events: channel::events::SessionEventHub::default(),
-            asr_client,
         };
         tokio::spawn(hermes::lifecycle::start_hermes_lifecycle_sweeper(
             state.clone(),
@@ -148,7 +143,6 @@ pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppIn
         config.initial_model_config.clone(),
     )
     .await?;
-    let asr_client = asr::default_asr_client(&config.speech_input);
     let state = AppState {
         config,
         store: SessionStore::postgres(pool.clone(), cipher),
@@ -159,7 +153,6 @@ pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppIn
         docker_provisioner,
         object_storage,
         session_events: channel::events::SessionEventHub::default(),
-        asr_client,
     };
     tokio::spawn(hermes::lifecycle::start_hermes_lifecycle_sweeper(
         state.clone(),

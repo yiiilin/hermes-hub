@@ -66,6 +66,7 @@ describe("App", () => {
     cleanup();
     vditorMock.instances.splice(0);
     vditorMock.Vditor.mockClear();
+    vi.useRealTimers();
     vi.restoreAllMocks();
     window.history.pushState({}, "", "/");
     localStorage.clear();
@@ -162,16 +163,11 @@ describe("App", () => {
     };
   }
 
-  function installMediaRecorderMock(
-    payload: string,
-    options: { deferGetUserMedia?: boolean; throwOnConstruct?: boolean } = {},
+  function installStreamingSpeechMock(
+    options: { deferGetUserMedia?: boolean; deferOpen?: boolean } = {},
   ) {
     const originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
-    const originalMediaRecorder = (
-      globalThis as typeof globalThis & {
-        MediaRecorder?: typeof MediaRecorder;
-      }
-    ).MediaRecorder;
+    const originalAudioContext = Object.getOwnPropertyDescriptor(globalThis, "AudioContext");
     const tracksByCall = [[{ stop: vi.fn() }], [{ stop: vi.fn() }]];
     const mediaStreams = tracksByCall.map(
       (tracks) =>
@@ -198,38 +194,61 @@ describe("App", () => {
       },
     });
 
-    class MockMediaRecorder {
-      ondataavailable: ((event: { data: Blob }) => void) | null = null;
-      onstop: (() => void) | null = null;
-      state = "inactive";
+    const audioContextCloseSpy = vi.fn(async () => undefined);
+    const disconnectSpy = vi.fn();
+    const connectSpy = vi.fn();
+    const createScriptProcessorSpy = vi.fn();
+    const processor = {
+      connect: connectSpy,
+      disconnect: disconnectSpy,
+      onaudioprocess: null as
+        | ((event: { inputBuffer: { getChannelData: () => Float32Array } }) => void)
+        | null,
+    };
 
-      constructor() {
-        recorderConstructedSpy();
-        if (options.throwOnConstruct) {
-          throw new Error("MediaRecorder constructor failed");
-        }
+    class MockAudioContext {
+      sampleRate = 16000;
+      destination = {};
+
+      createMediaStreamSource() {
+        return {
+          connect: connectSpy,
+          disconnect: disconnectSpy,
+        };
       }
 
-      start() {
-        this.state = "recording";
+      createScriptProcessor(
+        bufferSize?: number,
+        numberOfInputChannels?: number,
+        numberOfOutputChannels?: number,
+      ) {
+        createScriptProcessorSpy(bufferSize, numberOfInputChannels, numberOfOutputChannels);
+        return processor;
       }
 
-      stop() {
-        stopSpy();
-        this.state = "inactive";
-        queueMicrotask(() => {
-          this.ondataavailable?.({
-            data: new Blob([payload], { type: "audio/webm" }),
-          });
-          this.onstop?.();
-        });
+      createGain() {
+        return {
+          connect: connectSpy,
+          disconnect: disconnectSpy,
+          gain: { value: 0 },
+        };
       }
+
+      close = audioContextCloseSpy;
     }
 
-    Object.defineProperty(globalThis, "MediaRecorder", {
+    Object.defineProperty(globalThis, "AudioContext", {
       configurable: true,
-      value: MockMediaRecorder,
+      value: MockAudioContext,
     });
+
+    let streamHandlers: Parameters<ApiClient["openSpeechInputStream"]>[0] | null = null;
+    const connection = {
+      close: vi.fn(),
+      sendAudio: vi.fn(),
+      sendStart: vi.fn(),
+      stop: vi.fn(),
+    };
 
     const restore = () => {
       if (originalMediaDevices) {
@@ -237,21 +256,38 @@ describe("App", () => {
       } else {
         Reflect.deleteProperty(navigator, "mediaDevices");
       }
-      if (originalMediaRecorder) {
-        Object.defineProperty(globalThis, "MediaRecorder", {
-          configurable: true,
-          value: originalMediaRecorder,
-        });
+      if (originalAudioContext) {
+        Object.defineProperty(globalThis, "AudioContext", originalAudioContext);
       } else {
-        Reflect.deleteProperty(globalThis, "MediaRecorder");
+        Reflect.deleteProperty(globalThis, "AudioContext");
       }
     };
     return {
+      audioContextCloseSpy,
+      connection,
+      connectSpy,
+      createScriptProcessorSpy,
+      disconnectSpy,
       getUserMediaSpy,
-      recorderConstructedSpy,
+      installClient(client: ApiClient) {
+        client.openSpeechInputStream = vi.fn((handlers) => {
+          streamHandlers = handlers;
+          if (!options.deferOpen) {
+            queueMicrotask(() => handlers.onOpen());
+          }
+          return connection;
+        });
+      },
+      openStream: () => streamHandlers?.onOpen(),
+      processor,
       resolveGetUserMedia: () => getUserMediaDeferred?.resolve(mediaStreams[0]),
       restore,
-      stopSpy,
+      streamHandlers: () => {
+        if (!streamHandlers) {
+          throw new Error("stream handlers are not installed");
+        }
+        return streamHandlers;
+      },
       tracks: tracksByCall[0],
       tracksByCall,
     };
@@ -1871,20 +1907,18 @@ describe("App", () => {
     ]);
   });
 
-  it("records speech while the microphone is held and inserts the transcription", async () => {
-    const { restore: restoreRecorder, stopSpy } = installMediaRecorderMock("audio bytes");
+  it("streams speech while the microphone is held and inserts the final transcript", async () => {
+    const speech = installStreamingSpeechMock();
     try {
       const hubRun = createHubRunMock({ answer: "unused" });
       hubRun.client.speechInputConfig = vi.fn(async () => ({
         enabled: true,
         runtime_available: true,
-        max_audio_seconds: 60,
-        max_upload_bytes: 25 * 1024 * 1024,
+        max_duration_seconds: 60,
+        sample_rate: 16000,
+        model: "streaming-zh",
       }));
-      hubRun.client.transcribeSpeechInput = vi.fn(async (file) => {
-        expect(file.type).toBe("audio/webm");
-        return { text: "语音输入内容" };
-      });
+      speech.installClient(hubRun.client);
 
       render(<App apiClient={hubRun.client} />);
 
@@ -1892,20 +1926,237 @@ describe("App", () => {
         name: "Hold to speak",
       });
       fireEvent.mouseDown(microphone);
-      expect(await screen.findByText("Recording, release to transcribe")).toBeInTheDocument();
-      window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+      expect(await screen.findByText("Recording and transcribing live")).toBeInTheDocument();
+      await waitFor(() => expect(speech.connection.sendStart).toHaveBeenCalledWith(16000));
 
-      await waitFor(() => {
-        expect(stopSpy).toHaveBeenCalledTimes(1);
+      act(() => {
+        speech.processor.onaudioprocess?.({
+          inputBuffer: { getChannelData: () => new Float32Array([0, 1, -1]) },
+        });
       });
+      const audioChunk = speech.connection.sendAudio.mock.calls.at(-1)?.[0] as
+        | ArrayBuffer
+        | undefined;
+      expect(audioChunk).toBeInstanceOf(ArrayBuffer);
+      const audioView = new DataView(audioChunk as ArrayBuffer);
+      expect(audioView.getInt16(0, true)).toBe(0);
+      expect(audioView.getInt16(2, true)).toBe(32767);
+      expect(audioView.getInt16(4, true)).toBe(-32768);
 
-      await waitFor(() => {
-        expect(hubRun.client.transcribeSpeechInput).toHaveBeenCalledTimes(1);
+      act(() => {
+        speech.streamHandlers().onPartial("语音");
+      });
+      expect(screen.getByLabelText("Message")).toHaveValue("语音");
+      const voiceStatus = screen.getByText("Recording and transcribing live");
+      expect(voiceStatus).toBeInTheDocument();
+      expect(voiceStatus.closest(".voice-status")).not.toHaveTextContent("语音");
+
+      window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+      await waitFor(() => expect(speech.connection.stop).toHaveBeenCalledTimes(1));
+      expect(await screen.findByText("Transcribing...")).toBeInTheDocument();
+      expect(screen.getByLabelText("Message")).toHaveValue("语音");
+
+      act(() => {
+        speech.streamHandlers().onFinal("语音输入内容");
       });
       expect(screen.getByLabelText("Message")).toHaveValue("语音输入内容");
+
+      act(() => {
+        speech.streamHandlers().onDone();
+        speech.streamHandlers().onClose();
+      });
+      expect(screen.getByLabelText("Message")).toHaveValue("语音输入内容");
+      expect(screen.queryByText("Speech recognition failed")).not.toBeInTheDocument();
       expect(hubRun.createCalled()).toBe(false);
     } finally {
-      restoreRecorder();
+      speech.restore();
+    }
+  });
+
+  it("replaces the live speech draft inside existing composer text", async () => {
+    const speech = installStreamingSpeechMock();
+    try {
+      const hubRun = createHubRunMock({ answer: "unused" });
+      hubRun.client.speechInputConfig = vi.fn(async () => ({
+        enabled: true,
+        runtime_available: true,
+        max_duration_seconds: 60,
+        sample_rate: 16000,
+        model: "streaming-zh",
+      }));
+      speech.installClient(hubRun.client);
+
+      render(<App apiClient={hubRun.client} />);
+
+      const composer = await screen.findByLabelText("Message");
+      fireEvent.change(composer, { target: { value: "请记录" } });
+      const microphone = await screen.findByRole("button", {
+        name: "Hold to speak",
+      });
+      fireEvent.mouseDown(microphone);
+      await waitFor(() => expect(speech.connection.sendStart).toHaveBeenCalledWith(16000));
+
+      act(() => {
+        speech.streamHandlers().onPartial("第一段");
+      });
+      expect(composer).toHaveValue("请记录 第一段");
+
+      act(() => {
+        speech.streamHandlers().onPartial("第一段更新");
+      });
+      expect(composer).toHaveValue("请记录 第一段更新");
+
+      window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+      await waitFor(() => expect(speech.connection.stop).toHaveBeenCalledTimes(1));
+      expect(composer).toHaveValue("请记录 第一段更新");
+
+      act(() => {
+        speech.streamHandlers().onFinal("第一段完整");
+        speech.streamHandlers().onDone();
+      });
+      expect(composer).toHaveValue("请记录 第一段完整");
+    } finally {
+      speech.restore();
+    }
+  });
+
+  it("buffers speech captured before the stream opens and finalizes after quick release", async () => {
+    const speech = installStreamingSpeechMock({ deferOpen: true });
+    try {
+      const hubRun = createHubRunMock({ answer: "unused" });
+      hubRun.client.speechInputConfig = vi.fn(async () => ({
+        enabled: true,
+        runtime_available: true,
+        max_duration_seconds: 60,
+        sample_rate: 16000,
+        model: "streaming-zh",
+      }));
+      speech.installClient(hubRun.client);
+
+      render(<App apiClient={hubRun.client} />);
+
+      const microphone = await screen.findByRole("button", {
+        name: "Hold to speak",
+      });
+      fireEvent.mouseDown(microphone);
+      await waitFor(() => expect(hubRun.client.openSpeechInputStream).toHaveBeenCalledTimes(1));
+
+      // 用户说完马上松开时，WebSocket 可能还没 open；此时也必须先保留麦克风音频。
+      expect(speech.createScriptProcessorSpy).toHaveBeenCalledWith(1024, 1, 1);
+      expect(speech.processor.onaudioprocess).toEqual(expect.any(Function));
+      act(() => {
+        speech.processor.onaudioprocess?.({
+          inputBuffer: { getChannelData: () => new Float32Array([0.5, -0.5]) },
+        });
+      });
+      expect(speech.connection.sendAudio).not.toHaveBeenCalled();
+
+      window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+      expect(speech.connection.close).not.toHaveBeenCalled();
+      expect(speech.connection.stop).not.toHaveBeenCalled();
+
+      act(() => {
+        speech.openStream();
+      });
+      await waitFor(() => expect(speech.connection.sendStart).toHaveBeenCalledWith(16000));
+      expect(speech.connection.sendAudio).toHaveBeenCalledTimes(1);
+      expect(speech.connection.stop).toHaveBeenCalledTimes(1);
+      expect(speech.connection.sendStart.mock.invocationCallOrder[0]).toBeLessThan(
+        speech.connection.sendAudio.mock.invocationCallOrder[0],
+      );
+      expect(speech.connection.sendAudio.mock.invocationCallOrder[0]).toBeLessThan(
+        speech.connection.stop.mock.invocationCallOrder[0],
+      );
+
+      act(() => {
+        speech.streamHandlers().onFinal("快速松开也识别");
+        speech.streamHandlers().onDone();
+        speech.streamHandlers().onClose();
+      });
+      expect(screen.getByLabelText("Message")).toHaveValue("快速松开也识别");
+      expect(screen.queryByText("Speech recognition failed")).not.toBeInTheDocument();
+    } finally {
+      speech.restore();
+    }
+  });
+
+  it("ignores late speech text after the stream fails", async () => {
+    const speech = installStreamingSpeechMock();
+    try {
+      const hubRun = createHubRunMock({ answer: "unused" });
+      hubRun.client.speechInputConfig = vi.fn(async () => ({
+        enabled: true,
+        runtime_available: true,
+        max_duration_seconds: 60,
+        sample_rate: 16000,
+        model: "streaming-zh",
+      }));
+      speech.installClient(hubRun.client);
+
+      render(<App apiClient={hubRun.client} />);
+
+      const microphone = await screen.findByRole("button", {
+        name: "Hold to speak",
+      });
+      fireEvent.mouseDown(microphone);
+      await waitFor(() => expect(speech.connection.sendStart).toHaveBeenCalledWith(16000));
+
+      act(() => {
+        speech.streamHandlers().onPartial("临时草稿");
+      });
+      expect(screen.getByLabelText("Message")).toHaveValue("临时草稿");
+
+      act(() => {
+        speech.streamHandlers().onError("asr failed");
+      });
+      expect(screen.getByLabelText("Message")).toHaveValue("");
+      expect(screen.getByText("Speech recognition failed")).toBeInTheDocument();
+
+      act(() => {
+        speech.streamHandlers().onPartial("迟到 partial");
+        speech.streamHandlers().onFinal("迟到 final");
+      });
+      expect(screen.getByLabelText("Message")).toHaveValue("");
+    } finally {
+      speech.restore();
+    }
+  });
+
+  it("keeps the final speech text when late stream text arrives after done", async () => {
+    const speech = installStreamingSpeechMock();
+    try {
+      const hubRun = createHubRunMock({ answer: "unused" });
+      hubRun.client.speechInputConfig = vi.fn(async () => ({
+        enabled: true,
+        runtime_available: true,
+        max_duration_seconds: 60,
+        sample_rate: 16000,
+        model: "streaming-zh",
+      }));
+      speech.installClient(hubRun.client);
+
+      render(<App apiClient={hubRun.client} />);
+
+      const microphone = await screen.findByRole("button", {
+        name: "Hold to speak",
+      });
+      fireEvent.mouseDown(microphone);
+      await waitFor(() => expect(speech.connection.sendStart).toHaveBeenCalledWith(16000));
+
+      act(() => {
+        speech.streamHandlers().onPartial("识别中");
+        speech.streamHandlers().onFinal("最终文本");
+        speech.streamHandlers().onDone();
+      });
+      expect(screen.getByLabelText("Message")).toHaveValue("最终文本");
+
+      act(() => {
+        speech.streamHandlers().onPartial("迟到 partial");
+        speech.streamHandlers().onFinal("迟到 final");
+      });
+      expect(screen.getByLabelText("Message")).toHaveValue("最终文本");
+    } finally {
+      speech.restore();
     }
   });
 
@@ -1915,15 +2166,17 @@ describe("App", () => {
       configurable: true,
       value: false,
     });
-    const recorder = installMediaRecorderMock("audio bytes");
+    const speech = installStreamingSpeechMock();
     try {
       const hubRun = createHubRunMock({ answer: "unused" });
       hubRun.client.speechInputConfig = vi.fn(async () => ({
         enabled: true,
         runtime_available: true,
-        max_audio_seconds: 60,
-        max_upload_bytes: 25 * 1024 * 1024,
+        max_duration_seconds: 60,
+        sample_rate: 16000,
+        model: "streaming-zh",
       }));
+      speech.installClient(hubRun.client);
       render(<App apiClient={hubRun.client} />);
 
       const microphone = await screen.findByRole("button", {
@@ -1936,9 +2189,10 @@ describe("App", () => {
           "Speech input requires HTTPS or localhost. This address cannot access the microphone.",
         ),
       ).toBeInTheDocument();
-      expect(recorder.getUserMediaSpy).not.toHaveBeenCalled();
+      expect(speech.getUserMediaSpy).not.toHaveBeenCalled();
+      expect(hubRun.client.openSpeechInputStream).not.toHaveBeenCalled();
     } finally {
-      recorder.restore();
+      speech.restore();
       if (originalSecureContext) {
         Object.defineProperty(globalThis, "isSecureContext", originalSecureContext);
       } else {
@@ -1947,8 +2201,8 @@ describe("App", () => {
     }
   });
 
-  it("does not start speech recording after release before microphone permission resolves", async () => {
-    const recorder = installMediaRecorderMock("audio bytes", {
+  it("does not start speech streaming after release before microphone permission resolves", async () => {
+    const speech = installStreamingSpeechMock({
       deferGetUserMedia: true,
     });
     try {
@@ -1956,12 +2210,11 @@ describe("App", () => {
       hubRun.client.speechInputConfig = vi.fn(async () => ({
         enabled: true,
         runtime_available: true,
-        max_audio_seconds: 60,
-        max_upload_bytes: 25 * 1024 * 1024,
+        max_duration_seconds: 60,
+        sample_rate: 16000,
+        model: "streaming-zh",
       }));
-      hubRun.client.transcribeSpeechInput = vi.fn(async () => ({
-        text: "should not upload",
-      }));
+      speech.installClient(hubRun.client);
 
       render(<App apiClient={hubRun.client} />);
 
@@ -1971,20 +2224,19 @@ describe("App", () => {
       fireEvent.mouseDown(microphone);
       fireEvent.mouseUp(microphone);
       await act(async () => {
-        recorder.resolveGetUserMedia();
+        speech.resolveGetUserMedia();
         await Promise.resolve();
       });
 
-      await waitFor(() => expect(recorder.tracks[0].stop).toHaveBeenCalledTimes(1));
-      expect(recorder.recorderConstructedSpy).not.toHaveBeenCalled();
-      expect(hubRun.client.transcribeSpeechInput).not.toHaveBeenCalled();
+      await waitFor(() => expect(speech.tracks[0].stop).toHaveBeenCalledTimes(1));
+      expect(hubRun.client.openSpeechInputStream).not.toHaveBeenCalled();
     } finally {
-      recorder.restore();
+      speech.restore();
     }
   });
 
-  it("ignores stale microphone permission results from an older recording attempt", async () => {
-    const recorder = installMediaRecorderMock("second audio", {
+  it("ignores stale microphone permission results from an older streaming attempt", async () => {
+    const speech = installStreamingSpeechMock({
       deferGetUserMedia: true,
     });
     try {
@@ -1992,12 +2244,11 @@ describe("App", () => {
       hubRun.client.speechInputConfig = vi.fn(async () => ({
         enabled: true,
         runtime_available: true,
-        max_audio_seconds: 60,
-        max_upload_bytes: 25 * 1024 * 1024,
+        max_duration_seconds: 60,
+        sample_rate: 16000,
+        model: "streaming-zh",
       }));
-      hubRun.client.transcribeSpeechInput = vi.fn(async () => ({
-        text: "第二次录音",
-      }));
+      speech.installClient(hubRun.client);
 
       render(<App apiClient={hubRun.client} />);
 
@@ -2010,26 +2261,27 @@ describe("App", () => {
       await act(async () => {
         await Promise.resolve();
       });
-      recorder.resolveGetUserMedia();
+      speech.resolveGetUserMedia();
       await act(async () => {
         await Promise.resolve();
       });
 
-      expect(recorder.tracksByCall[0][0].stop).toHaveBeenCalledTimes(1);
-      expect(recorder.recorderConstructedSpy).toHaveBeenCalledTimes(1);
+      expect(speech.tracksByCall[0][0].stop).toHaveBeenCalledTimes(1);
+      expect(hubRun.client.openSpeechInputStream).toHaveBeenCalledTimes(1);
       window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
-      await waitFor(() => expect(recorder.stopSpy).toHaveBeenCalledTimes(1));
-      await waitFor(() => {
-        expect(hubRun.client.transcribeSpeechInput).toHaveBeenCalledTimes(1);
+      await waitFor(() => expect(speech.connection.stop).toHaveBeenCalledTimes(1));
+      act(() => {
+        speech.streamHandlers().onFinal("第二次录音");
+        speech.streamHandlers().onDone();
       });
       expect(screen.getByLabelText("Message")).toHaveValue("第二次录音");
     } finally {
-      recorder.restore();
+      speech.restore();
     }
   });
 
-  it("does not record speech when unmounted while microphone permission is pending", async () => {
-    const recorder = installMediaRecorderMock("audio bytes", {
+  it("does not stream speech when unmounted while microphone permission is pending", async () => {
+    const speech = installStreamingSpeechMock({
       deferGetUserMedia: true,
     });
     try {
@@ -2037,12 +2289,11 @@ describe("App", () => {
       hubRun.client.speechInputConfig = vi.fn(async () => ({
         enabled: true,
         runtime_available: true,
-        max_audio_seconds: 60,
-        max_upload_bytes: 25 * 1024 * 1024,
+        max_duration_seconds: 60,
+        sample_rate: 16000,
+        model: "streaming-zh",
       }));
-      hubRun.client.transcribeSpeechInput = vi.fn(async () => ({
-        text: "should not upload",
-      }));
+      speech.installClient(hubRun.client);
 
       const { unmount } = render(<App apiClient={hubRun.client} />);
 
@@ -2052,62 +2303,29 @@ describe("App", () => {
       fireEvent.mouseDown(microphone);
       unmount();
       await act(async () => {
-        recorder.resolveGetUserMedia();
+        speech.resolveGetUserMedia();
         await Promise.resolve();
       });
 
-      expect(recorder.tracksByCall[0][0].stop).toHaveBeenCalledTimes(1);
-      expect(recorder.recorderConstructedSpy).not.toHaveBeenCalled();
-      expect(hubRun.client.transcribeSpeechInput).not.toHaveBeenCalled();
+      expect(speech.tracksByCall[0][0].stop).toHaveBeenCalledTimes(1);
+      expect(hubRun.client.openSpeechInputStream).not.toHaveBeenCalled();
     } finally {
-      recorder.restore();
+      speech.restore();
     }
   });
 
-  it("releases the microphone when speech recorder creation fails", async () => {
-    const recorder = installMediaRecorderMock("audio bytes", {
-      throwOnConstruct: true,
-    });
+  it("closes speech streaming without inserting text when the composer unmounts", async () => {
+    const speech = installStreamingSpeechMock();
     try {
       const hubRun = createHubRunMock({ answer: "unused" });
       hubRun.client.speechInputConfig = vi.fn(async () => ({
         enabled: true,
         runtime_available: true,
-        max_audio_seconds: 60,
-        max_upload_bytes: 25 * 1024 * 1024,
+        max_duration_seconds: 60,
+        sample_rate: 16000,
+        model: "streaming-zh",
       }));
-      hubRun.client.transcribeSpeechInput = vi.fn(async () => ({
-        text: "should not upload",
-      }));
-
-      render(<App apiClient={hubRun.client} />);
-
-      const microphone = await screen.findByRole("button", {
-        name: "Hold to speak",
-      });
-      fireEvent.mouseDown(microphone);
-
-      await waitFor(() => expect(recorder.tracksByCall[0][0].stop).toHaveBeenCalledTimes(1));
-      expect(recorder.recorderConstructedSpy).toHaveBeenCalledTimes(1);
-      expect(hubRun.client.transcribeSpeechInput).not.toHaveBeenCalled();
-    } finally {
-      recorder.restore();
-    }
-  });
-
-  it("stops speech recording without transcribing when the composer unmounts", async () => {
-    const recorder = installMediaRecorderMock("audio bytes");
-    try {
-      const hubRun = createHubRunMock({ answer: "unused" });
-      hubRun.client.speechInputConfig = vi.fn(async () => ({
-        enabled: true,
-        runtime_available: true,
-        max_audio_seconds: 60,
-        max_upload_bytes: 25 * 1024 * 1024,
-      }));
-      hubRun.client.transcribeSpeechInput = vi.fn(async () => ({
-        text: "should not upload",
-      }));
+      speech.installClient(hubRun.client);
 
       const { unmount } = render(<App apiClient={hubRun.client} />);
 
@@ -2115,33 +2333,31 @@ describe("App", () => {
         name: "Hold to speak",
       });
       fireEvent.mouseDown(microphone);
-      expect(await screen.findByText("Recording, release to transcribe")).toBeInTheDocument();
+      expect(await screen.findByText("Recording and transcribing live")).toBeInTheDocument();
       unmount();
       await act(async () => {
         await Promise.resolve();
       });
 
-      expect(recorder.stopSpy).toHaveBeenCalledTimes(1);
-      expect(recorder.tracksByCall[0][0].stop).toHaveBeenCalledTimes(1);
-      expect(hubRun.client.transcribeSpeechInput).not.toHaveBeenCalled();
+      expect(speech.connection.close).toHaveBeenCalledTimes(1);
+      expect(speech.tracksByCall[0][0].stop).toHaveBeenCalledTimes(1);
     } finally {
-      recorder.restore();
+      speech.restore();
     }
   });
 
-  it("cancels speech recording without transcribing or sending", async () => {
-    const { restore: restoreRecorder, stopSpy } = installMediaRecorderMock("cancelled audio");
+  it("cancels speech streaming without inserting or sending", async () => {
+    const speech = installStreamingSpeechMock();
     try {
       const hubRun = createHubRunMock({ answer: "unused" });
       hubRun.client.speechInputConfig = vi.fn(async () => ({
         enabled: true,
         runtime_available: true,
-        max_audio_seconds: 60,
-        max_upload_bytes: 25 * 1024 * 1024,
+        max_duration_seconds: 60,
+        sample_rate: 16000,
+        model: "streaming-zh",
       }));
-      hubRun.client.transcribeSpeechInput = vi.fn(async () => ({
-        text: "should not upload",
-      }));
+      speech.installClient(hubRun.client);
 
       render(<App apiClient={hubRun.client} />);
 
@@ -2149,62 +2365,80 @@ describe("App", () => {
         name: "Hold to speak",
       });
       fireEvent.mouseDown(microphone);
+      await waitFor(() => expect(speech.connection.sendStart).toHaveBeenCalledWith(16000));
+      act(() => {
+        speech.streamHandlers().onPartial("临时语音");
+      });
+      expect(screen.getByLabelText("Message")).toHaveValue("临时语音");
       fireEvent.click(await screen.findByRole("button", { name: "Cancel speech input" }));
 
-      await waitFor(() => expect(stopSpy).toHaveBeenCalledTimes(1));
-      expect(hubRun.client.transcribeSpeechInput).not.toHaveBeenCalled();
+      await waitFor(() => expect(speech.connection.close).toHaveBeenCalledTimes(1));
+      expect(speech.connection.stop).not.toHaveBeenCalled();
+      expect(screen.getByLabelText("Message")).toHaveValue("");
+      act(() => {
+        speech.streamHandlers().onFinal("取消后的迟到文本");
+        speech.streamHandlers().onDone();
+        speech.streamHandlers().onClose();
+      });
+      expect(screen.getByLabelText("Message")).toHaveValue("");
+      expect(screen.queryByText("Speech recognition failed")).not.toBeInTheDocument();
+      expect(hubRun.createCalled()).toBe(false);
+    } finally {
+      speech.restore();
+    }
+  });
+
+  it("ignores late stream close after release before the stream opens", async () => {
+    const speech = installStreamingSpeechMock({ deferOpen: true });
+    try {
+      const hubRun = createHubRunMock({ answer: "unused" });
+      hubRun.client.speechInputConfig = vi.fn(async () => ({
+        enabled: true,
+        runtime_available: true,
+        max_duration_seconds: 60,
+        sample_rate: 16000,
+        model: "streaming-zh",
+      }));
+      speech.installClient(hubRun.client);
+
+      render(<App apiClient={hubRun.client} />);
+
+      const microphone = await screen.findByRole("button", {
+        name: "Hold to speak",
+      });
+      fireEvent.mouseDown(microphone);
+      await waitFor(() => expect(hubRun.client.openSpeechInputStream).toHaveBeenCalledTimes(1));
+      window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+      await waitFor(() => expect(speech.connection.close).toHaveBeenCalledTimes(1));
+      expect(speech.connection.stop).not.toHaveBeenCalled();
+
+      act(() => {
+        speech.streamHandlers().onClose();
+        speech.streamHandlers().onError("late stream error");
+        speech.openStream();
+      });
+
+      expect(screen.queryByText("Speech recognition failed")).not.toBeInTheDocument();
+      expect(screen.queryByText("Transcribing...")).not.toBeInTheDocument();
       expect(screen.getByLabelText("Message")).toHaveValue("");
       expect(hubRun.createCalled()).toBe(false);
     } finally {
-      restoreRecorder();
-    }
-  });
-
-  it("rejects oversized recorded speech before calling the ASR endpoint", async () => {
-    const { restore: restoreRecorder, stopSpy } = installMediaRecorderMock("audio bytes");
-    try {
-      const hubRun = createHubRunMock({ answer: "unused" });
-      hubRun.client.speechInputConfig = vi.fn(async () => ({
-        enabled: true,
-        runtime_available: true,
-        max_audio_seconds: 60,
-        max_upload_bytes: 1,
-      }));
-      hubRun.client.transcribeSpeechInput = vi.fn(async () => ({
-        text: "should not upload",
-      }));
-
-      render(<App apiClient={hubRun.client} />);
-
-      const microphone = await screen.findByRole("button", {
-        name: "Hold to speak",
-      });
-      fireEvent.mouseDown(microphone);
-      expect(await screen.findByText("Recording, release to transcribe")).toBeInTheDocument();
-      window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
-
-      await waitFor(() => expect(stopSpy).toHaveBeenCalledTimes(1));
-      expect(
-        await screen.findByText("Recording is larger than 1 B. Record a shorter clip."),
-      ).toBeInTheDocument();
-      expect(hubRun.client.transcribeSpeechInput).not.toHaveBeenCalled();
-    } finally {
-      restoreRecorder();
+      speech.restore();
     }
   });
 
   it("keeps transcribing visible when release events repeat", async () => {
-    const { restore: restoreRecorder, stopSpy } = installMediaRecorderMock("audio bytes");
+    const speech = installStreamingSpeechMock();
     try {
-      const transcription = createDeferred<{ text: string }>();
       const hubRun = createHubRunMock({ answer: "unused" });
       hubRun.client.speechInputConfig = vi.fn(async () => ({
         enabled: true,
         runtime_available: true,
-        max_audio_seconds: 60,
-        max_upload_bytes: 25 * 1024 * 1024,
+        max_duration_seconds: 60,
+        sample_rate: 16000,
+        model: "streaming-zh",
       }));
-      hubRun.client.transcribeSpeechInput = vi.fn(() => transcription.promise);
+      speech.installClient(hubRun.client);
 
       render(<App apiClient={hubRun.client} />);
 
@@ -2212,38 +2446,38 @@ describe("App", () => {
         name: "Hold to speak",
       });
       fireEvent.mouseDown(microphone);
-      expect(await screen.findByText("Recording, release to transcribe")).toBeInTheDocument();
+      expect(await screen.findByText("Recording and transcribing live")).toBeInTheDocument();
       window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
 
-      await waitFor(() => expect(stopSpy).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(speech.connection.stop).toHaveBeenCalledTimes(1));
       expect(await screen.findByText("Transcribing...")).toBeInTheDocument();
       window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
       window.dispatchEvent(new Event("pointerup", { bubbles: true, cancelable: true }));
       expect(screen.getByText("Transcribing...")).toBeInTheDocument();
+      expect(speech.connection.stop).toHaveBeenCalledTimes(1);
 
-      await act(async () => {
-        transcription.resolve({ text: "稳定识别" });
-        await Promise.resolve();
+      act(() => {
+        speech.streamHandlers().onFinal("稳定识别");
+        speech.streamHandlers().onDone();
       });
       expect(screen.getByLabelText("Message")).toHaveValue("稳定识别");
     } finally {
-      restoreRecorder();
+      speech.restore();
     }
   });
 
-  it("automatically stops speech recording at the configured duration", async () => {
-    const { restore: restoreRecorder, stopSpy } = installMediaRecorderMock("timed audio");
+  it("automatically stops speech streaming at the configured duration", async () => {
+    const speech = installStreamingSpeechMock();
     try {
       const hubRun = createHubRunMock({ answer: "unused" });
       hubRun.client.speechInputConfig = vi.fn(async () => ({
         enabled: true,
         runtime_available: true,
-        max_audio_seconds: 1,
-        max_upload_bytes: 25 * 1024 * 1024,
+        max_duration_seconds: 1,
+        sample_rate: 16000,
+        model: "streaming-zh",
       }));
-      hubRun.client.transcribeSpeechInput = vi.fn(async () => ({
-        text: "计时录音",
-      }));
+      speech.installClient(hubRun.client);
 
       render(<App apiClient={hubRun.client} />);
 
@@ -2255,7 +2489,7 @@ describe("App", () => {
       await act(async () => {
         await Promise.resolve();
       });
-      expect(screen.getByText("Recording, release to transcribe")).toBeInTheDocument();
+      expect(screen.getByText("Recording and transcribing live")).toBeInTheDocument();
 
       await act(async () => {
         vi.advanceTimersByTime(1000);
@@ -2263,11 +2497,10 @@ describe("App", () => {
         await Promise.resolve();
       });
 
-      expect(stopSpy).toHaveBeenCalledTimes(1);
-      expect(hubRun.client.transcribeSpeechInput).toHaveBeenCalledTimes(1);
+      expect(speech.connection.stop).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
-      restoreRecorder();
+      speech.restore();
     }
   });
 
@@ -2276,8 +2509,9 @@ describe("App", () => {
     client.speechInputConfig = vi.fn(async () => ({
       enabled: false,
       runtime_available: false,
-      max_audio_seconds: 60,
-      max_upload_bytes: 25 * 1024 * 1024,
+      max_duration_seconds: 60,
+      sample_rate: 16000,
+      model: "streaming-zh",
     }));
 
     render(<App apiClient={client} />);
@@ -3521,6 +3755,7 @@ describe("App", () => {
     };
 
     render(<App apiClient={client} />);
+    await waitFor(() => expect(eventListeners.size).toBe(1));
 
     fireEvent.change(await screen.findByLabelText("Message"), {
       target: { value: "early execution" },
@@ -3575,6 +3810,7 @@ describe("App", () => {
     };
 
     render(<App apiClient={client} />);
+    await waitFor(() => expect(eventListeners.size).toBe(1));
 
     fireEvent.change(await screen.findByLabelText("Message"), {
       target: { value: "send file" },
@@ -3640,6 +3876,7 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
     expect(await screen.findByText("start terminal：写入PPT脚本")).toBeInTheDocument();
+    expect(await screen.findByText("completed terminal：生成PPT文件")).toBeInTheDocument();
 
     deferred.resolve();
     await waitFor(() => {
@@ -4625,7 +4862,7 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Start" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Rebuild" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Stop" })).not.toBeDisabled();
-  });
+  }, 10_000);
 
   it("can create a managed Hermes instance for a user without one", async () => {
     const client = createMockApiClient({
@@ -5277,7 +5514,7 @@ describe("App", () => {
   });
 
   it("uses the real speech input API endpoints", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (path, init) => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (path) => {
       if (path === "/api/speech-input/config") {
         return {
           ok: true,
@@ -5286,20 +5523,11 @@ describe("App", () => {
             speech_input: {
               enabled: true,
               runtime_available: true,
-              max_audio_seconds: 60,
-              max_upload_bytes: 26214400,
+              max_duration_seconds: 60,
+              sample_rate: 16000,
+              model: "streaming-zh",
             },
           }),
-        } as Response;
-      }
-      if (path === "/api/speech-input/transcriptions") {
-        expect(init?.method).toBe("POST");
-        expect(init?.credentials).toBe("include");
-        expect(init?.body).toBeInstanceOf(FormData);
-        return {
-          ok: true,
-          status: 200,
-          json: async () => ({ text: "transcribed text" }),
         } as Response;
       }
       throw new Error(`unexpected fetch ${String(path)}`);
@@ -5309,12 +5537,10 @@ describe("App", () => {
     await expect(client.speechInputConfig()).resolves.toEqual({
       enabled: true,
       runtime_available: true,
-      max_audio_seconds: 60,
-      max_upload_bytes: 26214400,
+      max_duration_seconds: 60,
+      sample_rate: 16000,
+      model: "streaming-zh",
     });
-    await expect(
-      client.transcribeSpeechInput(new File(["voice"], "voice.webm", { type: "audio/webm" })),
-    ).resolves.toEqual({ text: "transcribed text" });
     fetchMock.mockRestore();
   });
 

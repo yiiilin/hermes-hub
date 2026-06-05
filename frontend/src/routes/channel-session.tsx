@@ -7,6 +7,8 @@ import type {
   HermesAttachment,
   HermesVerboseEvent,
   SpeechInputConfig,
+  SpeechInputStreamConnection,
+  SpeechInputStreamHandlers,
   SessionSummary,
 } from "../api/client";
 import { ApiRequestError } from "../api/client";
@@ -83,6 +85,7 @@ const MESSAGE_VIRTUALIZATION_DEFAULT_GAP_PX = 16;
 const MESSAGE_INITIAL_VISIBLE_TURNS = 2;
 const MESSAGE_HISTORY_PAGE_SIZE = 24;
 const MESSAGE_HISTORY_LOAD_TOP_PX = 48;
+const VOICE_AUDIO_PROCESSOR_BUFFER_SIZE = 1024;
 
 export function ChannelSessionRoute({
   active = true,
@@ -107,8 +110,9 @@ export function ChannelSessionRoute({
   const [speechInputConfig, setSpeechInputConfig] = useState<SpeechInputConfig>({
     enabled: false,
     runtime_available: false,
-    max_audio_seconds: 60,
-    max_upload_bytes: 25 * 1024 * 1024,
+    max_duration_seconds: 60,
+    sample_rate: 16000,
+    model: "",
   });
   const [configuredEmptyChatPrompt, setConfiguredEmptyChatPrompt] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -1185,7 +1189,7 @@ export function ChannelSessionRoute({
           onPreviewImage={setPreviewAttachment}
           onStop={() => void stopCurrentRun()}
           onSubmit={submitPrompt}
-          onTranscribeSpeechInput={apiClient.transcribeSpeechInput}
+          onOpenSpeechInputStream={apiClient.openSpeechInputStream}
           onUploadAttachments={uploadAttachmentFiles}
           t={t}
         />
@@ -1965,7 +1969,7 @@ const ChatComposer = memo(function ChatComposer({
   onPreviewImage,
   onStop,
   onSubmit,
-  onTranscribeSpeechInput,
+  onOpenSpeechInputStream,
   onUploadAttachments,
   t,
 }: {
@@ -1976,7 +1980,7 @@ const ChatComposer = memo(function ChatComposer({
   onPreviewImage: (attachment: HermesAttachment) => void;
   onStop: () => void;
   onSubmit: (text: string, attachments: HermesAttachment[]) => Promise<void>;
-  onTranscribeSpeechInput: (file: Blob & { name?: string }) => Promise<{ text: string }>;
+  onOpenSpeechInputStream: (handlers: SpeechInputStreamHandlers) => SpeechInputStreamConnection;
   onUploadAttachments: (files: File[]) => Promise<HermesAttachment[]>;
   t: Translate;
 }) {
@@ -1988,14 +1992,27 @@ const ChatComposer = memo(function ChatComposer({
   const [voiceError, setVoiceError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
-  const recordedChunksRef = useRef<Blob[]>([]);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const audioProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const audioMuteGainRef = useRef<GainNode | null>(null);
+  const streamConnectionRef = useRef<SpeechInputStreamConnection | null>(null);
+  const queuedVoiceAudioRef = useRef<ArrayBuffer[]>([]);
+  const voiceFinalTextRef = useRef("");
+  const voicePromptBaseRef = useRef<string | null>(null);
   const voiceReleaseRequestedRef = useRef(false);
+  const voiceStreamOpenedRef = useRef(false);
   const voiceCancelRequestedRef = useRef(false);
   const voiceStopInitiatedRef = useRef(false);
+  const voiceFinishedRef = useRef(false);
   const voiceAttemptIdRef = useRef(0);
+  const voiceStateRef = useRef(voiceState);
   const voiceMaxDurationTimerRef = useRef<ReturnType<typeof globalThis.setTimeout> | null>(null);
+
+  useEffect(() => {
+    voiceStateRef.current = voiceState;
+  }, [voiceState]);
 
   function focusComposerInputSoon() {
     const schedule =
@@ -2101,11 +2118,11 @@ const ChatComposer = memo(function ChatComposer({
     if (!speechInputConfig.enabled) {
       return;
     }
-    const recordingSupport = recordingSupportStatus();
-    if (recordingSupport !== "supported") {
+    const streamingSupport = streamingSpeechSupportStatus();
+    if (streamingSupport !== "supported") {
       setVoiceError(
         t(
-          recordingSupport === "requires-secure-context"
+          streamingSupport === "requires-secure-context"
             ? "chat.voiceRequiresSecureContext"
             : "chat.voiceUnsupported",
         ),
@@ -2117,10 +2134,14 @@ const ChatComposer = memo(function ChatComposer({
     voiceAttemptIdRef.current = attemptId;
     try {
       setVoiceError(null);
-      recordedChunksRef.current = [];
+      voiceFinalTextRef.current = "";
+      voicePromptBaseRef.current = prompt;
+      queuedVoiceAudioRef.current = [];
       voiceReleaseRequestedRef.current = false;
+      voiceStreamOpenedRef.current = false;
       voiceCancelRequestedRef.current = false;
       voiceStopInitiatedRef.current = false;
+      voiceFinishedRef.current = false;
       clearVoiceMaxDurationTimer();
       setVoiceState("starting");
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -2130,36 +2151,66 @@ const ChatComposer = memo(function ChatComposer({
       }
       if (voiceReleaseRequestedRef.current) {
         stopMediaStream(stream);
+        discardVoiceDraft();
         resetVoiceCaptureState();
         setVoiceState("idle");
         return;
       }
       mediaStreamRef.current = stream;
-      const recorder = new MediaRecorder(stream, preferredRecorderOptions());
-      mediaRecorderRef.current = recorder;
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          recordedChunksRef.current.push(event.data);
-        }
-      };
-      recorder.onstop = () => void finishVoiceRecording(attemptId);
-      recorder.start();
+      let connection: SpeechInputStreamConnection | null = null;
+      connection = onOpenSpeechInputStream({
+        onClose: () => handleVoiceStreamClose(attemptId),
+        onDone: () => finishVoiceStream(attemptId),
+        onError: () => failVoiceStream(attemptId),
+        onFinal: (text) => receiveVoiceFinal(attemptId, text),
+        onOpen: () => {
+          const activeConnection = connection ?? streamConnectionRef.current;
+          if (activeConnection) {
+            openVoiceStream(attemptId, activeConnection);
+          }
+        },
+        onPartial: (text) => receiveVoicePartial(attemptId, text),
+      });
+      streamConnectionRef.current = connection;
+      startVoiceAudioPipeline(stream);
       setVoiceState("recording");
       startVoiceMaxDurationTimer();
-      if (voiceReleaseRequestedRef.current) {
-        stopVoiceRecording(voiceCancelRequestedRef.current);
-      }
-    } catch {
+    } catch (cause) {
       if (voiceAttemptIdRef.current !== attemptId) {
         return;
       }
-      setVoiceError(t("chat.voicePermissionDenied"));
-      clearVoiceMaxDurationTimer();
-      stopMediaStream(mediaStreamRef.current);
-      mediaStreamRef.current = null;
-      mediaRecorderRef.current = null;
+      setVoiceError(
+        cause instanceof DOMException
+          ? t("chat.voicePermissionDenied")
+          : t("chat.voiceTranscriptionFailed"),
+      );
+      cleanupVoiceCaptureResources(true);
+      discardVoiceDraft();
       resetVoiceCaptureState();
       setVoiceState("idle");
+    }
+  }
+
+  function openVoiceStream(attemptId: number, connection: SpeechInputStreamConnection) {
+    if (voiceAttemptIdRef.current !== attemptId) {
+      connection.close();
+      return;
+    }
+    if (voiceCancelRequestedRef.current) {
+      finishCurrentVoiceAttempt(attemptId);
+      connection.close();
+      return;
+    }
+    try {
+      connection.sendStart(speechInputConfig.sample_rate);
+      voiceStreamOpenedRef.current = true;
+      flushQueuedVoiceAudio(connection);
+      if (voiceReleaseRequestedRef.current || voiceStopInitiatedRef.current) {
+        connection.stop();
+        setVoiceState("transcribing");
+      }
+    } catch {
+      failVoiceStream(attemptId);
     }
   }
 
@@ -2175,67 +2226,190 @@ const ChatComposer = memo(function ChatComposer({
     }
     voiceReleaseRequestedRef.current = true;
     voiceCancelRequestedRef.current = voiceCancelRequestedRef.current || cancelled;
-    const recorder = mediaRecorderRef.current;
-    if (!recorder || recorder.state === "inactive") {
+    const connection = streamConnectionRef.current;
+    if (cancelled) {
+      finishCurrentVoiceAttempt(voiceAttemptIdRef.current);
+      cleanupVoiceCaptureResources(true);
+      discardVoiceDraft();
+      resetVoiceCaptureState();
+      setVoiceState("idle");
+      focusComposerInputSoon();
+      return;
+    }
+    voiceStopInitiatedRef.current = true;
+    clearVoiceMaxDurationTimer();
+    cleanupVoiceCaptureResources(false);
+    if (!connection) {
       if (voiceState === "starting" || voiceState === "idle") {
         setVoiceState("idle");
       }
       return;
     }
-    voiceStopInitiatedRef.current = true;
-    clearVoiceMaxDurationTimer();
-    recorder.stop();
+    if (!voiceStreamOpenedRef.current) {
+      if (queuedVoiceAudioRef.current.length === 0) {
+        finishCurrentVoiceAttempt(voiceAttemptIdRef.current);
+        cleanupVoiceCaptureResources(true);
+        discardVoiceDraft();
+        resetVoiceCaptureState();
+        setVoiceState("idle");
+      } else {
+        setVoiceState("transcribing");
+      }
+      focusComposerInputSoon();
+      return;
+    }
+    connection.stop();
+    setVoiceState("transcribing");
   }
 
-  async function finishVoiceRecording(attemptId: number) {
-    if (voiceAttemptIdRef.current !== attemptId) {
+  function receiveVoicePartial(attemptId: number, text: string) {
+    if (voiceAttemptIdRef.current !== attemptId || voiceFinishedRef.current) {
       return;
     }
-    clearVoiceMaxDurationTimer();
+    const partialText = text.trim();
+    setPrompt(composePromptWithVoiceDraft(voicePromptBaseRef.current ?? prompt, partialText));
+  }
+
+  function receiveVoiceFinal(attemptId: number, text: string) {
+    if (voiceAttemptIdRef.current !== attemptId || voiceFinishedRef.current) {
+      return;
+    }
+    const finalText = text.trim();
+    voiceFinalTextRef.current = finalText;
+    setPrompt(composePromptWithVoiceDraft(voicePromptBaseRef.current ?? prompt, finalText));
+  }
+
+  function finishVoiceStream(attemptId: number) {
+    if (voiceAttemptIdRef.current !== attemptId || voiceFinishedRef.current) {
+      return;
+    }
+    voiceFinishedRef.current = true;
     const cancelled = voiceCancelRequestedRef.current;
-    const chunks = recordedChunksRef.current;
-    const stream = mediaStreamRef.current;
-    mediaRecorderRef.current = null;
-    mediaStreamRef.current = null;
-    recordedChunksRef.current = [];
-    stopMediaStream(stream);
+    const finalText = voiceFinalTextRef.current;
+    cleanupVoiceCaptureResources(true);
     resetVoiceCaptureState();
-    if (cancelled) {
-      setVoiceState("idle");
-      return;
-    }
-
-    const blobType = chunks.find((chunk) => chunk.type)?.type || "audio/webm";
-    const blob = new Blob(chunks, { type: blobType });
-    if (blob.size === 0) {
-      setVoiceState("idle");
-      return;
-    }
-    if (blob.size > speechInputConfig.max_upload_bytes) {
-      setVoiceError(
-        t("chat.voiceTooLarge", {
-          size: formatUploadLimit(speechInputConfig.max_upload_bytes),
-        }),
-      );
-      setVoiceState("idle");
-      focusComposerInputSoon();
-      return;
-    }
-
-    setVoiceState("transcribing");
-    try {
-      const extension = blobType.includes("ogg") ? "ogg" : "webm";
-      const file = Object.assign(blob, {
-        name: `speech-input-${Date.now()}.${extension}`,
-      });
-      const result = await onTranscribeSpeechInput(file);
-      appendPromptText(result.text);
+    if (!cancelled) {
+      finishVoiceDraft(finalText);
       setVoiceError(null);
+    } else {
+      discardVoiceDraft();
+    }
+    setVoiceState("idle");
+    focusComposerInputSoon();
+  }
+
+  function failVoiceStream(attemptId: number) {
+    if (voiceAttemptIdRef.current !== attemptId || voiceFinishedRef.current) {
+      return;
+    }
+    voiceFinishedRef.current = true;
+    cleanupVoiceCaptureResources(true);
+    discardVoiceDraft();
+    resetVoiceCaptureState();
+    setVoiceError(t("chat.voiceTranscriptionFailed"));
+    setVoiceState("idle");
+    focusComposerInputSoon();
+  }
+
+  function handleVoiceStreamClose(attemptId: number) {
+    if (
+      voiceAttemptIdRef.current !== attemptId ||
+      voiceFinishedRef.current ||
+      voiceCancelRequestedRef.current ||
+      voiceStateRef.current === "idle"
+    ) {
+      return;
+    }
+    failVoiceStream(attemptId);
+  }
+
+  function startVoiceAudioPipeline(stream: MediaStream) {
+    const AudioContextCtor = audioContextConstructor();
+    if (!AudioContextCtor) {
+      throw new Error("AudioContext is not available");
+    }
+    const audioContext = new AudioContextCtor();
+    const source = audioContext.createMediaStreamSource(stream);
+    // 较小的处理块可以更快拿到首段 PCM，减少用户短句后立刻松开时的漏识别概率。
+    const processor = audioContext.createScriptProcessor(VOICE_AUDIO_PROCESSOR_BUFFER_SIZE, 1, 1);
+    const muteGain = audioContext.createGain();
+    muteGain.gain.value = 0;
+
+    processor.onaudioprocess = (event) => {
+      if (
+        (voiceStateRef.current !== "starting" && voiceStateRef.current !== "recording") ||
+        voiceStopInitiatedRef.current
+      ) {
+        return;
+      }
+      const samples = event.inputBuffer.getChannelData(0);
+      const pcm = encodePcm16(samples, audioContext.sampleRate, speechInputConfig.sample_rate);
+      if (pcm.byteLength > 0) {
+        sendOrQueueVoiceAudio(pcm);
+      }
+    };
+
+    // ScriptProcessor 必须接入图中才会触发；静音 gain 避免把麦克风声音回放出来。
+    source.connect(processor);
+    processor.connect(muteGain);
+    muteGain.connect(audioContext.destination);
+    audioContextRef.current = audioContext;
+    audioSourceRef.current = source;
+    audioProcessorRef.current = processor;
+    audioMuteGainRef.current = muteGain;
+  }
+
+  function sendOrQueueVoiceAudio(pcm: ArrayBuffer) {
+    const connection = streamConnectionRef.current;
+    if (voiceStreamOpenedRef.current && connection) {
+      connection.sendAudio(pcm);
+      return;
+    }
+    // WebSocket 打开前先缓存音频，避免用户说完立刻松开时首段语音被丢掉。
+    queuedVoiceAudioRef.current.push(pcm);
+  }
+
+  function flushQueuedVoiceAudio(connection: SpeechInputStreamConnection) {
+    for (const pcm of queuedVoiceAudioRef.current) {
+      connection.sendAudio(pcm);
+    }
+    queuedVoiceAudioRef.current = [];
+  }
+
+  function cleanupVoiceCaptureResources(closeConnection: boolean) {
+    clearVoiceMaxDurationTimer();
+    const processor = audioProcessorRef.current;
+    if (processor) {
+      processor.onaudioprocess = null;
+      try {
+        processor.disconnect();
+      } catch {
+        // 资源清理阶段允许节点已经断开。
+      }
+    }
+    try {
+      audioSourceRef.current?.disconnect();
     } catch {
-      setVoiceError(t("chat.voiceTranscriptionFailed"));
-    } finally {
-      setVoiceState("idle");
-      focusComposerInputSoon();
+      // 资源清理阶段允许节点已经断开。
+    }
+    try {
+      audioMuteGainRef.current?.disconnect();
+    } catch {
+      // 资源清理阶段允许节点已经断开。
+    }
+    const audioContext = audioContextRef.current;
+    if (audioContext && audioContext.state !== "closed") {
+      void audioContext.close().catch(() => undefined);
+    }
+    stopMediaStream(mediaStreamRef.current);
+    mediaStreamRef.current = null;
+    audioContextRef.current = null;
+    audioSourceRef.current = null;
+    audioProcessorRef.current = null;
+    audioMuteGainRef.current = null;
+    if (closeConnection) {
+      streamConnectionRef.current?.close();
+      streamConnectionRef.current = null;
     }
   }
 
@@ -2247,9 +2421,35 @@ const ChatComposer = memo(function ChatComposer({
     setPrompt((current) => (current.trim() ? `${current.trimEnd()} ${normalized}` : normalized));
   }
 
+  function composePromptWithVoiceDraft(baseText: string, draftText: string) {
+    const normalizedDraft = draftText.trim();
+    if (!normalizedDraft) {
+      return baseText;
+    }
+    return baseText.trim() ? `${baseText.trimEnd()} ${normalizedDraft}` : normalizedDraft;
+  }
+
+  function finishVoiceDraft(text: string) {
+    const baseText = voicePromptBaseRef.current;
+    voicePromptBaseRef.current = null;
+    if (baseText === null) {
+      appendPromptText(text);
+      return;
+    }
+    setPrompt(composePromptWithVoiceDraft(baseText, text.trim()));
+  }
+
+  function discardVoiceDraft() {
+    const baseText = voicePromptBaseRef.current;
+    voicePromptBaseRef.current = null;
+    if (baseText !== null) {
+      setPrompt(baseText);
+    }
+  }
+
   function startVoiceMaxDurationTimer() {
     clearVoiceMaxDurationTimer();
-    const maxAudioSeconds = Math.max(1, speechInputConfig.max_audio_seconds);
+    const maxAudioSeconds = Math.max(1, speechInputConfig.max_duration_seconds);
     voiceMaxDurationTimerRef.current = globalThis.setTimeout(() => {
       stopVoiceRecording(false);
     }, maxAudioSeconds * 1000);
@@ -2263,30 +2463,28 @@ const ChatComposer = memo(function ChatComposer({
   }
 
   function resetVoiceCaptureState() {
+    queuedVoiceAudioRef.current = [];
     voiceReleaseRequestedRef.current = false;
+    voiceStreamOpenedRef.current = false;
     voiceCancelRequestedRef.current = false;
     voiceStopInitiatedRef.current = false;
+  }
+
+  function finishCurrentVoiceAttempt(attemptId: number) {
+    if (voiceAttemptIdRef.current !== attemptId) {
+      return;
+    }
+    voiceFinishedRef.current = true;
+    // 取消或放弃本次流后，旧 WebSocket 的迟到回调必须彻底失效。
+    voiceAttemptIdRef.current += 1;
   }
 
   function cleanupVoiceCaptureOnUnmount() {
     voiceAttemptIdRef.current += 1;
     voiceReleaseRequestedRef.current = true;
+    voiceStreamOpenedRef.current = false;
     voiceCancelRequestedRef.current = true;
-    clearVoiceMaxDurationTimer();
-    const recorder = mediaRecorderRef.current;
-    if (recorder && recorder.state !== "inactive") {
-      recorder.ondataavailable = null;
-      recorder.onstop = null;
-      try {
-        recorder.stop();
-      } catch {
-        // 卸载阶段只负责释放浏览器资源；停止失败时仍继续清理 stream 引用。
-      }
-    }
-    stopMediaStream(mediaStreamRef.current);
-    mediaRecorderRef.current = null;
-    mediaStreamRef.current = null;
-    recordedChunksRef.current = [];
+    cleanupVoiceCaptureResources(true);
     resetVoiceCaptureState();
   }
 
@@ -2404,27 +2602,25 @@ const ChatComposer = memo(function ChatComposer({
   );
 });
 
-type RecordingSupportStatus = "supported" | "requires-secure-context" | "unsupported";
+type StreamingSpeechSupportStatus = "supported" | "requires-secure-context" | "unsupported";
 
-function recordingSupportStatus(): RecordingSupportStatus {
+function streamingSpeechSupportStatus(): StreamingSpeechSupportStatus {
   if (globalThis.isSecureContext === false) {
     return "requires-secure-context";
   }
   const mediaDevices = globalThis.navigator?.mediaDevices as Partial<MediaDevices> | undefined;
   return typeof mediaDevices?.getUserMedia === "function" &&
-    typeof globalThis.MediaRecorder !== "undefined"
+    typeof globalThis.WebSocket === "function" &&
+    Boolean(audioContextConstructor())
     ? "supported"
     : "unsupported";
 }
 
-function preferredRecorderOptions(): MediaRecorderOptions | undefined {
-  const recorder = globalThis.MediaRecorder as unknown as
-    | { isTypeSupported?: (mimeType: string) => boolean }
-    | undefined;
-  if (recorder?.isTypeSupported?.("audio/webm;codecs=opus")) {
-    return { mimeType: "audio/webm;codecs=opus" };
-  }
-  return undefined;
+function audioContextConstructor(): typeof AudioContext | null {
+  const candidate = globalThis as typeof globalThis & {
+    webkitAudioContext?: typeof AudioContext;
+  };
+  return candidate.AudioContext ?? candidate.webkitAudioContext ?? null;
 }
 
 function stopMediaStream(stream: MediaStream | null) {
@@ -2433,14 +2629,21 @@ function stopMediaStream(stream: MediaStream | null) {
   }
 }
 
-function formatUploadLimit(size: number): string {
-  if (size < 1024) {
-    return `${size} B`;
+function encodePcm16(samples: Float32Array, sourceSampleRate: number, targetSampleRate: number) {
+  if (samples.length === 0 || sourceSampleRate <= 0 || targetSampleRate <= 0) {
+    return new ArrayBuffer(0);
   }
-  if (size < 1024 * 1024) {
-    return `${(size / 1024).toFixed(1)} KB`;
+  const ratio = sourceSampleRate / targetSampleRate;
+  const outputLength = Math.max(1, Math.floor(samples.length / ratio));
+  const buffer = new ArrayBuffer(outputLength * 2);
+  const view = new DataView(buffer);
+  for (let index = 0; index < outputLength; index += 1) {
+    const sourceIndex = Math.min(samples.length - 1, Math.floor(index * ratio));
+    const sample = Math.max(-1, Math.min(1, samples[sourceIndex] ?? 0));
+    const value = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+    view.setInt16(index * 2, value, true);
   }
-  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+  return buffer;
 }
 
 function ChatSidebar({

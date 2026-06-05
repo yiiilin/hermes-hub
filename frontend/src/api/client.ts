@@ -213,12 +213,25 @@ export type PublicPlatformSettings = {
 export type SpeechInputConfig = {
   enabled: boolean;
   runtime_available: boolean;
-  max_audio_seconds: number;
-  max_upload_bytes: number;
+  max_duration_seconds: number;
+  sample_rate: number;
+  model: string;
 };
 
-export type SpeechTranscription = {
-  text: string;
+export type SpeechInputStreamHandlers = {
+  onClose: () => void;
+  onDone: () => void;
+  onError: (message: string) => void;
+  onFinal: (text: string) => void;
+  onOpen: () => void;
+  onPartial: (text: string) => void;
+};
+
+export type SpeechInputStreamConnection = {
+  close: () => void;
+  sendAudio: (audio: ArrayBuffer) => void;
+  sendStart: (sampleRate: number) => void;
+  stop: () => void;
 };
 
 // Hermes Profile 前端只管理 SOUL.md；旧后端字段在读取时兼容忽略。
@@ -492,7 +505,7 @@ export type ApiClient = {
     options?: PublicSessionRequestOptions,
   ) => Promise<HermesAttachment[]>;
   speechInputConfig: () => Promise<SpeechInputConfig>;
-  transcribeSpeechInput: (file: Blob & { name?: string }) => Promise<SpeechTranscription>;
+  openSpeechInputStream: (handlers: SpeechInputStreamHandlers) => SpeechInputStreamConnection;
   subscribeSessionEventsPublic: (
     sessionId: string,
     onEvent: (event: ChannelSessionEvent) => void,
@@ -847,14 +860,84 @@ function systemSettingsFromPayload(settings: SystemSettingsPayload): SystemSetti
 function speechInputConfigFromPayload(payload: {
   enabled?: boolean;
   runtime_available?: boolean;
-  max_audio_seconds?: number;
-  max_upload_bytes?: number;
+  max_duration_seconds?: number;
+  sample_rate?: number;
+  model?: string;
 }): SpeechInputConfig {
   return {
     enabled: Boolean(payload.enabled),
     runtime_available: Boolean(payload.runtime_available),
-    max_audio_seconds: positiveNumberOrDefault(payload.max_audio_seconds, 60),
-    max_upload_bytes: positiveNumberOrDefault(payload.max_upload_bytes, 25 * 1024 * 1024),
+    max_duration_seconds: positiveNumberOrDefault(payload.max_duration_seconds, 60),
+    sample_rate: positiveNumberOrDefault(payload.sample_rate, 16000),
+    model: typeof payload.model === "string" ? payload.model : "",
+  };
+}
+
+function speechInputStreamUrl(): string {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}/api/speech-input/stream`;
+}
+
+function parseSpeechInputStreamMessage(raw: unknown): { type?: string; text?: string; message?: string } {
+  if (typeof raw !== "string") {
+    return {};
+  }
+  try {
+    const payload = JSON.parse(raw) as { type?: unknown; text?: unknown; message?: unknown };
+    return {
+      message: typeof payload.message === "string" ? payload.message : undefined,
+      text: typeof payload.text === "string" ? payload.text : undefined,
+      type: typeof payload.type === "string" ? payload.type : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+function openSpeechInputStream(handlers: SpeechInputStreamHandlers): SpeechInputStreamConnection {
+  const socket = new WebSocket(speechInputStreamUrl());
+  socket.binaryType = "arraybuffer";
+  socket.onopen = () => handlers.onOpen();
+  socket.onerror = () => handlers.onError("speech input stream failed");
+  socket.onclose = () => handlers.onClose();
+  socket.onmessage = (event) => {
+    const message = parseSpeechInputStreamMessage(event.data);
+    if (message.type === "partial") {
+      handlers.onPartial(message.text ?? "");
+      return;
+    }
+    if (message.type === "final") {
+      handlers.onFinal(message.text ?? "");
+      return;
+    }
+    if (message.type === "done") {
+      handlers.onDone();
+      return;
+    }
+    if (message.type === "error") {
+      handlers.onError(message.message ?? "speech input stream failed");
+    }
+  };
+  const sendJson = (payload: unknown) => {
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(payload));
+    }
+  };
+  return {
+    close() {
+      socket.close();
+    },
+    sendAudio(audio) {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(audio);
+      }
+    },
+    sendStart(sampleRate) {
+      sendJson({ type: "start", sample_rate: sampleRate });
+    },
+    stop() {
+      sendJson({ type: "stop" });
+    },
   };
 }
 
@@ -1409,10 +1492,8 @@ export function createApiClient(): ApiClient {
       );
       return speechInputConfigFromPayload(payload.speech_input);
     },
-    async transcribeSpeechInput(file) {
-      const form = new FormData();
-      form.append("file", file, file.name ?? "speech-input.webm");
-      return requestForm<SpeechTranscription>("/api/speech-input/transcriptions", form);
+    openSpeechInputStream(handlers) {
+      return openSpeechInputStream(handlers);
     },
     subscribeSessionEventsPublic(sessionId, onEvent, onError) {
       const source = new EventSource(`/api/sessions/${sessionId}/events`, {
@@ -2413,11 +2494,12 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       return {
         enabled: false,
         runtime_available: false,
-        max_audio_seconds: 60,
-        max_upload_bytes: 25 * 1024 * 1024,
+        max_duration_seconds: 60,
+        sample_rate: 16000,
+        model: "",
       };
     },
-    async transcribeSpeechInput() {
+    openSpeechInputStream() {
       throw new Error("speech input is disabled");
     },
     subscribeSessionEventsPublic(sessionId, onEvent, onError) {

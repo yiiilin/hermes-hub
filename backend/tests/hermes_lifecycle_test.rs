@@ -8,7 +8,6 @@ use hermes_hub_backend::hermes::{
     },
 };
 use hermes_hub_backend::{
-    asr,
     channel::{events::SessionEventHub, service::ChannelStore},
     docker_config_from_app,
     ldap::DefaultLdapAuthenticator,
@@ -62,7 +61,6 @@ fn ready_test_state(store: SessionStore) -> AppState {
     let mut config = AppConfig::for_tests();
     config.initial_model_config.provider_base_url = "https://ready-provider.example/v1".into();
     config.initial_model_config.provider_api_key = "ready-provider-key".into();
-    let asr_client = asr::default_asr_client(&config.speech_input);
     let model_registry = ModelRegistry::new(config.initial_model_config.clone());
     AppState {
         docker_provisioner: DockerProvisioner::new_with_runtime(
@@ -77,7 +75,6 @@ fn ready_test_state(store: SessionStore) -> AppState {
         ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
         object_storage: InMemoryObjectStorage::default().shared(),
         session_events: SessionEventHub::default(),
-        asr_client,
     }
 }
 

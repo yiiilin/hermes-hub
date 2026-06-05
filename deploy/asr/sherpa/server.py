@@ -3,9 +3,7 @@ import hashlib
 import json
 import os
 import shutil
-import subprocess
 import tarfile
-import tempfile
 import urllib.request
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -13,34 +11,34 @@ from threading import Lock
 
 import numpy as np
 import sherpa_onnx
-import soundfile as sf
 import uvicorn
-from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "9991"))
 MODEL_ROOT = Path(os.getenv("MODEL_ROOT", "/models"))
 MODEL_ARCHIVE = os.getenv(
-    "MODEL_ARCHIVE", "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2"
+    "MODEL_ARCHIVE", "sherpa-onnx-streaming-paraformer-bilingual-zh-en.tar.bz2"
 )
-MODEL_DIR = os.getenv("MODEL_DIR", "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17")
-MODEL_FILE = os.getenv("MODEL_FILE", "model.int8.onnx")
+MODEL_DIR = os.getenv("MODEL_DIR", "sherpa-onnx-streaming-paraformer-bilingual-zh-en")
+ENCODER_FILE = os.getenv("MODEL_FILE", "encoder.int8.onnx")
+DECODER_FILE = os.getenv("DECODER_FILE", "decoder.int8.onnx")
 TOKENS_FILE = os.getenv("TOKENS_FILE", "tokens.txt")
-USE_ITN = os.getenv("USE_ITN", "true").lower() in {"1", "true", "yes", "on"}
 NUM_THREADS = int(os.getenv("NUM_THREADS", "4"))
-MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "26214400"))
 MAX_AUDIO_SECONDS = int(os.getenv("MAX_AUDIO_SECONDS", "60"))
 DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "60"))
 DOWNLOAD_RETRIES = int(os.getenv("DOWNLOAD_RETRIES", "3"))
-FFMPEG_TIMEOUT_SECONDS = int(os.getenv("FFMPEG_TIMEOUT_SECONDS", str(max(30, MAX_AUDIO_SECONDS * 3))))
 MODEL_SHA256 = os.getenv("MODEL_SHA256", "").strip().lower()
 MODEL_URL = os.getenv(
     "MODEL_URL",
     f"https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/{MODEL_ARCHIVE}",
 )
-UPLOAD_CHUNK_SIZE = 1024 * 1024
+SAMPLE_RATE = 16000
+FEATURE_DIM = 80
+TAIL_PADDING_SECONDS = 0.66
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+MAX_PCM_BYTES = SAMPLE_RATE * MAX_AUDIO_SECONDS * 2 if MAX_AUDIO_SECONDS > 0 else 0
 
 recognizer = None
 recognizer_lock = Lock()
@@ -79,7 +77,7 @@ def extract_model_archive(archive_path: Path, target: Path) -> None:
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(UPLOAD_CHUNK_SIZE), b""):
+        for chunk in iter(lambda: source.read(DOWNLOAD_CHUNK_SIZE), b""):
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -94,7 +92,7 @@ def download_model_archive(archive_path: Path) -> None:
             print(f"Downloading model from {MODEL_URL} (attempt {attempt})", flush=True)
             with urllib.request.urlopen(MODEL_URL, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
                 with part_path.open("wb") as output:
-                    shutil.copyfileobj(response, output, length=UPLOAD_CHUNK_SIZE)
+                    shutil.copyfileobj(response, output, length=DOWNLOAD_CHUNK_SIZE)
             if MODEL_SHA256:
                 actual_sha256 = sha256_file(part_path)
                 if actual_sha256 != MODEL_SHA256:
@@ -110,16 +108,17 @@ def download_model_archive(archive_path: Path) -> None:
     raise RuntimeError(f"model download failed after {DOWNLOAD_RETRIES} attempts: {last_error}")
 
 
-def validated_model_paths(model_dir: Path) -> tuple[Path, Path]:
-    model_path = model_dir / MODEL_FILE
+def validated_model_paths(model_dir: Path) -> tuple[Path, Path, Path]:
+    encoder_path = model_dir / ENCODER_FILE
+    decoder_path = model_dir / DECODER_FILE
     tokens_path = model_dir / TOKENS_FILE
-    if not model_path.is_file() or not tokens_path.is_file():
-        raise RuntimeError(f"model files not found under {model_dir}")
-    return model_path, tokens_path
+    if not encoder_path.is_file() or not decoder_path.is_file() or not tokens_path.is_file():
+        raise RuntimeError(f"streaming model files not found under {model_dir}")
+    return encoder_path, decoder_path, tokens_path
 
 
-def ensure_model() -> tuple[Path, Path]:
-    """确保本地模型存在；不存在时下载官方 sherpa-onnx SenseVoice int8 模型。"""
+def ensure_model() -> tuple[Path, Path, Path]:
+    """确保本地流式模型存在；不存在时下载官方 sherpa-onnx streaming Paraformer 模型。"""
     MODEL_ROOT.mkdir(parents=True, exist_ok=True)
     model_dir = MODEL_ROOT / MODEL_DIR
     try:
@@ -150,25 +149,26 @@ async def lifespan(app: FastAPI):
     """启动时加载模型，避免用户第一次按住说话时才付出加载成本。"""
     del app
     global recognizer
-    model_path, tokens_path = ensure_model()
+    encoder_path, decoder_path, tokens_path = ensure_model()
     try:
-        recognizer = load_recognizer(model_path, tokens_path)
+        recognizer = load_recognizer(encoder_path, decoder_path, tokens_path)
     except Exception:
         # 持久化目录里如果残留了旧的坏模型，清理后重新走下载/校验/原子替换流程。
         shutil.rmtree(MODEL_ROOT / MODEL_DIR, ignore_errors=True)
-        model_path, tokens_path = ensure_model()
-        recognizer = load_recognizer(model_path, tokens_path)
+        encoder_path, decoder_path, tokens_path = ensure_model()
+        recognizer = load_recognizer(encoder_path, decoder_path, tokens_path)
     print(
         json.dumps(
             {
                 "status": "UP",
                 "engine": "sherpa-onnx",
-                "model": str(model_path),
+                "model": str(MODEL_ROOT / MODEL_DIR),
+                "encoder": str(encoder_path),
+                "decoder": str(decoder_path),
                 "tokens": str(tokens_path),
-                "use_itn": USE_ITN,
                 "num_threads": NUM_THREADS,
+                "sample_rate": SAMPLE_RATE,
                 "max_audio_seconds": MAX_AUDIO_SECONDS,
-                "max_file_size": MAX_FILE_SIZE,
             },
             ensure_ascii=False,
         ),
@@ -178,15 +178,18 @@ async def lifespan(app: FastAPI):
     recognizer = None
 
 
-app = FastAPI(title="Hermes Hub sherpa-onnx ASR", lifespan=lifespan)
+app = FastAPI(title="Hermes Hub sherpa-onnx streaming ASR", lifespan=lifespan)
 
 
-def load_recognizer(model_path: Path, tokens_path: Path):
-    return sherpa_onnx.OfflineRecognizer.from_sense_voice(
-        model=str(model_path),
+def load_recognizer(encoder_path: Path, decoder_path: Path, tokens_path: Path):
+    return sherpa_onnx.OnlineRecognizer.from_paraformer(
         tokens=str(tokens_path),
+        encoder=str(encoder_path),
+        decoder=str(decoder_path),
         num_threads=NUM_THREADS,
-        use_itn=USE_ITN,
+        sample_rate=SAMPLE_RATE,
+        feature_dim=FEATURE_DIM,
+        decoding_method="greedy_search",
         debug=False,
     )
 
@@ -194,10 +197,10 @@ def load_recognizer(model_path: Path, tokens_path: Path):
 @app.get("/")
 def root() -> dict:
     return {
-        "message": "Hermes Hub sherpa-onnx ASR",
+        "message": "Hermes Hub sherpa-onnx streaming ASR",
         "endpoints": {
             "health": "/health",
-            "audio_transcriptions": "/v1/audio/transcriptions",
+            "stream": "/stream",
         },
     }
 
@@ -207,121 +210,117 @@ def health() -> dict:
     return {
         "status": "UP" if recognizer is not None else "DOWN",
         "engine": "sherpa-onnx",
-        "model": MODEL_FILE,
-        "use_itn": USE_ITN,
+        "model": MODEL_DIR,
+        "sample_rate": SAMPLE_RATE,
         "num_threads": NUM_THREADS,
     }
 
 
-def convert_to_wav(input_path: Path, output_path: Path) -> None:
-    """统一把浏览器上传的 webm/ogg/wav 转成单声道 16k wav。"""
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            str(input_path),
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-f",
-            "wav",
-            str(output_path),
-        ],
-        check=True,
-        timeout=FFMPEG_TIMEOUT_SECONDS,
-    )
+def pcm16le_to_float32(payload: bytes) -> np.ndarray:
+    """浏览器侧已经重采样为 16k 单声道 PCM16 LE；这里只做轻量归一化。"""
+    if len(payload) % 2 != 0:
+        payload = payload[:-1]
+    if not payload:
+        return np.array([], dtype=np.float32)
+    pcm = np.frombuffer(payload, dtype="<i2").astype(np.float32)
+    return np.ascontiguousarray(pcm / 32768.0)
 
 
-def decode_audio(audio_path: Path) -> str:
+def decode_ready_chunks(stream) -> str:
     if recognizer is None:
         raise RuntimeError("recognizer is not loaded")
-    samples, sample_rate = sf.read(audio_path, dtype="float32", always_2d=True)
-    audio = np.ascontiguousarray(samples[:, 0])
-    if MAX_AUDIO_SECONDS > 0 and len(audio) / sample_rate > MAX_AUDIO_SECONDS:
-        raise AudioTooLongError("audio duration is too long")
-    stream = recognizer.create_stream()
-    stream.accept_waveform(sample_rate, audio)
     with recognizer_lock:
-        recognizer.decode_stream(stream)
-    result = stream.result
-    text = getattr(result, "text", None)
-    if text is not None:
-        return text
+        while recognizer.is_ready(stream):
+            recognizer.decode_stream(stream)
+        result = recognizer.get_result(stream)
+    return str(getattr(result, "text", result)).strip()
+
+
+def decode_final(stream) -> str:
+    if recognizer is None:
+        raise RuntimeError("recognizer is not loaded")
+    tail_padding = np.zeros(int(SAMPLE_RATE * TAIL_PADDING_SECONDS), dtype=np.float32)
+    stream.accept_waveform(SAMPLE_RATE, tail_padding)
+    input_finished = getattr(stream, "input_finished", None)
+    if callable(input_finished):
+        input_finished()
+    with recognizer_lock:
+        while recognizer.is_ready(stream):
+            recognizer.decode_stream(stream)
+        result = recognizer.get_result(stream)
+    return str(getattr(result, "text", result)).strip()
+
+
+async def send_stream_error(websocket: WebSocket, message: str) -> None:
+    await websocket.send_json({"type": "error", "message": message})
+
+
+@app.websocket("/stream")
+async def stream_asr(websocket: WebSocket):
+    await websocket.accept()
+    if recognizer is None:
+        await send_stream_error(websocket, "recognizer is not loaded")
+        await websocket.close()
+        return
+
+    stream = recognizer.create_stream()
+    total_pcm_bytes = 0
+    started = False
     try:
-        parsed = json.loads(str(result))
-        return str(parsed.get("text", "")).strip()
-    except json.JSONDecodeError:
-        return str(result).strip()
-
-
-async def spool_upload_to_path(file: UploadFile, input_path: Path) -> int:
-    """分块保存上传音频，超过上限立即中止，避免把大请求完整读入内存。"""
-    size = 0
-    with input_path.open("wb") as output:
         while True:
-            chunk = await file.read(UPLOAD_CHUNK_SIZE)
-            if not chunk:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
                 break
-            size += len(chunk)
-            if size > MAX_FILE_SIZE:
-                raise ValueError("audio file is too large")
-            output.write(chunk)
-    return size
 
+            if "text" in message:
+                try:
+                    event = json.loads(message["text"])
+                except json.JSONDecodeError:
+                    await send_stream_error(websocket, "stream event is invalid json")
+                    continue
+                event_type = event.get("type")
+                if event_type == "start":
+                    sample_rate = int(event.get("sample_rate") or SAMPLE_RATE)
+                    if sample_rate != SAMPLE_RATE:
+                        await send_stream_error(websocket, "sample_rate must be 16000")
+                        await websocket.close()
+                        return
+                    started = True
+                    continue
+                if event_type == "stop":
+                    text = await asyncio.to_thread(decode_final, stream)
+                    await websocket.send_json({"type": "final", "text": text})
+                    await websocket.send_json({"type": "done"})
+                    await websocket.close()
+                    return
+                await send_stream_error(websocket, "stream event type is unsupported")
+                continue
 
-def openai_error(status_code: int, message: str, code: str, error_type: str = "invalid_request_error"):
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "error": {
-                "message": message,
-                "type": error_type,
-                "code": code,
-            }
-        },
-    )
-
-
-@app.post("/v1/audio/transcriptions")
-async def transcribe(
-    file: UploadFile = File(...),
-    model: str | None = Form(None),
-    language: str | None = Form(None),
-    response_format: str | None = Form(None),
-) -> dict:
-    """OpenAI 兼容的短音频转写接口；模型选择由容器环境变量固定。"""
-    del model, language
-    if response_format not in (None, "", "json"):
-        return openai_error(400, "response_format only supports json", "unsupported_response_format")
-    suffix = Path(file.filename or "audio.webm").suffix or ".webm"
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        input_path = Path(temp_dir) / f"input{suffix}"
-        wav_path = Path(temp_dir) / "audio.wav"
-        try:
-            await spool_upload_to_path(file, input_path)
-            convert_to_wav(input_path, wav_path)
-            text = await asyncio.to_thread(decode_audio, wav_path)
-        except ValueError as exc:
-            if str(exc) == "audio file is too large":
-                return openai_error(413, "audio file is too large", "audio_file_too_large")
-            raise
-        except AudioTooLongError:
-            return openai_error(413, "audio duration is too long", "audio_duration_too_long")
-        except subprocess.CalledProcessError as exc:
-            return openai_error(400, "audio conversion failed", "audio_conversion_failed")
-        except subprocess.TimeoutExpired:
-            return openai_error(408, "audio conversion timed out", "audio_conversion_timeout")
-        except Exception as exc:
-            print(f"ASR failed: {exc}", flush=True)
-            return openai_error(500, "asr failed", "asr_failed", "server_error")
-    return {"text": text}
+            payload = message.get("bytes")
+            if payload is None:
+                continue
+            if not started:
+                await send_stream_error(websocket, "stream must start before audio")
+                continue
+            total_pcm_bytes += len(payload)
+            if MAX_PCM_BYTES > 0 and total_pcm_bytes > MAX_PCM_BYTES:
+                raise AudioTooLongError("audio duration is too long")
+            samples = pcm16le_to_float32(payload)
+            if samples.size == 0:
+                continue
+            stream.accept_waveform(SAMPLE_RATE, samples)
+            text = await asyncio.to_thread(decode_ready_chunks, stream)
+            if text:
+                await websocket.send_json({"type": "partial", "text": text})
+    except WebSocketDisconnect:
+        return
+    except AudioTooLongError:
+        await send_stream_error(websocket, "audio duration is too long")
+        await websocket.close()
+    except Exception as exc:  # noqa: BLE001 - ASR 服务边界需要把内部失败降级为协议错误。
+        print(f"Streaming ASR failed: {exc}", flush=True)
+        await send_stream_error(websocket, "asr failed")
+        await websocket.close()
 
 
 if __name__ == "__main__":

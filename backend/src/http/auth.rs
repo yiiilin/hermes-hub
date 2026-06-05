@@ -312,7 +312,6 @@ fn map_update_password_error(error: StoreError) -> ApiError {
 #[cfg(test)]
 mod tests {
     use crate::{
-        asr,
         channel::{events::SessionEventHub, service::ChannelStore},
         docker_config_from_app,
         hermes::docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
@@ -413,7 +412,6 @@ mod tests {
             Arc::new(NoopDockerRuntime),
             object_storage.clone(),
         );
-        let asr_client = asr::default_asr_client(&config.speech_input);
         AppState {
             model_registry: ModelRegistry::new(config.initial_model_config.clone()),
             config,
@@ -424,7 +422,6 @@ mod tests {
             docker_provisioner,
             object_storage,
             session_events: SessionEventHub::default(),
-            asr_client,
         }
     }
 }

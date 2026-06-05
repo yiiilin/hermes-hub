@@ -92,7 +92,7 @@ COMPOSE_PROFILES=asr
 HERMES_HUB_SPEECH_INPUT_ENABLED=true
 ```
 
-The default ASR image is `ghcr.io/yiiilin/hermes-hub-asr:0.0.18`. It wraps `sherpa-onnx` + SenseVoice int8 and exposes an OpenAI-compatible `http://asr:9991/v1/audio/transcriptions` endpoint. The ASR image is version-pinned; update `HERMES_HUB_ASR_IMAGE` only when intentionally aligning to a newer ASR image. You can replace it with any image that exposes an HTTP multipart transcription endpoint accepting `file` and `model` fields and returning JSON with `text` or `transcript`.
+The default ASR image is `ghcr.io/yiiilin/hermes-hub-asr:v2026.6.4.21`. It wraps `sherpa-onnx` streaming Paraformer and exposes a WebSocket stream at `ws://asr:9991/stream`. The browser sends 16 kHz PCM16 audio through the Hub backend proxy, so replacement ASR images must implement the same streaming message contract instead of an HTTP multipart transcription endpoint.
 
 Start without ASR:
 
@@ -141,7 +141,7 @@ docker pull ghcr.io/yiiilin/hermes-hub-hermes:vYYYY.M.D
 docker pull ghcr.io/yiiilin/hermes-hub-asr:vYYYY.M.D
 ```
 
-The Hub image contains the Rust backend and the built React frontend. The `hermes-hub-hermes` image is the Hermes runtime wrapper used by managed per-user containers. The optional `hermes-hub-asr` image wraps sherpa-onnx + SenseVoice for speech input. The service listens on port `8080`.
+The Hub image contains the Rust backend and the built React frontend. The `hermes-hub-hermes` image is the Hermes runtime wrapper used by managed per-user containers. The optional `hermes-hub-asr` image wraps sherpa-onnx streaming ASR for speech input. The service listens on port `8080`.
 
 Hermes wrapper and ASR runtime images use release-generated date tags such as `v2026.6.4` for the first UTC release that day and `v2026.6.4.2` for the second release that day; the final number is the daily release count, not a patch version. Use the exact tag from the GitHub Release notes. The Hermes runtime wrapper uses the selected upstream `nousresearch/hermes-agent:v2026.5.29.2` base image tag. Do not rely on `latest` drift for runtime images; update the Dockerfile `HERMES_AGENT_IMAGE` tag only when intentionally aligning to a newer Hermes Agent base.
 

@@ -238,7 +238,7 @@ const translations = {
     "chat.voiceHoldToRecord": "按住说话",
     "chat.voicePermissionDenied": "请允许浏览器使用麦克风",
     "chat.voiceRequiresSecureContext": "语音输入需要 HTTPS 或 localhost，当前访问地址无法调用麦克风",
-    "chat.voiceRecording": "正在录音，松开转文字",
+    "chat.voiceRecording": "正在录音并实时转写",
     "chat.voiceTranscribing": "正在识别...",
     "chat.voiceTranscriptionFailed": "语音识别失败",
     "chat.voiceTooLarge": "录音文件超过 {size}，请重新录制更短的语音",
@@ -520,7 +520,7 @@ const translations = {
     "chat.voicePermissionDenied": "Allow microphone access in the browser",
     "chat.voiceRequiresSecureContext":
       "Speech input requires HTTPS or localhost. This address cannot access the microphone.",
-    "chat.voiceRecording": "Recording, release to transcribe",
+    "chat.voiceRecording": "Recording and transcribing live",
     "chat.voiceTranscribing": "Transcribing...",
     "chat.voiceTranscriptionFailed": "Speech recognition failed",
     "chat.voiceTooLarge": "Recording is larger than {size}. Record a shorter clip.",

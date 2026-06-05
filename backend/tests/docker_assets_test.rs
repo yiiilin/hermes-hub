@@ -233,6 +233,36 @@ fn hermes_wrapper_image_uses_selected_official_hermes_agent_tag() {
 }
 
 #[test]
+fn asr_runtime_uses_streaming_model_with_pinned_artifacts() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("backend crate lives under repo root");
+    let dockerfile = std::fs::read_to_string(repo_root.join("deploy/asr/sherpa/Dockerfile"))
+        .expect("ASR Dockerfile is present");
+    let compose = std::fs::read_to_string(repo_root.join("deploy/compose.yml"))
+        .expect("compose file is present");
+    let env_example = std::fs::read_to_string(repo_root.join("deploy/.env.example"))
+        .expect("env example is present");
+
+    // ASR 运行时必须保持流式模型和固定校验，避免回退到旧 SenseVoice multipart 流程。
+    let model_sha = "5462a1fce42693deae572af1e8c4687124b12aa85fe61ff4d3168bb5280e205f";
+    assert!(compose.contains("ghcr.io/yiiilin/hermes-hub-asr:v2026.6.4.21"));
+    assert!(!compose.contains("ghcr.io/yiiilin/hermes-hub-asr:latest"));
+    assert!(compose.contains(&format!(
+        "MODEL_SHA256: ${{HERMES_HUB_ASR_MODEL_SHA256:-{model_sha}}}"
+    )));
+    assert!(dockerfile.contains(&format!("MODEL_SHA256={model_sha}")));
+    assert!(env_example
+        .contains("HERMES_HUB_ASR_MODEL=sherpa-onnx-streaming-paraformer-bilingual-zh-en"));
+    assert!(env_example.contains("HERMES_HUB_ASR_MODEL_FILE=encoder.int8.onnx"));
+    assert!(env_example.contains("HERMES_HUB_ASR_DECODER_FILE=decoder.int8.onnx"));
+    assert!(!env_example.contains("HERMES_HUB_ASR_TRANSCRIBE_PATH"));
+    assert!(!env_example.contains("HERMES_HUB_ASR_MAX_UPLOAD_BYTES"));
+    assert!(!env_example.contains("sensevoice"));
+    assert!(!env_example.contains("SenseVoice"));
+}
+
+#[test]
 fn hermes_hub_send_plugin_uses_official_media_policy_when_docker_is_available() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

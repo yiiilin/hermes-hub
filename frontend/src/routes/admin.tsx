@@ -475,8 +475,9 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
   const [speechInputRuntimeConfig, setSpeechInputRuntimeConfig] = useState<SpeechInputConfig>({
     enabled: false,
     runtime_available: false,
-    max_audio_seconds: 60,
-    max_upload_bytes: 25 * 1024 * 1024,
+    max_duration_seconds: 60,
+    sample_rate: 16000,
+    model: "",
   });
   const [publicPlatformHermesStatus, setPublicPlatformHermesStatus] =
     useState<PublicPlatformHermesStatus>({
