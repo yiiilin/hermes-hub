@@ -500,7 +500,10 @@ pub fn map_channel_error(error: ChannelStoreError) -> ApiError {
         ChannelStoreError::InvalidSessionKind
         | ChannelStoreError::InvalidMessageRole
         | ChannelStoreError::InvalidAttachment
-        | ChannelStoreError::InvalidRunStatus => ApiError::BadRequest("invalid channel request"),
+        | ChannelStoreError::InvalidRunStatus
+        | ChannelStoreError::InvalidIntegrationId => {
+            ApiError::BadRequest("invalid channel request")
+        }
         ChannelStoreError::RunNotFound => ApiError::NotFound("resource not found"),
         ChannelStoreError::SessionLimitExceeded {
             max_sessions_per_user,

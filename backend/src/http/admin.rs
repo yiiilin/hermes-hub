@@ -1,9 +1,9 @@
 use axum::{
     body::to_bytes,
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
-    http::{HeaderMap, Method, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use bytes::Bytes;
@@ -39,7 +39,10 @@ use crate::{
         DEFAULT_TEMPERATURE, IMAGE_MODEL_CONFIG_KIND, LLM_MODEL_CONFIG_KIND, RESPONSES_API_TYPE,
     },
     public_platform,
-    session::store::{HermesSchedulerSnapshot, SystemSettings},
+    session::store::{
+        ApiManagementSettings, BusinessOAuthSettings, HermesSchedulerSnapshot, LdapSettings,
+        OidcSettings, PublicPlatformSettings, SpeechInputSettings, StoreError, SystemSettings,
+    },
     skills_fs::normalize_skills_path,
     storage::ObjectStorageError,
     AppState,
@@ -104,6 +107,19 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/admin/model-config/{config_kind}/fallback/test",
             post(test_model_fallback_config),
+        )
+        .route(
+            "/api/admin/system-settings/system",
+            put(update_system_parameters),
+        )
+        .route("/api/admin/system-settings/auth", put(update_auth_settings))
+        .route(
+            "/api/admin/system-settings/public-platform",
+            put(update_public_platform_settings),
+        )
+        .route(
+            "/api/admin/system-settings/api-management",
+            put(update_api_management_settings),
         )
         .route(
             "/api/admin/system-settings",
@@ -245,6 +261,32 @@ struct SystemSettingsResponse {
 }
 
 type UpdateSystemSettingsRequest = SystemSettings;
+
+#[derive(Deserialize)]
+struct UpdateSystemParametersRequest {
+    max_sessions_per_user: u32,
+    max_attachment_upload_bytes: usize,
+    attachment_retention_days: u32,
+    empty_chat_prompt: String,
+    speech_input: SpeechInputSettings,
+}
+
+#[derive(Deserialize)]
+struct UpdateAuthSettingsRequest {
+    oidc: OidcSettings,
+    ldap: LdapSettings,
+    business_oauth: BusinessOAuthSettings,
+}
+
+#[derive(Deserialize)]
+struct UpdatePublicPlatformSettingsRequest {
+    public_platform: PublicPlatformSettings,
+}
+
+#[derive(Deserialize)]
+struct UpdateApiManagementSettingsRequest {
+    api_management: ApiManagementSettings,
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 struct HermesProfileContent {
@@ -892,7 +934,13 @@ async fn get_system_settings(
         .await
         .map_err(|_| ApiError::Internal)?;
 
-    Ok(Json(SystemSettingsResponse { settings }))
+    Ok((
+        [(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache, no-store, no-transform"),
+        )],
+        Json(SystemSettingsResponse { settings }),
+    ))
 }
 
 async fn update_system_settings(
@@ -920,23 +968,144 @@ async fn update_system_settings(
     // 空会话提示允许不配置；空值会在前端回退到当前语言的默认文案。
     payload.empty_chat_prompt = payload.empty_chat_prompt.trim().to_string();
     let should_ensure_public_hermes = payload.public_platform.enabled;
+    persist_system_settings_update(&state, move |settings| {
+        *settings = payload;
+    })
+    .await?;
+    post_system_settings_save(&state, should_ensure_public_hermes).await?;
 
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn update_system_parameters(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut payload): Json<UpdateSystemParametersRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    if payload.max_sessions_per_user == 0 {
+        return Err(ApiError::BadRequest(
+            "max sessions per user must be greater than zero",
+        ));
+    }
+    if payload.max_attachment_upload_bytes == 0 {
+        return Err(ApiError::BadRequest(
+            "max attachment upload bytes must be greater than zero",
+        ));
+    }
+    if payload.attachment_retention_days == 0 {
+        return Err(ApiError::BadRequest(
+            "attachment retention days must be greater than zero",
+        ));
+    }
+
+    payload.empty_chat_prompt = payload.empty_chat_prompt.trim().to_string();
     state
         .store
-        .update_system_settings(payload)
+        .update_system_parameter_settings(
+            payload.max_sessions_per_user,
+            payload.max_attachment_upload_bytes,
+            payload.attachment_retention_days,
+            payload.empty_chat_prompt,
+            payload.speech_input,
+        )
         .await
-        .map_err(|_| ApiError::BadRequest("invalid system settings"))?;
-    refresh_managed_hermes_configs(&state).await?;
+        .map_err(map_system_settings_error)?;
+    post_system_settings_save(&state, false).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn update_auth_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<UpdateAuthSettingsRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    state
+        .store
+        .update_auth_settings(payload.oidc, payload.ldap, payload.business_oauth)
+        .await
+        .map_err(map_system_settings_error)?;
+    post_system_settings_save(&state, false).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn update_public_platform_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<UpdatePublicPlatformSettingsRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    let should_ensure_public_hermes = payload.public_platform.enabled;
+    state
+        .store
+        .update_public_platform_settings(payload.public_platform)
+        .await
+        .map_err(map_system_settings_error)?;
+    post_system_settings_save(&state, should_ensure_public_hermes).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn update_api_management_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<UpdateApiManagementSettingsRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    state
+        .store
+        .update_api_management_settings(payload.api_management)
+        .await
+        .map_err(map_system_settings_error)?;
+    post_system_settings_save(&state, false).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn persist_system_settings_update<F>(
+    state: &AppState,
+    mutate: F,
+) -> Result<SystemSettings, ApiError>
+where
+    F: FnOnce(&mut SystemSettings),
+{
+    let mut settings = state
+        .store
+        .system_settings()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    mutate(&mut settings);
+    state
+        .store
+        .update_system_settings(settings)
+        .await
+        .map_err(|_| ApiError::BadRequest("invalid system settings"))
+}
+
+async fn post_system_settings_save(
+    state: &AppState,
+    should_ensure_public_hermes: bool,
+) -> Result<(), ApiError> {
+    refresh_managed_hermes_configs(state).await?;
     if should_ensure_public_hermes {
-        if let Err(error) = public_platform::ensure_public_hermes_if_enabled(&state).await {
+        if let Err(error) = public_platform::ensure_public_hermes_if_enabled(state).await {
             tracing::warn!(
                 ?error,
                 "public platform Hermes could not be ensured after settings save"
             );
         }
     }
+    Ok(())
+}
 
-    Ok(StatusCode::NO_CONTENT)
+fn map_system_settings_error(error: StoreError) -> ApiError {
+    match error {
+        StoreError::InvalidSystemSettings => ApiError::BadRequest("invalid system settings"),
+        _ => ApiError::Internal,
+    }
 }
 
 async fn get_hermes_profile(

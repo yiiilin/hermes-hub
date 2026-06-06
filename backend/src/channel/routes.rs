@@ -202,6 +202,7 @@ async fn create_session(
             kind,
             None,
             settings.max_sessions_per_user,
+            false,
         )
         .await
         .map_err(map_channel_error)?;
@@ -223,6 +224,10 @@ async fn list_sessions(
         .list_sessions(&user.id, &channel_id)
         .await
         .map_err(map_channel_error)?;
+    let sessions = sessions
+        .into_iter()
+        .filter(|session| !session.hidden_from_web)
+        .collect();
 
     Ok(Json(SessionListResponse { sessions }))
 }
@@ -644,6 +649,7 @@ async fn delete_session_objects(
 fn map_channel_error(error: ChannelStoreError) -> ApiError {
     match error {
         ChannelStoreError::ChannelNotFound => ApiError::NotFound("channel not found"),
+        ChannelStoreError::InvalidIntegrationId => ApiError::BadRequest("invalid integration id"),
         ChannelStoreError::InvalidSessionKind => ApiError::BadRequest("invalid session kind"),
         ChannelStoreError::InvalidMessageRole => ApiError::BadRequest("invalid message role"),
         ChannelStoreError::InvalidAttachment => ApiError::BadRequest("invalid attachment"),

@@ -38,6 +38,8 @@ const PUBLIC_PLATFORM_SETTINGS_KEY: &str = "public_platform";
 const EMPTY_CHAT_PROMPT_KEY: &str = "empty_chat_prompt";
 const OIDC_SETTINGS_KEY: &str = "oidc";
 const LDAP_SETTINGS_KEY: &str = "ldap";
+const BUSINESS_OAUTH_SETTINGS_KEY: &str = "business_oauth";
+const API_MANAGEMENT_SETTINGS_KEY: &str = "api_management";
 pub const PUBLIC_PLATFORM_USER_EMAIL: &str = "public-platform@hermes-hub.local";
 
 #[derive(Clone)]
@@ -63,6 +65,7 @@ struct StoreInner {
     users_by_id: HashMap<String, User>,
     user_ids_by_email: HashMap<String, String>,
     sessions_by_hash: HashMap<String, StoredSession>,
+    business_oauth_codes_by_hash: HashMap<String, StoredBusinessOAuthAuthorizationCode>,
     invites_by_id: HashMap<String, Invite>,
     invite_ids_by_hash: HashMap<String, String>,
     hermes_instances_by_user_id: HashMap<String, HermesInstance>,
@@ -81,6 +84,7 @@ impl Default for StoreInner {
             users_by_id: HashMap::new(),
             user_ids_by_email: HashMap::new(),
             sessions_by_hash: HashMap::new(),
+            business_oauth_codes_by_hash: HashMap::new(),
             invites_by_id: HashMap::new(),
             invite_ids_by_hash: HashMap::new(),
             hermes_instances_by_user_id: HashMap::new(),
@@ -109,9 +113,13 @@ pub struct SystemSettings {
     #[serde(default)]
     pub public_platform: PublicPlatformSettings,
     #[serde(default)]
+    pub api_management: ApiManagementSettings,
+    #[serde(default)]
     pub oidc: OidcSettings,
     #[serde(default)]
     pub ldap: LdapSettings,
+    #[serde(default)]
+    pub business_oauth: BusinessOAuthSettings,
 }
 
 /// 管理员运行时语音输入软开关。真正的 ASR 服务是否存在由环境变量控制。
@@ -127,6 +135,13 @@ pub struct SpeechInputSettings {
 pub struct PublicPlatformSettings {
     pub enabled: bool,
     pub temporary_session_retention_hours: u32,
+}
+
+/// API 管理开关只负责控制 Swagger UI 和 OpenAPI JSON 是否对外开放。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ApiManagementSettings {
+    pub enabled: bool,
 }
 
 /// 管理员可配置的 OIDC 参数。字段名尽量贴近 Outline 的环境变量语义，
@@ -166,6 +181,46 @@ pub struct LdapSettings {
     pub auto_create_users: bool,
 }
 
+/// 业务 OAuth 只负责给外部系统签发访问令牌和授权码。
+/// 客户端密钥等敏感字段会沿用系统设置加密存储。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct BusinessOAuthSettings {
+    pub enabled: bool,
+    pub client_id: String,
+    pub client_secret: String,
+    pub allowed_redirect_uris: Vec<String>,
+    pub scopes: String,
+    pub authorization_code_ttl_seconds: u64,
+    pub hidden_session_idle_timeout_seconds: u64,
+    pub toolset_names: Vec<String>,
+}
+
+/// Hub 会话 token 的用途。
+/// web 用于浏览器会话，oauth 用于业务系统的 bearer access token。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionPurpose {
+    Web,
+    OAuth,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionLookup {
+    pub user: User,
+    pub purpose: SessionPurpose,
+    pub integration_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BusinessOAuthAuthorizationCode {
+    pub user_id: String,
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub scope: String,
+    pub expires_at: u64,
+}
+
 /// OIDC 登录会复用已有用户，也可能按配置自动创建新用户。
 /// HTTP 层需要知道是否新建，才能只在创建用户后补建 Hermes 运行时。
 #[derive(Clone, Debug)]
@@ -190,8 +245,10 @@ impl Default for SystemSettings {
             empty_chat_prompt: String::new(),
             speech_input: SpeechInputSettings::default(),
             public_platform: PublicPlatformSettings::default(),
+            api_management: ApiManagementSettings::default(),
             oidc: OidcSettings::default(),
             ldap: LdapSettings::default(),
+            business_oauth: BusinessOAuthSettings::default(),
         }
     }
 }
@@ -208,6 +265,12 @@ impl Default for PublicPlatformSettings {
             enabled: false,
             temporary_session_retention_hours: DEFAULT_PUBLIC_SESSION_RETENTION_HOURS,
         }
+    }
+}
+
+impl Default for ApiManagementSettings {
+    fn default() -> Self {
+        Self { enabled: false }
     }
 }
 
@@ -256,9 +319,35 @@ impl Default for LdapSettings {
     }
 }
 
+impl Default for BusinessOAuthSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            client_id: String::new(),
+            client_secret: String::new(),
+            allowed_redirect_uris: Vec::new(),
+            scopes: "openid profile email".to_string(),
+            authorization_code_ttl_seconds: 600,
+            hidden_session_idle_timeout_seconds: 3600,
+            toolset_names: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct StoredSession {
     user_id: String,
+    purpose: SessionPurpose,
+    integration_id: Option<String>,
+    expires_at: u64,
+}
+
+#[derive(Clone)]
+struct StoredBusinessOAuthAuthorizationCode {
+    user_id: String,
+    client_id: String,
+    redirect_uri: String,
+    scope: String,
     expires_at: u64,
 }
 
@@ -840,12 +929,34 @@ impl SessionStore {
     }
 
     pub async fn create_session(&self, user_id: &str) -> Result<String, StoreError> {
+        self.create_session_with_purpose(user_id, SessionPurpose::Web, None)
+            .await
+    }
+
+    pub async fn create_oauth_session(
+        &self,
+        user_id: &str,
+        integration_id: &str,
+    ) -> Result<String, StoreError> {
+        self.create_session_with_purpose(user_id, SessionPurpose::OAuth, Some(integration_id))
+            .await
+    }
+
+    pub async fn create_session_with_purpose(
+        &self,
+        user_id: &str,
+        purpose: SessionPurpose,
+        integration_id: Option<&str>,
+    ) -> Result<String, StoreError> {
+        let integration_id = integration_id.and_then(trimmed_optional_string);
         match &self.backend {
             SessionStoreBackend::Memory(inner) => {
                 let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
                 let token = random_token();
                 let session = StoredSession {
                     user_id: user_id.to_string(),
+                    purpose,
+                    integration_id: integration_id.clone(),
                     expires_at: unix_now() + SESSION_TTL_SECONDS,
                 };
 
@@ -857,13 +968,17 @@ impl SessionStore {
                 let expires_at = unix_now() + SESSION_TTL_SECONDS;
                 sqlx::query(
                     r#"
-                    insert into sessions (id, user_id, session_token_hash, expires_at)
-                    values ($1::uuid, $2::uuid, $3, to_timestamp($4))
+                    insert into sessions (
+                        id, user_id, session_token_hash, purpose, integration_id, expires_at
+                    )
+                    values ($1::uuid, $2::uuid, $3, $4, $5, to_timestamp($6))
                     "#,
                 )
                 .bind(Uuid::new_v4().to_string())
                 .bind(user_id)
                 .bind(hash_token(&token))
+                .bind(session_purpose_as_str(&purpose))
+                .bind(integration_id)
                 .bind(expires_at as f64)
                 .execute(pool)
                 .await
@@ -875,16 +990,38 @@ impl SessionStore {
     }
 
     pub async fn user_by_session_token(&self, token: &str) -> Result<User, StoreError> {
+        Ok(self
+            .user_and_session_lookup_by_session_token(token)
+            .await?
+            .user)
+    }
+
+    pub async fn session_purpose_by_token(
+        &self,
+        token: &str,
+    ) -> Result<SessionPurpose, StoreError> {
+        Ok(self
+            .user_and_session_lookup_by_session_token(token)
+            .await?
+            .purpose)
+    }
+
+    pub async fn user_and_session_lookup_by_session_token(
+        &self,
+        token: &str,
+    ) -> Result<SessionLookup, StoreError> {
         match &self.backend {
             SessionStoreBackend::Memory(inner) => {
                 let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
-                user_by_session_token_in_memory(&mut inner, token)
+                user_and_session_lookup_by_session_token_in_memory(&mut inner, token)
             }
             SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
                 let token_hash = hash_token(token);
                 let row = sqlx::query(
                     r#"
                     select extract(epoch from sessions.expires_at)::bigint as session_expires_at,
+                           sessions.purpose,
+                           sessions.integration_id,
                            users.id::text as id,
                            users.email,
                            users.password_hash,
@@ -923,7 +1060,18 @@ impl SessionStore {
                     return Err(StoreError::Unauthorized);
                 }
 
-                Ok(user)
+                let purpose = session_purpose_from_str(
+                    &row.try_get::<String, _>("purpose")
+                        .map_err(|_| StoreError::DatabaseFailed)?,
+                )?;
+
+                Ok(SessionLookup {
+                    user,
+                    purpose,
+                    integration_id: row
+                        .try_get::<Option<String>, _>("integration_id")
+                        .map_err(|_| StoreError::DatabaseFailed)?,
+                })
             }),
         }
     }
@@ -942,6 +1090,140 @@ impl SessionStore {
                     .await
                     .map_err(|_| StoreError::DatabaseFailed)?;
                 Ok(())
+            }),
+        }
+    }
+
+    pub async fn create_business_oauth_authorization_code(
+        &self,
+        user_id: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        scope: &str,
+        ttl_seconds: u64,
+    ) -> Result<String, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let code = random_token();
+                let stored = StoredBusinessOAuthAuthorizationCode {
+                    user_id: user_id.to_string(),
+                    client_id: client_id.to_string(),
+                    redirect_uri: redirect_uri.to_string(),
+                    scope: scope.to_string(),
+                    expires_at: unix_now().saturating_add(ttl_seconds),
+                };
+                inner
+                    .business_oauth_codes_by_hash
+                    .insert(hash_token(&code), stored);
+                Ok(code)
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let code = random_token();
+                let expires_at = unix_now().saturating_add(ttl_seconds);
+                sqlx::query(
+                    r#"
+                    insert into business_oauth_authorization_codes (
+                        id, code_hash, user_id, client_id, redirect_uri, scope, expires_at
+                    )
+                    values ($1::uuid, $2, $3::uuid, $4, $5, $6, to_timestamp($7))
+                    "#,
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(hash_token(&code))
+                .bind(user_id)
+                .bind(client_id)
+                .bind(redirect_uri)
+                .bind(scope)
+                .bind(expires_at as f64)
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+                Ok(code)
+            }),
+        }
+    }
+
+    pub async fn consume_business_oauth_authorization_code(
+        &self,
+        code: &str,
+        client_id: &str,
+        redirect_uri: &str,
+    ) -> Result<BusinessOAuthAuthorizationCode, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let code_hash = hash_token(code);
+                let stored = inner
+                    .business_oauth_codes_by_hash
+                    .remove(&code_hash)
+                    .ok_or(StoreError::Unauthorized)?;
+                if stored.expires_at <= unix_now()
+                    || stored.client_id != client_id
+                    || stored.redirect_uri != redirect_uri
+                {
+                    return Err(StoreError::Unauthorized);
+                }
+                Ok(BusinessOAuthAuthorizationCode {
+                    user_id: stored.user_id,
+                    client_id: stored.client_id,
+                    redirect_uri: stored.redirect_uri,
+                    scope: stored.scope,
+                    expires_at: stored.expires_at,
+                })
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let row = sqlx::query(
+                    r#"
+                    delete from business_oauth_authorization_codes
+                    where code_hash = $1
+                    returning user_id::text as user_id,
+                              client_id,
+                              redirect_uri,
+                              scope,
+                              extract(epoch from expires_at)::bigint as expires_at
+                    "#,
+                )
+                .bind(hash_token(code))
+                .fetch_optional(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?
+                .ok_or(StoreError::Unauthorized)?;
+
+                if row
+                    .try_get::<String, _>("client_id")
+                    .map_err(|_| StoreError::DatabaseFailed)?
+                    != client_id
+                    || row
+                        .try_get::<String, _>("redirect_uri")
+                        .map_err(|_| StoreError::DatabaseFailed)?
+                        != redirect_uri
+                    || row
+                        .try_get::<i64, _>("expires_at")
+                        .map_err(|_| StoreError::DatabaseFailed)? as u64
+                        <= unix_now()
+                {
+                    return Err(StoreError::Unauthorized);
+                }
+
+                Ok(BusinessOAuthAuthorizationCode {
+                    user_id: row
+                        .try_get("user_id")
+                        .map_err(|_| StoreError::DatabaseFailed)?,
+                    client_id: row
+                        .try_get("client_id")
+                        .map_err(|_| StoreError::DatabaseFailed)?,
+                    redirect_uri: row
+                        .try_get("redirect_uri")
+                        .map_err(|_| StoreError::DatabaseFailed)?,
+                    scope: row
+                        .try_get("scope")
+                        .map_err(|_| StoreError::DatabaseFailed)?,
+                    expires_at: row
+                        .try_get::<i64, _>("expires_at")
+                        .map_err(|_| StoreError::DatabaseFailed)?
+                        as u64,
+                })
             }),
         }
     }
@@ -2007,6 +2289,20 @@ impl SessionStore {
                         .transpose()?
                         .unwrap_or_default();
 
+                let api_management =
+                    sqlx::query("select value from system_settings where key = $1")
+                        .bind(API_MANAGEMENT_SETTINGS_KEY)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(|_| StoreError::DatabaseFailed)?
+                        .and_then(|row| row.try_get::<String, _>("value").ok())
+                        .map(|value| {
+                            serde_json::from_str::<ApiManagementSettings>(&value)
+                                .map_err(|_| StoreError::DatabaseFailed)
+                        })
+                        .transpose()?
+                        .unwrap_or_default();
+
                 let oidc = sqlx::query("select value from system_settings where key = $1")
                     .bind(OIDC_SETTINGS_KEY)
                     .fetch_optional(pool)
@@ -2035,6 +2331,23 @@ impl SessionStore {
                     .transpose()?
                     .unwrap_or_default();
 
+                let business_oauth =
+                    sqlx::query("select value from system_settings where key = $1")
+                        .bind(BUSINESS_OAUTH_SETTINGS_KEY)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(|_| StoreError::DatabaseFailed)?
+                        .and_then(|row| row.try_get::<String, _>("value").ok())
+                        .map(|value| {
+                            serde_json::from_str::<BusinessOAuthSettings>(&value)
+                                .map_err(|_| StoreError::DatabaseFailed)
+                                .and_then(|settings| {
+                                    decrypt_business_oauth_settings(settings, cipher)
+                                })
+                        })
+                        .transpose()?
+                        .unwrap_or_default();
+
                 Ok(SystemSettings {
                     max_sessions_per_user: value,
                     max_attachment_upload_bytes,
@@ -2042,9 +2355,132 @@ impl SessionStore {
                     empty_chat_prompt,
                     speech_input,
                     public_platform,
+                    api_management,
                     oidc,
                     ldap,
+                    business_oauth,
                 })
+            }),
+        }
+    }
+
+    /// 分段保存系统参数，只写这一页对应的键，避免其它设置页的旧值被回写覆盖。
+    pub async fn update_system_parameter_settings(
+        &self,
+        max_sessions_per_user: u32,
+        max_attachment_upload_bytes: usize,
+        attachment_retention_days: u32,
+        empty_chat_prompt: String,
+        speech_input: SpeechInputSettings,
+    ) -> Result<(), StoreError> {
+        validate_system_parameter_values(
+            max_sessions_per_user,
+            max_attachment_upload_bytes,
+            attachment_retention_days,
+        )?;
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let settings = &mut inner.system_settings;
+                settings.max_sessions_per_user = max_sessions_per_user;
+                settings.max_attachment_upload_bytes = max_attachment_upload_bytes;
+                settings.attachment_retention_days = attachment_retention_days;
+                settings.empty_chat_prompt = empty_chat_prompt;
+                settings.speech_input = speech_input;
+                Ok(())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                upsert_system_setting_value(pool, MAX_SESSIONS_PER_USER_KEY, max_sessions_per_user)
+                    .await?;
+                upsert_system_setting_value(
+                    pool,
+                    MAX_ATTACHMENT_UPLOAD_BYTES_KEY,
+                    max_attachment_upload_bytes,
+                )
+                .await?;
+                upsert_system_setting_value(
+                    pool,
+                    ATTACHMENT_RETENTION_DAYS_KEY,
+                    attachment_retention_days,
+                )
+                .await?;
+                upsert_system_setting_value(pool, EMPTY_CHAT_PROMPT_KEY, empty_chat_prompt).await?;
+                upsert_system_setting_json(pool, SPEECH_INPUT_SETTINGS_KEY, &speech_input).await?;
+                Ok(())
+            }),
+        }
+    }
+
+    /// 分段保存认证设置，只写认证相关的三组键。
+    pub async fn update_auth_settings(
+        &self,
+        oidc: OidcSettings,
+        ldap: LdapSettings,
+        business_oauth: BusinessOAuthSettings,
+    ) -> Result<(), StoreError> {
+        validate_auth_settings(&oidc, &ldap, &business_oauth)?;
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let settings = &mut inner.system_settings;
+                settings.oidc = oidc;
+                settings.ldap = ldap;
+                settings.business_oauth = business_oauth;
+                Ok(())
+            }
+            SessionStoreBackend::Postgres { pool, cipher } => block_on_db(async {
+                let stored_oidc = encrypted_oidc_settings(&oidc, cipher);
+                let stored_ldap = encrypted_ldap_settings(&ldap, cipher);
+                let stored_business_oauth =
+                    encrypted_business_oauth_settings(&business_oauth, cipher);
+                upsert_system_setting_json(pool, OIDC_SETTINGS_KEY, &stored_oidc).await?;
+                upsert_system_setting_json(pool, LDAP_SETTINGS_KEY, &stored_ldap).await?;
+                upsert_system_setting_json(
+                    pool,
+                    BUSINESS_OAUTH_SETTINGS_KEY,
+                    &stored_business_oauth,
+                )
+                .await?;
+                Ok(())
+            }),
+        }
+    }
+
+    /// 分段保存公共平台设置，只写公共平台自己的键。
+    pub async fn update_public_platform_settings(
+        &self,
+        public_platform: PublicPlatformSettings,
+    ) -> Result<(), StoreError> {
+        validate_public_platform_settings(&public_platform)?;
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                inner.system_settings.public_platform = public_platform;
+                Ok(())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                upsert_system_setting_json(pool, PUBLIC_PLATFORM_SETTINGS_KEY, &public_platform)
+                    .await?;
+                Ok(())
+            }),
+        }
+    }
+
+    /// 分段保存 API 管理开关，只写 API 管理自己的键。
+    pub async fn update_api_management_settings(
+        &self,
+        api_management: ApiManagementSettings,
+    ) -> Result<(), StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                inner.system_settings.api_management = api_management;
+                Ok(())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                upsert_system_setting_json(pool, API_MANAGEMENT_SETTINGS_KEY, &api_management)
+                    .await?;
+                Ok(())
             }),
         }
     }
@@ -2063,131 +2499,54 @@ impl SessionStore {
             SessionStoreBackend::Postgres { pool, cipher } => block_on_db(async {
                 let stored_oidc = encrypted_oidc_settings(&settings.oidc, cipher);
                 let stored_ldap = encrypted_ldap_settings(&settings.ldap, cipher);
-                sqlx::query(
-                    r#"
-                    insert into system_settings (key, value, updated_at)
-                    values ($1, $2, now())
-                    on conflict (key) do update set
-                        value = excluded.value,
-                        updated_at = now()
-                    "#,
+                let stored_business_oauth =
+                    encrypted_business_oauth_settings(&settings.business_oauth, cipher);
+                upsert_system_setting_value(
+                    pool,
+                    MAX_SESSIONS_PER_USER_KEY,
+                    settings.max_sessions_per_user,
                 )
-                .bind(MAX_SESSIONS_PER_USER_KEY)
-                .bind(settings.max_sessions_per_user.to_string())
-                .execute(pool)
-                .await
-                .map_err(|_| StoreError::DatabaseFailed)?;
-
-                sqlx::query(
-                    r#"
-                    insert into system_settings (key, value, updated_at)
-                    values ($1, $2, now())
-                    on conflict (key) do update set
-                        value = excluded.value,
-                        updated_at = now()
-                    "#,
+                .await?;
+                upsert_system_setting_value(
+                    pool,
+                    EMPTY_CHAT_PROMPT_KEY,
+                    settings.empty_chat_prompt.clone(),
                 )
-                .bind(EMPTY_CHAT_PROMPT_KEY)
-                .bind(settings.empty_chat_prompt.clone())
-                .execute(pool)
-                .await
-                .map_err(|_| StoreError::DatabaseFailed)?;
-
-                sqlx::query(
-                    r#"
-                    insert into system_settings (key, value, updated_at)
-                    values ($1, $2, now())
-                    on conflict (key) do update set
-                        value = excluded.value,
-                        updated_at = now()
-                    "#,
+                .await?;
+                upsert_system_setting_json(
+                    pool,
+                    PUBLIC_PLATFORM_SETTINGS_KEY,
+                    &settings.public_platform,
                 )
-                .bind(PUBLIC_PLATFORM_SETTINGS_KEY)
-                .bind(
-                    serde_json::to_string(&settings.public_platform)
-                        .map_err(|_| StoreError::DatabaseFailed)?,
+                .await?;
+                upsert_system_setting_json(
+                    pool,
+                    API_MANAGEMENT_SETTINGS_KEY,
+                    &settings.api_management,
                 )
-                .execute(pool)
-                .await
-                .map_err(|_| StoreError::DatabaseFailed)?;
-
-                sqlx::query(
-                    r#"
-                    insert into system_settings (key, value, updated_at)
-                    values ($1, $2, now())
-                    on conflict (key) do update set
-                        value = excluded.value,
-                        updated_at = now()
-                    "#,
+                .await?;
+                upsert_system_setting_value(
+                    pool,
+                    ATTACHMENT_RETENTION_DAYS_KEY,
+                    settings.attachment_retention_days,
                 )
-                .bind(ATTACHMENT_RETENTION_DAYS_KEY)
-                .bind(settings.attachment_retention_days.to_string())
-                .execute(pool)
-                .await
-                .map_err(|_| StoreError::DatabaseFailed)?;
-
-                sqlx::query(
-                    r#"
-                    insert into system_settings (key, value, updated_at)
-                    values ($1, $2, now())
-                    on conflict (key) do update set
-                        value = excluded.value,
-                        updated_at = now()
-                    "#,
+                .await?;
+                upsert_system_setting_value(
+                    pool,
+                    MAX_ATTACHMENT_UPLOAD_BYTES_KEY,
+                    settings.max_attachment_upload_bytes,
                 )
-                .bind(MAX_ATTACHMENT_UPLOAD_BYTES_KEY)
-                .bind(settings.max_attachment_upload_bytes.to_string())
-                .execute(pool)
-                .await
-                .map_err(|_| StoreError::DatabaseFailed)?;
-
-                sqlx::query(
-                    r#"
-                    insert into system_settings (key, value, updated_at)
-                    values ($1, $2, now())
-                    on conflict (key) do update set
-                        value = excluded.value,
-                        updated_at = now()
-                    "#,
+                .await?;
+                upsert_system_setting_json(pool, SPEECH_INPUT_SETTINGS_KEY, &settings.speech_input)
+                    .await?;
+                upsert_system_setting_json(pool, LDAP_SETTINGS_KEY, &stored_ldap).await?;
+                upsert_system_setting_json(pool, OIDC_SETTINGS_KEY, &stored_oidc).await?;
+                upsert_system_setting_json(
+                    pool,
+                    BUSINESS_OAUTH_SETTINGS_KEY,
+                    &stored_business_oauth,
                 )
-                .bind(SPEECH_INPUT_SETTINGS_KEY)
-                .bind(
-                    serde_json::to_string(&settings.speech_input)
-                        .map_err(|_| StoreError::DatabaseFailed)?,
-                )
-                .execute(pool)
-                .await
-                .map_err(|_| StoreError::DatabaseFailed)?;
-
-                sqlx::query(
-                    r#"
-                    insert into system_settings (key, value, updated_at)
-                    values ($1, $2, now())
-                    on conflict (key) do update set
-                        value = excluded.value,
-                        updated_at = now()
-                    "#,
-                )
-                .bind(LDAP_SETTINGS_KEY)
-                .bind(serde_json::to_string(&stored_ldap).map_err(|_| StoreError::DatabaseFailed)?)
-                .execute(pool)
-                .await
-                .map_err(|_| StoreError::DatabaseFailed)?;
-
-                sqlx::query(
-                    r#"
-                    insert into system_settings (key, value, updated_at)
-                    values ($1, $2, now())
-                    on conflict (key) do update set
-                        value = excluded.value,
-                        updated_at = now()
-                    "#,
-                )
-                .bind(OIDC_SETTINGS_KEY)
-                .bind(serde_json::to_string(&stored_oidc).map_err(|_| StoreError::DatabaseFailed)?)
-                .execute(pool)
-                .await
-                .map_err(|_| StoreError::DatabaseFailed)?;
+                .await?;
 
                 Ok(settings)
             }),
@@ -2575,52 +2934,140 @@ impl SessionStore {
 }
 
 fn validate_system_settings(settings: &SystemSettings) -> Result<(), StoreError> {
-    if settings.max_sessions_per_user == 0
-        || settings.max_sessions_per_user > MAX_CONFIGURABLE_SESSIONS_PER_USER
+    validate_system_parameter_values(
+        settings.max_sessions_per_user,
+        settings.max_attachment_upload_bytes,
+        settings.attachment_retention_days,
+    )?;
+    validate_public_platform_settings(&settings.public_platform)?;
+    validate_auth_settings(&settings.oidc, &settings.ldap, &settings.business_oauth)?;
+    Ok(())
+}
+
+fn validate_system_parameter_values(
+    max_sessions_per_user: u32,
+    max_attachment_upload_bytes: usize,
+    attachment_retention_days: u32,
+) -> Result<(), StoreError> {
+    if max_sessions_per_user == 0 || max_sessions_per_user > MAX_CONFIGURABLE_SESSIONS_PER_USER {
+        return Err(StoreError::InvalidSystemSettings);
+    }
+    if max_attachment_upload_bytes == 0
+        || max_attachment_upload_bytes > MAX_CONFIGURABLE_ATTACHMENT_UPLOAD_BYTES
     {
         return Err(StoreError::InvalidSystemSettings);
     }
-    if settings.max_attachment_upload_bytes == 0
-        || settings.max_attachment_upload_bytes > MAX_CONFIGURABLE_ATTACHMENT_UPLOAD_BYTES
+    if attachment_retention_days == 0 || attachment_retention_days > MAX_ATTACHMENT_RETENTION_DAYS {
+        return Err(StoreError::InvalidSystemSettings);
+    }
+
+    Ok(())
+}
+
+fn validate_public_platform_settings(
+    public_platform: &PublicPlatformSettings,
+) -> Result<(), StoreError> {
+    if public_platform.temporary_session_retention_hours == 0
+        || public_platform.temporary_session_retention_hours > MAX_PUBLIC_SESSION_RETENTION_HOURS
     {
         return Err(StoreError::InvalidSystemSettings);
     }
-    if settings.attachment_retention_days == 0
-        || settings.attachment_retention_days > MAX_ATTACHMENT_RETENTION_DAYS
-    {
-        return Err(StoreError::InvalidSystemSettings);
-    }
-    if settings.public_platform.temporary_session_retention_hours == 0
-        || settings.public_platform.temporary_session_retention_hours
-            > MAX_PUBLIC_SESSION_RETENTION_HOURS
-    {
-        return Err(StoreError::InvalidSystemSettings);
-    }
-    if settings.oidc.enabled {
-        let oidc = &settings.oidc;
-        if oidc.client_id.trim().is_empty()
+
+    Ok(())
+}
+
+fn validate_auth_settings(
+    oidc: &OidcSettings,
+    ldap: &LdapSettings,
+    business_oauth: &BusinessOAuthSettings,
+) -> Result<(), StoreError> {
+    if oidc.enabled
+        && (oidc.client_id.trim().is_empty()
             || oidc.client_secret.trim().is_empty()
             || oidc.authorization_url.trim().is_empty()
             || oidc.token_url.trim().is_empty()
             || oidc.userinfo_url.trim().is_empty()
-            || oidc.email_claim.trim().is_empty()
-        {
-            return Err(StoreError::InvalidSystemSettings);
-        }
+            || oidc.email_claim.trim().is_empty())
+    {
+        return Err(StoreError::InvalidSystemSettings);
     }
-    if settings.ldap.enabled {
-        let ldap = &settings.ldap;
-        if ldap.url.trim().is_empty()
+    if ldap.enabled
+        && (ldap.url.trim().is_empty()
             || ldap.bind_dn.trim().is_empty()
             || ldap.bind_password.trim().is_empty()
             || ldap.base_dn.trim().is_empty()
             || ldap.user_filter.trim().is_empty()
             || !ldap.user_filter.contains("{email}")
-            || ldap.email_attribute.trim().is_empty()
-        {
-            return Err(StoreError::InvalidSystemSettings);
-        }
+            || ldap.email_attribute.trim().is_empty())
+    {
+        return Err(StoreError::InvalidSystemSettings);
     }
+    if business_oauth.enabled
+        && (business_oauth.client_id.trim().is_empty()
+            || business_oauth.client_secret.trim().is_empty()
+            || business_oauth.scopes.trim().is_empty()
+            || business_oauth.authorization_code_ttl_seconds == 0
+            || business_oauth.hidden_session_idle_timeout_seconds == 0
+            || business_oauth.allowed_redirect_uris.is_empty()
+            || business_oauth
+                .allowed_redirect_uris
+                .iter()
+                .any(|uri| uri.trim().is_empty()))
+    {
+        return Err(StoreError::InvalidSystemSettings);
+    }
+
+    Ok(())
+}
+
+async fn upsert_system_setting_value<V>(
+    pool: &PgPool,
+    key: &str,
+    value: V,
+) -> Result<(), StoreError>
+where
+    V: ToString,
+{
+    sqlx::query(
+        r#"
+        insert into system_settings (key, value, updated_at)
+        values ($1, $2, now())
+        on conflict (key) do update set
+            value = excluded.value,
+            updated_at = now()
+        "#,
+    )
+    .bind(key)
+    .bind(value.to_string())
+    .execute(pool)
+    .await
+    .map_err(|_| StoreError::DatabaseFailed)?;
+
+    Ok(())
+}
+
+async fn upsert_system_setting_json<T>(
+    pool: &PgPool,
+    key: &str,
+    value: &T,
+) -> Result<(), StoreError>
+where
+    T: Serialize + ?Sized,
+{
+    sqlx::query(
+        r#"
+        insert into system_settings (key, value, updated_at)
+        values ($1, $2, now())
+        on conflict (key) do update set
+            value = excluded.value,
+            updated_at = now()
+        "#,
+    )
+    .bind(key)
+    .bind(serde_json::to_string(value).map_err(|_| StoreError::DatabaseFailed)?)
+    .execute(pool)
+    .await
+    .map_err(|_| StoreError::DatabaseFailed)?;
 
     Ok(())
 }
@@ -2658,6 +3105,28 @@ fn decrypt_ldap_settings(
 ) -> Result<LdapSettings, StoreError> {
     if looks_like_encrypted_secret(&settings.bind_password) {
         settings.bind_password = decrypt_secret(cipher, &settings.bind_password)
+            .map_err(|_| StoreError::SecretFailed)?;
+    }
+    Ok(settings)
+}
+
+fn encrypted_business_oauth_settings(
+    settings: &BusinessOAuthSettings,
+    cipher: &SecretCipher,
+) -> BusinessOAuthSettings {
+    let mut stored = settings.clone();
+    if !stored.client_secret.is_empty() {
+        stored.client_secret = encrypt_secret(cipher, &stored.client_secret);
+    }
+    stored
+}
+
+fn decrypt_business_oauth_settings(
+    mut settings: BusinessOAuthSettings,
+    cipher: &SecretCipher,
+) -> Result<BusinessOAuthSettings, StoreError> {
+    if looks_like_encrypted_secret(&settings.client_secret) {
+        settings.client_secret = decrypt_secret(cipher, &settings.client_secret)
             .map_err(|_| StoreError::SecretFailed)?;
     }
     Ok(settings)
@@ -2791,10 +3260,10 @@ fn login_in_memory(
     Ok(user.clone())
 }
 
-fn user_by_session_token_in_memory(
+fn user_and_session_lookup_by_session_token_in_memory(
     inner: &mut StoreInner,
     token: &str,
-) -> Result<User, StoreError> {
+) -> Result<SessionLookup, StoreError> {
     let token_hash = hash_token(token);
     let now = unix_now();
     let session = inner
@@ -2815,7 +3284,36 @@ fn user_by_session_token_in_memory(
             user.status == UserStatus::Active && !is_public_platform_reserved_email(&user.email)
         })
         .cloned()
+        .map(|user| SessionLookup {
+            user,
+            purpose: session.purpose,
+            integration_id: session.integration_id,
+        })
         .ok_or(StoreError::Unauthorized)
+}
+
+fn session_purpose_as_str(purpose: &SessionPurpose) -> &'static str {
+    match purpose {
+        SessionPurpose::Web => "web",
+        SessionPurpose::OAuth => "oauth",
+    }
+}
+
+fn session_purpose_from_str(value: &str) -> Result<SessionPurpose, StoreError> {
+    match value {
+        "web" => Ok(SessionPurpose::Web),
+        "oauth" => Ok(SessionPurpose::OAuth),
+        _ => Err(StoreError::DatabaseFailed),
+    }
+}
+
+fn trimmed_optional_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 fn create_invite_in_memory(

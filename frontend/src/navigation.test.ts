@@ -32,6 +32,10 @@ describe("navigation", () => {
       sessionId: "session-1",
     });
     expect(routeFrom("/settings/auth")).toEqual({ name: "settings", tab: "auth" });
+    expect(routeFrom("/settings/api-management")).toEqual({
+      name: "settings",
+      tab: "api-management",
+    });
     expect(routeFrom("/personal/password")).toEqual({ name: "personal", tab: "password" });
     expect(routeFrom("/public/sessions/public-1")).toEqual({
       name: "public-chat",
@@ -40,6 +44,9 @@ describe("navigation", () => {
 
     expect(buildAppPath({ name: "settings", tab: "public-platform" })).toBe(
       "/settings/public-platform",
+    );
+    expect(buildAppPath({ name: "settings", tab: "api-management" })).toBe(
+      "/settings/api-management",
     );
     expect(buildAppPath({ name: "personal", tab: "password" })).toBe("/personal/password");
     expect(buildAppPath({ name: "chat", sessionId: "session/with/slash" })).toBe(

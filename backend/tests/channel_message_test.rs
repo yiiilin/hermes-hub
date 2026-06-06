@@ -11,7 +11,7 @@ async fn memory_messages_expose_and_refresh_updated_at() {
         .await
         .expect("channel can be ensured");
     let session = store
-        .create_session(user_id, &channel.id, ChannelSessionKind::Chat, None)
+        .create_session(user_id, &channel.id, ChannelSessionKind::Chat, None, false)
         .await
         .expect("session can be created");
     let created = store

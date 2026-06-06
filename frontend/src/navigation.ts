@@ -8,6 +8,7 @@ export type AdminSettingsTab =
   | "scheduler"
   | "skills"
   | "system"
+  | "api-management"
   | "public-platform"
   | "auth";
 
@@ -33,6 +34,7 @@ const adminSettingsTabs = new Set<AdminSettingsTab>([
   "scheduler",
   "skills",
   "system",
+  "api-management",
   "public-platform",
   "auth",
 ]);

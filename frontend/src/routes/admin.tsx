@@ -20,6 +20,8 @@ import type {
   User,
 } from "../api/client";
 import {
+  defaultApiManagementSettings,
+  defaultBusinessOAuthSettings,
   defaultLdapSettings,
   defaultOidcSettings,
   defaultPublicPlatformSettings,
@@ -28,7 +30,7 @@ import {
 import { useI18n } from "../i18n";
 import type { AdminSettingsTab } from "../navigation";
 import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
-import { FilePlus2, FileText, Folder, FolderPlus, Upload } from "lucide-react";
+import { ExternalLink, FilePlus2, FileText, Folder, FolderPlus, Upload } from "lucide-react";
 import Vditor from "vditor";
 import "vditor/dist/index.css";
 
@@ -88,6 +90,17 @@ function fallbackConfigForModel(config: ModelConfig): ModelFallbackConfig {
         config.config_kind === "llm" ? config.supports_parallel_tools !== false : false,
     }
   );
+}
+
+function multilineListToString(values: string[]): string {
+  return values.join("\n");
+}
+
+function multilineStringToList(value: string): string[] {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
 }
 
 function MarkdownVditorEditor({
@@ -469,6 +482,8 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
     empty_chat_prompt: "",
     speech_input: defaultSpeechInputSettings(),
     public_platform: defaultPublicPlatformSettings(),
+    api_management: defaultApiManagementSettings(),
+    business_oauth: defaultBusinessOAuthSettings(),
     oidc: defaultOidcSettings(),
     ldap: defaultLdapSettings(),
   });
@@ -497,6 +512,7 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
     null,
   );
   const [settingsSaved, setSettingsSaved] = useState(false);
+  const [systemSettingsLoaded, setSystemSettingsLoaded] = useState(false);
   const [inviteHours, setInviteHours] = useState(defaultInviteHours);
   const [inviteMaxUses, setInviteMaxUses] = useState(1);
   const [lastInviteLink, setLastInviteLink] = useState<string | null>(null);
@@ -538,6 +554,8 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
     [modelConfigs],
   );
   const oidcRedirectUri = useMemo(() => `${window.location.origin}/api/auth/oidc/callback`, []);
+  const apiDocsUrl = useMemo(() => `${window.location.origin}/api/docs`, []);
+  const apiOpenApiUrl = useMemo(() => `${window.location.origin}/api/docs/openapi.json`, []);
   const adminSettingsTabs: Array<{ key: AdminSettingsTab; label: string }> = [
     { key: "users", label: t("admin.userManagement") },
     { key: "models", label: t("admin.modelConfig") },
@@ -546,8 +564,9 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
     { key: "scheduler", label: t("admin.scheduledTasks") },
     { key: "skills", label: t("admin.skillManagement") },
     { key: "system", label: t("admin.systemParameters") },
-    { key: "public-platform", label: t("admin.publicPlatform") },
     { key: "auth", label: t("admin.authSettings") },
+    { key: "api-management", label: t("admin.apiManagementSettings") },
+    { key: "public-platform", label: t("admin.publicPlatform") },
   ];
 
   async function fetchPublicPlatformSessionsPage(page: number) {
@@ -567,6 +586,14 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
   async function refresh() {
     setError(null);
     try {
+      if (
+        activeTab === "auth" ||
+        activeTab === "system" ||
+        activeTab === "api-management" ||
+        activeTab === "public-platform"
+      ) {
+        setSystemSettingsLoaded(false);
+      }
       const [
         nextUsers,
         nextInvites,
@@ -583,7 +610,10 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
         apiClient.listInvites(),
         apiClient.listHermesInstances(),
         apiClient.modelConfigStatus(),
-        activeTab === "auth" || activeTab === "system" || activeTab === "public-platform"
+        activeTab === "auth" ||
+        activeTab === "system" ||
+        activeTab === "api-management" ||
+        activeTab === "public-platform"
           ? apiClient.systemSettings()
           : Promise.resolve(null),
         activeTab === "scheduler"
@@ -606,6 +636,7 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
       setMissingRequiredModels(nextModelStatus.missing_required_model_config_kinds);
       if (nextSettings) {
         setSystemSettings(nextSettings);
+        setSystemSettingsLoaded(true);
       }
       if (nextSchedulerSnapshots) {
         setSchedulerSnapshots(nextSchedulerSnapshots);
@@ -640,6 +671,9 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
     setSettingsSaved(false);
     setSkillSaved(false);
     setHermesProfileSaved(false);
+    if (tab === "auth" || tab === "system" || tab === "api-management" || tab === "public-platform") {
+      setSystemSettingsLoaded(false);
+    }
     onTabChange(tab);
   }
 
@@ -813,27 +847,85 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
     }
   }
 
-  async function saveSystemSettings(event: FormEvent<HTMLFormElement>) {
+  async function saveSystemParameters(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!systemSettingsLoaded) {
+      return;
+    }
     setSettingsSaved(false);
     setError(null);
     try {
-      const submittedEmptyChatPrompt = systemSettings.empty_chat_prompt.trim();
-      await apiClient.updateSystemSettings(systemSettings);
-      const reloadedSettings = await apiClient.systemSettings();
-      setSystemSettings({
-        ...reloadedSettings,
-        // 老版本后端或短暂回读缺字段时，不要把管理员刚保存的非空文案清空。
-        empty_chat_prompt: reloadedSettings.empty_chat_prompt || submittedEmptyChatPrompt,
+      const submittedSettings = {
+        max_sessions_per_user: systemSettings.max_sessions_per_user,
+        max_attachment_upload_bytes: systemSettings.max_attachment_upload_bytes,
+        attachment_retention_days: systemSettings.attachment_retention_days,
+        empty_chat_prompt: systemSettings.empty_chat_prompt.trim(),
+        speech_input: systemSettings.speech_input,
+      };
+      await apiClient.updateSystemParameters(submittedSettings);
+      setSystemSettings((current) => ({
+        ...current,
+        empty_chat_prompt: submittedSettings.empty_chat_prompt,
+      }));
+      setSettingsSaved(true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("admin.settingsSaveFailed"));
+    }
+  }
+
+  async function saveAuthSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!systemSettingsLoaded) {
+      return;
+    }
+    setSettingsSaved(false);
+    setError(null);
+    try {
+      await apiClient.updateAuthSettings({
+        oidc: systemSettings.oidc,
+        ldap: systemSettings.ldap,
+        business_oauth: systemSettings.business_oauth,
       });
-      if (activeTab === "public-platform") {
-        const [nextPublicPlatformHermesStatus, nextPublicSessionsPage] = await Promise.all([
-          apiClient.publicPlatformHermesInstance(),
-          fetchPublicPlatformSessionsPage(publicSessionsPage.page),
-        ]);
-        setPublicPlatformHermesStatus(nextPublicPlatformHermesStatus);
-        setPublicSessionsPage(nextPublicSessionsPage);
-      }
+      setSettingsSaved(true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("admin.settingsSaveFailed"));
+    }
+  }
+
+  async function savePublicPlatformSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!systemSettingsLoaded) {
+      return;
+    }
+    setSettingsSaved(false);
+    setError(null);
+    try {
+      await apiClient.updatePublicPlatformSettings({
+        public_platform: systemSettings.public_platform,
+      });
+      const [nextPublicPlatformHermesStatus, nextPublicSessionsPage] = await Promise.all([
+        apiClient.publicPlatformHermesInstance(),
+        fetchPublicPlatformSessionsPage(publicSessionsPage.page),
+      ]);
+      setPublicPlatformHermesStatus(nextPublicPlatformHermesStatus);
+      setPublicSessionsPage(nextPublicSessionsPage);
+      setSettingsSaved(true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("admin.settingsSaveFailed"));
+    }
+  }
+
+  async function saveApiManagementSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!systemSettingsLoaded) {
+      return;
+    }
+    setSettingsSaved(false);
+    setError(null);
+    try {
+      await apiClient.updateApiManagementSettings({
+        api_management: systemSettings.api_management,
+      });
       setSettingsSaved(true);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("admin.settingsSaveFailed"));
@@ -903,10 +995,24 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
   }
 
   function updateLdapSettings(patch: Partial<SystemSettings["ldap"]>) {
-    setSystemSettings({
-      ...systemSettings,
-      ldap: { ...systemSettings.ldap, ...patch },
-    });
+    setSystemSettings((current) => ({
+      ...current,
+      ldap: { ...current.ldap, ...patch },
+    }));
+  }
+
+  function updateBusinessOAuthSettings(patch: Partial<SystemSettings["business_oauth"]>) {
+    setSystemSettings((current) => ({
+      ...current,
+      business_oauth: { ...current.business_oauth, ...patch },
+    }));
+  }
+
+  function updateApiManagementSettings(patch: Partial<SystemSettings["api_management"]>) {
+    setSystemSettings((current) => ({
+      ...current,
+      api_management: { ...current.api_management, ...patch },
+    }));
   }
 
   async function openManagedSkill(path: string) {
@@ -1820,7 +1926,7 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
   if (activeTab === "system") {
     return renderSystemSettingsShell(
       <section className="admin-page" id="admin-system-parameters">
-        <form className="panel form" onSubmit={(event) => void saveSystemSettings(event)}>
+        <form className="panel form" onSubmit={(event) => void saveSystemParameters(event)}>
           <div className="tab-actions">
             <button type="button" className="secondary" onClick={() => void refresh()}>
               {t("admin.refresh")}
@@ -1911,7 +2017,9 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
               : t("admin.speechInputRuntimeUnavailable")}
           </p>
           <div className="button-row">
-            <button type="submit">{t("admin.saveSettings")}</button>
+            <button type="submit" disabled={!systemSettingsLoaded}>
+              {t("admin.saveSettings")}
+            </button>
           </div>
         </form>
       </section>,
@@ -1921,7 +2029,7 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
   if (activeTab === "public-platform") {
     return renderSystemSettingsShell(
       <section className="admin-page" id="admin-public-platform">
-        <form className="panel form" onSubmit={(event) => void saveSystemSettings(event)}>
+        <form className="panel form" onSubmit={(event) => void savePublicPlatformSettings(event)}>
           <div className="tab-actions">
             <button type="button" className="secondary" onClick={() => void refresh()}>
               {t("admin.refresh")}
@@ -2127,7 +2235,9 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
             ) : null}
           </div>
           <div className="button-row">
-            <button type="submit">{t("admin.saveSettings")}</button>
+            <button type="submit" disabled={!systemSettingsLoaded}>
+              {t("admin.saveSettings")}
+            </button>
           </div>
         </form>
       </section>,
@@ -2137,7 +2247,7 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
   if (activeTab === "auth") {
     return renderSystemSettingsShell(
       <section className="admin-page" id="admin-auth-settings">
-        <form className="panel form" onSubmit={(event) => void saveSystemSettings(event)}>
+        <form className="panel form" onSubmit={(event) => void saveAuthSettings(event)}>
           <div className="tab-actions">
             <button type="button" className="secondary" onClick={() => void refresh()}>
               {t("admin.refresh")}
@@ -2423,8 +2533,157 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
               {t("admin.ldapAutoCreateUsers")}
             </label>
           </fieldset>
+          <fieldset className="form-section">
+            <legend>{t("admin.businessOAuthSettings")}</legend>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={systemSettings.business_oauth.enabled}
+                onChange={(event) =>
+                  updateBusinessOAuthSettings({ enabled: event.target.checked })
+                }
+              />
+              {t("admin.businessOAuthEnabled")}
+            </label>
+            <label>
+              {t("admin.businessOAuthClientId")}
+              <input
+                value={systemSettings.business_oauth.client_id}
+                onChange={(event) =>
+                  updateBusinessOAuthSettings({ client_id: event.target.value })
+                }
+              />
+            </label>
+            <label>
+              {t("admin.businessOAuthClientSecret")}
+              <input
+                type="password"
+                value={systemSettings.business_oauth.client_secret}
+                onChange={(event) =>
+                  updateBusinessOAuthSettings({ client_secret: event.target.value })
+                }
+              />
+            </label>
+            <label>
+              {t("admin.businessOAuthScopes")}
+              <input
+                value={systemSettings.business_oauth.scopes}
+                onChange={(event) => updateBusinessOAuthSettings({ scopes: event.target.value })}
+              />
+            </label>
+            <label>
+              {t("admin.businessOAuthAllowedRedirectUris")}
+              <textarea
+                rows={3}
+                value={multilineListToString(
+                  systemSettings.business_oauth.allowed_redirect_uris,
+                )}
+                onChange={(event) =>
+                  updateBusinessOAuthSettings({
+                    allowed_redirect_uris: multilineStringToList(event.target.value),
+                  })
+                }
+              />
+            </label>
+            <label>
+              {t("admin.businessOAuthAuthorizationCodeTtlSeconds")}
+              <input
+                type="number"
+                min={1}
+                value={systemSettings.business_oauth.authorization_code_ttl_seconds}
+                onChange={(event) =>
+                  updateBusinessOAuthSettings({
+                    authorization_code_ttl_seconds: Number(event.target.value),
+                  })
+                }
+                required
+              />
+            </label>
+            <label>
+              {t("admin.businessOAuthHiddenSessionIdleTimeoutSeconds")}
+              <input
+                type="number"
+                min={1}
+                value={systemSettings.business_oauth.hidden_session_idle_timeout_seconds}
+                onChange={(event) =>
+                  updateBusinessOAuthSettings({
+                    hidden_session_idle_timeout_seconds: Number(event.target.value),
+                  })
+                }
+                required
+              />
+            </label>
+            <label>
+              {t("admin.businessOAuthToolsetNames")}
+              <textarea
+                rows={3}
+                value={multilineListToString(systemSettings.business_oauth.toolset_names)}
+                onChange={(event) =>
+                  updateBusinessOAuthSettings({
+                    toolset_names: multilineStringToList(event.target.value),
+                  })
+                }
+              />
+            </label>
+          </fieldset>
           <div className="button-row">
-            <button type="submit">{t("admin.saveSettings")}</button>
+            <button type="submit" disabled={!systemSettingsLoaded}>
+              {t("admin.saveSettings")}
+            </button>
+          </div>
+        </form>
+      </section>,
+    );
+  }
+
+  if (activeTab === "api-management") {
+    return renderSystemSettingsShell(
+      <section className="admin-page" id="admin-api-management">
+        <form className="panel form" onSubmit={(event) => void saveApiManagementSettings(event)}>
+          <div className="tab-actions">
+            <button type="button" className="secondary" onClick={() => void refresh()}>
+              {t("admin.refresh")}
+            </button>
+          </div>
+          {error ? <p className="error">{error}</p> : null}
+          {settingsSaved ? <p className="copy-line">{t("admin.settingsSaved")}</p> : null}
+          <fieldset className="form-section">
+            <legend>{t("admin.apiManagementSettings")}</legend>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={systemSettings.api_management.enabled}
+                onChange={(event) =>
+                  updateApiManagementSettings({ enabled: event.target.checked })
+                }
+              />
+              {t("admin.apiManagementEnabled")}
+            </label>
+            <p className="copy-line">{t("admin.apiManagementHint")}</p>
+            <label className="readonly-field">
+              {t("admin.apiDocsUrl")}
+              <input readOnly value={apiDocsUrl} />
+            </label>
+            <label className="readonly-field">
+              {t("admin.apiOpenApiUrl")}
+              <input readOnly value={apiOpenApiUrl} />
+            </label>
+            <div className="button-row">
+              <button
+                type="button"
+                className="secondary"
+                disabled={!systemSettings.api_management.enabled}
+                onClick={() => window.open(apiDocsUrl, "_blank", "noopener,noreferrer")}
+              >
+                <ExternalLink aria-hidden="true" size={16} />
+                {t("admin.openApiDocs")}
+              </button>
+            </div>
+          </fieldset>
+          <div className="button-row">
+            <button type="submit" disabled={!systemSettingsLoaded}>
+              {t("admin.saveSettings")}
+            </button>
           </div>
         </form>
       </section>,

@@ -1521,20 +1521,11 @@ async fn admin_can_configure_per_user_session_limit() {
     assert_eq!(body["ldap"]["display_name"], "Corporate LDAP");
     assert!(body["ldap"].get("bind_password").is_none());
 
-    let channels = request_empty(&app, Method::GET, "/api/channels", Some(&admin_cookie)).await;
-    let (status, body) = response_json(channels).await;
-    assert_eq!(status, StatusCode::OK);
-    let channel_id = body["channels"][0]
-        .as_object()
-        .and_then(|channel| channel.get("id"))
-        .and_then(Value::as_str)
-        .expect("channel id");
-
     for _ in 0..2 {
         let created = request_json(
             &app,
             Method::POST,
-            &format!("/api/channels/{channel_id}/sessions"),
+            "/api/sessions",
             json!({ "kind": "agent" }),
             Some(&admin_cookie),
         )
@@ -1545,7 +1536,7 @@ async fn admin_can_configure_per_user_session_limit() {
     let blocked = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
+        "/api/sessions",
         json!({ "kind": "agent" }),
         Some(&admin_cookie),
     )
@@ -1895,6 +1886,153 @@ async fn admin_can_upload_managed_skill_files_and_folders() {
     let (status, body) = response_json(read).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["skill"]["content"], "Read primary sources.\n");
+}
+
+#[tokio::test]
+async fn admin_can_update_system_settings_by_section() {
+    let app = test_app();
+    let admin_cookie = bootstrap_admin(&app).await;
+
+    let system_update = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/system-settings/system",
+        json!({
+            "max_sessions_per_user": 3,
+            "max_attachment_upload_bytes": 128 * 1024 * 1024,
+            "attachment_retention_days": 14,
+            "empty_chat_prompt": "Ask Hermes anything",
+            "speech_input": {
+                "enabled": true
+            }
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(system_update.status(), StatusCode::NO_CONTENT);
+
+    let auth_update = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/system-settings/auth",
+        json!({
+            "oidc": {
+                "enabled": true,
+                "display_name": "Acme SSO",
+                "client_id": "hermes-hub",
+                "client_secret": "oidc-secret",
+                "issuer_url": "https://idp.example.com",
+                "authorization_url": "https://idp.example.com/oauth2/v1/authorize",
+                "token_url": "https://idp.example.com/oauth2/v1/token",
+                "userinfo_url": "https://idp.example.com/oauth2/v1/userinfo",
+                "logout_url": "https://idp.example.com/logout",
+                "scopes": "openid profile email",
+                "username_claim": "preferred_username",
+                "email_claim": "email",
+                "allow_password_login": true,
+                "auto_create_users": true
+            },
+            "ldap": {
+                "enabled": true,
+                "display_name": "Corporate LDAP",
+                "url": "ldaps://ldap.example.com:636",
+                "bind_dn": "cn=hub,ou=apps,dc=example,dc=com",
+                "bind_password": "ldap-bind-secret",
+                "base_dn": "ou=people,dc=example,dc=com",
+                "user_filter": "(&(objectClass=person)(mail={email}))",
+                "email_attribute": "mail",
+                "auto_create_users": true
+            },
+            "business_oauth": {
+                "enabled": true,
+                "client_id": "business-client",
+                "client_secret": "business-secret",
+                "allowed_redirect_uris": [
+                    "https://biz.example/callback",
+                    "https://biz.example/alt"
+                ],
+                "scopes": "openid profile email",
+                "authorization_code_ttl_seconds": 900,
+                "hidden_session_idle_timeout_seconds": 1800,
+                "toolset_names": [
+                    "business-crm",
+                    "business-search"
+                ]
+            }
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(auth_update.status(), StatusCode::NO_CONTENT);
+
+    let public_platform_update = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/system-settings/public-platform",
+        json!({
+            "public_platform": {
+                "enabled": false,
+                "temporary_session_retention_hours": 48
+            }
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(public_platform_update.status(), StatusCode::NO_CONTENT);
+
+    let api_management_update = request_json(
+        &app,
+        Method::PUT,
+        "/api/admin/system-settings/api-management",
+        json!({
+            "api_management": {
+                "enabled": true
+            }
+        }),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(api_management_update.status(), StatusCode::NO_CONTENT);
+
+    let settings = request_empty(
+        &app,
+        Method::GET,
+        "/api/admin/system-settings",
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(
+        settings
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-cache, no-store, no-transform")
+    );
+    let (status, body) = response_json(settings).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["settings"]["max_sessions_per_user"], 3);
+    assert_eq!(
+        body["settings"]["max_attachment_upload_bytes"],
+        128 * 1024 * 1024
+    );
+    assert_eq!(body["settings"]["attachment_retention_days"], 14);
+    assert_eq!(body["settings"]["empty_chat_prompt"], "Ask Hermes anything");
+    assert_eq!(body["settings"]["speech_input"]["enabled"], true);
+    assert_eq!(body["settings"]["oidc"]["enabled"], true);
+    assert_eq!(body["settings"]["oidc"]["client_id"], "hermes-hub");
+    assert_eq!(body["settings"]["ldap"]["enabled"], true);
+    assert_eq!(body["settings"]["ldap"]["display_name"], "Corporate LDAP");
+    assert_eq!(body["settings"]["business_oauth"]["enabled"], true);
+    assert_eq!(
+        body["settings"]["business_oauth"]["toolset_names"],
+        json!(["business-crm", "business-search"])
+    );
+    assert_eq!(body["settings"]["public_platform"]["enabled"], false);
+    assert_eq!(
+        body["settings"]["public_platform"]["temporary_session_retention_hours"],
+        48
+    );
+    assert_eq!(body["settings"]["api_management"]["enabled"], true);
 }
 
 #[tokio::test]

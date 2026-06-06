@@ -1477,6 +1477,7 @@ describe("App", () => {
     expect(
       within(settingsTabs).getByRole("tab", { name: "System parameters" }),
     ).toBeInTheDocument();
+    expect(within(settingsTabs).getByRole("tab", { name: "API management" })).toBeInTheDocument();
     expect(
       within(settingsTabs).queryByRole("tab", { name: "Session settings" }),
     ).not.toBeInTheDocument();
@@ -1513,13 +1514,13 @@ describe("App", () => {
 
   it("saves the empty chat prompt in system parameters and renders it in chat", async () => {
     const client = createMockApiClient();
-    const updateSystemSettings = client.updateSystemSettings.bind(client);
+    const updateSystemParameters = client.updateSystemParameters.bind(client);
     const systemSettings = client.systemSettings.bind(client);
     let savedSettings: unknown = null;
     let dropPromptOnReload = false;
-    client.updateSystemSettings = vi.fn(async (settings) => {
+    client.updateSystemParameters = vi.fn(async (settings) => {
       savedSettings = settings;
-      await updateSystemSettings(settings);
+      await updateSystemParameters(settings);
       dropPromptOnReload = true;
     });
     client.systemSettings = vi.fn(async () => {
@@ -3377,6 +3378,36 @@ describe("App", () => {
     });
   });
 
+  it("localizes clarify execution entries", async () => {
+    localStorage.setItem("hermes-hub-language", "zh");
+    const deferred = createDeferred<void>();
+    const hubRun = createHubRunMock({
+      answer: "收到",
+      answerDelay: deferred.promise,
+      executionEvents: [
+        {
+          kind: "tool.call",
+          tool: "clarify",
+          detail: "请补充路径",
+        },
+      ],
+    });
+
+    render(<App apiClient={hubRun.client} />);
+
+    fireEvent.change(await screen.findByRole("textbox", { name: "消息" }), {
+      target: { value: "need clarification" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(await screen.findByText("调用 澄清：请补充路径")).toBeInTheDocument();
+
+    deferred.resolve();
+    await waitFor(() => {
+      expect(screen.getByText("收到")).toBeInTheDocument();
+    });
+  });
+
   it("renders legacy Hermes tool logs as execution history", async () => {
     render(
       <App
@@ -4391,11 +4422,11 @@ describe("App", () => {
 
   it("shows and saves LDAP authentication settings", async () => {
     const client = createMockApiClient();
-    const updateSystemSettings = client.updateSystemSettings.bind(client);
+    const updateAuthSettings = client.updateAuthSettings.bind(client);
     let savedSettings: unknown = null;
-    client.updateSystemSettings = vi.fn(async (settings) => {
+    client.updateAuthSettings = vi.fn(async (settings) => {
       savedSettings = settings;
-      await updateSystemSettings(settings);
+      await updateAuthSettings(settings);
     });
 
     render(<App apiClient={client} />);
@@ -4430,7 +4461,6 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
 
     expect(await screen.findByText("Settings saved")).toBeInTheDocument();
-    expect(client.updateSystemSettings).toHaveBeenCalledTimes(1);
     expect(savedSettings).toMatchObject({
       ldap: {
         enabled: true,
@@ -4446,13 +4476,106 @@ describe("App", () => {
     });
   });
 
+  it("shows and saves business OAuth settings", async () => {
+    const client = createMockApiClient();
+    const updateAuthSettings = client.updateAuthSettings.bind(client);
+    let savedSettings: unknown = null;
+    client.updateAuthSettings = vi.fn(async (settings) => {
+      savedSettings = settings;
+      await updateAuthSettings(settings);
+    });
+
+    render(<App apiClient={client} />);
+
+    await openSettingsTab("Authentication settings");
+
+    expect(await screen.findByLabelText("Enable Business OAuth")).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("Enable Business OAuth"));
+    fireEvent.change(screen.getByLabelText("Business OAuth client ID"), {
+      target: { value: "business-client" },
+    });
+    fireEvent.change(screen.getByLabelText("Business OAuth client secret"), {
+      target: { value: "business-secret" },
+    });
+    fireEvent.change(screen.getByLabelText("Business OAuth scopes"), {
+      target: { value: "openid profile email" },
+    });
+    fireEvent.change(screen.getByLabelText("Allowed redirect URIs (one per line)"), {
+      target: { value: "https://biz.example/callback\nhttps://biz.example/alt" },
+    });
+    fireEvent.change(screen.getByLabelText("Authorization code TTL seconds"), {
+      target: { value: "900" },
+    });
+    fireEvent.change(screen.getByLabelText("Hidden session idle timeout seconds"), {
+      target: { value: "1800" },
+    });
+    fireEvent.change(screen.getByLabelText("Toolset names (one per line)"), {
+      target: { value: "business-crm\nbusiness-search" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+
+    expect(await screen.findByText("Settings saved")).toBeInTheDocument();
+    expect(savedSettings).toMatchObject({
+      business_oauth: {
+        enabled: true,
+        client_id: "business-client",
+        client_secret: "business-secret",
+        allowed_redirect_uris: ["https://biz.example/callback", "https://biz.example/alt"],
+        scopes: "openid profile email",
+        authorization_code_ttl_seconds: 900,
+        hidden_session_idle_timeout_seconds: 1800,
+        toolset_names: ["business-crm", "business-search"],
+      },
+    });
+  });
+
+  it("shows and saves API management settings", async () => {
+    const client = createMockApiClient();
+    const initialSystemSettings = await client.systemSettings();
+    const updateApiManagementSettings = client.updateApiManagementSettings.bind(client);
+    let savedSettings: unknown = null;
+    let systemSettingsCalls = 0;
+    client.updateApiManagementSettings = vi.fn(async (settings) => {
+      savedSettings = settings;
+      await updateApiManagementSettings(settings);
+    });
+    client.systemSettings = vi.fn(async () => {
+      systemSettingsCalls += 1;
+      if (systemSettingsCalls > 1) {
+        throw new Error("unexpected system settings refresh");
+      }
+      return initialSystemSettings;
+    });
+
+    render(<App apiClient={client} />);
+
+    await openSettingsTab("API management");
+
+    expect(await screen.findByLabelText("Enable API management")).toBeInTheDocument();
+    expect(screen.getByLabelText("Swagger UI URL")).toHaveValue(`${window.location.origin}/api/docs`);
+    expect(screen.getByLabelText("OpenAPI JSON URL")).toHaveValue(
+      `${window.location.origin}/api/docs/openapi.json`,
+    );
+    fireEvent.click(screen.getByLabelText("Enable API management"));
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+
+    expect(await screen.findByText("Settings saved")).toBeInTheDocument();
+    expect(screen.getByLabelText("Enable API management")).toBeChecked();
+    expect(savedSettings).toMatchObject({
+      api_management: {
+        enabled: true,
+      },
+    });
+  });
+
   it("shows and saves system attachment parameters", async () => {
     const client = createMockApiClient();
-    const updateSystemSettings = client.updateSystemSettings.bind(client);
+    const updateSystemParameters = client.updateSystemParameters.bind(client);
     let savedSettings: unknown = null;
-    client.updateSystemSettings = vi.fn(async (settings) => {
+    client.updateSystemParameters = vi.fn(async (settings) => {
       savedSettings = settings;
-      await updateSystemSettings(settings);
+      await updateSystemParameters(settings);
     });
 
     render(<App apiClient={client} />);
@@ -4485,11 +4608,11 @@ describe("App", () => {
 
   it("shows and saves public platform settings", async () => {
     const client = createMockApiClient();
-    const updateSystemSettings = client.updateSystemSettings.bind(client);
+    const updatePublicPlatformSettings = client.updatePublicPlatformSettings.bind(client);
     let savedSettings: unknown = null;
-    client.updateSystemSettings = vi.fn(async (settings) => {
+    client.updatePublicPlatformSettings = vi.fn(async (settings) => {
       savedSettings = settings;
-      await updateSystemSettings(settings);
+      await updatePublicPlatformSettings(settings);
     });
 
     render(<App apiClient={client} />);
@@ -5703,7 +5826,7 @@ describe("App", () => {
 
   it("uploads attachments and reads persisted messages in the real API client", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (path, init) => {
-      if (path === "/api/channels/channel-1/sessions/session-1/attachments") {
+      if (path === "/api/sessions/session-1/attachments") {
         expect(init?.method).toBe("POST");
         expect(init?.body).toBeInstanceOf(FormData);
         return {
@@ -5724,7 +5847,7 @@ describe("App", () => {
         } as Response;
       }
 
-      if (path === "/api/channels/channel-1/sessions/session-1/messages") {
+      if (path === "/api/sessions/session-1/messages") {
         if (init?.method === "POST") {
           const body = JSON.parse(init?.body as string);
           expect(body).toMatchObject({
@@ -5766,7 +5889,7 @@ describe("App", () => {
         } as Response;
       }
 
-      if (path === "/api/channels/channel-1/sessions/session-1/messages/message-1") {
+      if (path === "/api/sessions/session-1/messages/message-1") {
         expect(init?.method).toBe("PUT");
         expect(JSON.parse(init?.body as string)).toMatchObject({
           content: "updated answer",
@@ -5870,7 +5993,7 @@ describe("App", () => {
 
   it("uses active run, stop, clear, and session delete endpoints in the real API client", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (path, init) => {
-      if (path === "/api/channels/channel-1/sessions/session-1/active-run") {
+      if (path === "/api/sessions/session-1/active-run") {
         if (init?.method === "DELETE") {
           return {
             ok: true,
@@ -5892,16 +6015,16 @@ describe("App", () => {
         } as Response;
       }
 
-      if (path === "/api/channels/channel-1/sessions/session-1/active-run/stop") {
+      if (path === "/api/sessions/session-1/stop") {
         expect(init?.method).toBe("POST");
         return {
           ok: true,
-          status: 200,
-          json: async () => ({ active_run: null }),
+          status: 204,
+          json: async () => ({}),
         } as Response;
       }
 
-      if (path === "/api/channels/channel-1/sessions/session-1") {
+      if (path === "/api/sessions/session-1") {
         expect(init?.method).toBe("DELETE");
         return {
           ok: true,

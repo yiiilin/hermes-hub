@@ -409,16 +409,10 @@ async fn integration_test() {
         .llm_api_key
         .expect("instance token is stored for the managed hermes runtime");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&user_cookie), None).await;
-    let (status, body) = response_json(channel).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["channels"][0]["name"], "hermes-hub");
-    let channel_id = body["channels"][0]["id"].as_str().expect("channel id");
-
     let session = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
+        "/api/sessions",
         json!({
             "kind": "agent"
         }),
@@ -428,7 +422,7 @@ async fn integration_test() {
     .await;
     let (status, body) = response_json(session).await;
     assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(body["session"]["kind"], "agent");
+    assert!(body["session"]["id"].as_str().is_some());
 
     // 用户只能通过 Hub 访问自己的 Hermes；浏览器不会拿到 Hermes 的直接入口。
     let hermes = request_json(

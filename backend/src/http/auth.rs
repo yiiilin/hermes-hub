@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     domain::user::{PublicUser, User, UserRole},
     public_platform,
-    session::store::StoreError,
+    session::store::{SessionPurpose, StoreError},
     AppState,
 };
 
@@ -54,6 +54,13 @@ struct UpdatePasswordRequest {
 #[derive(Serialize)]
 struct UserResponse {
     user: PublicUser,
+}
+
+#[derive(Clone, Debug)]
+pub struct AuthContext {
+    pub user: User,
+    pub session_purpose: SessionPurpose,
+    pub integration_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -172,7 +179,7 @@ async fn login(
 }
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
-    if let Some(token) = session_token_from_headers(&headers, &state.config.cookie_name) {
+    if let Some(token) = cookie_value_from_headers(&headers, &state.config.cookie_name) {
         state
             .store
             .delete_session(&token)
@@ -195,7 +202,7 @@ async fn update_password(
     headers: HeaderMap,
     Json(payload): Json<UpdatePasswordRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = current_user(&state, &headers).await?;
+    let user = current_web_user(&state, &headers).await?;
     if payload.new_password.trim().is_empty() {
         return Err(ApiError::BadRequest("password cannot be empty"));
     }
@@ -214,7 +221,7 @@ async fn me(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = current_user(&state, &headers).await?;
+    let user = current_web_user(&state, &headers).await?;
 
     Ok(Json(UserResponse {
         user: user.public(),
@@ -222,18 +229,58 @@ async fn me(
 }
 
 pub async fn current_user(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError> {
-    let token = session_token_from_headers(headers, &state.config.cookie_name)
-        .ok_or(ApiError::Unauthorized)?;
+    current_web_user(state, headers).await
+}
 
-    state
+pub async fn current_bearer_auth_context(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthContext, ApiError> {
+    let token = bearer_token_from_headers(headers).ok_or(ApiError::Unauthorized)?;
+    auth_context_by_token(state, &token).await
+}
+
+async fn current_cookie_auth_context(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthContext, ApiError> {
+    let token = cookie_value_from_headers(headers, &state.config.cookie_name)
+        .ok_or(ApiError::Unauthorized)?;
+    auth_context_by_token(state, &token).await
+}
+
+async fn auth_context_by_token(state: &AppState, token: &str) -> Result<AuthContext, ApiError> {
+    let lookup = state
         .store
-        .user_by_session_token(&token)
+        .user_and_session_lookup_by_session_token(token)
         .await
-        .map_err(|_| ApiError::Unauthorized)
+        .map_err(|_| ApiError::Unauthorized)?;
+
+    Ok(AuthContext {
+        user: lookup.user,
+        session_purpose: lookup.purpose,
+        integration_id: lookup.integration_id,
+    })
+}
+
+pub async fn current_oauth_user(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError> {
+    let context = current_bearer_auth_context(state, headers).await?;
+    if context.session_purpose != SessionPurpose::OAuth {
+        return Err(ApiError::Unauthorized);
+    }
+    Ok(context.user)
+}
+
+pub async fn current_web_user(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError> {
+    let context = current_cookie_auth_context(state, headers).await?;
+    if context.session_purpose != SessionPurpose::Web {
+        return Err(ApiError::Unauthorized);
+    }
+    Ok(context.user)
 }
 
 pub async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError> {
-    let user = current_user(state, headers).await?;
+    let user = current_web_user(state, headers).await?;
 
     if user.role != UserRole::Admin {
         return Err(ApiError::Forbidden);
@@ -243,7 +290,10 @@ pub async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<User
 }
 
 pub fn session_cookie(cookie_name: &str, session_token: &str) -> String {
-    format!("{cookie_name}={session_token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800")
+    format!(
+        "{cookie_name}={session_token}; HttpOnly; SameSite=Lax; Path=/{}; Max-Age=604800",
+        secure_cookie_suffix()
+    )
 }
 
 fn clear_session_cookie(cookie_name: &str) -> String {
@@ -251,11 +301,23 @@ fn clear_session_cookie(cookie_name: &str) -> String {
 }
 
 pub fn clear_cookie(cookie_name: &str) -> String {
-    format!("{cookie_name}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
+    format!(
+        "{cookie_name}=; HttpOnly; SameSite=Lax; Path=/{}; Max-Age=0",
+        secure_cookie_suffix()
+    )
 }
 
-fn session_token_from_headers(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
-    cookie_value_from_headers(headers, cookie_name)
+fn bearer_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
+    let token = value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))?
+        .trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
 }
 
 pub fn cookie_value_from_headers(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
@@ -271,6 +333,14 @@ pub fn cookie_value_from_headers(headers: &HeaderMap, cookie_name: &str) -> Opti
                 None
             }
         })
+}
+
+fn secure_cookie_suffix() -> &'static str {
+    if cfg!(debug_assertions) {
+        ""
+    } else {
+        "; Secure"
+    }
 }
 
 fn map_register_error(error: StoreError) -> ApiError {

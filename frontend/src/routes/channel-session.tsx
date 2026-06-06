@@ -3287,6 +3287,8 @@ function localizeToolName(tool: string | undefined, t: Translate) {
     case "cmd":
     case "命令":
       return t("tool.command");
+    case "clarify":
+      return t("tool.clarify");
     case "browser":
     case "浏览器":
       return t("tool.browser");
@@ -3309,6 +3311,7 @@ function localizeKnownToolNames(text: string, t: Translate) {
     .replace(/\bimage_generate\b/gi, t("tool.imageGenerate"))
     .replace(/\bskill_view\b/gi, t("tool.skillView"))
     .replace(/\bterminal\b/gi, t("tool.terminal"))
+    .replace(/\bclarify\b/gi, t("tool.clarify"))
     .replace(/图片生成/g, t("tool.imageGenerate"))
     .replace(/技能查看|技能视图/g, t("tool.skillView"))
     .replace(/终端/g, t("tool.terminal"));

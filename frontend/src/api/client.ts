@@ -197,8 +197,32 @@ export type SystemSettings = {
   empty_chat_prompt: string;
   speech_input: SpeechInputSettings;
   public_platform: PublicPlatformSettings;
+  api_management: ApiManagementSettings;
+  business_oauth: BusinessOAuthSettings;
   oidc: OidcSettings;
   ldap: LdapSettings;
+};
+
+export type SystemParametersSettings = {
+  max_sessions_per_user: number;
+  max_attachment_upload_bytes: number;
+  attachment_retention_days: number;
+  empty_chat_prompt: string;
+  speech_input: SpeechInputSettings;
+};
+
+export type AuthSettings = {
+  oidc: OidcSettings;
+  ldap: LdapSettings;
+  business_oauth: BusinessOAuthSettings;
+};
+
+export type UpdatePublicPlatformSettingsRequest = {
+  public_platform: PublicPlatformSettings;
+};
+
+export type UpdateApiManagementSettingsRequest = {
+  api_management: ApiManagementSettings;
 };
 
 export type SpeechInputSettings = {
@@ -208,6 +232,21 @@ export type SpeechInputSettings = {
 export type PublicPlatformSettings = {
   enabled: boolean;
   temporary_session_retention_hours: number;
+};
+
+export type ApiManagementSettings = {
+  enabled: boolean;
+};
+
+export type BusinessOAuthSettings = {
+  enabled: boolean;
+  client_id: string;
+  client_secret: string;
+  allowed_redirect_uris: string[];
+  scopes: string;
+  authorization_code_ttl_seconds: number;
+  hidden_session_idle_timeout_seconds: number;
+  toolset_names: string[];
 };
 
 export type SpeechInputConfig = {
@@ -454,6 +493,10 @@ export type ApiClient = {
   testModelConfig: (config: ModelConfig) => Promise<ModelConfigTestResult>;
   testModelFallbackConfig: (config: ModelConfig) => Promise<ModelConfigTestResult>;
   systemSettings: () => Promise<SystemSettings>;
+  updateSystemParameters: (settings: SystemParametersSettings) => Promise<void>;
+  updateAuthSettings: (settings: AuthSettings) => Promise<void>;
+  updatePublicPlatformSettings: (settings: UpdatePublicPlatformSettingsRequest) => Promise<void>;
+  updateApiManagementSettings: (settings: UpdateApiManagementSettingsRequest) => Promise<void>;
   updateSystemSettings: (settings: SystemSettings) => Promise<void>;
   hermesProfile: () => Promise<HermesProfile>;
   updateHermesProfile: (profile: HermesProfile) => Promise<void>;
@@ -617,6 +660,26 @@ function requestHeaders(options: RequestOptions): Record<string, string> | undef
     }
   }
   return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
+function defaultHubChannel(): Channel {
+  // channel 已经是后端内部路由细节；旧签名只保留一个稳定占位，避免调用方继续关心真实 channel。
+  return {
+    id: "hermes-hub",
+    name: "hermes-hub",
+    description: "Hermes Hub default channel",
+  };
+}
+
+function channelSessionFromSummary(
+  session: SessionSummary,
+  channelId = defaultHubChannel().id,
+): ChannelSession {
+  return {
+    ...session,
+    channel_id: channelId,
+    kind: "agent",
+  };
 }
 
 function readPublicSessionToken(): string | null {
@@ -825,13 +888,37 @@ export function defaultPublicPlatformSettings(): PublicPlatformSettings {
   };
 }
 
+export function defaultApiManagementSettings(): ApiManagementSettings {
+  return {
+    enabled: false,
+  };
+}
+
+export function defaultBusinessOAuthSettings(): BusinessOAuthSettings {
+  return {
+    enabled: false,
+    client_id: "",
+    client_secret: "",
+    allowed_redirect_uris: [],
+    scopes: "openid profile email",
+    authorization_code_ttl_seconds: 600,
+    hidden_session_idle_timeout_seconds: 3600,
+    toolset_names: [],
+  };
+}
+
 type SystemSettingsPayload = Partial<
-  Omit<SystemSettings, "oidc" | "ldap" | "speech_input" | "public_platform">
+  Omit<
+    SystemSettings,
+    "oidc" | "ldap" | "speech_input" | "public_platform" | "api_management" | "business_oauth"
+  >
 > & {
   oidc?: Partial<OidcSettings> | null;
   ldap?: Partial<LdapSettings> | null;
   speech_input?: Partial<SpeechInputSettings> | null;
   public_platform?: Partial<PublicPlatformSettings> | null;
+  api_management?: Partial<ApiManagementSettings> | null;
+  business_oauth?: Partial<BusinessOAuthSettings> | null;
 };
 
 function systemSettingsFromPayload(settings: SystemSettingsPayload): SystemSettings {
@@ -851,6 +938,14 @@ function systemSettingsFromPayload(settings: SystemSettingsPayload): SystemSetti
     public_platform: {
       ...defaultPublicPlatformSettings(),
       ...(settings.public_platform ?? {}),
+    },
+    api_management: {
+      ...defaultApiManagementSettings(),
+      ...(settings.api_management ?? {}),
+    },
+    business_oauth: {
+      ...defaultBusinessOAuthSettings(),
+      ...(settings.business_oauth ?? {}),
     },
     oidc: { ...defaultOidcSettings(), ...(settings.oidc ?? {}) },
     ldap: { ...defaultLdapSettings(), ...(settings.ldap ?? {}) },
@@ -1108,43 +1203,38 @@ export function createApiClient(): ApiClient {
       return payload.hermes_scheduler_snapshot ?? payload.scheduler_snapshot ?? null;
     },
     async listChannels() {
-      const payload = await request<{ channels: Channel[] }>("/api/channels");
-      return payload.channels;
+      // channel 已变成 Hub 内部路由细节；保留旧方法只是为了兼容仍按旧签名注入的测试/组件。
+      return [defaultHubChannel()];
     },
     async createChannel(name, description) {
-      const payload = await request<{ channel: Channel }>("/api/channels", {
-        method: "POST",
-        body: { name, description },
-      });
-      return payload.channel;
+      // 前端不再创建真实 channel，返回调用方传入的展示信息即可。
+      return { id: "hermes-hub", name: name.trim() || "hermes-hub", description };
     },
     async listSessions(channelId) {
-      const payload = await request<{ sessions: ChannelSession[] }>(
-        `/api/channels/${channelId}/sessions`,
-      );
-      return payload.sessions;
+      const payload = await request<{ sessions: SessionSummary[] }>("/api/sessions");
+      return payload.sessions.map((session) => channelSessionFromSummary(session, channelId));
     },
     async createSession(channelId, kind, title) {
-      const payload = await request<{ session: ChannelSession }>(
-        `/api/channels/${channelId}/sessions`,
-        { method: "POST", body: { kind, title } },
-      );
-      return payload.session;
+      const payload = await request<{ session: SessionSummary }>("/api/sessions", {
+        method: "POST",
+        body: { kind, title },
+      });
+      return channelSessionFromSummary(payload.session, channelId);
     },
-    async deleteSession(channelId, sessionId) {
-      await request<void>(`/api/channels/${channelId}/sessions/${sessionId}`, {
+    async deleteSession(_channelId, sessionId) {
+      await request<void>(`/api/sessions/${sessionId}`, {
         method: "DELETE",
       });
     },
-    async listSessionMessages(channelId, sessionId) {
+    async listSessionMessages(_channelId, sessionId) {
       const payload = await request<{ messages: ChannelMessage[] }>(
-        `/api/channels/${channelId}/sessions/${sessionId}/messages`,
+        `/api/sessions/${sessionId}/messages`,
       );
       return payload.messages;
     },
-    async appendSessionMessage(channelId, sessionId, input) {
+    async appendSessionMessage(_channelId, sessionId, input) {
       const payload = await request<{ message: ChannelMessage }>(
-        `/api/channels/${channelId}/sessions/${sessionId}/messages`,
+        `/api/sessions/${sessionId}/messages`,
         {
           method: "POST",
           body: {
@@ -1157,9 +1247,9 @@ export function createApiClient(): ApiClient {
       );
       return payload.message;
     },
-    async updateSessionMessage(channelId, sessionId, messageId, input) {
+    async updateSessionMessage(_channelId, sessionId, messageId, input) {
       const payload = await request<{ message: ChannelMessage }>(
-        `/api/channels/${channelId}/sessions/${sessionId}/messages/${messageId}`,
+        `/api/sessions/${sessionId}/messages/${messageId}`,
         {
           method: "PUT",
           body: {
@@ -1170,13 +1260,13 @@ export function createApiClient(): ApiClient {
       );
       return payload.message;
     },
-    async uploadSessionAttachments(channelId, sessionId, files) {
+    async uploadSessionAttachments(_channelId, sessionId, files) {
       const form = new FormData();
       for (const file of files) {
         form.append("file", file, file.name);
       }
 
-      const response = await fetch(`/api/channels/${channelId}/sessions/${sessionId}/attachments`, {
+      const response = await fetch(`/api/sessions/${sessionId}/attachments`, {
         method: "POST",
         credentials: "include",
         body: form,
@@ -1195,9 +1285,9 @@ export function createApiClient(): ApiClient {
       };
       return payload.attachments;
     },
-    async createChannelRun(channelId, sessionId, input) {
+    async createChannelRun(_channelId, sessionId, input) {
       return request<{ message: ChannelMessage; run: ChannelRun }>(
-        `/api/channels/${channelId}/sessions/${sessionId}/runs`,
+        `/api/sessions/${sessionId}/runs`,
         {
           method: "POST",
           body: {
@@ -1209,11 +1299,11 @@ export function createApiClient(): ApiClient {
       );
     },
     async generateSessionTitle(channelId, sessionId, prompt) {
-      const payload = await request<{ session: ChannelSession }>(
-        `/api/channels/${channelId}/sessions/${sessionId}/title`,
+      const payload = await request<{ session: SessionSummary }>(
+        `/api/sessions/${sessionId}/title`,
         { method: "POST", body: { prompt } },
       );
-      return payload.session;
+      return channelSessionFromSummary(payload.session, channelId);
     },
     async workspaceStatus() {
       const payload = await request<{ hermes_instance: HermesInstance | null }>(
@@ -1279,6 +1369,30 @@ export function createApiClient(): ApiClient {
       );
       return systemSettingsFromPayload(payload.settings);
     },
+    async updateSystemParameters(settings) {
+      await request<void>("/api/admin/system-settings/system", {
+        method: "PUT",
+        body: settings,
+      });
+    },
+    async updateAuthSettings(settings) {
+      await request<void>("/api/admin/system-settings/auth", {
+        method: "PUT",
+        body: settings,
+      });
+    },
+    async updatePublicPlatformSettings(settings) {
+      await request<void>("/api/admin/system-settings/public-platform", {
+        method: "PUT",
+        body: settings,
+      });
+    },
+    async updateApiManagementSettings(settings) {
+      await request<void>("/api/admin/system-settings/api-management", {
+        method: "PUT",
+        body: settings,
+      });
+    },
     async updateSystemSettings(settings) {
       await request<void>("/api/admin/system-settings", {
         method: "PUT",
@@ -1341,14 +1455,14 @@ export function createApiClient(): ApiClient {
       );
       return payload.skills;
     },
-    async activeHermesRun(channelId, sessionId) {
+    async activeHermesRun(_channelId, sessionId) {
       const payload = await request<{ active_run: HermesActiveRun | null }>(
-        `/api/channels/${channelId}/sessions/${sessionId}/active-run`,
+        `/api/sessions/${sessionId}/active-run`,
       );
       return payload.active_run;
     },
-    subscribeSessionEvents(channelId, sessionId, onEvent, onError) {
-      const source = new EventSource(`/api/channels/${channelId}/sessions/${sessionId}/events`, {
+    subscribeSessionEvents(_channelId, sessionId, onEvent, onError) {
+      const source = new EventSource(`/api/sessions/${sessionId}/events`, {
         withCredentials: true,
       });
       const eventNames = [
@@ -1382,15 +1496,12 @@ export function createApiClient(): ApiClient {
         source.close();
       };
     },
-    async stopHermesRun(channelId, sessionId) {
-      const payload = await request<{ active_run: HermesActiveRun | null }>(
-        `/api/channels/${channelId}/sessions/${sessionId}/active-run/stop`,
-        { method: "POST" },
-      );
-      return payload.active_run;
+    async stopHermesRun(_channelId, sessionId) {
+      await request<void>(`/api/sessions/${sessionId}/stop`, { method: "POST" });
+      return null;
     },
-    async clearHermesRun(channelId, sessionId) {
-      await request<void>(`/api/channels/${channelId}/sessions/${sessionId}/active-run`, {
+    async clearHermesRun(_channelId, sessionId) {
+      await request<void>(`/api/sessions/${sessionId}/active-run`, {
         method: "DELETE",
       });
     },
@@ -1589,6 +1700,7 @@ type MockApiClientOptions = {
   initialHermesSchedulerSnapshots?: HermesSchedulerSnapshot[];
   initialPublicPlatformSessions?: PublicPlatformSessionSummary[];
   publicPlatformSettings?: Partial<PublicPlatformSettings>;
+  apiManagementSettings?: Partial<ApiManagementSettings>;
 };
 
 function withMockMessageKind(message: ChannelMessage): ChannelMessage {
@@ -1754,6 +1866,11 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       ...defaultPublicPlatformSettings(),
       ...(options.publicPlatformSettings ?? {}),
     },
+    api_management: {
+      ...defaultApiManagementSettings(),
+      ...(options.apiManagementSettings ?? {}),
+    },
+    business_oauth: defaultBusinessOAuthSettings(),
     oidc: defaultOidcSettings(),
     ldap: defaultLdapSettings(),
   };
@@ -2304,6 +2421,54 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
     },
     async systemSettings() {
       return systemSettingsFromPayload(systemSettings);
+    },
+    async updateSystemParameters(settings) {
+      systemSettings = {
+        ...systemSettings,
+        max_sessions_per_user: settings.max_sessions_per_user,
+        max_attachment_upload_bytes: settings.max_attachment_upload_bytes,
+        attachment_retention_days: settings.attachment_retention_days,
+        empty_chat_prompt: settings.empty_chat_prompt,
+        speech_input: {
+          ...systemSettings.speech_input,
+          ...settings.speech_input,
+        },
+      };
+    },
+    async updateAuthSettings(settings) {
+      systemSettings = {
+        ...systemSettings,
+        oidc: {
+          ...systemSettings.oidc,
+          ...settings.oidc,
+        },
+        ldap: {
+          ...systemSettings.ldap,
+          ...settings.ldap,
+        },
+        business_oauth: {
+          ...systemSettings.business_oauth,
+          ...settings.business_oauth,
+        },
+      };
+    },
+    async updatePublicPlatformSettings(settings) {
+      systemSettings = {
+        ...systemSettings,
+        public_platform: {
+          ...systemSettings.public_platform,
+          ...settings.public_platform,
+        },
+      };
+    },
+    async updateApiManagementSettings(settings) {
+      systemSettings = {
+        ...systemSettings,
+        api_management: {
+          ...systemSettings.api_management,
+          ...settings.api_management,
+        },
+      };
     },
     async updateSystemSettings(settings) {
       systemSettings = systemSettingsFromPayload(settings);

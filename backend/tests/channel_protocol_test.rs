@@ -342,6 +342,34 @@ async fn bootstrap_and_login(app: &Router) -> String {
     cookie_from(&response)
 }
 
+async fn create_web_session(app: &Router, cookie: &str) -> String {
+    // Web/API 层不再暴露 channel，测试统一通过公开 session API 创建会话。
+    let session = request_json(
+        app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent" }),
+        Some(cookie),
+    )
+    .await;
+    let (status, body) = response_json(session).await;
+    assert_eq!(status, StatusCode::CREATED);
+    body["session"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_string()
+}
+
+async fn internal_channel_id_for_session(state: &AppState, session_id: &str) -> String {
+    // 少数 adapter 测试仍要直接写底层 store，此时 channel_id 只能来自内部上下文。
+    state
+        .channel_store
+        .session_context(session_id)
+        .await
+        .expect("session context can be loaded")
+        .channel_id
+}
+
 fn managed_instance_for(user_id: &str) -> HermesInstance {
     HermesInstance {
         id: "instance-1".to_string(),
@@ -384,22 +412,7 @@ async fn channel_messages_and_attachments_are_hub_owned() {
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let boundary = "hermes-hub-test-boundary";
     let upload_body = format!(
@@ -413,7 +426,7 @@ async fn channel_messages_and_attachments_are_hub_owned() {
     let upload = request_raw(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/attachments"),
+        &format!("/api/sessions/{session_id}/attachments"),
         &format!("multipart/form-data; boundary={boundary}"),
         upload_body,
         Some(&cookie),
@@ -431,7 +444,7 @@ async fn channel_messages_and_attachments_are_hub_owned() {
     let appended = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         json!({
             "role": "user",
             "content": "see attachment",
@@ -451,7 +464,7 @@ async fn channel_messages_and_attachments_are_hub_owned() {
     let messages = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         Some(&cookie),
     )
     .await;
@@ -504,7 +517,7 @@ async fn channel_messages_and_attachments_are_hub_owned() {
     let upload = request_raw(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/attachments"),
+        &format!("/api/sessions/{session_id}/attachments"),
         &format!("multipart/form-data; boundary={boundary}"),
         upload_body,
         Some(&cookie),
@@ -546,7 +559,7 @@ async fn channel_messages_and_attachments_are_hub_owned() {
     let upload = request_raw(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/attachments"),
+        &format!("/api/sessions/{session_id}/attachments"),
         &format!("multipart/form-data; boundary={boundary}"),
         upload_body,
         Some(&cookie),
@@ -576,26 +589,12 @@ async fn channel_message_attachments_must_reference_uploaded_hub_objects() {
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let appended = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         json!({
             "role": "user",
             "content": "伪造附件",
@@ -626,21 +625,7 @@ async fn deleting_channel_session_stops_active_run_and_removes_messages_and_file
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let boundary = "hermes-hub-delete-boundary";
     let upload_body = format!(
@@ -654,7 +639,7 @@ async fn deleting_channel_session_stops_active_run_and_removes_messages_and_file
     let upload = request_raw(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/attachments"),
+        &format!("/api/sessions/{session_id}/attachments"),
         &format!("multipart/form-data; boundary={boundary}"),
         upload_body,
         Some(&cookie),
@@ -669,7 +654,7 @@ async fn deleting_channel_session_stops_active_run_and_removes_messages_and_file
     let started = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/runs"),
+        &format!("/api/sessions/{session_id}/runs"),
         json!({
             "content": "delete this conversation",
             "attachments": [attachment],
@@ -688,7 +673,7 @@ async fn deleting_channel_session_stops_active_run_and_removes_messages_and_file
     let deleted = request_empty(
         &app,
         Method::DELETE,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}"),
+        &format!("/api/sessions/{session_id}"),
         Some(&cookie),
     )
     .await;
@@ -697,7 +682,7 @@ async fn deleting_channel_session_stops_active_run_and_removes_messages_and_file
     let messages = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         Some(&cookie),
     )
     .await;
@@ -707,7 +692,7 @@ async fn deleting_channel_session_stops_active_run_and_removes_messages_and_file
     let active = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/active-run"),
+        &format!("/api/sessions/{session_id}/active-run"),
         Some(&cookie),
     )
     .await;
@@ -727,21 +712,7 @@ async fn deleting_channel_session_removes_cron_jobs_targeting_that_session() {
         .expect("user can be read from session")
         .id;
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let temp = tempdir().expect("temp config dir can be created");
     let config_path = temp.path().join("config");
@@ -786,7 +757,7 @@ async fn deleting_channel_session_removes_cron_jobs_targeting_that_session() {
     let deleted = request_empty(
         &app,
         Method::DELETE,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}"),
+        &format!("/api/sessions/{session_id}"),
         Some(&cookie),
     )
     .await;
@@ -826,26 +797,12 @@ async fn assistant_message_with_container_image_path_keeps_text_without_output_a
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let delivered = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         json!({
             "role": "assistant",
             "content": format!("生成好了：\n\n![赛博朋克猫](/config/cache/images/{image_name})"),
@@ -888,29 +845,16 @@ async fn listing_legacy_assistant_image_path_does_not_read_container_file() {
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
+    let channel_id = internal_channel_id_for_session(&state, &session_id).await;
 
     // 模拟旧版本已经落库的历史消息：内容里仍是 Hermes 容器路径，没有 Hub 附件。
     state
         .channel_store
         .append_session_message(
             &user_id,
-            channel_id,
-            session_id,
+            &channel_id,
+            &session_id,
             ChannelMessageRole::Assistant,
             None,
             format!("历史生成图：\n\n![旧图](/config/cache/images/{image_name})"),
@@ -922,7 +866,7 @@ async fn listing_legacy_assistant_image_path_does_not_read_container_file() {
     let listed = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         Some(&cookie),
     )
     .await;
@@ -944,7 +888,7 @@ async fn listing_legacy_assistant_image_path_does_not_read_container_file() {
     let listed_again = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         Some(&cookie),
     )
     .await;
@@ -975,26 +919,12 @@ async fn assistant_message_with_container_file_path_keeps_text_without_output_at
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let delivered = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         json!({
             "role": "assistant",
             "content": format!("PPT 已生成：/opt/data/{ppt_name}"),
@@ -1035,21 +965,7 @@ async fn assistant_message_with_client_key_is_idempotent_without_recopying_conta
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let payload = json!({
         "role": "assistant",
@@ -1060,7 +976,7 @@ async fn assistant_message_with_client_key_is_idempotent_without_recopying_conta
     let delivered = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         payload.clone(),
         Some(&cookie),
     )
@@ -1083,7 +999,7 @@ async fn assistant_message_with_client_key_is_idempotent_without_recopying_conta
     let delivered_again = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         payload,
         Some(&cookie),
     )
@@ -1102,7 +1018,7 @@ async fn assistant_message_with_client_key_is_idempotent_without_recopying_conta
     let messages = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         Some(&cookie),
     )
     .await;
@@ -1138,21 +1054,7 @@ async fn hermes_instance_can_deliver_channel_message_to_hub() {
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let delivered = request_json(
         &app,
@@ -1195,7 +1097,7 @@ async fn hermes_instance_can_deliver_channel_message_to_hub() {
     let messages = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         Some(&cookie),
     )
     .await;
@@ -1226,26 +1128,12 @@ async fn channel_session_events_stream_snapshot_and_adapter_messages() {
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let stored = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         json!({
             "role": "assistant",
             "content": "stored answer",
@@ -1259,7 +1147,7 @@ async fn channel_session_events_stream_snapshot_and_adapter_messages() {
     let stream_response = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/events"),
+        &format!("/api/sessions/{session_id}/events"),
         Some(&cookie),
     )
     .await;
@@ -2287,21 +2175,7 @@ async fn hermes_channel_protocol_uploads_output_file_before_delivering_message()
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let boundary = "hermes-channel-file-boundary";
     let upload_body = format!(
@@ -2419,7 +2293,7 @@ async fn hermes_channel_protocol_uploads_output_file_before_delivering_message()
     let messages = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         Some(&cookie),
     )
     .await;
@@ -2475,21 +2349,7 @@ async fn hermes_channel_protocol_delivers_atomic_media_output_message() {
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let boundary = "hermes-channel-atomic-media-boundary";
     let payload = vec![b'i'; 2048];
@@ -2559,7 +2419,7 @@ async fn hermes_channel_protocol_delivers_atomic_media_output_message() {
     let messages = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         Some(&cookie),
     )
     .await;
@@ -2617,21 +2477,7 @@ async fn hermes_channel_protocol_accepts_ordered_attachment_placeholders() {
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let boundary = "hermes-channel-ordered-attachments-boundary";
     let script_payload = b"#!/bin/sh\n./start_ntp.sh\n";
@@ -2751,21 +2597,7 @@ async fn hermes_channel_protocol_rejects_attachment_without_placeholder() {
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let boundary = "hermes-channel-placeholder-validation-boundary";
     let upload_body = format!(
@@ -2882,26 +2714,12 @@ async fn hermes_channel_protocol_returns_existing_media_output_after_run_stops()
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let created_run = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/runs"),
+        &format!("/api/sessions/{session_id}/runs"),
         json!({
             "content": "生成一张图",
             "client_message_key": "media-retry-user-turn"
@@ -2960,11 +2778,11 @@ async fn hermes_channel_protocol_returns_existing_media_output_after_run_stops()
     let stopped = request_empty(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/active-run/stop"),
+        &format!("/api/sessions/{session_id}/stop"),
         Some(&cookie),
     )
     .await;
-    assert_eq!(stopped.status(), StatusCode::OK);
+    assert_eq!(stopped.status(), StatusCode::NO_CONTENT);
 
     let repeated = request_raw(
         &app,
@@ -2988,7 +2806,7 @@ async fn hermes_channel_protocol_returns_existing_media_output_after_run_stops()
     let messages = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         Some(&cookie),
     )
     .await;
@@ -3031,21 +2849,7 @@ async fn hermes_channel_protocol_accepts_large_output_files_within_config_limit(
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let boundary = "hermes-channel-large-file-boundary";
     let mut upload_body = format!(
@@ -3103,21 +2907,7 @@ async fn hermes_channel_protocol_rejects_output_attachment_over_system_upload_li
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let boundary = "hermes-channel-too-large-file-boundary";
     let mut upload_body = format!(
@@ -3173,21 +2963,7 @@ async fn hermes_channel_protocol_rejects_media_output_file_over_system_upload_li
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let boundary = "hermes-channel-too-large-media-boundary";
     let mut upload_body = format!(
@@ -3236,21 +3012,7 @@ async fn user_attachment_upload_rejects_file_over_system_upload_limit() {
     let app = test_app(store.clone());
     let cookie = bootstrap_and_login(&app).await;
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let boundary = "user-too-large-file-boundary";
     let mut upload_body = format!(
@@ -3265,7 +3027,7 @@ async fn user_attachment_upload_rejects_file_over_system_upload_limit() {
     let upload = request_raw(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/attachments"),
+        &format!("/api/sessions/{session_id}/attachments"),
         &format!("multipart/form-data; boundary={boundary}"),
         upload_body,
         Some(&cookie),
@@ -3299,21 +3061,7 @@ async fn assistant_message_binds_hub_attachment_referenced_in_content() {
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let boundary = "hermes-channel-linked-file-boundary";
     let upload_body = format!(
@@ -3387,7 +3135,7 @@ async fn assistant_message_binds_hub_attachment_referenced_in_content() {
     let messages = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         Some(&cookie),
     )
     .await;
@@ -3834,21 +3582,7 @@ async fn channel_run_enqueue_can_be_polled_and_completed_by_hermes_hub_adapter()
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let boundary = "hermes-adapter-input-boundary";
     let upload_body = format!(
@@ -3862,7 +3596,7 @@ async fn channel_run_enqueue_can_be_polled_and_completed_by_hermes_hub_adapter()
     let upload = request_raw(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/attachments"),
+        &format!("/api/sessions/{session_id}/attachments"),
         &format!("multipart/form-data; boundary={boundary}"),
         upload_body,
         Some(&cookie),
@@ -3879,7 +3613,7 @@ async fn channel_run_enqueue_can_be_polled_and_completed_by_hermes_hub_adapter()
     let created_run = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/runs"),
+        &format!("/api/sessions/{session_id}/runs"),
         json!({
             "content": "请读取附件并回答",
             "attachments": [input_attachment],
@@ -3905,7 +3639,7 @@ async fn channel_run_enqueue_can_be_polled_and_completed_by_hermes_hub_adapter()
     let created_again = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/runs"),
+        &format!("/api/sessions/{session_id}/runs"),
         json!({
             "content": "请读取附件并回答",
             "attachments": [input_attachment],
@@ -3925,7 +3659,7 @@ async fn channel_run_enqueue_can_be_polled_and_completed_by_hermes_hub_adapter()
     let active = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/active-run"),
+        &format!("/api/sessions/{session_id}/active-run"),
         Some(&cookie),
     )
     .await;
@@ -4041,7 +3775,7 @@ async fn channel_run_enqueue_can_be_polled_and_completed_by_hermes_hub_adapter()
     let active = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/active-run"),
+        &format!("/api/sessions/{session_id}/active-run"),
         Some(&cookie),
     )
     .await;
@@ -4128,7 +3862,7 @@ async fn channel_run_enqueue_can_be_polled_and_completed_by_hermes_hub_adapter()
     let active = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/active-run"),
+        &format!("/api/sessions/{session_id}/active-run"),
         Some(&cookie),
     )
     .await;
@@ -4144,7 +3878,7 @@ async fn channel_run_enqueue_can_be_polled_and_completed_by_hermes_hub_adapter()
     let messages = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         Some(&cookie),
     )
     .await;
@@ -4186,21 +3920,7 @@ async fn adapter_execution_edit_after_newer_message_appends_to_latest_execution_
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let progress = request_raw(
         &app,
@@ -4228,7 +3948,7 @@ async fn adapter_execution_edit_after_newer_message_appends_to_latest_execution_
     let user_followup = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         json!({
             "role": "user",
             "content": "继续",
@@ -4262,7 +3982,7 @@ async fn adapter_execution_edit_after_newer_message_appends_to_latest_execution_
     let messages = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         Some(&cookie),
     )
     .await;
@@ -4302,26 +4022,12 @@ async fn assistant_message_with_hermes_run_key_does_not_clear_active_run() {
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let created_run = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/runs"),
+        &format!("/api/sessions/{session_id}/runs"),
         json!({
             "content": "请输出最终答案",
             "client_message_key": "hermes-run-key-user-turn"
@@ -4357,7 +4063,7 @@ async fn assistant_message_with_hermes_run_key_does_not_clear_active_run() {
     let active = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/active-run"),
+        &format!("/api/sessions/{session_id}/active-run"),
         Some(&cookie),
     )
     .await;
@@ -4389,26 +4095,12 @@ async fn terminal_adapter_run_remains_visible_until_browser_clears_it() {
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let created_run = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/runs"),
+        &format!("/api/sessions/{session_id}/runs"),
         json!({
             "content": "请执行一个会失败的任务",
             "client_message_key": "terminal-failed-user-turn"
@@ -4437,7 +4129,7 @@ async fn terminal_adapter_run_remains_visible_until_browser_clears_it() {
     let active = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/active-run"),
+        &format!("/api/sessions/{session_id}/active-run"),
         Some(&cookie),
     )
     .await;
@@ -4450,7 +4142,7 @@ async fn terminal_adapter_run_remains_visible_until_browser_clears_it() {
     let cleared = request_empty(
         &app,
         Method::DELETE,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/active-run"),
+        &format!("/api/sessions/{session_id}/active-run"),
         Some(&cookie),
     )
     .await;
@@ -4459,7 +4151,7 @@ async fn terminal_adapter_run_remains_visible_until_browser_clears_it() {
     let active = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/active-run"),
+        &format!("/api/sessions/{session_id}/active-run"),
         Some(&cookie),
     )
     .await;
@@ -4490,26 +4182,12 @@ async fn late_adapter_output_after_stop_does_not_create_message() {
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let created_run = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/runs"),
+        &format!("/api/sessions/{session_id}/runs"),
         json!({
             "content": "请生成一个会被停止的文件",
             "client_message_key": "late-output-user-turn"
@@ -4547,11 +4225,11 @@ async fn late_adapter_output_after_stop_does_not_create_message() {
     let stopped = request_empty(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/active-run/stop"),
+        &format!("/api/sessions/{session_id}/stop"),
         Some(&cookie),
     )
     .await;
-    assert_eq!(stopped.status(), StatusCode::OK);
+    assert_eq!(stopped.status(), StatusCode::NO_CONTENT);
 
     let late_edit = request_raw(
         &app,
@@ -4593,7 +4271,7 @@ async fn late_adapter_output_after_stop_does_not_create_message() {
     let messages = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         Some(&cookie),
     )
     .await;
@@ -4632,26 +4310,12 @@ async fn completed_adapter_run_exposes_output_message_id_until_cleared() {
         .await
         .expect("instance can be bound");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie)).await;
-    let (_, channel_body) = response_json(channel).await;
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-    let session = request_json(
-        &app,
-        Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
-        json!({ "kind": "agent" }),
-        Some(&cookie),
-    )
-    .await;
-    let (_, session_body) = response_json(session).await;
-    let session_id = session_body["session"]["id"].as_str().expect("session id");
+    let session_id = create_web_session(&app, &cookie).await;
 
     let created_run = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/runs"),
+        &format!("/api/sessions/{session_id}/runs"),
         json!({
             "content": "请输出最终答案",
             "client_message_key": "terminal-completed-user-turn"
@@ -4702,7 +4366,7 @@ async fn completed_adapter_run_exposes_output_message_id_until_cleared() {
     let active = request_empty(
         &app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/active-run"),
+        &format!("/api/sessions/{session_id}/active-run"),
         Some(&cookie),
     )
     .await;
@@ -4718,7 +4382,7 @@ async fn completed_adapter_run_exposes_output_message_id_until_cleared() {
     let cleared = request_empty(
         &app,
         Method::DELETE,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/active-run"),
+        &format!("/api/sessions/{session_id}/active-run"),
         Some(&cookie),
     )
     .await;

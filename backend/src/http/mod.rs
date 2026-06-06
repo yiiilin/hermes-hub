@@ -1,10 +1,13 @@
 pub mod admin;
+pub mod api_management;
 pub mod attachments;
 pub mod auth;
 pub mod channel_protocol;
+pub mod integrations;
 pub mod invites;
 pub mod ldap;
 pub mod llm_proxy;
+pub mod oauth;
 pub mod oidc;
 pub mod sessions;
 pub mod speech;
@@ -22,17 +25,19 @@ use crate::{hermes::provisioner::ProvisionerError, AppState};
 pub fn router() -> Router<AppState> {
     Router::new()
         .merge(auth::router())
+        .merge(api_management::router())
+        .merge(oauth::router())
         .merge(oidc::router())
         .merge(ldap::router())
         .merge(admin::router())
         .merge(invites::router())
+        .merge(integrations::router())
         .merge(attachments::router())
         .merge(channel_protocol::router())
         .merge(sessions::router())
         .merge(speech::router())
         .merge(llm_proxy::router())
         .merge(workspace::router())
-        .merge(crate::channel::routes::router())
 }
 
 pub(crate) fn map_provisioner_error(error: ProvisionerError) -> ApiError {

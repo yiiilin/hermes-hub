@@ -8,12 +8,16 @@ fn schema_migrations_include_initial_tables() {
     assert!(sql.contains("auth_provider text not null default 'local'"));
     assert!(sql.contains("add column if not exists auth_provider text not null default 'legacy'"));
     assert!(sql.contains("alter column auth_provider set default 'local'"));
+    assert!(sql.contains("add column if not exists purpose text not null default 'web'"));
     assert!(sql.contains("users_auth_provider_check"));
+    assert!(sql.contains("create table if not exists business_oauth_authorization_codes"));
     assert!(sql.contains("create table if not exists invites"));
     assert!(sql.contains("create table if not exists hermes_instances"));
     assert!(sql.contains("create table if not exists llm_usage_events"));
     assert!(sql.contains("create table if not exists channels"));
     assert!(sql.contains("create table if not exists channel_sessions"));
+    assert!(sql.contains("add column if not exists hidden_from_web boolean not null default false"));
+    assert!(sql.contains("api_management"));
     assert!(sql.contains("create table if not exists channel_session_messages"));
     assert!(sql.contains("create table if not exists channel_attachments"));
     assert!(sql.contains("create table if not exists channel_runs"));

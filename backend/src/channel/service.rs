@@ -184,6 +184,7 @@ pub struct ChannelSession {
     pub title: Option<String>,
     pub is_home: bool,
     pub deletable: bool,
+    pub hidden_from_web: bool,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -327,6 +328,13 @@ pub struct DeletedChannelSession {
 }
 
 #[derive(Clone, Debug)]
+pub struct HiddenSessionCleanupCandidate {
+    pub user_id: String,
+    pub channel_id: String,
+    pub session_id: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct ChannelSessionContext {
     pub user_id: String,
     pub channel_id: String,
@@ -337,6 +345,8 @@ pub struct ChannelSessionContext {
 pub enum ChannelStoreError {
     #[error("channel not found")]
     ChannelNotFound,
+    #[error("invalid integration id")]
+    InvalidIntegrationId,
     #[error("invalid session kind")]
     InvalidSessionKind,
     #[error("invalid message role")]
@@ -404,17 +414,21 @@ impl ChannelStore {
     ) -> Result<Channel, ChannelStoreError> {
         match &self.backend {
             ChannelStoreBackend::Memory(inner) => {
+                let name = name.trim().to_string();
+                let mut inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
+                if let Some(channel) = memory_channel_by_user_name(&inner, user_id, &name) {
+                    return Ok(channel);
+                }
                 let now = unix_now();
                 let channel = Channel {
                     id: Uuid::new_v4().to_string(),
                     user_id: user_id.to_string(),
-                    name: name.trim().to_string(),
+                    name,
                     description,
                     created_at: now,
                     updated_at: now,
                 };
 
-                let mut inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
                 inner
                     .channels_by_id
                     .insert(channel.id.clone(), channel.clone());
@@ -567,6 +581,84 @@ impl ChannelStore {
         }
     }
 
+    /// 业务系统 channel 是 Hub 内部路由细节：外部系统只拿 session API，
+    /// Hub 按 user_id + integration_id 自动创建或复用这个隐藏工作区。
+    pub async fn ensure_integration_channel(
+        &self,
+        user_id: &str,
+        integration_id: &str,
+    ) -> Result<Channel, ChannelStoreError> {
+        let integration_id = integration_id.trim();
+        if integration_id.is_empty() {
+            return Err(ChannelStoreError::InvalidIntegrationId);
+        }
+        let name = format!("integration:{integration_id}");
+        let description = Some(format!(
+            "Hermes Hub integration channel for {integration_id}"
+        ));
+
+        match &self.backend {
+            ChannelStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
+                if let Some(channel) = memory_channel_by_user_name(&inner, user_id, &name) {
+                    return Ok(channel);
+                }
+
+                let now = unix_now();
+                let channel = Channel {
+                    id: Uuid::new_v4().to_string(),
+                    user_id: user_id.to_string(),
+                    name,
+                    description,
+                    created_at: now,
+                    updated_at: now,
+                };
+                inner
+                    .channels_by_id
+                    .insert(channel.id.clone(), channel.clone());
+                Ok(channel)
+            }
+            ChannelStoreBackend::Postgres(pool) => block_on_db(async {
+                let row = sqlx::query(
+                    r#"
+                    insert into channels (id, user_id, hermes_instance_id, name, description)
+                    values (
+                        $1::uuid,
+                        $2::uuid,
+                        (
+                            select hermes_instances.id
+                            from hermes_instances
+                            where hermes_instances.user_id = $2::uuid
+                            order by hermes_instances.created_at desc, hermes_instances.id desc
+                            limit 1
+                        ),
+                        $3,
+                        $4
+                    )
+                    on conflict (user_id, name) do update set
+                        hermes_instance_id = coalesce(excluded.hermes_instance_id, channels.hermes_instance_id),
+                        updated_at = now()
+                    returning id::text as id,
+                              user_id::text as user_id,
+                              name,
+                              description,
+                              extract(epoch from created_at)::bigint as created_at,
+                              extract(epoch from updated_at)::bigint as updated_at
+                    "#,
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(user_id)
+                .bind(name)
+                .bind(description)
+                .fetch_one(pool)
+                .await
+                .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+
+                row_to_channel(&row)
+            }),
+        }
+    }
+
     /// Hermes 实例创建或改绑后，补齐该用户标准 Hub channel 的实例归属。
     ///
     /// 用户可能先打开聊天页创建 channel，再由邀请注册、管理员或 workspace ensure
@@ -599,6 +691,58 @@ impl ChannelStore {
                 .bind(instance_id)
                 .bind(HUB_CHANNEL_NAME)
                 .bind(Some("Hermes Hub default channel".to_string()))
+                .fetch_one(pool)
+                .await
+                .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+
+                row_to_channel(&row)
+            }),
+        }
+    }
+
+    /// 业务系统 channel 也必须绑定到当前用户 Hermes 实例；否则 Postgres adapter
+    /// 按 instance token 拉取队列时会过滤掉这些隐藏会话的 run。
+    pub async fn bind_integration_channel_to_instance(
+        &self,
+        user_id: &str,
+        integration_id: &str,
+        instance_id: &str,
+    ) -> Result<Channel, ChannelStoreError> {
+        let integration_id = integration_id.trim();
+        if integration_id.is_empty() {
+            return Err(ChannelStoreError::InvalidIntegrationId);
+        }
+        let name = format!("integration:{integration_id}");
+        let description = Some(format!(
+            "Hermes Hub integration channel for {integration_id}"
+        ));
+
+        match &self.backend {
+            ChannelStoreBackend::Memory(_) => {
+                self.ensure_integration_channel(user_id, integration_id)
+                    .await
+            }
+            ChannelStoreBackend::Postgres(pool) => block_on_db(async {
+                let row = sqlx::query(
+                    r#"
+                    insert into channels (id, user_id, hermes_instance_id, name, description)
+                    values ($1::uuid, $2::uuid, $3::uuid, $4, $5)
+                    on conflict (user_id, name) do update set
+                        hermes_instance_id = excluded.hermes_instance_id,
+                        updated_at = now()
+                    returning id::text as id,
+                              user_id::text as user_id,
+                              name,
+                              description,
+                              extract(epoch from created_at)::bigint as created_at,
+                              extract(epoch from updated_at)::bigint as updated_at
+                    "#,
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(user_id)
+                .bind(instance_id)
+                .bind(name)
+                .bind(description)
                 .fetch_one(pool)
                 .await
                 .map_err(|_| ChannelStoreError::DatabaseFailed)?;
@@ -654,6 +798,7 @@ impl ChannelStore {
         channel_id: &str,
         kind: ChannelSessionKind,
         title: Option<String>,
+        hidden_from_web: bool,
     ) -> Result<ChannelSession, ChannelStoreError> {
         self.get_channel(user_id, channel_id).await?;
 
@@ -670,6 +815,7 @@ impl ChannelStore {
                     title,
                     is_home: false,
                     deletable: true,
+                    hidden_from_web,
                     created_at: now,
                     updated_at: now,
                 };
@@ -683,8 +829,8 @@ impl ChannelStore {
             ChannelStoreBackend::Postgres(pool) => block_on_db(async {
                 let row = sqlx::query(
                     r#"
-                    insert into channel_sessions (id, channel_id, kind, title)
-                    values ($1::uuid, $2::uuid, $3, $4)
+                    insert into channel_sessions (id, channel_id, kind, title, hidden_from_web)
+                    values ($1::uuid, $2::uuid, $3, $4, $5)
                     returning id::text as id,
                               channel_id::text as channel_id,
                               kind,
@@ -694,6 +840,7 @@ impl ChannelStore {
                               title,
                               is_home,
                               deletable,
+                              hidden_from_web,
                               extract(epoch from created_at)::bigint as created_at,
                               extract(epoch from updated_at)::bigint as updated_at
                     "#,
@@ -702,6 +849,7 @@ impl ChannelStore {
                 .bind(channel_id)
                 .bind(kind.as_str())
                 .bind(title)
+                .bind(hidden_from_web)
                 .fetch_one(pool)
                 .await
                 .map_err(|_| ChannelStoreError::DatabaseFailed)?;
@@ -718,6 +866,7 @@ impl ChannelStore {
         kind: ChannelSessionKind,
         title: Option<String>,
         max_sessions_per_user: u32,
+        hidden_from_web: bool,
     ) -> Result<ChannelSession, ChannelStoreError> {
         self.get_channel(user_id, channel_id).await?;
 
@@ -754,6 +903,7 @@ impl ChannelStore {
                     title,
                     is_home: false,
                     deletable: true,
+                    hidden_from_web,
                     created_at: now,
                     updated_at: now,
                 };
@@ -803,8 +953,8 @@ impl ChannelStore {
 
                     let row = sqlx::query(
                         r#"
-                    insert into channel_sessions (id, channel_id, kind, title)
-                    values ($1::uuid, $2::uuid, $3, $4)
+                    insert into channel_sessions (id, channel_id, kind, title, hidden_from_web)
+                    values ($1::uuid, $2::uuid, $3, $4, $5)
                     returning id::text as id,
                               channel_id::text as channel_id,
                               kind,
@@ -814,6 +964,7 @@ impl ChannelStore {
                               title,
                               is_home,
                               deletable,
+                              hidden_from_web,
                               extract(epoch from created_at)::bigint as created_at,
                               extract(epoch from updated_at)::bigint as updated_at
                     "#,
@@ -822,6 +973,7 @@ impl ChannelStore {
                     .bind(channel_id)
                     .bind(kind.as_str())
                     .bind(title)
+                    .bind(hidden_from_web)
                     .fetch_one(&mut *tx)
                     .await
                     .map_err(|_| ChannelStoreError::DatabaseFailed)?;
@@ -866,6 +1018,7 @@ impl ChannelStore {
                     // 主会话是 Hermes 的固定 home channel，不能被用户误删，也不占用普通会话额度。
                     is_home: true,
                     deletable: false,
+                    hidden_from_web: false,
                     created_at: now,
                     updated_at: now,
                 };
@@ -877,8 +1030,8 @@ impl ChannelStore {
             ChannelStoreBackend::Postgres(pool) => block_on_db(async {
                 let row = sqlx::query(
                     r#"
-                    insert into channel_sessions (id, channel_id, kind, title, is_home, deletable)
-                    values ($1::uuid, $2::uuid, 'agent', null, true, false)
+                    insert into channel_sessions (id, channel_id, kind, title, is_home, deletable, hidden_from_web)
+                    values ($1::uuid, $2::uuid, 'agent', null, true, false, false)
                     on conflict (channel_id) where is_home do update set
                         is_home = channel_sessions.is_home
                     returning id::text as id,
@@ -890,6 +1043,7 @@ impl ChannelStore {
                               title,
                               is_home,
                               deletable,
+                              hidden_from_web,
                               extract(epoch from created_at)::bigint as created_at,
                               extract(epoch from updated_at)::bigint as updated_at
                     "#,
@@ -943,6 +1097,7 @@ impl ChannelStore {
                            title,
                            is_home,
                            deletable,
+                           hidden_from_web,
                            extract(epoch from created_at)::bigint as created_at,
                            extract(epoch from updated_at)::bigint as updated_at
                     from channel_sessions
@@ -1021,6 +1176,7 @@ impl ChannelStore {
                            title,
                            is_home,
                            deletable,
+                           hidden_from_web,
                            extract(epoch from created_at)::bigint as created_at,
                            extract(epoch from updated_at)::bigint as updated_at
                     from channel_sessions
@@ -1076,6 +1232,7 @@ impl ChannelStore {
                            title,
                            is_home,
                            deletable,
+                           hidden_from_web,
                            extract(epoch from created_at)::bigint as created_at,
                            extract(epoch from updated_at)::bigint as updated_at
                     from channel_sessions
@@ -1130,6 +1287,7 @@ impl ChannelStore {
                               title,
                               is_home,
                               deletable,
+                              hidden_from_web,
                               extract(epoch from created_at)::bigint as created_at,
                               extract(epoch from updated_at)::bigint as updated_at
                     "#,
@@ -1197,6 +1355,7 @@ impl ChannelStore {
                               title,
                               is_home,
                               deletable,
+                              hidden_from_web,
                               extract(epoch from created_at)::bigint as created_at,
                               extract(epoch from updated_at)::bigint as updated_at
                     "#,
@@ -1254,6 +1413,7 @@ impl ChannelStore {
                               title,
                               is_home,
                               deletable,
+                              hidden_from_web,
                               extract(epoch from created_at)::bigint as created_at,
                               extract(epoch from updated_at)::bigint as updated_at
                     "#,
@@ -2262,6 +2422,11 @@ impl ChannelStore {
                 .ok_or(ChannelStoreError::ChannelNotFound)?;
 
                 let message = row_to_message(&row)?;
+                sqlx::query("update channel_sessions set updated_at = now() where id = $1::uuid")
+                    .bind(session_id)
+                    .execute(pool)
+                    .await
+                    .map_err(|_| ChannelStoreError::DatabaseFailed)?;
                 unbind_postgres_attachments(pool, session_id, &message.id).await?;
                 bind_postgres_attachments(pool, session_id, &message.id, &message.attachments)
                     .await?;
@@ -2703,6 +2868,71 @@ impl ChannelStore {
         }
     }
 
+    pub async fn hidden_sessions_older_than(
+        &self,
+        cutoff_at: u64,
+    ) -> Result<Vec<HiddenSessionCleanupCandidate>, ChannelStoreError> {
+        match &self.backend {
+            ChannelStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
+                let mut sessions = inner
+                    .sessions_by_id
+                    .values()
+                    .filter(|session| {
+                        session.hidden_from_web
+                            && !session.is_home
+                            && session.updated_at <= cutoff_at
+                    })
+                    .filter_map(|session| {
+                        let channel = inner.channels_by_id.get(&session.channel_id)?;
+                        Some(HiddenSessionCleanupCandidate {
+                            user_id: channel.user_id.clone(),
+                            channel_id: channel.id.clone(),
+                            session_id: session.id.clone(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                sessions.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+                Ok(sessions)
+            }
+            ChannelStoreBackend::Postgres(pool) => block_on_db(async {
+                let rows = sqlx::query(
+                    r#"
+                    select channels.user_id::text as user_id,
+                           channels.id::text as channel_id,
+                           channel_sessions.id::text as session_id
+                    from channel_sessions
+                    join channels on channels.id = channel_sessions.channel_id
+                    where channel_sessions.hidden_from_web = true
+                      and not channel_sessions.is_home
+                      and channel_sessions.updated_at <= to_timestamp($1)
+                    order by channel_sessions.updated_at asc, channel_sessions.id asc
+                    "#,
+                )
+                .bind(cutoff_at as f64)
+                .fetch_all(pool)
+                .await
+                .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+
+                rows.iter()
+                    .map(|row| {
+                        Ok(HiddenSessionCleanupCandidate {
+                            user_id: row
+                                .try_get("user_id")
+                                .map_err(|_| ChannelStoreError::DatabaseFailed)?,
+                            channel_id: row
+                                .try_get("channel_id")
+                                .map_err(|_| ChannelStoreError::DatabaseFailed)?,
+                            session_id: row
+                                .try_get("session_id")
+                                .map_err(|_| ChannelStoreError::DatabaseFailed)?,
+                        })
+                    })
+                    .collect()
+            }),
+        }
+    }
+
     pub async fn session_context(
         &self,
         session_id: &str,
@@ -2755,6 +2985,25 @@ impl ChannelStore {
             }),
         }
     }
+}
+
+fn memory_channel_by_user_name(
+    inner: &ChannelStoreInner,
+    user_id: &str,
+    name: &str,
+) -> Option<Channel> {
+    // 内存后端没有数据库唯一索引，测试或并发调用可能留下同名 channel；
+    // 这里固定取最早创建的一条，保证后续 user_id + name 映射稳定。
+    inner
+        .channels_by_id
+        .values()
+        .filter(|channel| channel.user_id == user_id && channel.name == name)
+        .min_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        })
+        .cloned()
 }
 
 fn row_to_channel(row: &sqlx::postgres::PgRow) -> Result<Channel, ChannelStoreError> {
@@ -2810,6 +3059,9 @@ fn row_to_session(row: &sqlx::postgres::PgRow) -> Result<ChannelSession, Channel
             .map_err(|_| ChannelStoreError::DatabaseFailed)?,
         deletable: row
             .try_get("deletable")
+            .map_err(|_| ChannelStoreError::DatabaseFailed)?,
+        hidden_from_web: row
+            .try_get("hidden_from_web")
             .map_err(|_| ChannelStoreError::DatabaseFailed)?,
         created_at: row
             .try_get::<i64, _>("created_at")

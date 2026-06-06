@@ -18,8 +18,8 @@ use hermes_hub_backend::{
     model_config::{ModelConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND},
     security::crypto::SecretCipher,
     session::store::{
-        LdapSettings, OidcSettings, PublicPlatformSettings, SessionStore, SpeechInputSettings,
-        SystemSettings,
+        ApiManagementSettings, BusinessOAuthSettings, LdapSettings, OidcSettings,
+        PublicPlatformSettings, SessionPurpose, SessionStore, SpeechInputSettings, SystemSettings,
     },
     storage::InMemoryObjectStorage,
     AppConfig, AppState,
@@ -492,18 +492,10 @@ async fn postgres_state_survives_recreated_router_state() {
         .await
         .expect("instance token can be stored");
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&user_cookie), None).await;
-    let (status, channel_body) = response_json(channel).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(channel_body["channels"][0]["name"], "hermes-hub");
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id");
-
     let session = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
+        "/api/sessions",
         json!({
             "kind": "agent"
         }),
@@ -518,7 +510,7 @@ async fn postgres_state_survives_recreated_router_state() {
     let title = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/title"),
+        &format!("/api/sessions/{session_id}/title"),
         json!({
             "prompt": "persisted session"
         }),
@@ -542,7 +534,7 @@ async fn postgres_state_survives_recreated_router_state() {
     let upload = request_raw(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/attachments"),
+        &format!("/api/sessions/{session_id}/attachments"),
         &format!("multipart/form-data; boundary={boundary}"),
         upload_body,
         Some(&user_cookie),
@@ -555,7 +547,7 @@ async fn postgres_state_survives_recreated_router_state() {
     let message = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         json!({
             "role": "user",
             "content": "persisted message",
@@ -594,22 +586,10 @@ async fn postgres_state_survives_recreated_router_state() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(invites_body["invites"][0]["used_count"], 1);
 
-    let channels = request_empty(
-        &restarted_app,
-        Method::GET,
-        "/api/channels",
-        Some(&user_cookie),
-        None,
-    )
-    .await;
-    let (status, channels_body) = response_json(channels).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(channels_body["channels"][0]["name"], "hermes-hub");
-
     let sessions = request_empty(
         &restarted_app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions"),
+        "/api/sessions",
         Some(&user_cookie),
         None,
     )
@@ -621,7 +601,7 @@ async fn postgres_state_survives_recreated_router_state() {
     let messages = request_empty(
         &restarted_app,
         Method::GET,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/messages"),
+        &format!("/api/sessions/{session_id}/messages"),
         Some(&user_cookie),
         None,
     )
@@ -665,7 +645,7 @@ async fn postgres_state_survives_recreated_router_state() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn postgres_adapter_can_poll_when_channel_predates_instance() {
+async fn postgres_adapter_can_poll_when_session_predates_instance() {
     let Some(pool) = postgres_pool().await else {
         eprintln!(
             "skipping postgres adapter binding test: HERMES_HUB_TEST_DATABASE_URL is not set"
@@ -710,18 +690,10 @@ async fn postgres_adapter_can_poll_when_channel_predates_instance() {
     assert_eq!(logged_in.status(), StatusCode::OK);
     let cookie = cookie_from(&logged_in);
 
-    let channel = request_empty(&app, Method::GET, "/api/channels", Some(&cookie), None).await;
-    let (status, channel_body) = response_json(channel).await;
-    assert_eq!(status, StatusCode::OK);
-    let channel_id = channel_body["channels"][0]["id"]
-        .as_str()
-        .expect("channel id")
-        .to_string();
-
     let session = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions"),
+        "/api/sessions",
         json!({ "kind": "agent" }),
         Some(&cookie),
         None,
@@ -734,8 +706,8 @@ async fn postgres_adapter_can_poll_when_channel_predates_instance() {
         .expect("session id")
         .to_string();
 
-    // 生产里用户可能先进入会话页生成 channel，之后 ensure Hermes 才创建实例。
-    // ensure 成功后必须反向补齐 channel.hermes_instance_id，否则 adapter 按实例 token 拉不到队列。
+    // 生产里用户可能先进入会话页生成内部 channel，之后 ensure Hermes 才创建实例。
+    // ensure 成功后必须反向补齐内部 channel.hermes_instance_id，否则 adapter 按实例 token 拉不到队列。
     let ensured = request_empty(
         &app,
         Method::POST,
@@ -759,7 +731,7 @@ async fn postgres_adapter_can_poll_when_channel_predates_instance() {
     let created_run = request_json(
         &app,
         Method::POST,
-        &format!("/api/channels/{channel_id}/sessions/{session_id}/runs"),
+        &format!("/api/sessions/{session_id}/runs"),
         json!({
             "content": "late bound channel",
             "attachments": [],
@@ -869,6 +841,7 @@ async fn postgres_adapter_releases_stale_running_runs() {
             &channel.id,
             ChannelSessionKind::Agent,
             None,
+            false,
         )
         .await
         .expect("session can be created");
@@ -1007,7 +980,13 @@ async fn postgres_adapter_output_heartbeats_running_runs() {
         .expect("hub channel can be ensured");
     let session = state
         .channel_store
-        .create_session(&user_id, &channel.id, ChannelSessionKind::Agent, None)
+        .create_session(
+            &user_id,
+            &channel.id,
+            ChannelSessionKind::Agent,
+            None,
+            false,
+        )
         .await
         .expect("session can be created");
     let user_message = state
@@ -1162,7 +1141,13 @@ async fn postgres_channel_session_persists_hermes_anchors() {
         .await
         .expect("hub channel can be ensured");
     let session = channel_store
-        .create_session(&user.id, &channel.id, ChannelSessionKind::Agent, None)
+        .create_session(
+            &user.id,
+            &channel.id,
+            ChannelSessionKind::Agent,
+            None,
+            false,
+        )
         .await
         .expect("session can be created");
 
@@ -1218,6 +1203,262 @@ async fn postgres_channel_session_persists_hermes_anchors() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn postgres_hidden_session_message_updates_session_timestamp() {
+    let Some(pool) = postgres_pool().await else {
+        eprintln!("skipping postgres persistence test: HERMES_HUB_TEST_DATABASE_URL is not set");
+        return;
+    };
+    run_migrations(&pool).await.expect("migrations can run");
+
+    let cipher = SecretCipher::from_master_key(TEST_SECRET_KEY).expect("test cipher is valid");
+    let store = SessionStore::postgres(pool.clone(), cipher.clone());
+    let channel_store = ChannelStore::postgres(pool.clone());
+
+    let user = store
+        .create_bootstrap_admin("hidden-session@example.com", "hidden-session-password")
+        .await
+        .expect("bootstrap admin can be created");
+    let channel = channel_store
+        .ensure_hub_channel(&user.id)
+        .await
+        .expect("hub channel can be ensured");
+    let session = channel_store
+        .create_session(&user.id, &channel.id, ChannelSessionKind::Agent, None, true)
+        .await
+        .expect("hidden session can be created");
+    let message = channel_store
+        .append_session_message(
+            &user.id,
+            &channel.id,
+            &session.id,
+            ChannelMessageRole::User,
+            Some("hidden-session-message".to_string()),
+            "hello".to_string(),
+            json!([]),
+        )
+        .await
+        .expect("message can be appended");
+
+    let stale_at = unix_now().saturating_sub(600) as f64;
+    sqlx::query("update channel_sessions set updated_at = to_timestamp($1) where id = $2::uuid")
+        .bind(stale_at)
+        .bind(&session.id)
+        .execute(&pool)
+        .await
+        .expect("session timestamp can be aged");
+
+    let before: i64 = sqlx::query(
+        "select extract(epoch from updated_at)::bigint as updated_at from channel_sessions where id = $1::uuid",
+    )
+    .bind(&session.id)
+    .fetch_one(&pool)
+    .await
+    .expect("stale timestamp can be read")
+    .try_get("updated_at")
+    .expect("session timestamp is readable");
+    assert!(before <= unix_now().saturating_sub(500) as i64);
+
+    let edited = channel_store
+        .update_session_message(
+            &user.id,
+            &channel.id,
+            &session.id,
+            &message.id,
+            "hello again".to_string(),
+            json!([]),
+        )
+        .await
+        .expect("message can be edited");
+    assert_eq!(edited.content, "hello again");
+
+    let after: i64 = sqlx::query(
+        "select extract(epoch from updated_at)::bigint as updated_at from channel_sessions where id = $1::uuid",
+    )
+    .bind(&session.id)
+    .fetch_one(&pool)
+    .await
+    .expect("refreshed timestamp can be read")
+    .try_get("updated_at")
+    .expect("session timestamp is readable");
+    assert!(
+        after > before,
+        "editing a hidden session message should refresh the session timestamp"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_hidden_session_cleanup_skips_active_runs() {
+    let Some(pool) = postgres_pool().await else {
+        eprintln!("skipping postgres persistence test: HERMES_HUB_TEST_DATABASE_URL is not set");
+        return;
+    };
+    run_migrations(&pool).await.expect("migrations can run");
+
+    let state = test_state(pool.clone(), InMemoryLlmProviderClient::default()).await;
+    let user = state
+        .store
+        .create_bootstrap_admin("active-hidden@example.com", "active-hidden-password")
+        .await
+        .expect("bootstrap admin can be created");
+    let channel = state
+        .channel_store
+        .ensure_hub_channel(&user.id)
+        .await
+        .expect("hub channel can be ensured");
+    let session = state
+        .channel_store
+        .create_session(&user.id, &channel.id, ChannelSessionKind::Agent, None, true)
+        .await
+        .expect("hidden session can be created");
+    let user_message = state
+        .channel_store
+        .append_session_message(
+            &user.id,
+            &channel.id,
+            &session.id,
+            ChannelMessageRole::User,
+            Some("active-hidden-turn".to_string()),
+            "keep me alive".to_string(),
+            json!([]),
+        )
+        .await
+        .expect("message can be appended");
+    let run = state
+        .channel_store
+        .create_channel_run(
+            &user.id,
+            &channel.id,
+            &session.id,
+            &user_message.id,
+            "keep me alive".to_string(),
+            json!([]),
+        )
+        .await
+        .expect("run can be created");
+    state
+        .channel_store
+        .update_run_status_for_session(
+            &session.id,
+            &run.run_id,
+            ChannelRunStatus::Running,
+            None,
+            None,
+        )
+        .await
+        .expect("run can be marked running");
+
+    sqlx::query(
+        "update channel_sessions set updated_at = now() - interval '2 hours' where id = $1::uuid",
+    )
+    .bind(&session.id)
+    .execute(&pool)
+    .await
+    .expect("session timestamp can be aged");
+
+    hermes_hub_backend::http::sessions::cleanup_expired_hidden_sessions(&state)
+        .await
+        .expect("cleanup can run");
+
+    let fetched_session = state
+        .channel_store
+        .get_session(&user.id, &channel.id, &session.id)
+        .await
+        .expect("active hidden session should survive cleanup");
+    assert!(fetched_session.hidden_from_web);
+
+    let active_run = state
+        .channel_store
+        .get_active_run_for_session(&user.id, &channel.id, &session.id)
+        .await
+        .expect("active run can be read")
+        .expect("active run should remain");
+    assert_eq!(active_run.status, ChannelRunStatus::Running);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_hidden_session_cleanup_removes_terminal_runs() {
+    let Some(pool) = postgres_pool().await else {
+        eprintln!("skipping postgres persistence test: HERMES_HUB_TEST_DATABASE_URL is not set");
+        return;
+    };
+    run_migrations(&pool).await.expect("migrations can run");
+
+    let state = test_state(pool.clone(), InMemoryLlmProviderClient::default()).await;
+    let user = state
+        .store
+        .create_bootstrap_admin("terminal-hidden@example.com", "terminal-hidden-password")
+        .await
+        .expect("bootstrap admin can be created");
+    let channel = state
+        .channel_store
+        .ensure_hub_channel(&user.id)
+        .await
+        .expect("hub channel can be ensured");
+    let session = state
+        .channel_store
+        .create_session(&user.id, &channel.id, ChannelSessionKind::Agent, None, true)
+        .await
+        .expect("hidden session can be created");
+    let user_message = state
+        .channel_store
+        .append_session_message(
+            &user.id,
+            &channel.id,
+            &session.id,
+            ChannelMessageRole::User,
+            Some("terminal-hidden-turn".to_string()),
+            "done work".to_string(),
+            json!([]),
+        )
+        .await
+        .expect("message can be appended");
+    let run = state
+        .channel_store
+        .create_channel_run(
+            &user.id,
+            &channel.id,
+            &session.id,
+            &user_message.id,
+            "done work".to_string(),
+            json!([]),
+        )
+        .await
+        .expect("run can be created");
+    state
+        .channel_store
+        .update_run_status_for_session(
+            &session.id,
+            &run.run_id,
+            ChannelRunStatus::Completed,
+            None,
+            None,
+        )
+        .await
+        .expect("run can be marked completed");
+
+    sqlx::query(
+        "update channel_sessions set updated_at = now() - interval '2 hours' where id = $1::uuid",
+    )
+    .bind(&session.id)
+    .execute(&pool)
+    .await
+    .expect("session timestamp can be aged");
+
+    hermes_hub_backend::http::sessions::cleanup_expired_hidden_sessions(&state)
+        .await
+        .expect("cleanup can run");
+
+    assert!(
+        state
+            .channel_store
+            .get_session(&user.id, &channel.id, &session.id)
+            .await
+            .is_err(),
+        "terminal hidden sessions should be cleaned even if hermes_run_id remains"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn postgres_can_bind_stopped_hermes_instance_without_activity_timestamp() {
     let Some(pool) = postgres_pool().await else {
         eprintln!(
@@ -1265,6 +1506,36 @@ async fn postgres_can_bind_stopped_hermes_instance_without_activity_timestamp() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn postgres_oauth_session_lookup_persists_integration_id() {
+    let Some(pool) = postgres_pool().await else {
+        eprintln!("skipping postgres OAuth session test: HERMES_HUB_TEST_DATABASE_URL is not set");
+        return;
+    };
+    run_migrations(&pool).await.expect("migrations can run");
+
+    let cipher = SecretCipher::from_master_key(TEST_SECRET_KEY).expect("test cipher is valid");
+    let store = SessionStore::postgres(pool.clone(), cipher.clone());
+    let user = store
+        .create_bootstrap_admin("oauth-pg@example.com", "admin-password-123")
+        .await
+        .expect("postgres user can be created");
+    let token = store
+        .create_oauth_session(&user.id, "business-client")
+        .await
+        .expect("oauth session can be created");
+
+    let reloaded = SessionStore::postgres(pool, cipher);
+    let lookup = reloaded
+        .user_and_session_lookup_by_session_token(&token)
+        .await
+        .expect("oauth session lookup can be reloaded from postgres");
+
+    assert_eq!(lookup.user.email, "oauth-pg@example.com");
+    assert_eq!(lookup.purpose, SessionPurpose::OAuth);
+    assert_eq!(lookup.integration_id.as_deref(), Some("business-client"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn postgres_system_settings_persist_session_limit() {
     let Some(pool) = postgres_pool().await else {
         eprintln!(
@@ -1296,6 +1567,7 @@ async fn postgres_system_settings_persist_session_limit() {
                 enabled: true,
                 temporary_session_retention_hours: 48,
             },
+            api_management: ApiManagementSettings { enabled: true },
             oidc: OidcSettings {
                 enabled: true,
                 display_name: "Acme SSO".to_string(),
@@ -1323,6 +1595,7 @@ async fn postgres_system_settings_persist_session_limit() {
                 email_attribute: "mail".to_string(),
                 auto_create_users: true,
             },
+            business_oauth: BusinessOAuthSettings::default(),
         })
         .await
         .expect("settings can be updated");
@@ -1357,6 +1630,7 @@ async fn postgres_system_settings_persist_session_limit() {
         reloaded.public_platform.temporary_session_retention_hours,
         48
     );
+    assert!(reloaded.api_management.enabled);
     assert_eq!(reloaded.oidc.client_secret, "oidc-secret");
     assert_eq!(reloaded.ldap.bind_password, "ldap-bind-secret");
 }

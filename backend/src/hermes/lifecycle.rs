@@ -99,6 +99,9 @@ pub async fn start_hermes_lifecycle_sweeper(state: AppState) {
         if let Err(error) = crate::http::sessions::cleanup_expired_public_sessions(&state).await {
             tracing::warn!(?error, "Public platform session cleanup failed");
         }
+        if let Err(error) = crate::http::sessions::cleanup_expired_hidden_sessions(&state).await {
+            tracing::warn!(?error, "Hidden session cleanup failed");
+        }
         if let Err(error) = sweep_hermes_lifecycle_once(&state, unix_now()).await {
             tracing::warn!(?error, "Hermes lifecycle sweep failed");
         }

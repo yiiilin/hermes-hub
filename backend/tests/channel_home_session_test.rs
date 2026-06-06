@@ -22,7 +22,14 @@ async fn home_session_is_pinned_protected_and_excluded_from_session_limit() {
     assert_eq!(duplicate.id, home.id);
 
     let regular = store
-        .create_session_with_limit("user-1", &channel.id, ChannelSessionKind::Agent, None, 1)
+        .create_session_with_limit(
+            "user-1",
+            &channel.id,
+            ChannelSessionKind::Agent,
+            None,
+            1,
+            false,
+        )
         .await
         .expect("home session does not consume the regular session quota");
     assert!(!regular.is_home);
@@ -38,7 +45,14 @@ async fn home_session_is_pinned_protected_and_excluded_from_session_limit() {
     );
 
     let second_regular = store
-        .create_session_with_limit("user-1", &channel.id, ChannelSessionKind::Agent, None, 1)
+        .create_session_with_limit(
+            "user-1",
+            &channel.id,
+            ChannelSessionKind::Agent,
+            None,
+            1,
+            false,
+        )
         .await;
     assert!(matches!(
         second_regular,
@@ -51,5 +65,36 @@ async fn home_session_is_pinned_protected_and_excluded_from_session_limit() {
     assert!(matches!(
         deleted_home,
         Err(ChannelStoreError::ProtectedSession)
+    ));
+}
+
+#[tokio::test]
+async fn integration_channel_is_stable_per_user_and_integration() {
+    let store = ChannelStore::default();
+
+    let crm_for_user_1 = store
+        .ensure_integration_channel("user-1", "crm-client")
+        .await
+        .expect("integration channel can be created");
+    let crm_for_user_1_again = store
+        .ensure_integration_channel("user-1", " crm-client ")
+        .await
+        .expect("integration channel can be reused");
+    let erp_for_user_1 = store
+        .ensure_integration_channel("user-1", "erp-client")
+        .await
+        .expect("second integration channel can be created");
+    let crm_for_user_2 = store
+        .ensure_integration_channel("user-2", "crm-client")
+        .await
+        .expect("same integration can be created for another user");
+
+    assert_eq!(crm_for_user_1.id, crm_for_user_1_again.id);
+    assert_eq!(crm_for_user_1.name, "integration:crm-client");
+    assert_ne!(crm_for_user_1.id, erp_for_user_1.id);
+    assert_ne!(crm_for_user_1.id, crm_for_user_2.id);
+    assert!(matches!(
+        store.ensure_integration_channel("user-1", " ").await,
+        Err(ChannelStoreError::InvalidIntegrationId)
     ));
 }

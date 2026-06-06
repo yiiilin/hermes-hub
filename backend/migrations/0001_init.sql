@@ -25,9 +25,37 @@ create table if not exists sessions (
     id uuid primary key,
     user_id uuid not null references users(id) on delete cascade,
     session_token_hash text not null unique,
+    purpose text not null default 'web' check (purpose in ('web', 'oauth')),
+    integration_id text,
     expires_at timestamptz not null,
     created_at timestamptz not null default now()
 );
+
+alter table sessions
+    add column if not exists purpose text not null default 'web';
+
+alter table sessions
+    add column if not exists integration_id text;
+
+alter table sessions
+    drop constraint if exists sessions_purpose_check;
+
+alter table sessions
+    add constraint sessions_purpose_check check (purpose in ('web', 'oauth'));
+
+create table if not exists business_oauth_authorization_codes (
+    id uuid primary key,
+    code_hash text not null unique,
+    user_id uuid not null references users(id) on delete cascade,
+    client_id text not null,
+    redirect_uri text not null,
+    scope text not null,
+    expires_at timestamptz not null,
+    created_at timestamptz not null default now()
+);
+
+create index if not exists business_oauth_authorization_codes_expires_at_idx
+    on business_oauth_authorization_codes (expires_at);
 
 create table if not exists invites (
     id uuid primary key,
@@ -197,6 +225,10 @@ insert into system_settings (key, value)
 values ('max_sessions_per_user', '20')
 on conflict (key) do nothing;
 
+insert into system_settings (key, value)
+values ('api_management', '{"enabled":false}')
+on conflict (key) do nothing;
+
 create table if not exists channels (
     id uuid primary key,
     user_id uuid not null references users(id) on delete cascade,
@@ -218,12 +250,14 @@ create table if not exists channel_sessions (
     title text,
     is_home boolean not null default false,
     deletable boolean not null default true,
+    hidden_from_web boolean not null default false,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
 
 alter table channel_sessions add column if not exists is_home boolean not null default false;
 alter table channel_sessions add column if not exists deletable boolean not null default true;
+alter table channel_sessions add column if not exists hidden_from_web boolean not null default false;
 create unique index if not exists channel_sessions_one_home_per_channel
     on channel_sessions(channel_id)
     where is_home;

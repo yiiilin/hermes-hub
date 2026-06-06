@@ -24,10 +24,11 @@ use crate::{
         events::SessionEvent,
         service::{
             ChannelActiveRun, ChannelAttachment, ChannelAttachmentDirection, ChannelMessage,
-            ChannelMessageRole, ChannelRunStatus, ChannelSession, ChannelSessionKind,
-            ChannelStoreError,
+            ChannelMessageRole, ChannelRun, ChannelRunStatus, ChannelSession, ChannelSessionKind,
+            ChannelStoreError, HiddenSessionCleanupCandidate,
         },
     },
+    domain::user::User,
     http::{
         attachments::{map_channel_error, upload_session_attachments},
         auth::{cookie_value_from_headers, current_user},
@@ -53,7 +54,12 @@ pub fn router() -> Router<AppState> {
         .route("/api/sessions/{session_id}", delete(delete_session))
         .route(
             "/api/sessions/{session_id}/messages",
-            post(append_session_message),
+            get(list_session_messages).post(append_session_message),
+        )
+        .route("/api/sessions/{session_id}/runs", post(create_channel_run))
+        .route(
+            "/api/sessions/{session_id}/active-run",
+            get(get_active_run).delete(clear_active_run),
         )
         .route(
             "/api/sessions/{session_id}/messages/{message_id}",
@@ -65,6 +71,10 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/sessions/{session_id}/events", get(session_events))
         .route("/api/sessions/{session_id}/stop", post(stop_active_run))
+        .route(
+            "/api/sessions/{session_id}/title",
+            post(generate_session_title),
+        )
 }
 
 #[derive(Deserialize)]
@@ -82,9 +92,21 @@ struct AppendMessageRequest {
 }
 
 #[derive(Deserialize)]
+struct CreateRunRequest {
+    content: String,
+    attachments: Option<Value>,
+    client_message_key: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct UpdateMessageRequest {
     content: String,
     attachments: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct GenerateTitleRequest {
+    prompt: String,
 }
 
 #[derive(Serialize)]
@@ -119,8 +141,24 @@ struct MessageResponse {
 }
 
 #[derive(Serialize)]
+struct MessageListResponse {
+    messages: Vec<ChannelMessage>,
+}
+
+#[derive(Serialize)]
+struct RunCreateResponse {
+    message: ChannelMessage,
+    run: ChannelRun,
+}
+
+#[derive(Serialize)]
 struct AttachmentListResponse {
     attachments: Vec<ChannelAttachment>,
+}
+
+#[derive(Serialize)]
+struct ActiveRunResponse {
+    active_run: Option<ChannelActiveRun>,
 }
 
 #[derive(Deserialize)]
@@ -142,6 +180,7 @@ struct PublicCreateAccess {
     owner_user_id: String,
     token: Option<String>,
     set_cookie: Option<String>,
+    hidden_from_web: bool,
 }
 
 impl SessionAccess {
@@ -161,7 +200,7 @@ async fn list_sessions(
     let request_started_at = Instant::now();
     let auth_started_at = Instant::now();
     // 列表接口是登录后首屏路径，复用这次鉴权结果，避免同一请求重复查 session cookie。
-    let authenticated_user = current_user(&state, &headers).await.ok();
+    let authenticated_user = optional_web_user(&state, &headers).await?;
     let auth_elapsed_ms = elapsed_ms(auth_started_at);
     let is_authenticated = authenticated_user.is_some();
 
@@ -185,7 +224,9 @@ async fn list_sessions(
     let public_prepare_elapsed_ms = elapsed_ms(public_prepare_started_at);
 
     let access = if let Some(user) = authenticated_user {
-        SessionAccess::Authenticated { user_id: user.id }
+        SessionAccess::Authenticated {
+            user_id: user.id.clone(),
+        }
     } else {
         SessionAccess::Public {
             owner_user_id: public_platform_owner_user_id(&state).await?,
@@ -218,8 +259,16 @@ async fn list_sessions(
         .list_sessions(access.user_id(), &channel.id)
         .await
         .map_err(map_channel_error)?;
-    let list_elapsed_ms = elapsed_ms(list_started_at);
     let raw_session_count = sessions.len();
+    let sessions = if is_authenticated {
+        sessions
+            .into_iter()
+            .filter(|session| !session.hidden_from_web)
+            .collect()
+    } else {
+        sessions
+    };
+    let list_elapsed_ms = elapsed_ms(list_started_at);
     let filter_started_at = Instant::now();
     let sessions = filter_sessions_for_access(&state, &access, sessions).await?;
     let filter_elapsed_ms = elapsed_ms(filter_started_at);
@@ -260,12 +309,9 @@ async fn create_session(
     headers: HeaderMap,
     Json(payload): Json<CreateSessionRequest>,
 ) -> Result<Response, ApiError> {
-    ensure_public_platform_enabled_for_anonymous(
-        &state,
-        current_user(&state, &headers).await.is_ok(),
-    )
-    .await?;
-    let access = session_create_access(&state, &headers).await?;
+    let authenticated_user = optional_web_user(&state, &headers).await?;
+    ensure_public_platform_enabled_for_anonymous(&state, authenticated_user.is_some()).await?;
+    let access = session_create_access(&state, &headers, authenticated_user).await?;
     if access.token.is_some() {
         cleanup_expired_public_sessions(&state).await?;
         ensure_managed_hermes_for_user(&state, &access.owner_user_id).await?;
@@ -282,7 +328,13 @@ async fn create_session(
     let session = if is_public_session {
         state
             .channel_store
-            .create_session(&access.owner_user_id, &channel.id, kind, payload.title)
+            .create_session(
+                &access.owner_user_id,
+                &channel.id,
+                kind,
+                payload.title,
+                access.hidden_from_web,
+            )
             .await
             .map_err(map_channel_error)?
     } else {
@@ -294,6 +346,7 @@ async fn create_session(
                 kind,
                 payload.title,
                 settings.max_sessions_per_user,
+                access.hidden_from_web,
             )
             .await
             .map_err(map_channel_error)?
@@ -362,6 +415,64 @@ async fn delete_session(
         session_id: session_id.clone(),
     });
     delete_session_objects(&state, &deleted.attachments).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_session_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let access = session_access_requiring_session(&state, &headers, &session_id).await?;
+    let channel = ensure_public_channel(&state, access.user_id()).await?;
+    let messages = state
+        .channel_store
+        .list_session_messages(access.user_id(), &channel.id, &session_id)
+        .await
+        .map_err(map_channel_error)?;
+
+    Ok(Json(MessageListResponse { messages }))
+}
+
+async fn get_active_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let access = session_access_requiring_session(&state, &headers, &session_id).await?;
+    let channel = ensure_public_channel(&state, access.user_id()).await?;
+    state
+        .channel_store
+        .get_session(access.user_id(), &channel.id, &session_id)
+        .await
+        .map_err(map_channel_error)?;
+    let active_run = state
+        .channel_store
+        .get_active_run_for_session(access.user_id(), &channel.id, &session_id)
+        .await
+        .map_err(map_channel_error)?
+        .map(ChannelActiveRun::from);
+
+    Ok(Json(ActiveRunResponse { active_run }))
+}
+
+async fn clear_active_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let access = session_access_requiring_session(&state, &headers, &session_id).await?;
+    let channel = ensure_public_channel(&state, access.user_id()).await?;
+    state
+        .channel_store
+        .get_session(access.user_id(), &channel.id, &session_id)
+        .await
+        .map_err(map_channel_error)?;
+    clear_persisted_hermes_run(&state, access.user_id(), &channel.id, &session_id).await?;
+    state.session_events.publish(SessionEvent::RunCleared {
+        session_id: session_id.clone(),
+    });
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -447,6 +558,86 @@ async fn append_session_message(
     }
 
     Ok((StatusCode::CREATED, Json(MessageResponse { message })))
+}
+
+async fn create_channel_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(payload): Json<CreateRunRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let access = session_access_requiring_session(&state, &headers, &session_id).await?;
+    let channel = ensure_public_channel(&state, access.user_id()).await?;
+    let session = state
+        .channel_store
+        .get_session(access.user_id(), &channel.id, &session_id)
+        .await
+        .map_err(map_channel_error)?;
+
+    // 兼容旧前端 client 的 run 创建入口；公开 URL 不再带 channel，但仍由后端统一创建用户消息和 Hub run。
+    ensure_managed_hermes_for_user(&state, access.user_id()).await?;
+    let message = state
+        .channel_store
+        .append_session_message(
+            access.user_id(),
+            &channel.id,
+            &session_id,
+            ChannelMessageRole::User,
+            payload.client_message_key,
+            payload.content,
+            payload.attachments.unwrap_or_else(|| json!([])),
+        )
+        .await
+        .map_err(map_channel_error)?;
+    state.session_events.publish(SessionEvent::MessageCreated {
+        message: message.clone(),
+    });
+    if let Some(updated_session) = refresh_public_session_retention_from_message(
+        &state,
+        access.user_id(),
+        &channel.id,
+        &session_id,
+        message.updated_at,
+    )
+    .await?
+    {
+        state.session_events.publish(SessionEvent::SessionUpdated {
+            session: updated_session,
+        });
+    }
+
+    let run = state
+        .channel_store
+        .create_channel_run(
+            access.user_id(),
+            &channel.id,
+            &session_id,
+            &message.id,
+            message.content.clone(),
+            message.attachments.clone(),
+        )
+        .await
+        .map_err(map_channel_error)?;
+    state
+        .session_events
+        .publish(SessionEvent::RunUpdated { run: run.clone() });
+
+    if !session.is_home && session.title.is_none() && !message.content.trim().is_empty() {
+        let title = model_generated_title(&state, access.user_id(), &message.content).await;
+        let updated_session = state
+            .channel_store
+            .update_session_title(access.user_id(), &channel.id, &session_id, title)
+            .await
+            .map_err(map_channel_error)?;
+        state.session_events.publish(SessionEvent::SessionUpdated {
+            session: updated_session,
+        });
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(RunCreateResponse { message, run }),
+    ))
 }
 
 async fn update_session_message(
@@ -584,6 +775,37 @@ async fn stop_active_run(
     stop_active_run_for_session(&state, access.user_id(), &channel.id, &session_id).await?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn generate_session_title(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(payload): Json<GenerateTitleRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let access = session_access_requiring_session(&state, &headers, &session_id).await?;
+    let channel = ensure_public_channel(&state, access.user_id()).await?;
+    state
+        .channel_store
+        .get_session(access.user_id(), &channel.id, &session_id)
+        .await
+        .map_err(map_channel_error)?;
+
+    let title = model_generated_title(&state, access.user_id(), &payload.prompt).await;
+    let session = state
+        .channel_store
+        .update_session_title(access.user_id(), &channel.id, &session_id, title)
+        .await
+        .map_err(map_channel_error)?;
+    state.session_events.publish(SessionEvent::SessionUpdated {
+        session: session.clone(),
+    });
+    let session = public_session_summary_for_access(&state, &access, session).await?;
+
+    Ok(Json(SessionResponse {
+        session,
+        public_token: None,
+    }))
 }
 
 async fn stop_active_run_for_session(
@@ -759,15 +981,96 @@ pub(crate) async fn refresh_public_session_retention_from_message(
     Ok(Some(session))
 }
 
+pub async fn cleanup_expired_hidden_sessions(state: &AppState) -> Result<(), ApiError> {
+    let settings = state
+        .store
+        .system_settings()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let idle_timeout = settings.business_oauth.hidden_session_idle_timeout_seconds;
+    if idle_timeout == 0 {
+        return Ok(());
+    }
+
+    let cutoff = unix_now().saturating_sub(idle_timeout);
+    let candidates = state
+        .channel_store
+        .hidden_sessions_older_than(cutoff)
+        .await
+        .map_err(map_channel_error)?;
+
+    for candidate in candidates {
+        if let Err(error) = cleanup_hidden_session_candidate(state, &candidate).await {
+            tracing::warn!(
+                ?error,
+                session_id = %candidate.session_id,
+                "hidden session cleanup failed"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn cleanup_hidden_session_candidate(
+    state: &AppState,
+    candidate: &HiddenSessionCleanupCandidate,
+) -> Result<(), ApiError> {
+    if state
+        .channel_store
+        .get_session(
+            &candidate.user_id,
+            &candidate.channel_id,
+            &candidate.session_id,
+        )
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+    if let Some(run) = state
+        .channel_store
+        .get_active_run_for_session(
+            &candidate.user_id,
+            &candidate.channel_id,
+            &candidate.session_id,
+        )
+        .await
+        .map_err(map_channel_error)?
+    {
+        if !run.status.is_terminal() {
+            // 隐藏会话的“空闲销毁”只适用于真正仍在运行的会话；终态 run 不应阻止回收。
+            return Ok(());
+        }
+    }
+    delete_managed_cron_jobs_for_session(state, &candidate.user_id, &candidate.session_id).await?;
+    let deleted = state
+        .channel_store
+        .delete_session(
+            &candidate.user_id,
+            &candidate.channel_id,
+            &candidate.session_id,
+        )
+        .await
+        .map_err(map_channel_error)?;
+    state.session_events.publish(SessionEvent::SessionDeleted {
+        session_id: candidate.session_id.clone(),
+    });
+    delete_session_objects(state, &deleted.attachments).await?;
+    Ok(())
+}
+
 async fn session_create_access(
     state: &AppState,
     headers: &HeaderMap,
+    authenticated_user: Option<User>,
 ) -> Result<PublicCreateAccess, ApiError> {
-    if let Ok(user) = current_user(state, headers).await {
+    if let Some(user) = authenticated_user {
         return Ok(PublicCreateAccess {
             owner_user_id: user.id,
             token: None,
             set_cookie: None,
+            hidden_from_web: false,
         });
     }
     ensure_public_platform_enabled_for_anonymous(state, false).await?;
@@ -782,7 +1085,21 @@ async fn session_create_access(
         owner_user_id,
         token: Some(token),
         set_cookie,
+        hidden_from_web: false,
     })
+}
+
+async fn optional_web_user(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<User>, ApiError> {
+    match current_user(state, headers).await {
+        Ok(user) => Ok(Some(user)),
+        // `/api/sessions` 支持匿名公共平台，但 Authorization 头属于受保护 API。
+        // OAuth bearer 不能在这里被降级成匿名公共会话。
+        Err(_) if headers.get(header::AUTHORIZATION).is_some() => Err(ApiError::Unauthorized),
+        Err(_) => Ok(None),
+    }
 }
 
 async fn session_access_requiring_session(
@@ -1011,7 +1328,18 @@ fn generate_public_session_token() -> String {
 }
 
 fn public_session_cookie(public_token: &str) -> String {
-    format!("{PUBLIC_SESSION_COOKIE_NAME}={public_token}; HttpOnly; SameSite=Lax; Path=/")
+    format!(
+        "{PUBLIC_SESSION_COOKIE_NAME}={public_token}; HttpOnly; SameSite=Lax; Path=/{}",
+        secure_cookie_suffix()
+    )
+}
+
+fn secure_cookie_suffix() -> &'static str {
+    if cfg!(debug_assertions) {
+        ""
+    } else {
+        "; Secure"
+    }
 }
 
 fn session_list_response(
