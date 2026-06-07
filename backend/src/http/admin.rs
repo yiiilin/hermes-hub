@@ -40,8 +40,9 @@ use crate::{
     },
     public_platform,
     session::store::{
-        ApiManagementSettings, BusinessOAuthSettings, HermesSchedulerSnapshot, LdapSettings,
-        OidcSettings, PublicPlatformSettings, SpeechInputSettings, StoreError, SystemSettings,
+        ApiManagementSettings, HermesSchedulerSnapshot, IntegrationApp, IntegrationToolDefinition,
+        LdapSettings, NewIntegrationApp, OidcSettings, PublicPlatformSettings, SpeechInputSettings,
+        StoreError, SystemSettings, UpdateIntegrationApp,
     },
     skills_fs::normalize_skills_path,
     storage::ObjectStorageError,
@@ -113,6 +114,22 @@ pub fn router() -> Router<AppState> {
             put(update_system_parameters),
         )
         .route("/api/admin/system-settings/auth", put(update_auth_settings))
+        .route(
+            "/api/admin/integration-apps",
+            get(list_integration_apps).post(create_integration_app),
+        )
+        .route(
+            "/api/admin/integration-apps/{app_id}/secret/rotate",
+            post(rotate_integration_app_secret),
+        )
+        .route(
+            "/api/admin/integration-apps/{app_id}/tools",
+            get(list_integration_app_tools),
+        )
+        .route(
+            "/api/admin/integration-apps/{app_id}",
+            put(update_integration_app).delete(delete_integration_app),
+        )
         .route(
             "/api/admin/system-settings/public-platform",
             put(update_public_platform_settings),
@@ -275,7 +292,45 @@ struct UpdateSystemParametersRequest {
 struct UpdateAuthSettingsRequest {
     oidc: OidcSettings,
     ldap: LdapSettings,
-    business_oauth: BusinessOAuthSettings,
+}
+
+#[derive(Deserialize)]
+struct CreateIntegrationAppRequest {
+    name: String,
+    enabled: bool,
+    redirect_uri: String,
+    scopes: String,
+    authorization_code_ttl_seconds: Option<u64>,
+    hidden_session_idle_timeout_seconds: Option<u64>,
+    default_tool_timeout_seconds: Option<u64>,
+    max_tool_timeout_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct UpdateIntegrationAppRequest {
+    name: String,
+    enabled: bool,
+    redirect_uri: String,
+    scopes: String,
+    authorization_code_ttl_seconds: u64,
+    hidden_session_idle_timeout_seconds: u64,
+    default_tool_timeout_seconds: u64,
+    max_tool_timeout_seconds: u64,
+}
+
+#[derive(Serialize)]
+struct IntegrationAppsResponse {
+    integration_apps: Vec<IntegrationApp>,
+}
+
+#[derive(Serialize)]
+struct IntegrationAppResponse {
+    integration_app: IntegrationApp,
+}
+
+#[derive(Serialize)]
+struct IntegrationToolsResponse {
+    tools: Vec<IntegrationToolDefinition>,
 }
 
 #[derive(Deserialize)]
@@ -1024,12 +1079,124 @@ async fn update_auth_settings(
     require_admin(&state, &headers).await?;
     state
         .store
-        .update_auth_settings(payload.oidc, payload.ldap, payload.business_oauth)
+        .update_auth_settings(payload.oidc, payload.ldap)
         .await
         .map_err(map_system_settings_error)?;
     post_system_settings_save(&state, false).await?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_integration_apps(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    let integration_apps = state
+        .store
+        .list_integration_apps()
+        .await
+        .map_err(map_integration_app_error)?;
+    Ok(Json(IntegrationAppsResponse { integration_apps }))
+}
+
+async fn create_integration_app(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateIntegrationAppRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    let created = state
+        .store
+        .create_integration_app(NewIntegrationApp {
+            name: payload.name,
+            enabled: payload.enabled,
+            redirect_uri: payload.redirect_uri,
+            scopes: payload.scopes,
+            authorization_code_ttl_seconds: payload.authorization_code_ttl_seconds,
+            hidden_session_idle_timeout_seconds: payload.hidden_session_idle_timeout_seconds,
+            default_tool_timeout_seconds: payload.default_tool_timeout_seconds,
+            max_tool_timeout_seconds: payload.max_tool_timeout_seconds,
+        })
+        .await
+        .map_err(map_integration_app_error)?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+async fn update_integration_app(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(app_id): Path<String>,
+    Json(payload): Json<UpdateIntegrationAppRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    let app = state
+        .store
+        .update_integration_app(
+            &app_id,
+            UpdateIntegrationApp {
+                name: payload.name,
+                enabled: payload.enabled,
+                redirect_uri: payload.redirect_uri,
+                scopes: payload.scopes,
+                authorization_code_ttl_seconds: payload.authorization_code_ttl_seconds,
+                hidden_session_idle_timeout_seconds: payload.hidden_session_idle_timeout_seconds,
+                default_tool_timeout_seconds: payload.default_tool_timeout_seconds,
+                max_tool_timeout_seconds: payload.max_tool_timeout_seconds,
+            },
+        )
+        .await
+        .map_err(map_integration_app_error)?;
+
+    Ok(Json(IntegrationAppResponse {
+        integration_app: app,
+    }))
+}
+
+async fn delete_integration_app(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(app_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    state
+        .store
+        .delete_integration_app(&app_id)
+        .await
+        .map_err(map_integration_app_error)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn rotate_integration_app_secret(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(app_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    let created = state
+        .store
+        .rotate_integration_app_secret(&app_id)
+        .await
+        .map_err(map_integration_app_error)?;
+
+    Ok(Json(created))
+}
+
+async fn list_integration_app_tools(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(app_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state, &headers).await?;
+    let app = require_integration_app_by_id(&state, &app_id).await?;
+    let tools = state
+        .store
+        .list_integration_tools(&app.integration_id)
+        .await
+        .map_err(map_integration_app_error)?;
+
+    Ok(Json(IntegrationToolsResponse { tools }))
 }
 
 async fn update_public_platform_settings(
@@ -1106,6 +1273,26 @@ fn map_system_settings_error(error: StoreError) -> ApiError {
         StoreError::InvalidSystemSettings => ApiError::BadRequest("invalid system settings"),
         _ => ApiError::Internal,
     }
+}
+
+fn map_integration_app_error(error: StoreError) -> ApiError {
+    match error {
+        StoreError::InvalidSystemSettings => ApiError::BadRequest("invalid integration app"),
+        StoreError::InviteNotFound => ApiError::NotFound("integration app not found"),
+        _ => ApiError::Internal,
+    }
+}
+
+async fn require_integration_app_by_id(
+    state: &AppState,
+    app_id: &str,
+) -> Result<IntegrationApp, ApiError> {
+    state
+        .store
+        .integration_app_by_id(app_id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::NotFound("integration app not found"))
 }
 
 async fn get_hermes_profile(

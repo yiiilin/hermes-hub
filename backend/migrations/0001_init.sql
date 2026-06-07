@@ -57,6 +57,133 @@ create table if not exists business_oauth_authorization_codes (
 create index if not exists business_oauth_authorization_codes_expires_at_idx
     on business_oauth_authorization_codes (expires_at);
 
+create table if not exists integration_apps (
+    id uuid primary key,
+    integration_id text not null unique,
+    name text not null,
+    enabled boolean not null default true,
+    client_id text not null unique,
+    client_secret_hash text not null,
+    redirect_uri text not null,
+    scopes text not null default 'openid profile email',
+    authorization_code_ttl_seconds bigint not null default 600 check (authorization_code_ttl_seconds > 0),
+    hidden_session_idle_timeout_seconds bigint not null default 3600 check (hidden_session_idle_timeout_seconds > 0),
+    default_tool_timeout_seconds bigint not null default 60 check (default_tool_timeout_seconds > 0),
+    max_tool_timeout_seconds bigint not null default 300 check (max_tool_timeout_seconds > 0),
+    last_used_at timestamptz,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    check (default_tool_timeout_seconds <= max_tool_timeout_seconds)
+);
+
+alter table integration_apps
+    add column if not exists redirect_uri text;
+
+do $$
+declare
+    ambiguous_integration_id text;
+    missing_integration_id text;
+    invalid_integration_id text;
+begin
+    if exists (
+        select 1
+        from information_schema.columns
+        where table_name = 'integration_apps'
+          and column_name = 'allowed_redirect_uris'
+    ) then
+        select candidate.integration_id
+        into ambiguous_integration_id
+        from (
+            select
+                app.integration_id,
+                count(distinct trim(uri.value)) filter (where trim(uri.value) <> '') as uri_count
+            from integration_apps app
+            left join lateral jsonb_array_elements_text(
+                case
+                    when jsonb_typeof(app.allowed_redirect_uris) = 'array'
+                        then app.allowed_redirect_uris
+                    else '[]'::jsonb
+                end
+            ) as uri(value)
+                on true
+            group by app.integration_id
+        ) as candidate
+        where candidate.uri_count > 1
+        limit 1;
+
+        if ambiguous_integration_id is not null then
+            raise exception
+                'integration app % has multiple legacy callback URLs; please keep exactly one before upgrading',
+                ambiguous_integration_id;
+        end if;
+
+        -- 旧版本把回调地址存成 JSON 数组；现在每个接入应用只保留唯一回调地址，
+        -- 升级时把第一条非空地址迁移到新列，供 OAuth code 回传统一使用。
+        update integration_apps
+        set redirect_uri = coalesce(
+            nullif(trim(redirect_uri), ''),
+            (
+                select trim(uri.value)
+                from jsonb_array_elements_text(
+                    case
+                        when jsonb_typeof(allowed_redirect_uris) = 'array'
+                            then allowed_redirect_uris
+                        else '[]'::jsonb
+                    end
+                )
+                    with ordinality as uri(value, ord)
+                where trim(uri.value) <> ''
+                order by uri.ord
+                limit 1
+            )
+        )
+        where redirect_uri is null
+           or trim(redirect_uri) = '';
+
+        select integration_id
+        into missing_integration_id
+        from integration_apps
+        where redirect_uri is null
+           or trim(redirect_uri) = ''
+        limit 1;
+
+        if missing_integration_id is not null then
+            raise exception
+                'integration app % has no usable legacy callback URL; please fix its configuration before upgrading',
+                missing_integration_id;
+        end if;
+
+        select integration_id
+        into invalid_integration_id
+        from integration_apps
+        where redirect_uri !~* '^https?://([^/?#:@[:space:]]+|\\[[0-9A-Fa-f:.]+\\])(:(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}|0))?([/?#][^[:space:]]*)?$'
+        limit 1;
+
+        if invalid_integration_id is not null then
+            raise exception
+                'integration app % has an invalid callback URL; please fix its configuration before upgrading',
+                invalid_integration_id;
+        end if;
+
+        alter table integration_apps
+            drop column allowed_redirect_uris;
+    end if;
+end $$;
+
+alter table integration_apps
+    alter column redirect_uri set not null;
+
+create table if not exists integration_tool_definitions (
+    id uuid primary key,
+    integration_id text not null references integration_apps(integration_id) on delete cascade,
+    name text not null,
+    description text not null,
+    parameters jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    unique (integration_id, name)
+);
+
 create table if not exists invites (
     id uuid primary key,
     token_hash text not null unique,

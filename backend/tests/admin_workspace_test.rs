@@ -1943,22 +1943,6 @@ async fn admin_can_update_system_settings_by_section() {
                 "email_attribute": "mail",
                 "auto_create_users": true
             },
-            "business_oauth": {
-                "enabled": true,
-                "client_id": "business-client",
-                "client_secret": "business-secret",
-                "allowed_redirect_uris": [
-                    "https://biz.example/callback",
-                    "https://biz.example/alt"
-                ],
-                "scopes": "openid profile email",
-                "authorization_code_ttl_seconds": 900,
-                "hidden_session_idle_timeout_seconds": 1800,
-                "toolset_names": [
-                    "business-crm",
-                    "business-search"
-                ]
-            }
         }),
         Some(&admin_cookie),
     )
@@ -2022,11 +2006,7 @@ async fn admin_can_update_system_settings_by_section() {
     assert_eq!(body["settings"]["oidc"]["client_id"], "hermes-hub");
     assert_eq!(body["settings"]["ldap"]["enabled"], true);
     assert_eq!(body["settings"]["ldap"]["display_name"], "Corporate LDAP");
-    assert_eq!(body["settings"]["business_oauth"]["enabled"], true);
-    assert_eq!(
-        body["settings"]["business_oauth"]["toolset_names"],
-        json!(["business-crm", "business-search"])
-    );
+    assert!(body["settings"].get("business_oauth").is_none());
     assert_eq!(body["settings"]["public_platform"]["enabled"], false);
     assert_eq!(
         body["settings"]["public_platform"]["temporary_session_retention_hours"],

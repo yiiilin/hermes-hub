@@ -4476,58 +4476,323 @@ describe("App", () => {
     });
   });
 
-  it("shows and saves business OAuth settings", async () => {
+  it("shows integration apps as a separate tab after API management is enabled", async () => {
     const client = createMockApiClient();
-    const updateAuthSettings = client.updateAuthSettings.bind(client);
-    let savedSettings: unknown = null;
-    client.updateAuthSettings = vi.fn(async (settings) => {
-      savedSettings = settings;
-      await updateAuthSettings(settings);
+
+    render(<App apiClient={client} />);
+
+    const settingsTabs = await openSettingsTab("API management");
+    expect(
+      within(settingsTabs).queryByRole("tab", { name: "Integration apps" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(await screen.findByLabelText("Enable API management"));
+    expect(
+      within(settingsTabs).queryByRole("tab", { name: "Integration apps" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    expect(await screen.findByText("Settings saved")).toBeInTheDocument();
+
+    expect(within(settingsTabs).getByRole("tab", { name: "Integration apps" })).toBeInTheDocument();
+  });
+
+  it("shows integration apps on cold start when API management is already enabled", async () => {
+    const client = createMockApiClient({
+      apiManagementSettings: { enabled: true },
+      initialIntegrationApps: [
+        {
+          id: "integration-app-1",
+          integration_id: "crm",
+          name: "CRM",
+          enabled: true,
+          client_id: "client-crm",
+          redirect_uri: "https://crm.example/callback",
+          scopes: "openid profile email",
+          authorization_code_ttl_seconds: 600,
+          hidden_session_idle_timeout_seconds: 3600,
+          default_tool_timeout_seconds: 60,
+          max_tool_timeout_seconds: 300,
+          last_used_at: null,
+          created_at: Date.now(),
+          updated_at: Date.now(),
+        },
+      ],
+      initialIntegrationAppTools: {
+        crm: [
+          {
+            name: "business-crm",
+            description: "Business CRM toolset",
+            parameters: { type: "object" },
+            created_at: Date.now(),
+            updated_at: Date.now(),
+          },
+        ],
+      },
     });
 
     render(<App apiClient={client} />);
 
-    await openSettingsTab("Authentication settings");
+    await openSettingsTab("Integration apps");
+    expect(await screen.findByRole("heading", { name: "Integration apps" })).toBeInTheDocument();
+    expect(await screen.findByText("CRM")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit CRM" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Edit CRM" }));
+    const dialog = await screen.findByRole("dialog", {
+      name: "Integration app details",
+    });
+    expect(within(dialog).getByText("business-crm")).toBeInTheDocument();
+    expect(
+      within(dialog).queryByRole("button", { name: "Add tool" }),
+    ).not.toBeInTheDocument();
+  });
 
-    expect(await screen.findByLabelText("Enable Business OAuth")).toBeInTheDocument();
-    fireEvent.click(screen.getByLabelText("Enable Business OAuth"));
-    fireEvent.change(screen.getByLabelText("Business OAuth client ID"), {
-      target: { value: "business-client" },
+  it("creates and manages integration apps", async () => {
+    const client = createMockApiClient();
+    const confirmMock = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<App apiClient={client} />);
+
+    await openSettingsTab("API management");
+    fireEvent.click(await screen.findByLabelText("Enable API management"));
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    expect(await screen.findByText("Settings saved")).toBeInTheDocument();
+
+    await openSettingsTab("Integration apps");
+    expect(
+      await screen.findByRole("heading", { name: "Integration apps" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "New app" }));
+    const createDialog = await screen.findByRole("dialog", {
+      name: "Create integration app",
     });
-    fireEvent.change(screen.getByLabelText("Business OAuth client secret"), {
-      target: { value: "business-secret" },
+    expect(screen.queryByRole("button", { name: "New app" })).not.toBeInTheDocument();
+
+    fireEvent.change(within(createDialog).getByLabelText("Name"), {
+      target: { value: "CRM" },
     });
-    fireEvent.change(screen.getByLabelText("Business OAuth scopes"), {
+    expect(within(createDialog).queryByLabelText("Integration ID")).not.toBeInTheDocument();
+    expect(within(createDialog).queryByLabelText("Redirect URI")).not.toBeInTheDocument();
+    const callbackUrlInput = within(createDialog).getByLabelText("Callback URL");
+    expect(callbackUrlInput).toHaveAttribute("type", "url");
+    fireEvent.change(callbackUrlInput, {
+      target: { value: "https://crm.example/callback" },
+    });
+    fireEvent.change(within(createDialog).getByLabelText("Scopes"), {
       target: { value: "openid profile email" },
     });
-    fireEvent.change(screen.getByLabelText("Allowed redirect URIs (one per line)"), {
-      target: { value: "https://biz.example/callback\nhttps://biz.example/alt" },
-    });
-    fireEvent.change(screen.getByLabelText("Authorization code TTL seconds"), {
+    fireEvent.change(within(createDialog).getByLabelText("Authorization code TTL seconds"), {
       target: { value: "900" },
     });
-    fireEvent.change(screen.getByLabelText("Hidden session idle timeout seconds"), {
+    fireEvent.change(within(createDialog).getByLabelText("Hidden session idle timeout seconds"), {
       target: { value: "1800" },
     });
-    fireEvent.change(screen.getByLabelText("Toolset names (one per line)"), {
-      target: { value: "business-crm\nbusiness-search" },
+    fireEvent.change(within(createDialog).getByLabelText("Default tool timeout seconds"), {
+      target: { value: "90" },
+    });
+    fireEvent.change(within(createDialog).getByLabelText("Max tool timeout seconds"), {
+      target: { value: "300" },
     });
 
+    fireEvent.click(within(createDialog).getByRole("button", { name: "Create" }));
+
+    expect(await screen.findByText("Integration app saved")).toBeInTheDocument();
+    expect(screen.getByText(/New secret shown once/)).toBeInTheDocument();
+
+    const editDialog = await screen.findByRole("dialog", {
+      name: "Integration app details",
+    });
+    expect(within(editDialog).getByDisplayValue("crm")).toBeInTheDocument();
+    expect(
+      within(editDialog).getByDisplayValue(/\/api\/integrations\/apps\/self\/tools$/),
+    ).toBeInTheDocument();
+    expect(
+      within(editDialog).queryByRole("button", { name: "Add tool" }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(editDialog).queryByRole("button", { name: "Save tools" }),
+    ).not.toBeInTheDocument();
+    expect(await screen.findByText("No synced tools yet")).toBeInTheDocument();
+
+    fireEvent.change(within(editDialog).getByLabelText("Name"), {
+      target: { value: "CRM Pro" },
+    });
+    fireEvent.click(within(editDialog).getByRole("button", { name: "Save" }));
+
+    expect(await screen.findByText("CRM Pro")).toBeInTheDocument();
+
+    fireEvent.click(within(editDialog).getByRole("button", { name: "Cancel" }));
+    expect(
+      await screen.findByRole("button", { name: "Edit CRM Pro" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit CRM Pro" }));
+    const reopenedDialog = await screen.findByRole("dialog", {
+      name: "Integration app details",
+    });
+    expect(reopenedDialog).toBeInTheDocument();
+    fireEvent.click(within(reopenedDialog).getByRole("button", { name: "Cancel" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete CRM Pro" }));
+
+    expect(confirmMock).toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.queryByText("CRM Pro")).not.toBeInTheDocument();
+    });
+  });
+
+  it("closes the integration app dialog on Escape", async () => {
+    const client = createMockApiClient();
+
+    render(<App apiClient={client} />);
+
+    await openSettingsTab("API management");
+    fireEvent.click(await screen.findByLabelText("Enable API management"));
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
-
     expect(await screen.findByText("Settings saved")).toBeInTheDocument();
-    expect(savedSettings).toMatchObject({
-      business_oauth: {
-        enabled: true,
-        client_id: "business-client",
-        client_secret: "business-secret",
-        allowed_redirect_uris: ["https://biz.example/callback", "https://biz.example/alt"],
-        scopes: "openid profile email",
-        authorization_code_ttl_seconds: 900,
-        hidden_session_idle_timeout_seconds: 1800,
-        toolset_names: ["business-crm", "business-search"],
-      },
+
+    await openSettingsTab("Integration apps");
+    fireEvent.click(screen.getByRole("button", { name: "New app" }));
+    expect(await screen.findByRole("dialog", { name: "Create integration app" })).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("dialog", { name: "Create integration app" }),
+      ).not.toBeInTheDocument();
     });
+    expect(await screen.findByRole("button", { name: "New app" })).toBeInTheDocument();
+  });
+
+  it("validates callback URL before saving an integration app", async () => {
+    const client = createMockApiClient();
+    const createIntegrationApp = vi.fn(client.createIntegrationApp.bind(client));
+    client.createIntegrationApp = createIntegrationApp;
+
+    render(<App apiClient={client} />);
+
+    await openSettingsTab("API management");
+    fireEvent.click(await screen.findByLabelText("Enable API management"));
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    expect(await screen.findByText("Settings saved")).toBeInTheDocument();
+
+    await openSettingsTab("Integration apps");
+    fireEvent.click(screen.getByRole("button", { name: "New app" }));
+    const dialog = await screen.findByRole("dialog", { name: "Create integration app" });
+    fireEvent.change(within(dialog).getByLabelText("Name"), {
+      target: { value: "CRM" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("Callback URL"), {
+      target: { value: "https://crm.example:99999/callback" },
+    });
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+
+    expect(
+      await screen.findByText("Callback URL must be a full http:// or https:// URL"),
+    ).toBeInTheDocument();
+    expect(createIntegrationApp).not.toHaveBeenCalled();
+  });
+
+  it("validates numeric integration app settings before sending the request", async () => {
+    const client = createMockApiClient();
+    const createIntegrationApp = vi.fn(client.createIntegrationApp.bind(client));
+    client.createIntegrationApp = createIntegrationApp;
+
+    render(<App apiClient={client} />);
+
+    await openSettingsTab("API management");
+    fireEvent.click(await screen.findByLabelText("Enable API management"));
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    expect(await screen.findByText("Settings saved")).toBeInTheDocument();
+
+    await openSettingsTab("Integration apps");
+    fireEvent.click(screen.getByRole("button", { name: "New app" }));
+    const dialog = await screen.findByRole("dialog", { name: "Create integration app" });
+    fireEvent.change(within(dialog).getByLabelText("Name"), {
+      target: { value: "CRM" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("Callback URL"), {
+      target: { value: "https://crm.example/callback" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("Authorization code TTL seconds"), {
+      target: { value: "NaN" },
+    });
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+
+    expect(
+      await screen.findByText("Authorization code and timeout fields must be positive integers"),
+    ).toBeInTheDocument();
+    expect(createIntegrationApp).not.toHaveBeenCalled();
+  });
+
+  it("validates tool timeout order before sending the request", async () => {
+    const client = createMockApiClient();
+    const createIntegrationApp = vi.fn(client.createIntegrationApp.bind(client));
+    client.createIntegrationApp = createIntegrationApp;
+
+    render(<App apiClient={client} />);
+
+    await openSettingsTab("API management");
+    fireEvent.click(await screen.findByLabelText("Enable API management"));
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    expect(await screen.findByText("Settings saved")).toBeInTheDocument();
+
+    await openSettingsTab("Integration apps");
+    fireEvent.click(screen.getByRole("button", { name: "New app" }));
+    const dialog = await screen.findByRole("dialog", { name: "Create integration app" });
+    fireEvent.change(within(dialog).getByLabelText("Name"), {
+      target: { value: "CRM" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("Callback URL"), {
+      target: { value: "https://crm.example/callback" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("Default tool timeout seconds"), {
+      target: { value: "301" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("Max tool timeout seconds"), {
+      target: { value: "300" },
+    });
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+
+    expect(
+      await screen.findByText("Default tool timeout cannot be greater than max tool timeout"),
+    ).toBeInTheDocument();
+    expect(createIntegrationApp).not.toHaveBeenCalled();
+  });
+
+  it("shows the backend validation message when integration app save returns plain-text 422", async () => {
+    const client = createMockApiClient();
+    client.createIntegrationApp = vi.fn(async () => {
+      throw new ApiRequestError(
+        "authorization_code_ttl_seconds: invalid type: null, expected u64",
+      );
+    });
+
+    render(<App apiClient={client} />);
+
+    await openSettingsTab("API management");
+    fireEvent.click(await screen.findByLabelText("Enable API management"));
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    expect(await screen.findByText("Settings saved")).toBeInTheDocument();
+
+    await openSettingsTab("Integration apps");
+    fireEvent.click(screen.getByRole("button", { name: "New app" }));
+    const dialog = await screen.findByRole("dialog", { name: "Create integration app" });
+    fireEvent.change(within(dialog).getByLabelText("Name"), {
+      target: { value: "CRM" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("Callback URL"), {
+      target: { value: "https://crm.example/callback" },
+    });
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+
+    expect(
+      await screen.findByText("authorization_code_ttl_seconds: invalid type: null, expected u64"),
+    ).toBeInTheDocument();
   });
 
   it("shows and saves API management settings", async () => {
@@ -4542,9 +4807,6 @@ describe("App", () => {
     });
     client.systemSettings = vi.fn(async () => {
       systemSettingsCalls += 1;
-      if (systemSettingsCalls > 1) {
-        throw new Error("unexpected system settings refresh");
-      }
       return initialSystemSettings;
     });
 
@@ -4557,11 +4819,13 @@ describe("App", () => {
     expect(screen.getByLabelText("OpenAPI JSON URL")).toHaveValue(
       `${window.location.origin}/api/docs/openapi.json`,
     );
+    const callsBeforeSave = systemSettingsCalls;
     fireEvent.click(screen.getByLabelText("Enable API management"));
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
 
     expect(await screen.findByText("Settings saved")).toBeInTheDocument();
     expect(screen.getByLabelText("Enable API management")).toBeChecked();
+    expect(systemSettingsCalls).toBe(callsBeforeSave);
     expect(savedSettings).toMatchObject({
       api_management: {
         enabled: true,
@@ -4809,7 +5073,7 @@ describe("App", () => {
     fireEvent.change(screen.getByLabelText("Password"), {
       target: { value: "admin-password-123" },
     });
-    const signInButton = screen.getByRole("button", { name: "Sign in" });
+    const signInButton = await screen.findByRole("button", { name: "Sign in" });
     fireEvent.click(signInButton);
 
     await waitFor(() => {

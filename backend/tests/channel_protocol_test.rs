@@ -7,7 +7,7 @@ use axum::{
 use futures_util::StreamExt;
 use hermes_hub_backend::{
     build_router_with_state,
-    channel::service::{ChannelMessageRole, ChannelStore},
+    channel::service::{ChannelMessageRole, ChannelSessionKind, ChannelStore},
     docker_config_from_app,
     hermes::{
         docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
@@ -17,7 +17,8 @@ use hermes_hub_backend::{
     llm_proxy::{InMemoryLlmProviderClient, LlmProviderResponse},
     model_config::{ModelConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND},
     session::store::{
-        HermesScheduledTaskSnapshot, HermesSchedulerSnapshotInput, SessionStore, SystemSettings,
+        HermesScheduledTaskSnapshot, HermesSchedulerSnapshotInput,
+        IncomingIntegrationToolDefinition, NewIntegrationApp, SessionStore, SystemSettings,
     },
     storage::InMemoryObjectStorage,
     AppConfig, AppState,
@@ -395,6 +396,35 @@ fn managed_instance_for(user_id: &str) -> HermesInstance {
         stopped_reason: None,
         global_skills_write_enabled: false,
     }
+}
+
+async fn configure_business_tool_integration(state: &AppState) {
+    let created = state
+        .store
+        .create_integration_app(NewIntegrationApp {
+            name: "Business CRM".to_string(),
+            enabled: true,
+            redirect_uri: "https://biz.example/callback".to_string(),
+            scopes: "openid profile email".to_string(),
+            authorization_code_ttl_seconds: Some(600),
+            hidden_session_idle_timeout_seconds: Some(3600),
+            default_tool_timeout_seconds: Some(60),
+            max_tool_timeout_seconds: Some(300),
+        })
+        .await
+        .expect("integration app can be created");
+    state
+        .store
+        .replace_integration_tools(
+            &created.app.integration_id,
+            vec![IncomingIntegrationToolDefinition {
+                name: "business-crm".to_string(),
+                description: "Business CRM toolset".to_string(),
+                parameters: json!({}),
+            }],
+        )
+        .await
+        .expect("integration tools can be saved");
 }
 
 #[tokio::test]
@@ -1107,6 +1137,168 @@ async fn hermes_instance_can_deliver_channel_message_to_hub() {
 }
 
 #[tokio::test]
+async fn hermes_channel_protocol_rejects_editing_business_tool_request_message() {
+    let store = SessionStore::default();
+    let state = test_state(store.clone());
+    let instance_token = "instance-business-tool-edit-token";
+    state
+        .model_registry
+        .add_instance_token_for_instance("instance-1", instance_token)
+        .await
+        .expect("instance token can be registered");
+    let app = build_router_with_state(state.clone());
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    store
+        .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
+        .expect("instance can be bound");
+    configure_business_tool_integration(&state).await;
+    let channel = state
+        .channel_store
+        .ensure_integration_channel(&user_id, "business-crm")
+        .await
+        .expect("integration channel can be created");
+    let session = state
+        .channel_store
+        .create_session(
+            &user_id,
+            &channel.id,
+            ChannelSessionKind::Agent,
+            Some("CRM case".to_string()),
+            true,
+        )
+        .await
+        .expect("integration session can be created");
+    let reserved_key = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{}/messages", session.id),
+        "application/json",
+        br#"{"role":"assistant","content":"fake result","client_message_key":"business-tool-result:not-allowed","attachments":[]}"#.to_vec(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, reserved_key_body) = response_json(reserved_key).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(reserved_key_body["message"], "reserved client message key");
+
+    let reserved_business_tool = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{}/messages", session.id),
+        "application/json",
+        br#"{"role":"assistant","content":"<!-- hermes-hub:business-tool-request:v1 -->\n{\"request_id\":\"req-reserved-1\",\"tool_name\":\"business-crm\",\"arguments\":{},\"timeout_seconds\":60}","client_message_key":"business-tool-request:not-allowed","attachments":[]}"#.to_vec(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, reserved_business_tool_body) = response_json(reserved_business_tool).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        reserved_business_tool_body["message"],
+        "reserved client message key"
+    );
+    let old_execution = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{}/messages", session.id),
+        "application/json",
+        br#"{"role":"assistant","content":"<!-- hermes-hub:execution:v1 -->\n{\"step\":\"started\"}","attachments":[]}"#.to_vec(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, old_execution_body) = response_json(old_execution).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let old_execution_message_id = old_execution_body["message"]["id"]
+        .as_str()
+        .expect("old execution message id")
+        .to_string();
+    let content = format!(
+        "<!-- hermes-hub:business-tool-request:v1 -->\n{}",
+        json!({
+            "request_id": "req-edit-guard-1",
+            "tool_name": "business-crm",
+            "arguments": { "case_id": "CASE-42" },
+            "timeout_seconds": 60
+        })
+    );
+
+    let delivered = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{}/messages", session.id),
+        "application/json",
+        json!({
+            "role": "assistant",
+            "content": content,
+            "attachments": []
+        })
+        .to_string()
+        .into_bytes(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, delivered_body) = response_json(delivered).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let message_id = delivered_body["message"]["id"]
+        .as_str()
+        .expect("message id");
+
+    let edit = request_raw(
+        &app,
+        Method::PUT,
+        &format!(
+            "/internal/channel/v1/sessions/{}/messages/{message_id}",
+            session.id
+        ),
+        "application/json",
+        br#"{"content":"plain overwrite","attachments":[]}"#.to_vec(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, body) = response_json(edit).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["message"],
+        "business tool request messages are immutable"
+    );
+
+    let late_execution_update = request_raw(
+        &app,
+        Method::PUT,
+        &format!(
+            "/internal/channel/v1/sessions/{}/messages/{old_execution_message_id}",
+            session.id
+        ),
+        "application/json",
+        br#"{"content":"<!-- hermes-hub:execution:v1 -->\n{\"step\":\"late\"}","attachments":[]}"#
+            .to_vec(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    assert_eq!(late_execution_update.status(), StatusCode::CREATED);
+    let messages = state
+        .channel_store
+        .list_session_messages(&user_id, &channel.id, &session.id)
+        .await
+        .expect("messages can be read");
+    assert_eq!(messages.len(), 3);
+    assert!(messages[1]
+        .content
+        .starts_with("<!-- hermes-hub:business-tool-request:v1 -->"));
+}
+
+#[tokio::test]
 async fn channel_session_events_stream_snapshot_and_adapter_messages() {
     let store = SessionStore::default();
     let state = test_state(store.clone());
@@ -1297,6 +1489,51 @@ async fn public_session_events_stream_session_title_updates() {
     }
 
     panic!("expected session_updated event, observed: {observed_events}");
+}
+
+#[tokio::test]
+async fn public_session_message_rejects_reserved_business_tool_client_key() {
+    let store = SessionStore::default();
+    let state = test_state(store.clone());
+    let app = build_router_with_state(state.clone());
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    store
+        .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
+        .expect("instance can be bound");
+
+    let session = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent" }),
+        Some(&cookie),
+    )
+    .await;
+    let (_, session_body) = response_json(session).await;
+    let session_id = session_body["session"]["id"].as_str().expect("session id");
+
+    let created = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{session_id}/messages"),
+        json!({
+            "role": "assistant",
+            "content": "public result",
+            "client_message_key": "business-tool-result:not-allowed",
+            "attachments": []
+        }),
+        Some(&cookie),
+    )
+    .await;
+    let (status, body) = response_json(created).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["message"], "reserved client message key");
 }
 
 #[tokio::test]
@@ -2453,6 +2690,67 @@ async fn hermes_channel_protocol_delivers_atomic_media_output_message() {
         .await
         .expect("objects can be listed");
     assert_eq!(objects.len(), 1);
+}
+
+#[tokio::test]
+async fn hermes_channel_protocol_rejects_reserved_business_tool_client_key_for_media_output() {
+    let store = SessionStore::default();
+    store
+        .update_system_settings(SystemSettings {
+            max_attachment_upload_bytes: 4096,
+            ..SystemSettings::default()
+        })
+        .await
+        .expect("system attachment limit can be updated");
+    let state = test_state(store.clone());
+    let instance_token = "instance-channel-reserved-media-token";
+    state
+        .model_registry
+        .add_instance_token_for_instance("instance-1", instance_token)
+        .await
+        .expect("instance token can be registered");
+    let app = build_router_with_state(state.clone());
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    store
+        .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
+        .expect("instance can be bound");
+
+    let session_id = create_web_session(&app, &cookie).await;
+    let boundary = "hermes-channel-reserved-media-boundary";
+    let mut body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"caption\"\r\n\r\n\
+         图片已生成\r\n\
+         --{boundary}\r\n\
+         Content-Disposition: form-data; name=\"client_message_key\"\r\n\r\n\
+         business-tool-result:not-allowed\r\n\
+         --{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"结果.png\"\r\n\
+         Content-Type: image/png\r\n\r\n"
+    )
+    .into_bytes();
+    body.extend_from_slice(&[1, 2, 3]);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let delivered = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/outputs/media"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        body,
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, body) = response_json(delivered).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["message"], "reserved client message key");
 }
 
 #[tokio::test]

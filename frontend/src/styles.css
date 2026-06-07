@@ -366,6 +366,10 @@ nav,
   margin: 0;
 }
 
+.table-actions {
+  justify-content: flex-end;
+}
+
 .model-card-heading {
   align-items: center;
   display: flex;
@@ -648,6 +652,10 @@ table {
   width: 100%;
 }
 
+table tr.selected td {
+  background: #eef6f8;
+}
+
 .table-scroll {
   overflow-x: auto;
   width: 100%;
@@ -670,11 +678,74 @@ table {
   text-align: center;
 }
 
+.admin-modal {
+  align-items: center;
+  display: grid;
+  inset: 0;
+  justify-items: center;
+  padding: 28px;
+  position: fixed;
+  z-index: 70;
+}
+
+.admin-modal-backdrop {
+  appearance: none;
+  background: rgba(13, 24, 30, 0.62);
+  border: 0;
+  inset: 0;
+  position: absolute;
+}
+
+.admin-modal-panel {
+  background: #ffffff;
+  border: 1px solid rgba(223, 231, 235, 0.92);
+  border-radius: 8px;
+  box-shadow: 0 24px 70px rgba(13, 24, 30, 0.24);
+  max-height: calc(100dvh - 56px);
+  max-width: min(860px, calc(100vw - 56px));
+  overflow: auto;
+  padding: 20px;
+  position: relative;
+  width: min(860px, calc(100vw - 56px));
+}
+
+.admin-modal-form {
+  min-width: 0;
+}
+
+.admin-modal-header {
+  align-items: start;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.admin-modal-heading {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.admin-modal-heading h2 {
+  margin: 0;
+}
+
+.admin-modal-heading .notice {
+  margin: 0;
+}
+
 th,
 td {
   border-bottom: 1px solid #e6ecef;
   padding: 9px 6px;
   text-align: left;
+}
+
+.integration-tool-parameters {
+  margin: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .list {
@@ -2067,6 +2138,23 @@ button.composer-attachment-chip {
     max-height: calc(100dvh - 96px);
     max-width: calc(100vw - 44px);
     width: 100%;
+  }
+
+  .admin-modal {
+    align-items: end;
+    padding: 14px;
+  }
+
+  .admin-modal-panel {
+    max-height: calc(100dvh - 28px);
+    max-width: calc(100vw - 28px);
+    padding: 16px;
+    width: calc(100vw - 28px);
+  }
+
+  .admin-modal-header {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .composer {

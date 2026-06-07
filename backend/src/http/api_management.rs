@@ -97,10 +97,15 @@ fn openapi_spec(cookie_name: &str, settings: &ApiManagementSettings) -> Value {
         ],
         "tags": [
             { "name": "OAuth", "description": "Business OAuth authorization flow" },
+            { "name": "Integration Apps", "description": "Machine-authenticated integration app management" },
             { "name": "Integrations", "description": "Session APIs for external systems" }
         ],
         "components": {
             "securitySchemes": {
+                "basicAuth": {
+                    "type": "http",
+                    "scheme": "basic"
+                },
                 "bearerAuth": {
                     "type": "http",
                     "scheme": "bearer"
@@ -142,6 +147,51 @@ fn openapi_spec(cookie_name: &str, settings: &ApiManagementSettings) -> Value {
                         "toolset_names": {
                             "type": "array",
                             "items": { "type": "string" }
+                        }
+                    }
+                },
+                "IntegrationToolDefinition": {
+                    "type": "object",
+                    "required": ["name", "description", "parameters", "created_at", "updated_at"],
+                    "properties": {
+                        "name": { "type": "string" },
+                        "description": { "type": "string" },
+                        "parameters": {
+                            "type": "object",
+                            "additionalProperties": true
+                        },
+                        "created_at": { "type": "integer", "format": "int64" },
+                        "updated_at": { "type": "integer", "format": "int64" }
+                    }
+                },
+                "IntegrationToolsResponse": {
+                    "type": "object",
+                    "required": ["tools"],
+                    "properties": {
+                        "tools": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/IntegrationToolDefinition" }
+                        }
+                    }
+                },
+                "ReplaceIntegrationToolsRequest": {
+                    "type": "object",
+                    "required": ["tools"],
+                    "properties": {
+                        "tools": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["name", "description", "parameters"],
+                                "properties": {
+                                    "name": { "type": "string" },
+                                    "description": { "type": "string" },
+                                    "parameters": {
+                                        "type": "object",
+                                        "additionalProperties": true
+                                    }
+                                }
+                            }
                         }
                     }
                 },
@@ -211,6 +261,19 @@ fn openapi_spec(cookie_name: &str, settings: &ApiManagementSettings) -> Value {
                         "updated_at": { "type": "integer", "format": "int64", "nullable": true }
                     }
                 },
+                "ChannelActiveRun": {
+                    "type": "object",
+                    "required": ["run_id", "status", "created_at", "updated_at"],
+                    "properties": {
+                        "run_id": { "type": "string" },
+                        "status": { "type": "string" },
+                        "output": { "type": "string", "nullable": true },
+                        "error": { "type": "string", "nullable": true },
+                        "output_message_id": { "type": "string", "nullable": true },
+                        "created_at": { "type": "integer", "format": "int64" },
+                        "updated_at": { "type": "integer", "format": "int64" }
+                    }
+                },
                 "MessageResponse": {
                     "type": "object",
                     "required": ["message"],
@@ -251,10 +314,127 @@ fn openapi_spec(cookie_name: &str, settings: &ApiManagementSettings) -> Value {
                             "items": { "$ref": "#/components/schemas/Attachment" }
                         }
                     }
+                },
+                "BusinessToolRequestStatus": {
+                    "type": "string",
+                    "enum": ["pending", "completed", "failed", "expired"]
+                },
+                "BusinessToolRequestEvent": {
+                    "type": "object",
+                    "required": [
+                        "type",
+                        "request"
+                    ],
+                    "properties": {
+                        "type": { "type": "string", "example": "business_tool_request" },
+                        "request": {
+                            "type": "object",
+                            "required": [
+                                "request_id",
+                                "session_id",
+                                "integration_id",
+                                "tool_name",
+                                "arguments",
+                                "timeout_seconds",
+                                "expires_at",
+                                "status",
+                                "created_at",
+                                "updated_at"
+                            ],
+                            "properties": {
+                                "request_id": { "type": "string" },
+                                "session_id": { "type": "string" },
+                                "integration_id": { "type": "string" },
+                                "tool_name": { "type": "string" },
+                                "arguments": {
+                                    "type": "object",
+                                    "additionalProperties": true
+                                },
+                                "timeout_seconds": {
+                                    "type": "integer",
+                                    "format": "int64",
+                                    "description": "Effective timeout after applying the integration app default/max settings."
+                                },
+                                "expires_at": {
+                                    "type": "integer",
+                                    "format": "int64",
+                                    "description": "Unix timestamp in seconds."
+                                },
+                                "status": { "$ref": "#/components/schemas/BusinessToolRequestStatus" },
+                                "created_at": { "type": "integer", "format": "int64" },
+                                "updated_at": { "type": "integer", "format": "int64" },
+                                "result_message_id": { "type": "string", "nullable": true }
+                            }
+                        }
+                    }
+                },
+                "BusinessToolResultRequest": {
+                    "type": "object",
+                    "required": ["result"],
+                    "properties": {
+                        "result": { "type": "string" }
+                    }
+                },
+                "BusinessToolRequestResultRequest": {
+                    "$ref": "#/components/schemas/BusinessToolResultRequest"
+                },
+                "MessagesSnapshotResponse": {
+                    "type": "object",
+                    "required": ["type", "messages", "active_run", "session", "business_tool_requests"],
+                    "properties": {
+                        "type": { "type": "string", "example": "messages_snapshot" },
+                        "messages": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/ChannelMessage" }
+                        },
+                        "active_run": {
+                            "allOf": [
+                                { "$ref": "#/components/schemas/ChannelActiveRun" }
+                            ],
+                            "nullable": true
+                        },
+                        "session": { "$ref": "#/components/schemas/IntegrationSession" },
+                        "business_tool_requests": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/BusinessToolRequestEvent" }
+                        }
+                    }
                 }
             }
         },
         "paths": {
+            "/api/integrations/apps/self/tools": {
+                "get": {
+                    "tags": ["Integration Apps"],
+                    "summary": "List tool definitions synced for the current integration app",
+                    "security": [{ "basicAuth": [] }],
+                    "responses": {
+                        "200": { "description": "Current tool definitions", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IntegrationToolsResponse" } } } },
+                        "401": { "description": "Integration app client credentials required", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+                        "404": { "description": "Integration app is disabled", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+                    }
+                },
+                "put": {
+                    "tags": ["Integration Apps"],
+                    "summary": "Replace tool definitions for the current integration app",
+                    "description": "Business systems should publish their full current tool list to Hermes Hub instead of relying on manual admin-side editing.",
+                    "security": [{ "basicAuth": [] }],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/ReplaceIntegrationToolsRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "description": "Updated tool definitions", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IntegrationToolsResponse" } } } },
+                        "400": { "description": "Invalid tool definitions", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+                        "401": { "description": "Integration app client credentials required", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+                        "404": { "description": "Integration app is disabled", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+                    }
+                }
+            },
             "/api/oauth/authorize": {
                 "get": {
                     "tags": ["OAuth"],
@@ -263,7 +443,13 @@ fn openapi_spec(cookie_name: &str, settings: &ApiManagementSettings) -> Value {
                     "parameters": [
                         { "name": "response_type", "in": "query", "required": true, "schema": { "type": "string", "example": "code" } },
                         { "name": "client_id", "in": "query", "required": true, "schema": { "type": "string" } },
-                        { "name": "redirect_uri", "in": "query", "required": true, "schema": { "type": "string", "format": "uri" } },
+                        {
+                            "name": "redirect_uri",
+                            "in": "query",
+                            "required": true,
+                            "description": "Must exactly match the integration app callback URL.",
+                            "schema": { "type": "string", "format": "uri" }
+                        },
                         { "name": "scope", "in": "query", "required": false, "schema": { "type": "string" } },
                         { "name": "state", "in": "query", "required": false, "schema": { "type": "string" } }
                     ],
@@ -289,7 +475,11 @@ fn openapi_spec(cookie_name: &str, settings: &ApiManagementSettings) -> Value {
                                         "grant_type": { "type": "string", "example": "authorization_code" },
                                         "client_id": { "type": "string" },
                                         "client_secret": { "type": "string" },
-                                        "redirect_uri": { "type": "string", "format": "uri" },
+                                        "redirect_uri": {
+                                            "type": "string",
+                                            "format": "uri",
+                                            "description": "Must exactly match the integration app callback URL."
+                                        },
                                         "code": { "type": "string" }
                                     }
                                 }
@@ -422,13 +612,20 @@ fn openapi_spec(cookie_name: &str, settings: &ApiManagementSettings) -> Value {
             "/api/integrations/sessions/{session_id}/events": {
                 "get": {
                     "tags": ["Integrations"],
-                    "summary": "Subscribe to session event stream",
+                    "summary": "Subscribe to session event stream, including business tool requests",
                     "security": [{ "bearerAuth": [] }],
                     "parameters": [
                         { "name": "session_id", "in": "path", "required": true, "schema": { "type": "string" } }
                     ],
                     "responses": {
-                        "200": { "description": "Server-sent event stream" },
+                        "200": {
+                            "description": "Server-sent event stream",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/MessagesSnapshotResponse" }
+                                }
+                            }
+                        },
                         "401": { "description": "OAuth bearer token required", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
                         "404": { "description": "Session not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
                     }
@@ -446,6 +643,32 @@ fn openapi_spec(cookie_name: &str, settings: &ApiManagementSettings) -> Value {
                         "204": { "description": "Stopped" },
                         "401": { "description": "OAuth bearer token required", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
                         "404": { "description": "Session not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+                    }
+                }
+            },
+            "/api/integrations/sessions/{session_id}/business-tool-requests/{request_id}/result": {
+                "post": {
+                    "tags": ["Integrations"],
+                    "summary": "Submit the result for a business tool request",
+                    "security": [{ "bearerAuth": [] }],
+                    "parameters": [
+                        { "name": "session_id", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "request_id", "in": "path", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/BusinessToolResultRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "description": "Existing result message reused", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MessageResponse" } } } },
+                        "201": { "description": "Created result message", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MessageResponse" } } } },
+                        "401": { "description": "OAuth bearer token required", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+                        "404": { "description": "Request not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+                        "410": { "description": "Request expired", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
                     }
                 }
             }

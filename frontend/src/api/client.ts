@@ -198,7 +198,6 @@ export type SystemSettings = {
   speech_input: SpeechInputSettings;
   public_platform: PublicPlatformSettings;
   api_management: ApiManagementSettings;
-  business_oauth: BusinessOAuthSettings;
   oidc: OidcSettings;
   ldap: LdapSettings;
 };
@@ -214,7 +213,6 @@ export type SystemParametersSettings = {
 export type AuthSettings = {
   oidc: OidcSettings;
   ldap: LdapSettings;
-  business_oauth: BusinessOAuthSettings;
 };
 
 export type UpdatePublicPlatformSettingsRequest = {
@@ -238,15 +236,59 @@ export type ApiManagementSettings = {
   enabled: boolean;
 };
 
-export type BusinessOAuthSettings = {
+export type IntegrationApp = {
+  id: string;
+  integration_id: string;
+  name: string;
   enabled: boolean;
   client_id: string;
-  client_secret: string;
-  allowed_redirect_uris: string[];
+  redirect_uri: string;
   scopes: string;
   authorization_code_ttl_seconds: number;
   hidden_session_idle_timeout_seconds: number;
-  toolset_names: string[];
+  default_tool_timeout_seconds: number;
+  max_tool_timeout_seconds: number;
+  last_used_at: number | null;
+  created_at: number;
+  updated_at: number;
+};
+
+export type CreatedIntegrationApp = {
+  app: IntegrationApp;
+  client_secret: string;
+};
+
+export type IncomingIntegrationToolDefinition = {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+};
+
+export type IntegrationToolDefinition = IncomingIntegrationToolDefinition & {
+  created_at: number;
+  updated_at: number;
+};
+
+export type CreateIntegrationAppInput = {
+  name: string;
+  enabled: boolean;
+  redirect_uri: string;
+  scopes: string;
+  authorization_code_ttl_seconds?: number;
+  hidden_session_idle_timeout_seconds?: number;
+  default_tool_timeout_seconds?: number;
+  max_tool_timeout_seconds?: number;
+};
+
+export type UpdateIntegrationAppInput = {
+  name: string;
+  enabled: boolean;
+  redirect_uri: string;
+  scopes: string;
+  authorization_code_ttl_seconds: number;
+  hidden_session_idle_timeout_seconds: number;
+  default_tool_timeout_seconds: number;
+  max_tool_timeout_seconds: number;
 };
 
 export type SpeechInputConfig = {
@@ -497,6 +539,15 @@ export type ApiClient = {
   updateAuthSettings: (settings: AuthSettings) => Promise<void>;
   updatePublicPlatformSettings: (settings: UpdatePublicPlatformSettingsRequest) => Promise<void>;
   updateApiManagementSettings: (settings: UpdateApiManagementSettingsRequest) => Promise<void>;
+  listIntegrationApps: () => Promise<IntegrationApp[]>;
+  createIntegrationApp: (settings: CreateIntegrationAppInput) => Promise<CreatedIntegrationApp>;
+  updateIntegrationApp: (
+    appId: string,
+    settings: UpdateIntegrationAppInput,
+  ) => Promise<IntegrationApp>;
+  deleteIntegrationApp: (appId: string) => Promise<void>;
+  rotateIntegrationAppSecret: (appId: string) => Promise<CreatedIntegrationApp>;
+  listIntegrationAppTools: (appId: string) => Promise<IntegrationToolDefinition[]>;
   updateSystemSettings: (settings: SystemSettings) => Promise<void>;
   hermesProfile: () => Promise<HermesProfile>;
   updateHermesProfile: (profile: HermesProfile) => Promise<void>;
@@ -587,6 +638,21 @@ export class ApiRequestError extends Error {
   }
 }
 
+async function errorPayloadFromResponse(response: Response): Promise<ApiErrorPayload> {
+  const raw = await response.text().catch(() => "");
+  if (!raw) {
+    return { message: response.statusText };
+  }
+  try {
+    const value = JSON.parse(raw);
+    return value && typeof value === "object"
+      ? (value as ApiErrorPayload)
+      : { message: raw };
+  } catch {
+    return { message: raw };
+  }
+}
+
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const headers = requestHeaders(options);
   const response = await fetch(path, {
@@ -604,15 +670,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     if (response.status === 401 && options.publicSessionToken) {
       clearPublicSessionToken();
     }
-    const payload: ApiErrorPayload = await response
-      .json()
-      .then(
-        (value): ApiErrorPayload =>
-          value && typeof value === "object"
-            ? (value as ApiErrorPayload)
-            : { message: response.statusText },
-      )
-      .catch((): ApiErrorPayload => ({ message: response.statusText }));
+    const payload = await errorPayloadFromResponse(response);
     const message = payload.message ?? payload.error ?? response.statusText;
     throw new ApiRequestError(String(message), payload);
   }
@@ -632,15 +690,7 @@ async function requestForm<T>(path: string, form: FormData): Promise<T> {
   });
 
   if (!response.ok) {
-    const payload: ApiErrorPayload = await response
-      .json()
-      .then(
-        (value): ApiErrorPayload =>
-          value && typeof value === "object"
-            ? (value as ApiErrorPayload)
-            : { message: response.statusText },
-      )
-      .catch((): ApiErrorPayload => ({ message: response.statusText }));
+    const payload = await errorPayloadFromResponse(response);
     const message = payload.message ?? payload.error ?? response.statusText;
     throw new ApiRequestError(String(message), payload);
   }
@@ -894,31 +944,14 @@ export function defaultApiManagementSettings(): ApiManagementSettings {
   };
 }
 
-export function defaultBusinessOAuthSettings(): BusinessOAuthSettings {
-  return {
-    enabled: false,
-    client_id: "",
-    client_secret: "",
-    allowed_redirect_uris: [],
-    scopes: "openid profile email",
-    authorization_code_ttl_seconds: 600,
-    hidden_session_idle_timeout_seconds: 3600,
-    toolset_names: [],
-  };
-}
-
 type SystemSettingsPayload = Partial<
-  Omit<
-    SystemSettings,
-    "oidc" | "ldap" | "speech_input" | "public_platform" | "api_management" | "business_oauth"
-  >
+  Omit<SystemSettings, "oidc" | "ldap" | "speech_input" | "public_platform" | "api_management">
 > & {
   oidc?: Partial<OidcSettings> | null;
   ldap?: Partial<LdapSettings> | null;
   speech_input?: Partial<SpeechInputSettings> | null;
   public_platform?: Partial<PublicPlatformSettings> | null;
   api_management?: Partial<ApiManagementSettings> | null;
-  business_oauth?: Partial<BusinessOAuthSettings> | null;
 };
 
 function systemSettingsFromPayload(settings: SystemSettingsPayload): SystemSettings {
@@ -942,10 +975,6 @@ function systemSettingsFromPayload(settings: SystemSettingsPayload): SystemSetti
     api_management: {
       ...defaultApiManagementSettings(),
       ...(settings.api_management ?? {}),
-    },
-    business_oauth: {
-      ...defaultBusinessOAuthSettings(),
-      ...(settings.business_oauth ?? {}),
     },
     oidc: { ...defaultOidcSettings(), ...(settings.oidc ?? {}) },
     ldap: { ...defaultLdapSettings(), ...(settings.ldap ?? {}) },
@@ -1393,6 +1422,44 @@ export function createApiClient(): ApiClient {
         body: settings,
       });
     },
+    async listIntegrationApps() {
+      const payload = await request<{ integration_apps: IntegrationApp[] }>(
+        "/api/admin/integration-apps",
+      );
+      return payload.integration_apps;
+    },
+    async createIntegrationApp(settings) {
+      return request<CreatedIntegrationApp>("/api/admin/integration-apps", {
+        method: "POST",
+        body: settings,
+      });
+    },
+    async updateIntegrationApp(appId, settings) {
+      const payload = await request<{ integration_app: IntegrationApp }>(
+        `/api/admin/integration-apps/${appId}`,
+        {
+          method: "PUT",
+          body: settings,
+        },
+      );
+      return payload.integration_app;
+    },
+    async deleteIntegrationApp(appId) {
+      await request<void>(`/api/admin/integration-apps/${appId}`, {
+        method: "DELETE",
+      });
+    },
+    async rotateIntegrationAppSecret(appId) {
+      return request<CreatedIntegrationApp>(`/api/admin/integration-apps/${appId}/secret/rotate`, {
+        method: "POST",
+      });
+    },
+    async listIntegrationAppTools(appId) {
+      const payload = await request<{ tools: IntegrationToolDefinition[] }>(
+        `/api/admin/integration-apps/${appId}/tools`,
+      );
+      return payload.tools;
+    },
     async updateSystemSettings(settings) {
       await request<void>("/api/admin/system-settings", {
         method: "PUT",
@@ -1701,6 +1768,8 @@ type MockApiClientOptions = {
   initialPublicPlatformSessions?: PublicPlatformSessionSummary[];
   publicPlatformSettings?: Partial<PublicPlatformSettings>;
   apiManagementSettings?: Partial<ApiManagementSettings>;
+  initialIntegrationApps?: IntegrationApp[];
+  initialIntegrationAppTools?: Record<string, IntegrationToolDefinition[]>;
 };
 
 function withMockMessageKind(message: ChannelMessage): ChannelMessage {
@@ -1750,6 +1819,50 @@ function isMockLegacyExecutionLine(line: string) {
 
   // 测试 mock 和后端保持同一类执行行判定，避免前端测试误用旧内容猜测。
   return /^[A-Za-z0-9_.-]+$/.test(rest.slice(0, openParen));
+}
+
+function mockIntegrationIdSlug(value: string): string | null {
+  let slug = "";
+  let lastWasDash = false;
+
+  for (const ch of value.trim()) {
+    const code = ch.charCodeAt(0);
+    const isAsciiUppercase = code >= 65 && code <= 90;
+    const isAsciiLowercase = code >= 97 && code <= 122;
+    const isAsciiDigit = code >= 48 && code <= 57;
+
+    if (isAsciiUppercase || isAsciiLowercase || isAsciiDigit) {
+      slug += isAsciiUppercase ? String.fromCharCode(code + 32) : ch;
+      lastWasDash = false;
+      continue;
+    }
+    if (!lastWasDash && slug.length > 0) {
+      slug += "-";
+      lastWasDash = true;
+    }
+  }
+
+  while (slug.endsWith("-")) {
+    slug = slug.slice(0, -1);
+  }
+  return slug.length > 0 ? slug : null;
+}
+
+function nextMockIntegrationId(name: string, apps: IntegrationApp[]): string {
+  const base = mockIntegrationIdSlug(name);
+  if (!base) {
+    throw new Error("invalid system settings");
+  }
+
+  const existingIds = new Set(apps.map((app) => app.integration_id));
+  let index = 1;
+  while (true) {
+    const candidate = index === 1 ? base : `${base}-${index}`;
+    if (!existingIds.has(candidate)) {
+      return candidate;
+    }
+    index += 1;
+  }
 }
 
 export function createMockApiClient(options: MockApiClientOptions = {}): ApiClient {
@@ -1870,10 +1983,23 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
       ...defaultApiManagementSettings(),
       ...(options.apiManagementSettings ?? {}),
     },
-    business_oauth: defaultBusinessOAuthSettings(),
     oidc: defaultOidcSettings(),
     ldap: defaultLdapSettings(),
   };
+  let integrationApps: IntegrationApp[] = [...(options.initialIntegrationApps ?? [])];
+  let integrationAppCounter = integrationApps.reduce((max, app) => {
+    const suffix = Number(app.id.match(/^integration-app-(\d+)$/)?.[1] ?? 0);
+    return Math.max(max, suffix);
+  }, 0);
+  const integrationToolsByIntegrationId = new Map<string, IntegrationToolDefinition[]>();
+  for (const [integrationId, tools] of Object.entries(options.initialIntegrationAppTools ?? {})) {
+    integrationToolsByIntegrationId.set(
+      integrationId,
+      tools.map((tool) => ({
+        ...tool,
+      })),
+    );
+  }
   let managedSkills: Record<string, string> = {
     "writing/SKILL.md": "# Writing\n\nUse concise prose.\n",
     ...(options.initialManagedSkills ?? {}),
@@ -2446,10 +2572,6 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
           ...systemSettings.ldap,
           ...settings.ldap,
         },
-        business_oauth: {
-          ...systemSettings.business_oauth,
-          ...settings.business_oauth,
-        },
       };
     },
     async updatePublicPlatformSettings(settings) {
@@ -2469,6 +2591,94 @@ export function createMockApiClient(options: MockApiClientOptions = {}): ApiClie
           ...settings.api_management,
         },
       };
+    },
+    async listIntegrationApps() {
+      return [...integrationApps].sort((left, right) => left.name.localeCompare(right.name));
+    },
+    async createIntegrationApp(settings) {
+      const now = Date.now();
+      integrationAppCounter += 1;
+      // mock 保持和后端相同的 integration_id 生成/冲突规避逻辑，
+      // 避免管理页在测试里通过、真实环境却因 slug 不一致出现偏差。
+      const integrationId = nextMockIntegrationId(settings.name, integrationApps);
+      const app: IntegrationApp = {
+        id: `integration-app-${integrationAppCounter}`,
+        integration_id: integrationId,
+        name: settings.name,
+        enabled: settings.enabled,
+        client_id: `client-${integrationAppCounter}`,
+        redirect_uri: settings.redirect_uri,
+        scopes: settings.scopes,
+        authorization_code_ttl_seconds: settings.authorization_code_ttl_seconds ?? 600,
+        hidden_session_idle_timeout_seconds:
+          settings.hidden_session_idle_timeout_seconds ?? 3600,
+        default_tool_timeout_seconds: settings.default_tool_timeout_seconds ?? 60,
+        max_tool_timeout_seconds: settings.max_tool_timeout_seconds ?? 300,
+        last_used_at: null,
+        created_at: now,
+        updated_at: now,
+      };
+      integrationApps = [...integrationApps, app];
+      return {
+        app,
+        client_secret: `secret-${integrationAppCounter}-${now}`,
+      };
+    },
+    async updateIntegrationApp(appId, settings) {
+      const now = Date.now();
+      const app = integrationApps.find((candidate) => candidate.id === appId);
+      if (!app) {
+        throw new Error("integration app not found");
+      }
+      const updated: IntegrationApp = {
+        ...app,
+        name: settings.name,
+        enabled: settings.enabled,
+        redirect_uri: settings.redirect_uri,
+        scopes: settings.scopes,
+        authorization_code_ttl_seconds: settings.authorization_code_ttl_seconds,
+        hidden_session_idle_timeout_seconds: settings.hidden_session_idle_timeout_seconds,
+        default_tool_timeout_seconds: settings.default_tool_timeout_seconds,
+        max_tool_timeout_seconds: settings.max_tool_timeout_seconds,
+        updated_at: now,
+      };
+      integrationApps = integrationApps.map((candidate) =>
+        candidate.id === appId ? updated : candidate,
+      );
+      return updated;
+    },
+    async deleteIntegrationApp(appId) {
+      const app = integrationApps.find((candidate) => candidate.id === appId);
+      if (!app) {
+        throw new Error("integration app not found");
+      }
+      integrationApps = integrationApps.filter((candidate) => candidate.id !== appId);
+      integrationToolsByIntegrationId.delete(app.integration_id);
+    },
+    async rotateIntegrationAppSecret(appId) {
+      const app = integrationApps.find((candidate) => candidate.id === appId);
+      if (!app) {
+        throw new Error("integration app not found");
+      }
+      const now = Date.now();
+      const rotated: IntegrationApp = {
+        ...app,
+        updated_at: now,
+      };
+      integrationApps = integrationApps.map((candidate) =>
+        candidate.id === appId ? rotated : candidate,
+      );
+      return {
+        app: rotated,
+        client_secret: `secret-${appId}-${now}`,
+      };
+    },
+    async listIntegrationAppTools(appId) {
+      const app = integrationApps.find((candidate) => candidate.id === appId);
+      if (!app) {
+        throw new Error("integration app not found");
+      }
+      return [...(integrationToolsByIntegrationId.get(app.integration_id) ?? [])];
     },
     async updateSystemSettings(settings) {
       systemSettings = systemSettingsFromPayload(settings);

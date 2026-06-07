@@ -265,10 +265,7 @@ async fn auth_context_by_token(state: &AppState, token: &str) -> Result<AuthCont
 
 pub async fn current_oauth_user(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError> {
     let context = current_bearer_auth_context(state, headers).await?;
-    if context.session_purpose != SessionPurpose::OAuth {
-        return Err(ApiError::Unauthorized);
-    }
-    Ok(context.user)
+    oauth_user_from_context(context)
 }
 
 pub async fn current_web_user(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError> {
@@ -287,6 +284,16 @@ pub async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<User
     }
 
     Ok(user)
+}
+
+fn oauth_user_from_context(context: AuthContext) -> Result<User, ApiError> {
+    if context.session_purpose != SessionPurpose::OAuth {
+        return Err(ApiError::Unauthorized);
+    }
+    if context.integration_id.is_none() {
+        return Err(ApiError::Unauthorized);
+    }
+    Ok(context.user)
 }
 
 pub fn session_cookie(cookie_name: &str, session_token: &str) -> String {
@@ -384,6 +391,7 @@ mod tests {
     use crate::{
         channel::{events::SessionEventHub, service::ChannelStore},
         docker_config_from_app,
+        domain::user::{User, UserAuthProvider, UserRole, UserStatus},
         hermes::docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
         ldap::DefaultLdapAuthenticator,
         llm_proxy::InMemoryLlmProviderClient,
@@ -493,5 +501,27 @@ mod tests {
             object_storage,
             session_events: SessionEventHub::default(),
         }
+    }
+
+    #[test]
+    fn oauth_context_requires_integration_id() {
+        let context = super::AuthContext {
+            user: User {
+                id: "oauth-user".to_string(),
+                email: "oauth@example.com".to_string(),
+                password_hash: "placeholder".to_string(),
+                auth_provider: UserAuthProvider::Local,
+                role: UserRole::User,
+                status: UserStatus::Active,
+                created_at: 0,
+                updated_at: 0,
+            },
+            session_purpose: super::SessionPurpose::OAuth,
+            integration_id: None,
+        };
+
+        let error = super::oauth_user_from_context(context)
+            .expect_err("OAuth context without integration_id must be rejected");
+        assert!(matches!(error, super::ApiError::Unauthorized));
     }
 }

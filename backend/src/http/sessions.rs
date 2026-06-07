@@ -23,15 +23,17 @@ use crate::{
     channel::{
         events::SessionEvent,
         service::{
-            ChannelActiveRun, ChannelAttachment, ChannelAttachmentDirection, ChannelMessage,
-            ChannelMessageRole, ChannelRun, ChannelRunStatus, ChannelSession, ChannelSessionKind,
-            ChannelStoreError, HiddenSessionCleanupCandidate,
+            is_business_tool_request_message, ChannelActiveRun, ChannelAttachment,
+            ChannelAttachmentDirection, ChannelMessage, ChannelMessageRole, ChannelRun,
+            ChannelRunStatus, ChannelSession, ChannelSessionKind, ChannelStoreError,
+            HiddenSessionCleanupCandidate,
         },
     },
     domain::user::User,
     http::{
         attachments::{map_channel_error, upload_session_attachments},
         auth::{cookie_value_from_headers, current_user},
+        integrations::is_reserved_business_tool_client_key,
         workspace::ensure_managed_hermes_for_user,
         ApiError,
     },
@@ -43,6 +45,7 @@ use crate::{
 
 const PUBLIC_SESSION_COOKIE_NAME: &str = "hermes_hub_public_session";
 const PUBLIC_SESSION_TOKEN_HEADER: &str = "x-hermes-hub-public-session";
+const DEFAULT_HIDDEN_SESSION_IDLE_TIMEOUT_SECONDS: u64 = 3600;
 
 fn elapsed_ms(started_at: Instant) -> u64 {
     started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
@@ -107,6 +110,19 @@ struct UpdateMessageRequest {
 #[derive(Deserialize)]
 struct GenerateTitleRequest {
     prompt: String,
+}
+
+fn reject_reserved_business_tool_public_message(
+    content: &str,
+    client_message_key: Option<&str>,
+) -> Result<(), ApiError> {
+    if is_business_tool_request_message(content)
+        || client_message_key.is_some_and(is_reserved_business_tool_client_key)
+    {
+        // 公共会话的写入口不允许占用业务工具保留 key，也不允许伪造业务工具请求 marker。
+        return Err(ApiError::BadRequest("reserved client message key"));
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -491,6 +507,10 @@ async fn append_session_message(
         .await
         .map_err(map_channel_error)?;
     let role = ChannelMessageRole::parse(&payload.role).map_err(map_channel_error)?;
+    reject_reserved_business_tool_public_message(
+        &payload.content,
+        payload.client_message_key.as_deref(),
+    )?;
 
     if role == ChannelMessageRole::User {
         // 用户消息在 public API 中仍然触发一次 Hub run，但不把 run 详情暴露给前端。
@@ -573,6 +593,10 @@ async fn create_channel_run(
         .get_session(access.user_id(), &channel.id, &session_id)
         .await
         .map_err(map_channel_error)?;
+    reject_reserved_business_tool_public_message(
+        &payload.content,
+        payload.client_message_key.as_deref(),
+    )?;
 
     // 兼容旧前端 client 的 run 创建入口；公开 URL 不再带 channel，但仍由后端统一创建用户消息和 Hub run。
     ensure_managed_hermes_for_user(&state, access.user_id()).await?;
@@ -649,6 +673,21 @@ async fn update_session_message(
     let access = session_access_requiring_session(&state, &headers, &session_id).await?;
     let channel = ensure_public_channel(&state, access.user_id()).await?;
     // 前端会把执行步骤写成可更新的 assistant 消息；这里只保留消息编辑，不暴露 channel。
+    let existing_message = state
+        .channel_store
+        .list_session_messages(access.user_id(), &channel.id, &session_id)
+        .await
+        .map_err(map_channel_error)?
+        .into_iter()
+        .find(|message| message.id == message_id)
+        .ok_or(ApiError::NotFound("message not found"))?;
+    if is_business_tool_request_message(&existing_message.content)
+        || is_business_tool_request_message(&payload.content)
+    {
+        return Err(ApiError::BadRequest(
+            "business tool request messages are immutable",
+        ));
+    }
     let message = state
         .channel_store
         .update_session_message(
@@ -982,23 +1021,13 @@ pub(crate) async fn refresh_public_session_retention_from_message(
 }
 
 pub async fn cleanup_expired_hidden_sessions(state: &AppState) -> Result<(), ApiError> {
-    let settings = state
-        .store
-        .system_settings()
-        .await
-        .map_err(|_| ApiError::Internal)?;
-    let idle_timeout = settings.business_oauth.hidden_session_idle_timeout_seconds;
-    if idle_timeout == 0 {
-        return Ok(());
-    }
-
-    let cutoff = unix_now().saturating_sub(idle_timeout);
+    let minimum_idle_timeout = hidden_session_idle_timeout_floor(state).await?;
+    let cutoff = unix_now().saturating_sub(minimum_idle_timeout);
     let candidates = state
         .channel_store
         .hidden_sessions_older_than(cutoff)
         .await
         .map_err(map_channel_error)?;
-
     for candidate in candidates {
         if let Err(error) = cleanup_hidden_session_candidate(state, &candidate).await {
             tracing::warn!(
@@ -1012,11 +1041,24 @@ pub async fn cleanup_expired_hidden_sessions(state: &AppState) -> Result<(), Api
     Ok(())
 }
 
+async fn hidden_session_idle_timeout_floor(state: &AppState) -> Result<u64, ApiError> {
+    let mut floor = DEFAULT_HIDDEN_SESSION_IDLE_TIMEOUT_SECONDS;
+    let apps = state
+        .store
+        .list_integration_apps()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    for app in apps {
+        floor = floor.min(app.hidden_session_idle_timeout_seconds);
+    }
+    Ok(floor)
+}
+
 async fn cleanup_hidden_session_candidate(
     state: &AppState,
     candidate: &HiddenSessionCleanupCandidate,
 ) -> Result<(), ApiError> {
-    if state
+    let session = match state
         .channel_store
         .get_session(
             &candidate.user_id,
@@ -1024,8 +1066,34 @@ async fn cleanup_hidden_session_candidate(
             &candidate.session_id,
         )
         .await
-        .is_err()
     {
+        Ok(session) => session,
+        Err(_) => return Ok(()),
+    };
+    let channel = match state
+        .channel_store
+        .get_channel(&candidate.user_id, &candidate.channel_id)
+        .await
+    {
+        Ok(channel) => channel,
+        Err(_) => return Ok(()),
+    };
+    let integration_id = channel
+        .name
+        .strip_prefix("integration:")
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(integration_id) = integration_id else {
+        return Ok(());
+    };
+    let idle_timeout = state
+        .store
+        .integration_app_by_integration_id(integration_id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .map(|app| app.hidden_session_idle_timeout_seconds)
+        .unwrap_or(DEFAULT_HIDDEN_SESSION_IDLE_TIMEOUT_SECONDS);
+    if session.updated_at.saturating_add(idle_timeout) > unix_now() {
         return Ok(());
     }
     if let Some(run) = state

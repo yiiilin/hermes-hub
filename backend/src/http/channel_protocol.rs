@@ -15,11 +15,16 @@ use std::{
 
 use crate::{
     channel::{
-        events::SessionEvent,
+        events::{BusinessToolRequestStatus, SessionEvent},
         service::{
-            ChannelAttachment, ChannelAttachmentDirection, ChannelMessage, ChannelMessageRole,
-            ChannelRun, ChannelRunStatus,
+            AppendSessionMessageOutcome, ChannelAttachment, ChannelAttachmentDirection,
+            ChannelMessage, ChannelMessageRole, ChannelRun, ChannelRunStatus,
         },
+    },
+    http::integrations::{
+        business_tool_request_client_key, business_tool_request_event,
+        is_business_tool_request_message, is_reserved_business_tool_client_key,
+        validate_business_tool_request_message, ValidatedBusinessToolRequest,
     },
     http::{
         attachments::{
@@ -210,6 +215,13 @@ async fn deliver_message(
         ));
     }
     let client_message_key = payload.client_message_key.and_then(trimmed_non_empty);
+    if client_message_key
+        .as_deref()
+        .is_some_and(is_reserved_business_tool_client_key)
+    {
+        // business-tool-* key 只允许业务工具请求路径生成，避免普通 adapter 输出抢占回调幂等位。
+        return Err(ApiError::BadRequest("reserved client message key"));
+    }
     let heartbeat_run_id = payload
         .run_id
         .as_deref()
@@ -227,19 +239,39 @@ async fn deliver_message(
         client_message_key.as_deref(),
     )
     .await?;
-    let message = state
+    let business_tool_request = validate_internal_business_tool_request_message(
+        &state,
+        &session_context.user_id,
+        &session_context.channel_id,
+        &payload.content,
+    )
+    .await?;
+    let message_content = business_tool_request
+        .as_ref()
+        .map(|(_, request)| request.normalized_content.clone())
+        .unwrap_or(payload.content);
+    let client_message_key = business_tool_request
+        .as_ref()
+        .map(|(_, request)| business_tool_request_client_key(&request.request_id))
+        .or(client_message_key);
+
+    let append_outcome = state
         .channel_store
-        .append_session_message(
+        .append_session_message_with_outcome(
             &session_context.user_id,
             &session_context.channel_id,
             &session_id,
             role,
             client_message_key,
-            payload.content,
+            message_content,
             payload.attachments.unwrap_or_else(|| json!([])),
         )
         .await
         .map_err(map_channel_error)?;
+    let (message, created) = match append_outcome {
+        AppendSessionMessageOutcome::Created(message) => (message, true),
+        AppendSessionMessageOutcome::Existing(message) => (message, false),
+    };
     if let Some(run_id) = heartbeat_run_id.as_deref() {
         // Hermes 的执行步骤、状态文本和最终输出都代表任务仍然活跃；
         // 刷新 run 心跳，避免长任务超过恢复窗口后被重复派发。
@@ -249,9 +281,25 @@ async fn deliver_message(
             .await
             .map_err(map_channel_error)?;
     }
-    state.session_events.publish(SessionEvent::MessageCreated {
-        message: message.clone(),
-    });
+    if let Some((integration_id, request)) = business_tool_request {
+        if created {
+            state
+                .session_events
+                .publish(SessionEvent::BusinessToolRequest {
+                    request: business_tool_request_event(
+                        &message,
+                        &integration_id,
+                        &request,
+                        BusinessToolRequestStatus::Pending,
+                        None,
+                    ),
+                });
+        }
+    } else {
+        state.session_events.publish(SessionEvent::MessageCreated {
+            message: message.clone(),
+        });
+    }
     if let Some(updated_session) = refresh_public_session_retention_from_message(
         &state,
         &session_context.user_id,
@@ -297,6 +345,34 @@ async fn reject_late_terminal_output(
         Ok(_) | Err(crate::channel::service::ChannelStoreError::RunNotFound) => Ok(()),
         Err(error) => Err(map_channel_error(error)),
     }
+}
+
+async fn validate_internal_business_tool_request_message(
+    state: &AppState,
+    user_id: &str,
+    channel_id: &str,
+    content: &str,
+) -> Result<Option<(String, ValidatedBusinessToolRequest)>, ApiError> {
+    if !is_business_tool_request_message(content) {
+        return Ok(None);
+    }
+    let channel = state
+        .channel_store
+        .get_channel(user_id, channel_id)
+        .await
+        .map_err(map_channel_error)?;
+    let integration_id = channel
+        .name
+        .strip_prefix("integration:")
+        .map(str::to_string)
+        .ok_or(ApiError::BadRequest(
+            "business tool request requires integration session",
+        ))?;
+    let request = validate_business_tool_request_message(state, &integration_id, content)
+        .await?
+        .ok_or(ApiError::BadRequest("invalid business tool request"))?;
+
+    Ok(Some((integration_id, request)))
 }
 
 fn hermes_run_id_from_client_message_key(value: &str) -> Option<&str> {
@@ -409,6 +485,11 @@ async fn deliver_media_output(
                         "media output content is too large",
                     )
                     .await?;
+                    if is_business_tool_request_message(&form.content) {
+                        return Err(ApiError::BadRequest(
+                            "business tool requests must use the append endpoint",
+                        ));
+                    }
                 }
                 "client_message_key" => {
                     let value = read_multipart_text_field_with_limit(
@@ -418,6 +499,9 @@ async fn deliver_media_output(
                     )
                     .await?;
                     if let Some(value) = trimmed_non_empty(value) {
+                        if is_reserved_business_tool_client_key(&value) {
+                            return Err(ApiError::BadRequest("reserved client message key"));
+                        }
                         form.client_message_key = Some(value);
                         if let Some(existing) = state
                             .channel_store
@@ -498,6 +582,12 @@ async fn deliver_media_output(
         return Err(ApiError::BadRequest("media file is required"));
     }
     if let Some(client_message_key) = form.client_message_key.as_deref() {
+        if is_reserved_business_tool_client_key(client_message_key) {
+            for file in &mut form.files {
+                file.cleanup().await;
+            }
+            return Err(ApiError::BadRequest("reserved client message key"));
+        }
         if let Some(existing) = state
             .channel_store
             .find_session_message_by_client_key(&session_id, client_message_key)
@@ -772,22 +862,33 @@ async fn update_message(
         &session_context.hermes_instance_id,
     )?;
     reject_late_terminal_output(&state, &token_context, payload.run_id.as_deref(), None).await?;
-    let attachments = payload.attachments.unwrap_or_else(|| json!([]));
-    let (status, message, created) = if is_execution_protocol_message(&payload.content) {
-        upsert_latest_execution_message(
-            &state,
+    let existing_message = state
+        .channel_store
+        .list_session_messages(
             &session_context.user_id,
             &session_context.channel_id,
             &session_id,
-            &message_id,
-            payload.content,
-            attachments,
         )
-        .await?
-    } else {
-        let message = state
-            .channel_store
-            .update_session_message(
+        .await
+        .map_err(map_channel_error)?
+        .into_iter()
+        .find(|message| message.id == message_id)
+        .ok_or(ApiError::NotFound("message not found"))?;
+    if is_business_tool_request_message(&existing_message.content) {
+        return Err(ApiError::BadRequest(
+            "business tool request messages are immutable",
+        ));
+    }
+    let attachments = payload.attachments.unwrap_or_else(|| json!([]));
+    if is_business_tool_request_message(&payload.content) {
+        return Err(ApiError::BadRequest(
+            "business tool requests must use the append endpoint",
+        ));
+    }
+    let (status, message, created, emit_message_event) =
+        if is_execution_protocol_message(&payload.content) {
+            upsert_latest_execution_message(
+                &state,
                 &session_context.user_id,
                 &session_context.channel_id,
                 &session_id,
@@ -795,10 +896,22 @@ async fn update_message(
                 payload.content,
                 attachments,
             )
-            .await
-            .map_err(map_channel_error)?;
-        (StatusCode::OK, message, false)
-    };
+            .await?
+        } else {
+            let message = state
+                .channel_store
+                .update_session_message(
+                    &session_context.user_id,
+                    &session_context.channel_id,
+                    &session_id,
+                    &message_id,
+                    payload.content,
+                    attachments,
+                )
+                .await
+                .map_err(map_channel_error)?;
+            (StatusCode::OK, message, false, true)
+        };
     if let Some(run_id) = payload
         .run_id
         .as_deref()
@@ -811,14 +924,16 @@ async fn update_message(
             .await
             .map_err(map_channel_error)?;
     }
-    if created {
-        state.session_events.publish(SessionEvent::MessageCreated {
-            message: message.clone(),
-        });
-    } else {
-        state.session_events.publish(SessionEvent::MessageUpdated {
-            message: message.clone(),
-        });
+    if emit_message_event {
+        if created {
+            state.session_events.publish(SessionEvent::MessageCreated {
+                message: message.clone(),
+            });
+        } else {
+            state.session_events.publish(SessionEvent::MessageUpdated {
+                message: message.clone(),
+            });
+        }
     }
     if let Some(updated_session) = refresh_public_session_retention_from_message(
         &state,
@@ -845,7 +960,15 @@ async fn upsert_latest_execution_message(
     message_id: &str,
     content: String,
     attachments: serde_json::Value,
-) -> Result<(StatusCode, crate::channel::service::ChannelMessage, bool), ApiError> {
+) -> Result<
+    (
+        StatusCode,
+        crate::channel::service::ChannelMessage,
+        bool,
+        bool,
+    ),
+    ApiError,
+> {
     let messages = state
         .channel_store
         .list_session_messages(user_id, channel_id, session_id)
@@ -883,7 +1006,7 @@ async fn upsert_latest_execution_message(
             )
             .await
             .map_err(map_channel_error)?;
-        return Ok((StatusCode::OK, message, false));
+        return Ok((StatusCode::OK, message, false, true));
     }
 
     // Hermes 对旧执行步骤消息的 edit 可能在用户新消息或正式回复之后才到达。
@@ -901,7 +1024,7 @@ async fn upsert_latest_execution_message(
         )
         .await
         .map_err(map_channel_error)?;
-    Ok((StatusCode::CREATED, message, true))
+    Ok((StatusCode::CREATED, message, true, true))
 }
 
 fn is_execution_protocol_message(content: &str) -> bool {

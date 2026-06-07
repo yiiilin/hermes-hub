@@ -1,4 +1,5 @@
 import type {
+  CreateIntegrationAppInput,
   ApiClient,
   HermesProfile,
   HermesInstance,
@@ -7,6 +8,8 @@ import type {
   Invite,
   ManagedSkill,
   ManagedSkillTreeNode,
+  IntegrationApp,
+  IntegrationToolDefinition,
   ModelApiType,
   ModelConfig,
   ModelFallbackConfig,
@@ -17,11 +20,11 @@ import type {
   ReasoningEffort,
   SpeechInputConfig,
   SystemSettings,
+  UpdateIntegrationAppInput,
   User,
 } from "../api/client";
 import {
   defaultApiManagementSettings,
-  defaultBusinessOAuthSettings,
   defaultLdapSettings,
   defaultOidcSettings,
   defaultPublicPlatformSettings,
@@ -30,7 +33,18 @@ import {
 import { useI18n } from "../i18n";
 import type { AdminSettingsTab } from "../navigation";
 import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
-import { ExternalLink, FilePlus2, FileText, Folder, FolderPlus, Upload } from "lucide-react";
+import {
+  ExternalLink,
+  FilePlus2,
+  FileText,
+  Folder,
+  FolderPlus,
+  KeyRound,
+  Plus,
+  RotateCcw,
+  Upload,
+  X,
+} from "lucide-react";
 import Vditor from "vditor";
 import "vditor/dist/index.css";
 
@@ -59,12 +73,70 @@ const bytesPerMegabyte = 1024 * 1024;
 const hermesIdleStopAfterSeconds = 30 * 60;
 const publicSessionsPageSize = 10;
 const modelConfigOrder: ModelConfigKind[] = ["llm", "title", "image"];
+const integrationAppCallbackUrlPattern =
+  /^https?:\/\/([^/?#:@\s]+|\[[0-9A-Fa-f:.]+\])(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}|0))?(?:[/?#][^\s]*)?$/i;
 const apiTypeLabels: Record<ModelApiType, string> = {
   chat_completions: "Chat Completions",
   responses: "Responses",
   images_generations: "Images",
 };
 const reasoningEfforts: Array<ReasoningEffort | ""> = ["", "minimal", "low", "medium", "high"];
+
+type IntegrationAppForm = {
+  name: string;
+  enabled: boolean;
+  redirect_uri: string;
+  scopes: string;
+  authorization_code_ttl_seconds: number;
+  hidden_session_idle_timeout_seconds: number;
+  default_tool_timeout_seconds: number;
+  max_tool_timeout_seconds: number;
+};
+
+function blankIntegrationAppForm(): IntegrationAppForm {
+  return {
+    name: "",
+    enabled: true,
+    redirect_uri: "",
+    scopes: "openid profile email",
+    authorization_code_ttl_seconds: 600,
+    hidden_session_idle_timeout_seconds: 3600,
+    default_tool_timeout_seconds: 60,
+    max_tool_timeout_seconds: 300,
+  };
+}
+
+function integrationAppFormFromApp(app: IntegrationApp): IntegrationAppForm {
+  return {
+    name: app.name,
+    enabled: app.enabled,
+    redirect_uri: app.redirect_uri,
+    scopes: app.scopes,
+    authorization_code_ttl_seconds: app.authorization_code_ttl_seconds,
+    hidden_session_idle_timeout_seconds: app.hidden_session_idle_timeout_seconds,
+    default_tool_timeout_seconds: app.default_tool_timeout_seconds,
+    max_tool_timeout_seconds: app.max_tool_timeout_seconds,
+  };
+}
+
+function isValidIntegrationAppRedirectUri(value: string): boolean {
+  return integrationAppCallbackUrlPattern.test(value.trim());
+}
+
+function isValidPositiveInteger(value: number): boolean {
+  return Number.isInteger(value) && value > 0;
+}
+
+function formatIntegrationToolParameters(parameters: unknown): string {
+  return JSON.stringify(parameters ?? {}, null, 2);
+}
+
+function latestIntegrationToolSyncAt(tools: IntegrationToolDefinition[]): number | null {
+  if (tools.length === 0) {
+    return null;
+  }
+  return tools.reduce((latest, tool) => Math.max(latest, tool.updated_at), 0);
+}
 
 function modelTestKey(kind: ModelConfigKind, target: ModelTestTarget): string {
   return `${kind}:${target}`;
@@ -483,7 +555,6 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
     speech_input: defaultSpeechInputSettings(),
     public_platform: defaultPublicPlatformSettings(),
     api_management: defaultApiManagementSettings(),
-    business_oauth: defaultBusinessOAuthSettings(),
     oidc: defaultOidcSettings(),
     ldap: defaultLdapSettings(),
   });
@@ -527,12 +598,54 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
   } | null>(null);
   const [publicHermesRebuilding, setPublicHermesRebuilding] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [apiManagementEnabledForTabs, setApiManagementEnabledForTabs] = useState(false);
+  const [integrationApps, setIntegrationApps] = useState<IntegrationApp[]>([]);
+  const [integrationAppDialogOpen, setIntegrationAppDialogOpen] = useState(false);
+  const [selectedIntegrationAppId, setSelectedIntegrationAppId] = useState<string | null>(null);
+  const [integrationAppForm, setIntegrationAppForm] = useState<IntegrationAppForm>(
+    blankIntegrationAppForm(),
+  );
+  const [integrationAppSecret, setIntegrationAppSecret] = useState<string | null>(null);
+  const [integrationAppSaved, setIntegrationAppSaved] = useState(false);
+  const [integrationTools, setIntegrationTools] = useState<IntegrationToolDefinition[]>([]);
+  const [integrationToolsLoading, setIntegrationToolsLoading] = useState(false);
+  const integrationAppNameInputRef = useRef<HTMLInputElement | null>(null);
+  const selectedIntegrationAppIdRef = useRef<string | null>(null);
 
   const instancesByUserId = useMemo(
     () => new Map(instances.map((instance) => [instance.user_id, instance])),
     [instances],
   );
   const usersById = useMemo(() => new Map(users.map((user) => [user.id, user])), [users]);
+  const selectedIntegrationApp = useMemo(
+    () => integrationApps.find((app) => app.id === selectedIntegrationAppId) ?? null,
+    [integrationApps, selectedIntegrationAppId],
+  );
+  const integrationToolsLastSyncedAt = useMemo(
+    () => latestIntegrationToolSyncAt(integrationTools),
+    [integrationTools],
+  );
+  useEffect(() => {
+    selectedIntegrationAppIdRef.current = selectedIntegrationAppId;
+  }, [selectedIntegrationAppId]);
+  useEffect(() => {
+    if (!integrationAppDialogOpen) {
+      return;
+    }
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        closeIntegrationAppDialog();
+      }
+    }
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [integrationAppDialogOpen]);
+  useEffect(() => {
+    if (!integrationAppDialogOpen) {
+      return;
+    }
+    integrationAppNameInputRef.current?.focus();
+  }, [integrationAppDialogOpen, selectedIntegrationAppId]);
   const schedulerTaskRows = useMemo<HermesSchedulerTaskRow[]>(
     () =>
       schedulerSnapshots.flatMap((snapshot) =>
@@ -556,6 +669,10 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
   const oidcRedirectUri = useMemo(() => `${window.location.origin}/api/auth/oidc/callback`, []);
   const apiDocsUrl = useMemo(() => `${window.location.origin}/api/docs`, []);
   const apiOpenApiUrl = useMemo(() => `${window.location.origin}/api/docs/openapi.json`, []);
+  const integrationAppToolsSyncUrl = useMemo(
+    () => `${window.location.origin}/api/integrations/apps/self/tools`,
+    [],
+  );
   const adminSettingsTabs: Array<{ key: AdminSettingsTab; label: string }> = [
     { key: "users", label: t("admin.userManagement") },
     { key: "models", label: t("admin.modelConfig") },
@@ -566,6 +683,9 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
     { key: "system", label: t("admin.systemParameters") },
     { key: "auth", label: t("admin.authSettings") },
     { key: "api-management", label: t("admin.apiManagementSettings") },
+    ...(apiManagementEnabledForTabs
+      ? [{ key: "integration-apps" as const, label: t("admin.integrationApps") }]
+      : []),
     { key: "public-platform", label: t("admin.publicPlatform") },
   ];
 
@@ -590,6 +710,7 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
         activeTab === "auth" ||
         activeTab === "system" ||
         activeTab === "api-management" ||
+        activeTab === "integration-apps" ||
         activeTab === "public-platform"
       ) {
         setSystemSettingsLoaded(false);
@@ -610,12 +731,7 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
         apiClient.listInvites(),
         apiClient.listHermesInstances(),
         apiClient.modelConfigStatus(),
-        activeTab === "auth" ||
-        activeTab === "system" ||
-        activeTab === "api-management" ||
-        activeTab === "public-platform"
-          ? apiClient.systemSettings()
-          : Promise.resolve(null),
+        apiClient.systemSettings(),
         activeTab === "scheduler"
           ? apiClient.listHermesSchedulerSnapshots()
           : Promise.resolve(null),
@@ -628,15 +744,27 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
           ? fetchPublicPlatformSessionsPage(publicSessionsPage.page)
           : Promise.resolve(null),
       ]);
+      const nextIntegrationApps =
+        activeTab === "integration-apps" && nextSettings.api_management.enabled
+          ? await apiClient.listIntegrationApps()
+          : null;
       setUsers(nextUsers);
       setInvites(nextInvites);
       setInstances(nextInstances);
       setModelConfigs(nextModelStatus.model_configs);
       setRequiredModelsReady(nextModelStatus.required_models_ready);
       setMissingRequiredModels(nextModelStatus.missing_required_model_config_kinds);
-      if (nextSettings) {
-        setSystemSettings(nextSettings);
-        setSystemSettingsLoaded(true);
+      setSystemSettings(nextSettings);
+      setApiManagementEnabledForTabs(nextSettings.api_management.enabled);
+      setSystemSettingsLoaded(true);
+      if (nextIntegrationApps) {
+        setIntegrationApps(sortIntegrationApps(nextIntegrationApps));
+        if (
+          selectedIntegrationAppIdRef.current &&
+          !nextIntegrationApps.some((app) => app.id === selectedIntegrationAppIdRef.current)
+        ) {
+          resetIntegrationAppForm();
+        }
       }
       if (nextSchedulerSnapshots) {
         setSchedulerSnapshots(nextSchedulerSnapshots);
@@ -665,13 +793,29 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
     void refresh();
   }, [activeTab]);
 
+  useEffect(() => {
+    if (
+      activeTab === "integration-apps" &&
+      systemSettingsLoaded &&
+      !apiManagementEnabledForTabs
+    ) {
+      onTabChange("api-management");
+    }
+  }, [activeTab, apiManagementEnabledForTabs, onTabChange, systemSettingsLoaded]);
+
   function selectAdminTab(tab: AdminSettingsTab) {
     setError(null);
     setModelSaved(false);
     setSettingsSaved(false);
     setSkillSaved(false);
     setHermesProfileSaved(false);
-    if (tab === "auth" || tab === "system" || tab === "api-management" || tab === "public-platform") {
+    if (
+      tab === "auth" ||
+      tab === "system" ||
+      tab === "api-management" ||
+      tab === "integration-apps" ||
+      tab === "public-platform"
+    ) {
       setSystemSettingsLoaded(false);
     }
     onTabChange(tab);
@@ -884,7 +1028,6 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
       await apiClient.updateAuthSettings({
         oidc: systemSettings.oidc,
         ldap: systemSettings.ldap,
-        business_oauth: systemSettings.business_oauth,
       });
       setSettingsSaved(true);
     } catch (cause) {
@@ -926,6 +1069,10 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
       await apiClient.updateApiManagementSettings({
         api_management: systemSettings.api_management,
       });
+      setApiManagementEnabledForTabs(systemSettings.api_management.enabled);
+      if (!systemSettings.api_management.enabled) {
+        closeIntegrationAppDialog();
+      }
       setSettingsSaved(true);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("admin.settingsSaveFailed"));
@@ -1001,18 +1148,195 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
     }));
   }
 
-  function updateBusinessOAuthSettings(patch: Partial<SystemSettings["business_oauth"]>) {
-    setSystemSettings((current) => ({
-      ...current,
-      business_oauth: { ...current.business_oauth, ...patch },
-    }));
-  }
-
   function updateApiManagementSettings(patch: Partial<SystemSettings["api_management"]>) {
     setSystemSettings((current) => ({
       ...current,
       api_management: { ...current.api_management, ...patch },
     }));
+  }
+
+  function sortIntegrationApps(nextIntegrationApps: IntegrationApp[]) {
+    return [...nextIntegrationApps].sort((left, right) =>
+      left.name.localeCompare(right.name),
+    );
+  }
+
+  async function loadIntegrationApps() {
+    const nextIntegrationApps = await apiClient.listIntegrationApps();
+    setIntegrationApps(sortIntegrationApps(nextIntegrationApps));
+  }
+
+  function resetIntegrationAppForm() {
+    setSettingsSaved(false);
+    setError(null);
+    selectedIntegrationAppIdRef.current = null;
+    setSelectedIntegrationAppId(null);
+    setIntegrationAppForm(blankIntegrationAppForm());
+    setIntegrationAppSecret(null);
+    setIntegrationAppSaved(false);
+    setIntegrationTools([]);
+    setIntegrationToolsLoading(false);
+  }
+
+  function openNewIntegrationAppDialog() {
+    resetIntegrationAppForm();
+    setIntegrationAppDialogOpen(true);
+  }
+
+  function closeIntegrationAppDialog() {
+    setIntegrationAppDialogOpen(false);
+    resetIntegrationAppForm();
+  }
+
+  async function loadIntegrationAppTools(appId: string) {
+    setIntegrationToolsLoading(true);
+    try {
+      const nextTools = await apiClient.listIntegrationAppTools(appId);
+      if (selectedIntegrationAppIdRef.current !== appId) {
+        return;
+      }
+      setIntegrationTools(nextTools);
+    } catch (cause) {
+      if (selectedIntegrationAppIdRef.current === appId) {
+        setError(cause instanceof Error ? cause.message : t("admin.settingsSaveFailed"));
+        setIntegrationTools([]);
+      }
+    } finally {
+      if (selectedIntegrationAppIdRef.current === appId) {
+        setIntegrationToolsLoading(false);
+      }
+    }
+  }
+
+  function selectIntegrationApp(app: IntegrationApp) {
+    setError(null);
+    setSettingsSaved(false);
+    setIntegrationAppDialogOpen(true);
+    selectedIntegrationAppIdRef.current = app.id;
+    setSelectedIntegrationAppId(app.id);
+    setIntegrationAppForm(integrationAppFormFromApp(app));
+    setIntegrationAppSecret(null);
+    setIntegrationAppSaved(false);
+    setIntegrationTools([]);
+    void loadIntegrationAppTools(app.id);
+  }
+
+  function updateIntegrationAppForm(patch: Partial<IntegrationAppForm>) {
+    setIntegrationAppSaved(false);
+    setIntegrationAppSecret(null);
+    setIntegrationAppForm((current) => ({
+      ...current,
+      ...patch,
+    }));
+  }
+
+  async function saveIntegrationApp(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setIntegrationAppSaved(false);
+    setSettingsSaved(false);
+    setError(null);
+    const payload: CreateIntegrationAppInput = {
+      name: integrationAppForm.name.trim(),
+      enabled: integrationAppForm.enabled,
+      redirect_uri: integrationAppForm.redirect_uri.trim(),
+      scopes: integrationAppForm.scopes.trim(),
+      authorization_code_ttl_seconds: integrationAppForm.authorization_code_ttl_seconds,
+      hidden_session_idle_timeout_seconds:
+        integrationAppForm.hidden_session_idle_timeout_seconds,
+      default_tool_timeout_seconds: integrationAppForm.default_tool_timeout_seconds,
+      max_tool_timeout_seconds: integrationAppForm.max_tool_timeout_seconds,
+    };
+    if (!isValidIntegrationAppRedirectUri(payload.redirect_uri)) {
+      setError(t("admin.integrationAppRedirectUriInvalid"));
+      return;
+    }
+    if (
+      !isValidPositiveInteger(payload.authorization_code_ttl_seconds ?? Number.NaN) ||
+      !isValidPositiveInteger(payload.hidden_session_idle_timeout_seconds ?? Number.NaN) ||
+      !isValidPositiveInteger(payload.default_tool_timeout_seconds ?? Number.NaN) ||
+      !isValidPositiveInteger(payload.max_tool_timeout_seconds ?? Number.NaN)
+    ) {
+      setError(t("admin.integrationAppNumericSettingsInvalid"));
+      return;
+    }
+    if ((payload.default_tool_timeout_seconds ?? 0) > (payload.max_tool_timeout_seconds ?? 0)) {
+      setError(t("admin.integrationAppToolTimeoutOrderInvalid"));
+      return;
+    }
+    try {
+      if (selectedIntegrationAppId) {
+        const updatePayload: UpdateIntegrationAppInput = {
+          name: payload.name,
+          enabled: payload.enabled,
+          redirect_uri: payload.redirect_uri,
+          scopes: payload.scopes,
+          authorization_code_ttl_seconds: payload.authorization_code_ttl_seconds ?? 1,
+          hidden_session_idle_timeout_seconds:
+            payload.hidden_session_idle_timeout_seconds ?? 1,
+          default_tool_timeout_seconds: payload.default_tool_timeout_seconds ?? 1,
+          max_tool_timeout_seconds: payload.max_tool_timeout_seconds ?? 1,
+        };
+        const app = await apiClient.updateIntegrationApp(selectedIntegrationAppId, updatePayload);
+        setIntegrationApps((current) =>
+          sortIntegrationApps(current.map((candidate) => (candidate.id === app.id ? app : candidate))),
+        );
+        selectedIntegrationAppIdRef.current = app.id;
+        setSelectedIntegrationAppId(app.id);
+        setIntegrationAppForm(integrationAppFormFromApp(app));
+        setIntegrationAppSecret(null);
+      } else {
+        const created = await apiClient.createIntegrationApp(payload);
+        setIntegrationApps((current) =>
+          sortIntegrationApps([...current.filter((candidate) => candidate.id !== created.app.id), created.app]),
+        );
+        selectedIntegrationAppIdRef.current = created.app.id;
+        setSelectedIntegrationAppId(created.app.id);
+        setIntegrationAppForm(integrationAppFormFromApp(created.app));
+        setIntegrationAppSecret(created.client_secret);
+        setIntegrationTools([]);
+      }
+      setIntegrationAppSaved(true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("admin.settingsSaveFailed"));
+    }
+  }
+
+  async function rotateIntegrationAppSecret() {
+    if (!selectedIntegrationApp) {
+      return;
+    }
+    setSettingsSaved(false);
+    setError(null);
+    try {
+      const rotated = await apiClient.rotateIntegrationAppSecret(selectedIntegrationApp.id);
+      setIntegrationApps((current) =>
+        sortIntegrationApps(
+          current.map((candidate) => (candidate.id === rotated.app.id ? rotated.app : candidate)),
+        ),
+      );
+      setIntegrationAppSecret(rotated.client_secret);
+      setIntegrationAppForm(integrationAppFormFromApp(rotated.app));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("admin.settingsSaveFailed"));
+    }
+  }
+
+  async function deleteIntegrationAppFromList(app: IntegrationApp) {
+    const confirmed = window.confirm(t("admin.integrationAppDeleteConfirm"));
+    if (!confirmed) {
+      return;
+    }
+    setSettingsSaved(false);
+    setError(null);
+    try {
+      await apiClient.deleteIntegrationApp(app.id);
+      setIntegrationApps((current) => current.filter((candidate) => candidate.id !== app.id));
+      if (selectedIntegrationAppIdRef.current === app.id) {
+        closeIntegrationAppDialog();
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("admin.settingsSaveFailed"));
+    }
   }
 
   async function openManagedSkill(path: string) {
@@ -2533,99 +2857,6 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
               {t("admin.ldapAutoCreateUsers")}
             </label>
           </fieldset>
-          <fieldset className="form-section">
-            <legend>{t("admin.businessOAuthSettings")}</legend>
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={systemSettings.business_oauth.enabled}
-                onChange={(event) =>
-                  updateBusinessOAuthSettings({ enabled: event.target.checked })
-                }
-              />
-              {t("admin.businessOAuthEnabled")}
-            </label>
-            <label>
-              {t("admin.businessOAuthClientId")}
-              <input
-                value={systemSettings.business_oauth.client_id}
-                onChange={(event) =>
-                  updateBusinessOAuthSettings({ client_id: event.target.value })
-                }
-              />
-            </label>
-            <label>
-              {t("admin.businessOAuthClientSecret")}
-              <input
-                type="password"
-                value={systemSettings.business_oauth.client_secret}
-                onChange={(event) =>
-                  updateBusinessOAuthSettings({ client_secret: event.target.value })
-                }
-              />
-            </label>
-            <label>
-              {t("admin.businessOAuthScopes")}
-              <input
-                value={systemSettings.business_oauth.scopes}
-                onChange={(event) => updateBusinessOAuthSettings({ scopes: event.target.value })}
-              />
-            </label>
-            <label>
-              {t("admin.businessOAuthAllowedRedirectUris")}
-              <textarea
-                rows={3}
-                value={multilineListToString(
-                  systemSettings.business_oauth.allowed_redirect_uris,
-                )}
-                onChange={(event) =>
-                  updateBusinessOAuthSettings({
-                    allowed_redirect_uris: multilineStringToList(event.target.value),
-                  })
-                }
-              />
-            </label>
-            <label>
-              {t("admin.businessOAuthAuthorizationCodeTtlSeconds")}
-              <input
-                type="number"
-                min={1}
-                value={systemSettings.business_oauth.authorization_code_ttl_seconds}
-                onChange={(event) =>
-                  updateBusinessOAuthSettings({
-                    authorization_code_ttl_seconds: Number(event.target.value),
-                  })
-                }
-                required
-              />
-            </label>
-            <label>
-              {t("admin.businessOAuthHiddenSessionIdleTimeoutSeconds")}
-              <input
-                type="number"
-                min={1}
-                value={systemSettings.business_oauth.hidden_session_idle_timeout_seconds}
-                onChange={(event) =>
-                  updateBusinessOAuthSettings({
-                    hidden_session_idle_timeout_seconds: Number(event.target.value),
-                  })
-                }
-                required
-              />
-            </label>
-            <label>
-              {t("admin.businessOAuthToolsetNames")}
-              <textarea
-                rows={3}
-                value={multilineListToString(systemSettings.business_oauth.toolset_names)}
-                onChange={(event) =>
-                  updateBusinessOAuthSettings({
-                    toolset_names: multilineStringToList(event.target.value),
-                  })
-                }
-              />
-            </label>
-          </fieldset>
           <div className="button-row">
             <button type="submit" disabled={!systemSettingsLoaded}>
               {t("admin.saveSettings")}
@@ -2639,14 +2870,14 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
   if (activeTab === "api-management") {
     return renderSystemSettingsShell(
       <section className="admin-page" id="admin-api-management">
+        <div className="tab-actions">
+          <button type="button" className="secondary" onClick={() => void refresh()}>
+            {t("admin.refresh")}
+          </button>
+        </div>
+        {error ? <p className="error">{error}</p> : null}
+        {settingsSaved ? <p className="copy-line">{t("admin.settingsSaved")}</p> : null}
         <form className="panel form" onSubmit={(event) => void saveApiManagementSettings(event)}>
-          <div className="tab-actions">
-            <button type="button" className="secondary" onClick={() => void refresh()}>
-              {t("admin.refresh")}
-            </button>
-          </div>
-          {error ? <p className="error">{error}</p> : null}
-          {settingsSaved ? <p className="copy-line">{t("admin.settingsSaved")}</p> : null}
           <fieldset className="form-section">
             <legend>{t("admin.apiManagementSettings")}</legend>
             <label className="checkbox-row">
@@ -2686,6 +2917,337 @@ export function AdminRoute({ activeTab, apiClient, currentUser, onTabChange }: A
             </button>
           </div>
         </form>
+      </section>,
+    );
+  }
+
+  if (activeTab === "integration-apps") {
+    return renderSystemSettingsShell(
+      <section className="admin-page" id="admin-integration-apps">
+        {error && !integrationAppDialogOpen ? <p className="error">{error}</p> : null}
+        <div
+          className="panel"
+          aria-hidden={integrationAppDialogOpen}
+          inert={integrationAppDialogOpen}
+        >
+          <div className="panel-heading">
+            <h2>{t("admin.integrationApps")}</h2>
+            <button type="button" className="secondary" onClick={openNewIntegrationAppDialog}>
+              <Plus aria-hidden="true" size={16} />
+              {t("admin.integrationAppNew")}
+            </button>
+          </div>
+          <p className="notice">{t("admin.integrationAppSelectHint")}</p>
+          {integrationApps.length === 0 ? (
+            <p className="notice">{t("admin.integrationAppEmpty")}</p>
+          ) : (
+            <div className="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>{t("admin.integrationAppListName")}</th>
+                    <th>{t("admin.integrationAppListIntegrationId")}</th>
+                    <th>{t("admin.integrationAppListClientId")}</th>
+                    <th>{t("admin.status")}</th>
+                    <th>{t("admin.action")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {integrationApps.map((app) => (
+                    <tr
+                      key={app.id}
+                      className={selectedIntegrationAppId === app.id ? "selected" : undefined}
+                    >
+                      <td>
+                        <strong>{app.name}</strong>
+                      </td>
+                      <td>{app.integration_id}</td>
+                      <td>{app.client_id}</td>
+                      <td>{app.enabled ? t("admin.enabled") : t("admin.disabled")}</td>
+                      <td>
+                        <div className="button-row table-actions">
+                          <button
+                            type="button"
+                            className="secondary"
+                            aria-label={`${t("admin.edit")} ${app.name}`}
+                            onClick={() => selectIntegrationApp(app)}
+                          >
+                            {t("admin.edit")}
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary danger"
+                            aria-label={`${t("admin.delete")} ${app.name}`}
+                            onClick={() => void deleteIntegrationAppFromList(app)}
+                          >
+                            {t("admin.delete")}
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+        {integrationAppDialogOpen ? (
+          <div
+            className="admin-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={
+              selectedIntegrationApp
+                ? t("admin.integrationAppDetails")
+                : t("admin.integrationAppCreate")
+            }
+          >
+            <button
+              type="button"
+              className="admin-modal-backdrop"
+              aria-label={t("admin.closeDialog")}
+              onClick={closeIntegrationAppDialog}
+            />
+            <div className="admin-modal-panel">
+              <form
+                className="form admin-modal-form"
+                noValidate
+                onSubmit={(event) => void saveIntegrationApp(event)}
+              >
+                <div className="admin-modal-header">
+                  <div className="admin-modal-heading">
+                    <h2>
+                      {selectedIntegrationApp
+                        ? t("admin.integrationAppDetails")
+                        : t("admin.integrationAppCreate")}
+                    </h2>
+                    <p className="notice">
+                      {selectedIntegrationApp
+                        ? t("admin.integrationAppEditHint")
+                        : t("admin.integrationAppCreateHint")}
+                    </p>
+                  </div>
+                  <div className="button-row">
+                    {selectedIntegrationApp ? (
+                      <button
+                        type="button"
+                        className="secondary"
+                        onClick={() => void rotateIntegrationAppSecret()}
+                      >
+                        <KeyRound aria-hidden="true" size={16} />
+                        {t("admin.integrationAppRotateSecret")}
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="secondary icon-button"
+                      aria-label={t("admin.closeDialog")}
+                      onClick={closeIntegrationAppDialog}
+                    >
+                      <X aria-hidden="true" size={16} />
+                    </button>
+                  </div>
+                </div>
+                {error ? <p className="error">{error}</p> : null}
+                {integrationAppSaved ? <p className="copy-line">{t("admin.integrationAppSaved")}</p> : null}
+                {integrationAppSecret ? (
+                  <p className="copy-line">
+                    {t("admin.integrationAppSecretGenerated")}: {integrationAppSecret}
+                  </p>
+                ) : null}
+                {selectedIntegrationApp ? (
+                  <label className="readonly-field">
+                    {t("admin.integrationAppClientId")}
+                    <input readOnly value={selectedIntegrationApp.client_id} />
+                  </label>
+                ) : null}
+                {selectedIntegrationApp ? (
+                  <label className="readonly-field">
+                    {t("admin.integrationAppIntegrationId")}
+                    <input readOnly value={selectedIntegrationApp.integration_id} />
+                  </label>
+                ) : null}
+                <label>
+                  {t("admin.integrationAppName")}
+                  <input
+                    ref={integrationAppNameInputRef}
+                    value={integrationAppForm.name}
+                    onChange={(event) => updateIntegrationAppForm({ name: event.target.value })}
+                    required
+                  />
+                </label>
+                <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={integrationAppForm.enabled}
+                    onChange={(event) =>
+                      updateIntegrationAppForm({ enabled: event.target.checked })
+                    }
+                  />
+                  {t("admin.integrationAppEnabled")}
+                </label>
+                <label>
+                  {t("admin.integrationAppRedirectUri")}
+                  <input
+                    type="url"
+                    value={integrationAppForm.redirect_uri}
+                    onChange={(event) =>
+                      updateIntegrationAppForm({
+                        redirect_uri: event.target.value,
+                      })
+                    }
+                    required
+                  />
+                </label>
+                <label>
+                  {t("admin.integrationAppScopes")}
+                  <input
+                    value={integrationAppForm.scopes}
+                    onChange={(event) => updateIntegrationAppForm({ scopes: event.target.value })}
+                    required
+                  />
+                </label>
+                <label>
+                  {t("admin.integrationAppAuthorizationCodeTtlSeconds")}
+                  <input
+                    type="number"
+                    min={1}
+                    value={integrationAppForm.authorization_code_ttl_seconds}
+                    onChange={(event) =>
+                      updateIntegrationAppForm({
+                        authorization_code_ttl_seconds: Number(event.target.value),
+                      })
+                    }
+                    required
+                  />
+                </label>
+                <label>
+                  {t("admin.integrationAppHiddenSessionIdleTimeoutSeconds")}
+                  <input
+                    type="number"
+                    min={1}
+                    value={integrationAppForm.hidden_session_idle_timeout_seconds}
+                    onChange={(event) =>
+                      updateIntegrationAppForm({
+                        hidden_session_idle_timeout_seconds: Number(event.target.value),
+                      })
+                    }
+                    required
+                  />
+                </label>
+                <label>
+                  {t("admin.integrationAppDefaultToolTimeoutSeconds")}
+                  <input
+                    type="number"
+                    min={1}
+                    value={integrationAppForm.default_tool_timeout_seconds}
+                    onChange={(event) =>
+                      updateIntegrationAppForm({
+                        default_tool_timeout_seconds: Number(event.target.value),
+                      })
+                    }
+                    required
+                  />
+                </label>
+                <label>
+                  {t("admin.integrationAppMaxToolTimeoutSeconds")}
+                  <input
+                    type="number"
+                    min={1}
+                    value={integrationAppForm.max_tool_timeout_seconds}
+                    onChange={(event) =>
+                      updateIntegrationAppForm({
+                        max_tool_timeout_seconds: Number(event.target.value),
+                      })
+                    }
+                    required
+                  />
+                </label>
+                <div className="button-row">
+                  <button type="button" className="secondary" onClick={closeIntegrationAppDialog}>
+                    {t("admin.cancel")}
+                  </button>
+                  <button type="submit" disabled={!systemSettingsLoaded}>
+                    {selectedIntegrationApp ? t("admin.save") : t("admin.create")}
+                  </button>
+                </div>
+                <fieldset className="form-section">
+                  <legend>{t("admin.integrationAppTools")}</legend>
+                  {selectedIntegrationApp ? (
+                    <>
+                      <p className="notice">{t("admin.integrationAppToolsManagedByApi")}</p>
+                      <label className="readonly-field">
+                        {t("admin.integrationAppToolsSyncUrl")}
+                        <input readOnly value={integrationAppToolsSyncUrl} />
+                      </label>
+                      <p className="copy-line">{t("admin.integrationAppToolsSyncAuthHint")}</p>
+                      <label className="readonly-field">
+                        {t("admin.integrationAppToolsLastSyncedAt")}
+                        <input
+                          readOnly
+                          value={
+                            integrationToolsLastSyncedAt === null
+                              ? t("admin.integrationAppToolsNotSynced")
+                              : formatSchedulerSnapshotTime(integrationToolsLastSyncedAt, language)
+                          }
+                        />
+                      </label>
+                      <p className="copy-line">
+                        {t("admin.integrationAppToolsCount", {
+                          count: integrationTools.length,
+                        })}
+                      </p>
+                      <div className="button-row">
+                        <button
+                          type="button"
+                          className="secondary"
+                          disabled={integrationToolsLoading}
+                          onClick={() => void loadIntegrationAppTools(selectedIntegrationApp.id)}
+                        >
+                          <RotateCcw aria-hidden="true" size={16} />
+                          {t("admin.refresh")}
+                        </button>
+                      </div>
+                      {integrationToolsLoading ? (
+                        <p className="notice">{t("admin.integrationAppToolsLoading")}</p>
+                      ) : null}
+                      {integrationTools.length === 0 ? (
+                        <p className="notice">{t("admin.integrationAppToolsEmpty")}</p>
+                      ) : (
+                        <div className="table-scroll">
+                          <table>
+                            <thead>
+                              <tr>
+                                <th>{t("admin.integrationAppToolName")}</th>
+                                <th>{t("admin.integrationAppToolDescription")}</th>
+                                <th>{t("admin.integrationAppToolParameters")}</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {integrationTools.map((tool) => (
+                                <tr key={tool.name}>
+                                  <td>{tool.name}</td>
+                                  <td>{tool.description}</td>
+                                  <td>
+                                    <pre className="integration-tool-parameters">
+                                      {formatIntegrationToolParameters(tool.parameters)}
+                                    </pre>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <p className="notice">{t("admin.integrationAppToolsCreateHint")}</p>
+                  )}
+                </fieldset>
+              </form>
+            </div>
+          </div>
+        ) : null}
       </section>,
     );
   }

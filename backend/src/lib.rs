@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub mod app_config;
 pub mod asr;
 pub mod channel;

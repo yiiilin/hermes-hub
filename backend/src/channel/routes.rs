@@ -17,14 +17,15 @@ use crate::{
     channel::{
         events::SessionEvent,
         service::{
-            Channel, ChannelActiveRun, ChannelAttachment, ChannelAttachmentDirection,
-            ChannelMessage, ChannelMessageRole, ChannelRun, ChannelRunStatus, ChannelSession,
-            ChannelSessionKind, ChannelStoreError,
+            is_business_tool_request_message, Channel, ChannelActiveRun, ChannelAttachment,
+            ChannelAttachmentDirection, ChannelMessage, ChannelMessageRole, ChannelRun,
+            ChannelRunStatus, ChannelSession, ChannelSessionKind, ChannelStoreError,
         },
     },
     http::{
         attachments::upload_session_attachments,
         auth::current_user,
+        integrations::is_reserved_business_tool_client_key,
         sessions::{apply_sse_no_buffer_headers, delete_managed_cron_jobs_for_session},
         workspace::ensure_managed_hermes_for_user,
         ApiError,
@@ -109,6 +110,19 @@ struct CreateRunRequest {
 struct UpdateMessageRequest {
     content: String,
     attachments: Option<Value>,
+}
+
+fn reject_reserved_business_tool_channel_message(
+    content: &str,
+    client_message_key: Option<&str>,
+) -> Result<(), ApiError> {
+    if is_business_tool_request_message(content)
+        || client_message_key.is_some_and(is_reserved_business_tool_client_key)
+    {
+        // legacy channel API 也不能占用业务工具请求/结果的保留 marker 和幂等 key。
+        return Err(ApiError::BadRequest("reserved client message key"));
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -355,6 +369,10 @@ async fn append_session_message(
 ) -> Result<impl IntoResponse, ApiError> {
     let user = current_user(&state, &headers).await?;
     let role = ChannelMessageRole::parse(&payload.role).map_err(map_channel_error)?;
+    reject_reserved_business_tool_channel_message(
+        &payload.content,
+        payload.client_message_key.as_deref(),
+    )?;
 
     let message = state
         .channel_store
@@ -386,6 +404,10 @@ async fn create_channel_run(
     Json(payload): Json<CreateRunRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = current_user(&state, &headers).await?;
+    reject_reserved_business_tool_channel_message(
+        &payload.content,
+        payload.client_message_key.as_deref(),
+    )?;
     // 创建 Hub run 的前置条件是托管 Hermes 已运行当前 adapter 规格；
     // 这个约束由后端统一保证，前端不参与容器版本判断。
     ensure_managed_hermes_for_user(&state, &user.id).await?;
@@ -437,6 +459,21 @@ async fn update_session_message(
     let user = current_user(&state, &headers).await?;
     // 前端会把正在执行的工具步骤保存为一条可更新的 assistant 消息；
     // 所有权仍由 channel/session 校验保证，用户不能跨会话修改消息。
+    let existing_message = state
+        .channel_store
+        .list_session_messages(&user.id, &channel_id, &session_id)
+        .await
+        .map_err(map_channel_error)?
+        .into_iter()
+        .find(|message| message.id == message_id)
+        .ok_or(ApiError::NotFound("message not found"))?;
+    if is_business_tool_request_message(&existing_message.content)
+        || is_business_tool_request_message(&payload.content)
+    {
+        return Err(ApiError::BadRequest(
+            "business tool request messages are immutable",
+        ));
+    }
     let message = state
         .channel_store
         .update_session_message(

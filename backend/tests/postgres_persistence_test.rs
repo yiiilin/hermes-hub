@@ -18,8 +18,8 @@ use hermes_hub_backend::{
     model_config::{ModelConfig, ModelRegistry, CHAT_COMPLETIONS_API_TYPE, LLM_MODEL_CONFIG_KIND},
     security::crypto::SecretCipher,
     session::store::{
-        ApiManagementSettings, BusinessOAuthSettings, LdapSettings, OidcSettings,
-        PublicPlatformSettings, SessionPurpose, SessionStore, SpeechInputSettings, SystemSettings,
+        ApiManagementSettings, LdapSettings, OidcSettings, PublicPlatformSettings, SessionPurpose,
+        SessionStore, SpeechInputSettings, SystemSettings,
     },
     storage::InMemoryObjectStorage,
     AppConfig, AppState,
@@ -38,22 +38,94 @@ const TEST_SECRET_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 async fn postgres_pool() -> Option<PgPool> {
     let database_url = std::env::var("HERMES_HUB_TEST_DATABASE_URL").ok()?;
     let schema = format!("persistence_{}", Uuid::new_v4().simple());
-    let pool = PgPoolOptions::new()
+    let setup_pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&database_url)
         .await
         .expect("postgres test database is reachable");
 
     sqlx::query(&format!(r#"create schema "{schema}""#))
-        .execute(&pool)
+        .execute(&setup_pool)
         .await
         .expect("test schema can be created");
-    sqlx::query(&format!(r#"set search_path to "{schema}", public"#))
-        .execute(&pool)
+    drop(setup_pool);
+
+    let search_path_sql = format!(r#"set search_path to "{schema}", public"#);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect({
+            let search_path_sql = search_path_sql.clone();
+            move |connection, _meta| {
+                let search_path_sql = search_path_sql.clone();
+                Box::pin(async move {
+                    sqlx::query(&search_path_sql).execute(connection).await?;
+                    Ok(())
+                })
+            }
+        })
+        .connect(&database_url)
         .await
-        .expect("test schema can be selected");
+        .expect("postgres test database is reachable");
 
     Some(pool)
+}
+
+async fn create_legacy_integration_apps_table(pool: &PgPool) {
+    sqlx::raw_sql(
+        r#"
+        create table integration_apps (
+            id uuid primary key,
+            integration_id text not null unique,
+            name text not null,
+            enabled boolean not null default true,
+            client_id text not null unique,
+            client_secret_hash text not null,
+            allowed_redirect_uris jsonb not null default '[]'::jsonb,
+            scopes text not null default 'openid profile email',
+            authorization_code_ttl_seconds bigint not null default 600 check (authorization_code_ttl_seconds > 0),
+            hidden_session_idle_timeout_seconds bigint not null default 3600 check (hidden_session_idle_timeout_seconds > 0),
+            default_tool_timeout_seconds bigint not null default 60 check (default_tool_timeout_seconds > 0),
+            max_tool_timeout_seconds bigint not null default 300 check (max_tool_timeout_seconds > 0),
+            last_used_at timestamptz,
+            created_at timestamptz not null default now(),
+            updated_at timestamptz not null default now(),
+            check (default_tool_timeout_seconds <= max_tool_timeout_seconds)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("legacy integration_apps table can be created");
+}
+
+async fn insert_legacy_integration_app(
+    pool: &PgPool,
+    integration_id: &str,
+    allowed_redirect_uris: Value,
+) {
+    sqlx::query(
+        r#"
+        insert into integration_apps (
+            id, integration_id, name, enabled, client_id, client_secret_hash,
+            allowed_redirect_uris, scopes, authorization_code_ttl_seconds,
+            hidden_session_idle_timeout_seconds, default_tool_timeout_seconds,
+            max_tool_timeout_seconds, created_at, updated_at
+        )
+        values (
+            $1::uuid, $2, $3, true, $4, $5, $6, 'openid profile email',
+            600, 3600, 60, 300, now(), now()
+        )
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(integration_id)
+    .bind(format!("{integration_id} app"))
+    .bind(format!("client-{integration_id}"))
+    .bind(format!("secret-{integration_id}"))
+    .bind(allowed_redirect_uris)
+    .execute(pool)
+    .await
+    .expect("legacy integration app row can be inserted");
 }
 
 fn unix_now() -> u64 {
@@ -257,6 +329,62 @@ async fn postgres_user_password_update_persists() {
         .await
         .expect("new password survives store recreation");
     assert_eq!(reloaded_admin.id, admin.id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_legacy_integration_app_migration_backfills_first_non_empty_callback_url() {
+    let Some(pool) = postgres_pool().await else {
+        eprintln!("skipping postgres persistence test: HERMES_HUB_TEST_DATABASE_URL is not set");
+        return;
+    };
+    create_legacy_integration_apps_table(&pool).await;
+    insert_legacy_integration_app(&pool, "crm", json!(["", "https://crm.example/callback"])).await;
+
+    run_migrations(&pool).await.expect("migrations can run");
+
+    let redirect_uri = sqlx::query_scalar::<_, String>(
+        "select redirect_uri from integration_apps where integration_id = 'crm'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("redirect_uri can be queried");
+    assert_eq!(redirect_uri, "https://crm.example/callback");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_legacy_integration_app_migration_rejects_multiple_callback_urls() {
+    let Some(pool) = postgres_pool().await else {
+        eprintln!("skipping postgres persistence test: HERMES_HUB_TEST_DATABASE_URL is not set");
+        return;
+    };
+    create_legacy_integration_apps_table(&pool).await;
+    insert_legacy_integration_app(
+        &pool,
+        "crm",
+        json!(["https://crm.example/a", "https://crm.example/b"]),
+    )
+    .await;
+
+    let error = run_migrations(&pool)
+        .await
+        .expect_err("migrations should reject multiple legacy callback URLs");
+    assert!(error.to_string().contains("multiple legacy callback URLs"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_legacy_integration_app_migration_rejects_invalid_callback_url() {
+    let Some(pool) = postgres_pool().await else {
+        eprintln!("skipping postgres persistence test: HERMES_HUB_TEST_DATABASE_URL is not set");
+        return;
+    };
+    create_legacy_integration_apps_table(&pool).await;
+    insert_legacy_integration_app(&pool, "crm", json!(["https://crm.example:99999/callback"]))
+        .await;
+
+    let error = run_migrations(&pool)
+        .await
+        .expect_err("migrations should reject invalid legacy callback URLs");
+    assert!(error.to_string().contains("invalid callback URL"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1595,7 +1723,6 @@ async fn postgres_system_settings_persist_session_limit() {
                 email_attribute: "mail".to_string(),
                 auto_create_users: true,
             },
-            business_oauth: BusinessOAuthSettings::default(),
         })
         .await
         .expect("settings can be updated");

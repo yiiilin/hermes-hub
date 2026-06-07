@@ -9,6 +9,7 @@ export type AdminSettingsTab =
   | "skills"
   | "system"
   | "api-management"
+  | "integration-apps"
   | "public-platform"
   | "auth";
 
@@ -35,6 +36,7 @@ const adminSettingsTabs = new Set<AdminSettingsTab>([
   "skills",
   "system",
   "api-management",
+  "integration-apps",
   "public-platform",
   "auth",
 ]);

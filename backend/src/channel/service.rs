@@ -78,7 +78,8 @@ impl ChannelMessageKind {
     ) -> Self {
         if role == &ChannelMessageRole::Assistant
             && (client_message_key.is_some_and(|key| key.starts_with("hermes-execution:"))
-                || is_execution_protocol_message(content))
+                || is_execution_protocol_message(content)
+                || is_business_tool_request_message(content))
         {
             Self::Execution
         } else {
@@ -92,6 +93,12 @@ fn is_execution_protocol_message(content: &str) -> bool {
     trimmed.starts_with("<!-- hermes-hub:execution:v1 -->")
         || trimmed.starts_with("执行步骤\n")
         || trimmed.lines().any(is_legacy_hermes_tool_line)
+}
+
+pub(crate) fn is_business_tool_request_message(content: &str) -> bool {
+    content
+        .trim_start()
+        .starts_with("<!-- hermes-hub:business-tool-request:v1 -->")
 }
 
 fn is_legacy_hermes_tool_line(line: &str) -> bool {
@@ -367,6 +374,12 @@ pub enum ChannelStoreError {
     LockFailed,
     #[error("database operation failed")]
     DatabaseFailed,
+}
+
+#[derive(Clone, Debug)]
+pub enum AppendSessionMessageOutcome {
+    Created(ChannelMessage),
+    Existing(ChannelMessage),
 }
 
 #[derive(Clone)]
@@ -1542,6 +1555,81 @@ impl ChannelStore {
         content: String,
         attachments: Value,
     ) -> Result<ChannelMessage, ChannelStoreError> {
+        self.append_session_message_with_outcome(
+            user_id,
+            channel_id,
+            session_id,
+            role,
+            client_message_key,
+            content,
+            attachments,
+        )
+        .await
+        .map(|outcome| match outcome {
+            AppendSessionMessageOutcome::Created(message)
+            | AppendSessionMessageOutcome::Existing(message) => message,
+        })
+    }
+
+    pub async fn append_session_message_with_outcome(
+        &self,
+        user_id: &str,
+        channel_id: &str,
+        session_id: &str,
+        role: ChannelMessageRole,
+        client_message_key: Option<String>,
+        content: String,
+        attachments: Value,
+    ) -> Result<AppendSessionMessageOutcome, ChannelStoreError> {
+        self.append_session_message_with_optional_deadline(
+            user_id,
+            channel_id,
+            session_id,
+            role,
+            client_message_key,
+            content,
+            attachments,
+            None,
+        )
+        .await
+        .map(|outcome| outcome.expect("append without deadline cannot expire"))
+    }
+
+    pub async fn append_session_message_with_outcome_before_deadline(
+        &self,
+        user_id: &str,
+        channel_id: &str,
+        session_id: &str,
+        role: ChannelMessageRole,
+        client_message_key: Option<String>,
+        content: String,
+        attachments: Value,
+        expires_at: u64,
+    ) -> Result<Option<AppendSessionMessageOutcome>, ChannelStoreError> {
+        self.append_session_message_with_optional_deadline(
+            user_id,
+            channel_id,
+            session_id,
+            role,
+            client_message_key,
+            content,
+            attachments,
+            Some(expires_at),
+        )
+        .await
+    }
+
+    async fn append_session_message_with_optional_deadline(
+        &self,
+        user_id: &str,
+        channel_id: &str,
+        session_id: &str,
+        role: ChannelMessageRole,
+        client_message_key: Option<String>,
+        content: String,
+        attachments: Value,
+        expires_at: Option<u64>,
+    ) -> Result<Option<AppendSessionMessageOutcome>, ChannelStoreError> {
         let message_id = Uuid::new_v4().to_string();
         let attachments = self
             .canonical_message_attachments(
@@ -1564,10 +1652,15 @@ impl ChannelStore {
                     session_id,
                     client_message_key.as_deref(),
                 ) {
-                    return Ok(existing);
+                    return Ok(Some(AppendSessionMessageOutcome::Existing(existing)));
                 }
 
                 let now = unix_now();
+                if expires_at.is_some_and(|deadline| now >= deadline) {
+                    // 业务工具结果回调可能在等待同 session/client key 锁时过期；
+                    // 在内存 store 的互斥区内重查，确保过期后不会再落库。
+                    return Ok(None);
+                }
                 let message_kind =
                     ChannelMessageKind::classify(&role, client_message_key.as_deref(), &content);
                 let message = ChannelMessage {
@@ -1590,7 +1683,7 @@ impl ChannelStore {
                     session.updated_at = now;
                 }
                 bind_memory_attachments(&mut inner, session_id, &message.id, &message.attachments);
-                Ok(message)
+                Ok(Some(AppendSessionMessageOutcome::Created(message)))
             }
             ChannelStoreBackend::Postgres(pool) => block_on_db(async {
                 let mut tx = pool
@@ -1598,6 +1691,14 @@ impl ChannelStore {
                     .await
                     .map_err(|_| ChannelStoreError::DatabaseFailed)?;
                 if let Some(key) = client_message_key.as_deref() {
+                    // 对同一 session + client key 加事务级锁，避免并发请求都先查到“空”，
+                    // 再各自插入一条结果消息。
+                    let lock_key = format!("{session_id}:{key}");
+                    sqlx::query("select pg_advisory_xact_lock(hashtext($1))")
+                        .bind(lock_key)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|_| ChannelStoreError::DatabaseFailed)?;
                     if let Some(message) =
                         find_postgres_message_by_client_key_in_transaction(&mut tx, session_id, key)
                             .await?
@@ -1612,7 +1713,7 @@ impl ChannelStore {
                         tx.commit()
                             .await
                             .map_err(|_| ChannelStoreError::DatabaseFailed)?;
-                        return Ok(message);
+                        return Ok(Some(AppendSessionMessageOutcome::Existing(message)));
                     }
                 }
 
@@ -1621,7 +1722,8 @@ impl ChannelStore {
                     insert into channel_session_messages (
                         id, session_id, role, client_message_key, content, attachments
                     )
-                    values ($1::uuid, $2::uuid, $3, $4, $5, $6)
+                    select $1::uuid, $2::uuid, $3, $4, $5, $6
+                    where $7::bigint is null or extract(epoch from now())::bigint < $7
                     on conflict (session_id, client_message_key) where client_message_key is not null
                     do update set client_message_key = excluded.client_message_key
                     returning id::text as id,
@@ -1640,9 +1742,17 @@ impl ChannelStore {
                 .bind(client_message_key)
                 .bind(content)
                 .bind(attachments)
-                .fetch_one(&mut *tx)
+                .bind(expires_at.map(|value| value as i64))
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+
+                let Some(row) = row else {
+                    tx.rollback()
+                        .await
+                        .map_err(|_| ChannelStoreError::DatabaseFailed)?;
+                    return Ok(None);
+                };
 
                 let message = row_to_message(&row)?;
                 sqlx::query("update channel_sessions set updated_at = now() where id = $1::uuid")
@@ -1660,7 +1770,7 @@ impl ChannelStore {
                 tx.commit()
                     .await
                     .map_err(|_| ChannelStoreError::DatabaseFailed)?;
-                Ok(message)
+                Ok(Some(AppendSessionMessageOutcome::Created(message)))
             }),
         }
     }

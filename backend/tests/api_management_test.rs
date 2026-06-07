@@ -113,7 +113,16 @@ async fn api_docs_are_exposed_when_api_management_is_enabled() {
     .expect("openapi json");
     assert_eq!(spec["openapi"], "3.0.3");
     assert!(spec["paths"]["/api/oauth/token"].is_object());
+    assert!(spec["paths"]["/api/integrations/apps/self/tools"].is_object());
     assert!(spec["paths"]["/api/integrations/sessions"].is_object());
+    assert!(spec["paths"]
+        ["/api/integrations/sessions/{session_id}/business-tool-requests/{request_id}/result"]
+        .is_object());
+    assert!(spec["components"]["securitySchemes"]["basicAuth"].is_object());
+    assert!(spec["components"]["schemas"]["IntegrationToolsResponse"].is_object());
+    assert!(spec["components"]["schemas"]["BusinessToolRequestEvent"].is_object());
+    assert!(spec["components"]["schemas"]["BusinessToolResultRequest"].is_object());
+    assert!(spec["components"]["schemas"]["MessagesSnapshotResponse"].is_object());
     assert!(spec["paths"]["/api/channels"].is_null());
     assert!(spec["paths"]["/api/auth/me"].is_null());
 }

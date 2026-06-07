@@ -11,6 +11,13 @@ fn schema_migrations_include_initial_tables() {
     assert!(sql.contains("add column if not exists purpose text not null default 'web'"));
     assert!(sql.contains("users_auth_provider_check"));
     assert!(sql.contains("create table if not exists business_oauth_authorization_codes"));
+    assert!(sql.contains("redirect_uri text not null"));
+    assert!(sql.contains("jsonb_array_elements_text"));
+    assert!(sql.contains("multiple legacy callback URLs"));
+    assert!(
+        !sql.contains("allowed_redirect_uris jsonb"),
+        "integration apps should store a single callback URL"
+    );
     assert!(sql.contains("create table if not exists invites"));
     assert!(sql.contains("create table if not exists hermes_instances"));
     assert!(sql.contains("create table if not exists llm_usage_events"));

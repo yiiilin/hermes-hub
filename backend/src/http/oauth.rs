@@ -11,7 +11,7 @@ use std::collections::HashSet;
 
 use crate::{
     http::auth::{current_bearer_auth_context, current_web_user},
-    session::store::BusinessOAuthSettings,
+    session::store::IntegrationApp,
     AppState,
 };
 
@@ -87,7 +87,6 @@ async fn authorize(
     headers: HeaderMap,
     Query(query): Query<AuthorizeQuery>,
 ) -> Result<Response, ApiError> {
-    let settings = enabled_business_oauth_settings(&state).await?;
     let user = current_web_user(&state, &headers).await?;
     let response_type = query
         .response_type
@@ -96,30 +95,24 @@ async fn authorize(
     if response_type != "code" {
         return Err(ApiError::BadRequest("unsupported response_type"));
     }
-    let client_id = query
-        .client_id
-        .as_deref()
-        .ok_or(ApiError::BadRequest("missing client_id"))?;
-    if client_id != settings.client_id {
-        return Err(ApiError::Unauthorized);
-    }
+    let app = enabled_integration_app_by_client_id(&state, query.client_id.as_deref()).await?;
     let redirect_uri = query
         .redirect_uri
         .as_deref()
         .ok_or(ApiError::BadRequest("missing redirect_uri"))?;
-    if !is_allowed_redirect_uri(&settings, redirect_uri) {
+    if !is_allowed_redirect_uri(&app, redirect_uri) {
         return Err(ApiError::Unauthorized);
     }
-    let scope = normalize_scope(query.scope.as_deref().unwrap_or(settings.scopes.as_str()))?;
-    validate_scope(&settings, &scope)?;
+    let scope = normalize_scope(query.scope.as_deref().unwrap_or(app.scopes.as_str()))?;
+    validate_scope(&app, &scope)?;
     let code = state
         .store
         .create_business_oauth_authorization_code(
             &user.id,
-            &settings.client_id,
+            &app.client_id,
             redirect_uri,
             &scope,
-            settings.authorization_code_ttl_seconds,
+            app.authorization_code_ttl_seconds,
         )
         .await
         .map_err(|_| ApiError::Internal)?;
@@ -138,20 +131,23 @@ async fn token(
     State(state): State<AppState>,
     Form(form): Form<TokenForm>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let settings = enabled_business_oauth_settings(&state).await?;
     if form.grant_type.as_deref() != Some("authorization_code") {
         return Err(ApiError::BadRequest("unsupported grant_type"));
     }
-    if form.client_id.as_deref() != Some(settings.client_id.as_str())
-        || form.client_secret.as_deref() != Some(settings.client_secret.as_str())
-    {
-        return Err(ApiError::Unauthorized);
+    let app = enabled_integration_app_by_client_id(&state, form.client_id.as_deref()).await?;
+    match form.client_secret.as_deref() {
+        Some(secret)
+            if state
+                .store
+                .verify_integration_app_secret(&app, secret)
+                .await => {}
+        _ => return Err(ApiError::Unauthorized),
     }
     let redirect_uri = form
         .redirect_uri
         .as_deref()
         .ok_or(ApiError::BadRequest("missing redirect_uri"))?;
-    if !is_allowed_redirect_uri(&settings, redirect_uri) {
+    if !is_allowed_redirect_uri(&app, redirect_uri) {
         return Err(ApiError::Unauthorized);
     }
     let code = form
@@ -160,13 +156,13 @@ async fn token(
         .ok_or(ApiError::BadRequest("missing code"))?;
     let grant = state
         .store
-        .consume_business_oauth_authorization_code(code, &settings.client_id, redirect_uri)
+        .consume_business_oauth_authorization_code(code, &app.client_id, redirect_uri)
         .await
         .map_err(|_| ApiError::Unauthorized)?;
 
     let access_token = state
         .store
-        .create_oauth_session(&grant.user_id, &settings.client_id)
+        .create_oauth_session(&grant.user_id, &app.integration_id)
         .await
         .map_err(|_| ApiError::Internal)?;
 
@@ -187,36 +183,53 @@ async fn userinfo(
         return Err(ApiError::Unauthorized);
     }
     let integration_id = auth.integration_id.clone().ok_or(ApiError::Unauthorized)?;
-    let settings = enabled_business_oauth_settings(&state).await?;
+    let app = state
+        .store
+        .integration_app_by_integration_id(&integration_id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .filter(|app| app.enabled)
+        .ok_or(ApiError::Unauthorized)?;
+    let toolset_names = state
+        .store
+        .list_integration_tools(&app.integration_id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>();
 
     Ok(Json(UserInfoResponse {
         id: auth.user.id.clone(),
         sub: auth.user.id,
         email: auth.user.email,
         integration_id,
-        toolset_names: settings.toolset_names,
+        toolset_names,
     }))
 }
 
-async fn enabled_business_oauth_settings(
+async fn enabled_integration_app_by_client_id(
     state: &AppState,
-) -> Result<BusinessOAuthSettings, ApiError> {
-    let settings = state
+    client_id: Option<&str>,
+) -> Result<IntegrationApp, ApiError> {
+    let client_id = client_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(ApiError::BadRequest("missing client_id"))?;
+    let app = state
         .store
-        .system_settings()
+        .integration_app_by_client_id(client_id)
         .await
-        .map_err(|_| ApiError::Internal)?;
-    if !settings.business_oauth.enabled {
-        return Err(ApiError::NotFound("business oauth is not enabled"));
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::Unauthorized)?;
+    if !app.enabled {
+        return Err(ApiError::NotFound("integration app is not enabled"));
     }
-    Ok(settings.business_oauth)
+    Ok(app)
 }
 
-fn is_allowed_redirect_uri(settings: &BusinessOAuthSettings, redirect_uri: &str) -> bool {
-    settings
-        .allowed_redirect_uris
-        .iter()
-        .any(|value| value == redirect_uri)
+fn is_allowed_redirect_uri(app: &IntegrationApp, redirect_uri: &str) -> bool {
+    app.redirect_uri == redirect_uri
 }
 
 fn normalize_scope(scope: &str) -> Result<String, ApiError> {
@@ -231,8 +244,8 @@ fn normalize_scope(scope: &str) -> Result<String, ApiError> {
     Ok(tokens.join(" "))
 }
 
-fn validate_scope(settings: &BusinessOAuthSettings, scope: &str) -> Result<(), ApiError> {
-    let allowed = settings
+fn validate_scope(app: &IntegrationApp, scope: &str) -> Result<(), ApiError> {
+    let allowed = app
         .scopes
         .split_whitespace()
         .map(str::trim)

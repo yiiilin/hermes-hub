@@ -10,12 +10,14 @@ use crate::{
     security::crypto::{decrypt_secret, encrypt_secret, SecretCipher},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{Executor, PgPool, Postgres, Row};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -38,9 +40,15 @@ const PUBLIC_PLATFORM_SETTINGS_KEY: &str = "public_platform";
 const EMPTY_CHAT_PROMPT_KEY: &str = "empty_chat_prompt";
 const OIDC_SETTINGS_KEY: &str = "oidc";
 const LDAP_SETTINGS_KEY: &str = "ldap";
-const BUSINESS_OAUTH_SETTINGS_KEY: &str = "business_oauth";
 const API_MANAGEMENT_SETTINGS_KEY: &str = "api_management";
 pub const PUBLIC_PLATFORM_USER_EMAIL: &str = "public-platform@hermes-hub.local";
+const DEFAULT_AUTHORIZATION_CODE_TTL_SECONDS: u64 = 600;
+const DEFAULT_HIDDEN_SESSION_IDLE_TIMEOUT_SECONDS: u64 = 3600;
+const DEFAULT_BUSINESS_TOOL_TIMEOUT_SECONDS: u64 = 60;
+const DEFAULT_MAX_BUSINESS_TOOL_TIMEOUT_SECONDS: u64 = 300;
+const CALLBACK_URL_PATTERN: &str = r"(?i)^https?://([^/?#:@[:space:]]+|\[[0-9A-Fa-f:.]+\])(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}|0))?([/?#][^[:space:]]*)?$";
+static CALLBACK_URL_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(CALLBACK_URL_PATTERN).expect("callback URL regex must stay valid"));
 
 #[derive(Clone)]
 pub struct SessionStore {
@@ -66,6 +74,10 @@ struct StoreInner {
     user_ids_by_email: HashMap<String, String>,
     sessions_by_hash: HashMap<String, StoredSession>,
     business_oauth_codes_by_hash: HashMap<String, StoredBusinessOAuthAuthorizationCode>,
+    integration_apps_by_id: HashMap<String, IntegrationApp>,
+    integration_app_ids_by_client_id: HashMap<String, String>,
+    integration_app_ids_by_integration_id: HashMap<String, String>,
+    integration_tools_by_integration_id: HashMap<String, Vec<IntegrationToolDefinition>>,
     invites_by_id: HashMap<String, Invite>,
     invite_ids_by_hash: HashMap<String, String>,
     hermes_instances_by_user_id: HashMap<String, HermesInstance>,
@@ -85,6 +97,10 @@ impl Default for StoreInner {
             user_ids_by_email: HashMap::new(),
             sessions_by_hash: HashMap::new(),
             business_oauth_codes_by_hash: HashMap::new(),
+            integration_apps_by_id: HashMap::new(),
+            integration_app_ids_by_client_id: HashMap::new(),
+            integration_app_ids_by_integration_id: HashMap::new(),
+            integration_tools_by_integration_id: HashMap::new(),
             invites_by_id: HashMap::new(),
             invite_ids_by_hash: HashMap::new(),
             hermes_instances_by_user_id: HashMap::new(),
@@ -118,8 +134,6 @@ pub struct SystemSettings {
     pub oidc: OidcSettings,
     #[serde(default)]
     pub ldap: LdapSettings,
-    #[serde(default)]
-    pub business_oauth: BusinessOAuthSettings,
 }
 
 /// 管理员运行时语音输入软开关。真正的 ASR 服务是否存在由环境变量控制。
@@ -181,19 +195,72 @@ pub struct LdapSettings {
     pub auto_create_users: bool,
 }
 
-/// 业务 OAuth 只负责给外部系统签发访问令牌和授权码。
-/// 客户端密钥等敏感字段会沿用系统设置加密存储。
+/// 第三方业务系统的接入应用配置。client_secret 只在创建/重置时返回一次，
+/// 这里保存的是哈希值，序列化给管理端时会自动隐藏。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
-#[serde(default)]
-pub struct BusinessOAuthSettings {
+pub struct IntegrationApp {
+    pub id: String,
+    pub integration_id: String,
+    pub name: String,
     pub enabled: bool,
     pub client_id: String,
-    pub client_secret: String,
-    pub allowed_redirect_uris: Vec<String>,
+    #[serde(skip_serializing)]
+    pub client_secret_hash: String,
+    pub redirect_uri: String,
     pub scopes: String,
     pub authorization_code_ttl_seconds: u64,
     pub hidden_session_idle_timeout_seconds: u64,
-    pub toolset_names: Vec<String>,
+    pub default_tool_timeout_seconds: u64,
+    pub max_tool_timeout_seconds: u64,
+    pub last_used_at: Option<u64>,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewIntegrationApp {
+    pub name: String,
+    pub enabled: bool,
+    pub redirect_uri: String,
+    pub scopes: String,
+    pub authorization_code_ttl_seconds: Option<u64>,
+    pub hidden_session_idle_timeout_seconds: Option<u64>,
+    pub default_tool_timeout_seconds: Option<u64>,
+    pub max_tool_timeout_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateIntegrationApp {
+    pub name: String,
+    pub enabled: bool,
+    pub redirect_uri: String,
+    pub scopes: String,
+    pub authorization_code_ttl_seconds: u64,
+    pub hidden_session_idle_timeout_seconds: u64,
+    pub default_tool_timeout_seconds: u64,
+    pub max_tool_timeout_seconds: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CreatedIntegrationApp {
+    pub app: IntegrationApp,
+    pub client_secret: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+pub struct IntegrationToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+pub struct IncomingIntegrationToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
 }
 
 /// Hub 会话 token 的用途。
@@ -248,7 +315,6 @@ impl Default for SystemSettings {
             api_management: ApiManagementSettings::default(),
             oidc: OidcSettings::default(),
             ldap: LdapSettings::default(),
-            business_oauth: BusinessOAuthSettings::default(),
         }
     }
 }
@@ -315,21 +381,6 @@ impl Default for LdapSettings {
             user_filter: "(mail={email})".to_string(),
             email_attribute: "mail".to_string(),
             auto_create_users: true,
-        }
-    }
-}
-
-impl Default for BusinessOAuthSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            client_id: String::new(),
-            client_secret: String::new(),
-            allowed_redirect_uris: Vec::new(),
-            scopes: "openid profile email".to_string(),
-            authorization_code_ttl_seconds: 600,
-            hidden_session_idle_timeout_seconds: 3600,
-            toolset_names: Vec::new(),
         }
     }
 }
@@ -541,7 +592,12 @@ impl SessionStore {
                 sqlx::query("select pg_advisory_xact_lock(hashtext('hermes_hub_bootstrap_admin'))")
                     .execute(&mut *tx)
                     .await
-                    .map_err(|_| StoreError::DatabaseFailed)?;
+                    .map_err(|error| match error {
+                        sqlx::Error::Database(db_error) if db_error.is_unique_violation() => {
+                            StoreError::InvalidSystemSettings
+                        }
+                        _ => StoreError::DatabaseFailed,
+                    })?;
                 let count =
                     sqlx::query("select count(*)::bigint as count from users where email <> $1")
                         .bind(PUBLIC_PLATFORM_USER_EMAIL)
@@ -949,6 +1005,10 @@ impl SessionStore {
         integration_id: Option<&str>,
     ) -> Result<String, StoreError> {
         let integration_id = integration_id.and_then(trimmed_optional_string);
+        // 业务 OAuth token 必须绑定接入应用；既然不再兼容旧数据，就直接拒绝非法写入。
+        if matches!(purpose, SessionPurpose::OAuth) && integration_id.is_none() {
+            return Err(StoreError::InvalidSystemSettings);
+        }
         match &self.backend {
             SessionStoreBackend::Memory(inner) => {
                 let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
@@ -2217,6 +2277,502 @@ impl SessionStore {
         }
     }
 
+    pub async fn list_integration_apps(&self) -> Result<Vec<IntegrationApp>, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let mut apps = inner
+                    .integration_apps_by_id
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                apps.sort_by(|left, right| left.name.cmp(&right.name));
+                Ok(apps)
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let rows = sqlx::query(&integration_app_select("", "order by name asc"))
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?;
+                rows.iter().map(row_to_integration_app).collect()
+            }),
+        }
+    }
+
+    pub async fn integration_app_by_client_id(
+        &self,
+        client_id: &str,
+    ) -> Result<Option<IntegrationApp>, StoreError> {
+        let client_id = client_id.trim();
+        if client_id.is_empty() {
+            return Ok(None);
+        }
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                Ok(inner
+                    .integration_app_ids_by_client_id
+                    .get(client_id)
+                    .and_then(|id| inner.integration_apps_by_id.get(id))
+                    .cloned())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let rows = sqlx::query(&integration_app_select("where client_id = $1", "limit 1"))
+                    .bind(client_id)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?;
+                rows.first().map(row_to_integration_app).transpose()
+            }),
+        }
+    }
+
+    pub async fn integration_app_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<IntegrationApp>, StoreError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Ok(None);
+        }
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                Ok(inner.integration_apps_by_id.get(id).cloned())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let rows = sqlx::query(&integration_app_select("where id = $1::uuid", "limit 1"))
+                    .bind(id)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?;
+                rows.first().map(row_to_integration_app).transpose()
+            }),
+        }
+    }
+
+    pub async fn integration_app_by_integration_id(
+        &self,
+        integration_id: &str,
+    ) -> Result<Option<IntegrationApp>, StoreError> {
+        let integration_id = integration_id.trim();
+        if integration_id.is_empty() {
+            return Ok(None);
+        }
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                Ok(inner
+                    .integration_app_ids_by_integration_id
+                    .get(integration_id)
+                    .and_then(|id| inner.integration_apps_by_id.get(id))
+                    .cloned())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let rows = sqlx::query(&integration_app_select(
+                    "where integration_id = $1",
+                    "limit 1",
+                ))
+                .bind(integration_id)
+                .fetch_all(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+                rows.first().map(row_to_integration_app).transpose()
+            }),
+        }
+    }
+
+    pub async fn create_integration_app(
+        &self,
+        input: NewIntegrationApp,
+    ) -> Result<CreatedIntegrationApp, StoreError> {
+        let integration_id = self.next_integration_id(&input.name).await?;
+        let app = new_integration_app(input, integration_id)?;
+        let client_secret = random_token();
+        let client_secret_hash = hash_token(&client_secret);
+        let mut stored = app.clone();
+        stored.client_secret_hash = client_secret_hash;
+
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                if inner
+                    .integration_app_ids_by_integration_id
+                    .contains_key(&stored.integration_id)
+                    || inner
+                        .integration_app_ids_by_client_id
+                        .contains_key(&stored.client_id)
+                {
+                    return Err(StoreError::InvalidSystemSettings);
+                }
+                insert_memory_integration_app(&mut inner, stored.clone());
+            }
+            SessionStoreBackend::Postgres { pool, .. } => {
+                let app_for_db = stored.clone();
+                block_on_db(async {
+                    sqlx::query(
+                        r#"
+                        insert into integration_apps (
+                            id, integration_id, name, enabled, client_id, client_secret_hash,
+                            redirect_uri, scopes, authorization_code_ttl_seconds,
+                            hidden_session_idle_timeout_seconds, default_tool_timeout_seconds,
+                            max_tool_timeout_seconds, created_at, updated_at
+                        )
+                        values (
+                            $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                            to_timestamp($13), to_timestamp($14)
+                        )
+                        "#,
+                    )
+                    .bind(&app_for_db.id)
+                    .bind(&app_for_db.integration_id)
+                    .bind(&app_for_db.name)
+                    .bind(app_for_db.enabled)
+                    .bind(&app_for_db.client_id)
+                    .bind(&app_for_db.client_secret_hash)
+                    .bind(&app_for_db.redirect_uri)
+                    .bind(&app_for_db.scopes)
+                    .bind(app_for_db.authorization_code_ttl_seconds as i64)
+                    .bind(app_for_db.hidden_session_idle_timeout_seconds as i64)
+                    .bind(app_for_db.default_tool_timeout_seconds as i64)
+                    .bind(app_for_db.max_tool_timeout_seconds as i64)
+                    .bind(app_for_db.created_at as f64)
+                    .bind(app_for_db.updated_at as f64)
+                    .execute(pool)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?;
+                    Ok::<(), StoreError>(())
+                })?;
+            }
+        }
+
+        Ok(CreatedIntegrationApp {
+            app: stored,
+            client_secret,
+        })
+    }
+
+    pub async fn update_integration_app(
+        &self,
+        id: &str,
+        input: UpdateIntegrationApp,
+    ) -> Result<IntegrationApp, StoreError> {
+        validate_integration_app_update(&input)?;
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let app = inner
+                    .integration_apps_by_id
+                    .get_mut(id)
+                    .ok_or(StoreError::InviteNotFound)?;
+                app.name = input.name.trim().to_string();
+                app.enabled = input.enabled;
+                app.redirect_uri = normalize_redirect_uri(input.redirect_uri)?;
+                app.scopes = normalize_scope_string(&input.scopes)?;
+                app.authorization_code_ttl_seconds = input.authorization_code_ttl_seconds;
+                app.hidden_session_idle_timeout_seconds = input.hidden_session_idle_timeout_seconds;
+                app.default_tool_timeout_seconds = input.default_tool_timeout_seconds;
+                app.max_tool_timeout_seconds = input.max_tool_timeout_seconds;
+                app.updated_at = unix_now();
+                Ok(app.clone())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let row = sqlx::query(
+                    r#"
+                    update integration_apps
+                    set name = $2,
+                        enabled = $3,
+                        redirect_uri = $4,
+                        scopes = $5,
+                        authorization_code_ttl_seconds = $6,
+                        hidden_session_idle_timeout_seconds = $7,
+                        default_tool_timeout_seconds = $8,
+                        max_tool_timeout_seconds = $9,
+                        updated_at = now()
+                    where id = $1::uuid
+                    returning id::text as id,
+                              integration_id,
+                              name,
+                              enabled,
+                              client_id,
+                              client_secret_hash,
+                              redirect_uri,
+                              scopes,
+                              authorization_code_ttl_seconds,
+                              hidden_session_idle_timeout_seconds,
+                              default_tool_timeout_seconds,
+                              max_tool_timeout_seconds,
+                              extract(epoch from last_used_at)::bigint as last_used_at,
+                              extract(epoch from created_at)::bigint as created_at,
+                              extract(epoch from updated_at)::bigint as updated_at
+                    "#,
+                )
+                .bind(id)
+                .bind(input.name.trim())
+                .bind(input.enabled)
+                .bind(normalize_redirect_uri(input.redirect_uri)?)
+                .bind(normalize_scope_string(&input.scopes)?)
+                .bind(input.authorization_code_ttl_seconds as i64)
+                .bind(input.hidden_session_idle_timeout_seconds as i64)
+                .bind(input.default_tool_timeout_seconds as i64)
+                .bind(input.max_tool_timeout_seconds as i64)
+                .fetch_optional(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?
+                .ok_or(StoreError::InviteNotFound)?;
+                row_to_integration_app(&row)
+            }),
+        }
+    }
+
+    pub async fn delete_integration_app(&self, id: &str) -> Result<(), StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let app = inner
+                    .integration_apps_by_id
+                    .remove(id)
+                    .ok_or(StoreError::InviteNotFound)?;
+                inner
+                    .integration_app_ids_by_client_id
+                    .remove(&app.client_id);
+                inner
+                    .integration_app_ids_by_integration_id
+                    .remove(&app.integration_id);
+                inner
+                    .integration_tools_by_integration_id
+                    .remove(&app.integration_id);
+                Ok(())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let mut tx = pool.begin().await.map_err(|_| StoreError::DatabaseFailed)?;
+                let integration_id =
+                    sqlx::query("select integration_id from integration_apps where id = $1::uuid")
+                        .bind(id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(|_| StoreError::DatabaseFailed)?
+                        .ok_or(StoreError::InviteNotFound)?
+                        .try_get::<String, _>("integration_id")
+                        .map_err(|_| StoreError::DatabaseFailed)?;
+
+                // Remove tools explicitly so both backends follow the same delete path.
+                sqlx::query("delete from integration_tool_definitions where integration_id = $1")
+                    .bind(&integration_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?;
+                let result = sqlx::query("delete from integration_apps where id = $1::uuid")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?;
+                if result.rows_affected() == 0 {
+                    tx.rollback().await.ok();
+                    return Err(StoreError::InviteNotFound);
+                }
+                tx.commit().await.map_err(|_| StoreError::DatabaseFailed)?;
+                Ok(())
+            }),
+        }
+    }
+
+    pub async fn rotate_integration_app_secret(
+        &self,
+        id: &str,
+    ) -> Result<CreatedIntegrationApp, StoreError> {
+        let client_secret = random_token();
+        let client_secret_hash = hash_token(&client_secret);
+        let app = match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let app = inner
+                    .integration_apps_by_id
+                    .get_mut(id)
+                    .ok_or(StoreError::InviteNotFound)?;
+                app.client_secret_hash = client_secret_hash;
+                app.updated_at = unix_now();
+                app.clone()
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let row = sqlx::query(
+                    r#"
+                    update integration_apps
+                    set client_secret_hash = $2,
+                        updated_at = now()
+                    where id = $1::uuid
+                    returning id::text as id,
+                              integration_id,
+                              name,
+                              enabled,
+                              client_id,
+                              client_secret_hash,
+                              redirect_uri,
+                              scopes,
+                              authorization_code_ttl_seconds,
+                              hidden_session_idle_timeout_seconds,
+                              default_tool_timeout_seconds,
+                              max_tool_timeout_seconds,
+                              extract(epoch from last_used_at)::bigint as last_used_at,
+                              extract(epoch from created_at)::bigint as created_at,
+                              extract(epoch from updated_at)::bigint as updated_at
+                    "#,
+                )
+                .bind(id)
+                .bind(&client_secret_hash)
+                .fetch_optional(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?
+                .ok_or(StoreError::InviteNotFound)?;
+                row_to_integration_app(&row)
+            })?,
+        };
+        Ok(CreatedIntegrationApp { app, client_secret })
+    }
+
+    pub async fn verify_integration_app_secret(
+        &self,
+        app: &IntegrationApp,
+        client_secret: &str,
+    ) -> bool {
+        hash_token(client_secret) == app.client_secret_hash
+    }
+
+    pub async fn touch_integration_app_last_used(
+        &self,
+        integration_id: &str,
+    ) -> Result<(), StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let Some(id) = inner
+                    .integration_app_ids_by_integration_id
+                    .get(integration_id)
+                    .cloned()
+                else {
+                    return Ok(());
+                };
+                if let Some(app) = inner.integration_apps_by_id.get_mut(&id) {
+                    app.last_used_at = Some(unix_now());
+                    app.updated_at = unix_now();
+                }
+                Ok(())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                sqlx::query(
+                    "update integration_apps set last_used_at = now(), updated_at = now() where integration_id = $1",
+                )
+                .bind(integration_id)
+                .execute(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+                Ok(())
+            }),
+        }
+    }
+
+    pub async fn replace_integration_tools(
+        &self,
+        integration_id: &str,
+        tools: Vec<IncomingIntegrationToolDefinition>,
+    ) -> Result<Vec<IntegrationToolDefinition>, StoreError> {
+        let integration_id = integration_id.trim();
+        if integration_id.is_empty() {
+            return Err(StoreError::InvalidSystemSettings);
+        }
+        let tools = normalize_integration_tools(tools)?;
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                let now = unix_now();
+                let stored = tools
+                    .into_iter()
+                    .map(|tool| IntegrationToolDefinition {
+                        name: tool.name,
+                        description: tool.description,
+                        parameters: tool.parameters,
+                        created_at: now,
+                        updated_at: now,
+                    })
+                    .collect::<Vec<_>>();
+                inner
+                    .integration_tools_by_integration_id
+                    .insert(integration_id.to_string(), stored.clone());
+                Ok(stored)
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let mut tx = pool.begin().await.map_err(|_| StoreError::DatabaseFailed)?;
+                sqlx::query("delete from integration_tool_definitions where integration_id = $1")
+                    .bind(integration_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?;
+                let mut stored = Vec::with_capacity(tools.len());
+                for tool in tools {
+                    let row = sqlx::query(
+                        r#"
+                        insert into integration_tool_definitions (
+                            id, integration_id, name, description, parameters
+                        )
+                        values ($1::uuid, $2, $3, $4, $5)
+                        returning name,
+                                  description,
+                                  parameters,
+                                  extract(epoch from created_at)::bigint as created_at,
+                                  extract(epoch from updated_at)::bigint as updated_at
+                        "#,
+                    )
+                    .bind(Uuid::new_v4().to_string())
+                    .bind(integration_id)
+                    .bind(&tool.name)
+                    .bind(&tool.description)
+                    .bind(tool.parameters)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|_| StoreError::DatabaseFailed)?;
+                    stored.push(row_to_integration_tool(&row)?);
+                }
+                tx.commit().await.map_err(|_| StoreError::DatabaseFailed)?;
+                Ok(stored)
+            }),
+        }
+    }
+
+    pub async fn list_integration_tools(
+        &self,
+        integration_id: &str,
+    ) -> Result<Vec<IntegrationToolDefinition>, StoreError> {
+        match &self.backend {
+            SessionStoreBackend::Memory(inner) => {
+                let inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
+                Ok(inner
+                    .integration_tools_by_integration_id
+                    .get(integration_id)
+                    .cloned()
+                    .unwrap_or_default())
+            }
+            SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+                let rows = sqlx::query(
+                    r#"
+                    select name,
+                           description,
+                           parameters,
+                           extract(epoch from created_at)::bigint as created_at,
+                           extract(epoch from updated_at)::bigint as updated_at
+                    from integration_tool_definitions
+                    where integration_id = $1
+                    order by name asc
+                    "#,
+                )
+                .bind(integration_id)
+                .fetch_all(pool)
+                .await
+                .map_err(|_| StoreError::DatabaseFailed)?;
+                rows.iter().map(row_to_integration_tool).collect()
+            }),
+        }
+    }
+
     pub async fn system_settings(&self) -> Result<SystemSettings, StoreError> {
         match &self.backend {
             SessionStoreBackend::Memory(inner) => {
@@ -2331,23 +2887,6 @@ impl SessionStore {
                     .transpose()?
                     .unwrap_or_default();
 
-                let business_oauth =
-                    sqlx::query("select value from system_settings where key = $1")
-                        .bind(BUSINESS_OAUTH_SETTINGS_KEY)
-                        .fetch_optional(pool)
-                        .await
-                        .map_err(|_| StoreError::DatabaseFailed)?
-                        .and_then(|row| row.try_get::<String, _>("value").ok())
-                        .map(|value| {
-                            serde_json::from_str::<BusinessOAuthSettings>(&value)
-                                .map_err(|_| StoreError::DatabaseFailed)
-                                .and_then(|settings| {
-                                    decrypt_business_oauth_settings(settings, cipher)
-                                })
-                        })
-                        .transpose()?
-                        .unwrap_or_default();
-
                 Ok(SystemSettings {
                     max_sessions_per_user: value,
                     max_attachment_upload_bytes,
@@ -2358,7 +2897,6 @@ impl SessionStore {
                     api_management,
                     oidc,
                     ldap,
-                    business_oauth,
                 })
             }),
         }
@@ -2416,31 +2954,21 @@ impl SessionStore {
         &self,
         oidc: OidcSettings,
         ldap: LdapSettings,
-        business_oauth: BusinessOAuthSettings,
     ) -> Result<(), StoreError> {
-        validate_auth_settings(&oidc, &ldap, &business_oauth)?;
+        validate_auth_settings(&oidc, &ldap)?;
         match &self.backend {
             SessionStoreBackend::Memory(inner) => {
                 let mut inner = inner.lock().map_err(|_| StoreError::LockFailed)?;
                 let settings = &mut inner.system_settings;
                 settings.oidc = oidc;
                 settings.ldap = ldap;
-                settings.business_oauth = business_oauth;
                 Ok(())
             }
             SessionStoreBackend::Postgres { pool, cipher } => block_on_db(async {
                 let stored_oidc = encrypted_oidc_settings(&oidc, cipher);
                 let stored_ldap = encrypted_ldap_settings(&ldap, cipher);
-                let stored_business_oauth =
-                    encrypted_business_oauth_settings(&business_oauth, cipher);
                 upsert_system_setting_json(pool, OIDC_SETTINGS_KEY, &stored_oidc).await?;
                 upsert_system_setting_json(pool, LDAP_SETTINGS_KEY, &stored_ldap).await?;
-                upsert_system_setting_json(
-                    pool,
-                    BUSINESS_OAUTH_SETTINGS_KEY,
-                    &stored_business_oauth,
-                )
-                .await?;
                 Ok(())
             }),
         }
@@ -2499,8 +3027,6 @@ impl SessionStore {
             SessionStoreBackend::Postgres { pool, cipher } => block_on_db(async {
                 let stored_oidc = encrypted_oidc_settings(&settings.oidc, cipher);
                 let stored_ldap = encrypted_ldap_settings(&settings.ldap, cipher);
-                let stored_business_oauth =
-                    encrypted_business_oauth_settings(&settings.business_oauth, cipher);
                 upsert_system_setting_value(
                     pool,
                     MAX_SESSIONS_PER_USER_KEY,
@@ -2541,12 +3067,6 @@ impl SessionStore {
                     .await?;
                 upsert_system_setting_json(pool, LDAP_SETTINGS_KEY, &stored_ldap).await?;
                 upsert_system_setting_json(pool, OIDC_SETTINGS_KEY, &stored_oidc).await?;
-                upsert_system_setting_json(
-                    pool,
-                    BUSINESS_OAUTH_SETTINGS_KEY,
-                    &stored_business_oauth,
-                )
-                .await?;
 
                 Ok(settings)
             }),
@@ -2940,7 +3460,7 @@ fn validate_system_settings(settings: &SystemSettings) -> Result<(), StoreError>
         settings.attachment_retention_days,
     )?;
     validate_public_platform_settings(&settings.public_platform)?;
-    validate_auth_settings(&settings.oidc, &settings.ldap, &settings.business_oauth)?;
+    validate_auth_settings(&settings.oidc, &settings.ldap)?;
     Ok(())
 }
 
@@ -2976,11 +3496,7 @@ fn validate_public_platform_settings(
     Ok(())
 }
 
-fn validate_auth_settings(
-    oidc: &OidcSettings,
-    ldap: &LdapSettings,
-    business_oauth: &BusinessOAuthSettings,
-) -> Result<(), StoreError> {
+fn validate_auth_settings(oidc: &OidcSettings, ldap: &LdapSettings) -> Result<(), StoreError> {
     if oidc.enabled
         && (oidc.client_id.trim().is_empty()
             || oidc.client_secret.trim().is_empty()
@@ -3002,21 +3518,6 @@ fn validate_auth_settings(
     {
         return Err(StoreError::InvalidSystemSettings);
     }
-    if business_oauth.enabled
-        && (business_oauth.client_id.trim().is_empty()
-            || business_oauth.client_secret.trim().is_empty()
-            || business_oauth.scopes.trim().is_empty()
-            || business_oauth.authorization_code_ttl_seconds == 0
-            || business_oauth.hidden_session_idle_timeout_seconds == 0
-            || business_oauth.allowed_redirect_uris.is_empty()
-            || business_oauth
-                .allowed_redirect_uris
-                .iter()
-                .any(|uri| uri.trim().is_empty()))
-    {
-        return Err(StoreError::InvalidSystemSettings);
-    }
-
     Ok(())
 }
 
@@ -3110,34 +3611,318 @@ fn decrypt_ldap_settings(
     Ok(settings)
 }
 
-fn encrypted_business_oauth_settings(
-    settings: &BusinessOAuthSettings,
-    cipher: &SecretCipher,
-) -> BusinessOAuthSettings {
-    let mut stored = settings.clone();
-    if !stored.client_secret.is_empty() {
-        stored.client_secret = encrypt_secret(cipher, &stored.client_secret);
-    }
-    stored
-}
-
-fn decrypt_business_oauth_settings(
-    mut settings: BusinessOAuthSettings,
-    cipher: &SecretCipher,
-) -> Result<BusinessOAuthSettings, StoreError> {
-    if looks_like_encrypted_secret(&settings.client_secret) {
-        settings.client_secret = decrypt_secret(cipher, &settings.client_secret)
-            .map_err(|_| StoreError::SecretFailed)?;
-    }
-    Ok(settings)
-}
-
 fn looks_like_encrypted_secret(value: &str) -> bool {
     let mut parts = value.split('.');
     matches!(
         (parts.next(), parts.next(), parts.next(), parts.next()),
         (Some("v1"), Some(_), Some(_), None)
     )
+}
+
+async fn integration_id_exists_in_backend(
+    backend: &SessionStoreBackend,
+    integration_id: &str,
+) -> Result<bool, StoreError> {
+    match backend {
+        SessionStoreBackend::Memory(inner) => Ok(inner
+            .lock()
+            .map_err(|_| StoreError::LockFailed)?
+            .integration_app_ids_by_integration_id
+            .contains_key(integration_id)),
+        SessionStoreBackend::Postgres { pool, .. } => block_on_db(async {
+            sqlx::query_scalar::<_, i64>(
+                "select count(*) from integration_apps where integration_id = $1",
+            )
+            .bind(integration_id)
+            .fetch_one(pool)
+            .await
+            .map(|count| count > 0)
+            .map_err(|_| StoreError::DatabaseFailed)
+        }),
+    }
+}
+
+impl SessionStore {
+    async fn next_integration_id(&self, name: &str) -> Result<String, StoreError> {
+        let base = integration_id_slug(name)?;
+        let mut index = 1u32;
+        loop {
+            let candidate = if index == 1 {
+                base.clone()
+            } else {
+                format!("{base}-{index}")
+            };
+            if !integration_id_exists_in_backend(&self.backend, &candidate).await? {
+                return Ok(candidate);
+            }
+            index = index.saturating_add(1);
+        }
+    }
+}
+
+fn new_integration_app(
+    input: NewIntegrationApp,
+    integration_id: String,
+) -> Result<IntegrationApp, StoreError> {
+    let name = normalize_required_token(&input.name)?;
+    let redirect_uri = normalize_redirect_uri(input.redirect_uri)?;
+    let scopes = normalize_scope_string(&input.scopes)?;
+    let authorization_code_ttl_seconds = input
+        .authorization_code_ttl_seconds
+        .unwrap_or(DEFAULT_AUTHORIZATION_CODE_TTL_SECONDS)
+        .max(1);
+    let hidden_session_idle_timeout_seconds = input
+        .hidden_session_idle_timeout_seconds
+        .unwrap_or(DEFAULT_HIDDEN_SESSION_IDLE_TIMEOUT_SECONDS)
+        .max(1);
+    let default_tool_timeout_seconds = input
+        .default_tool_timeout_seconds
+        .unwrap_or(DEFAULT_BUSINESS_TOOL_TIMEOUT_SECONDS)
+        .max(1);
+    let max_tool_timeout_seconds = input
+        .max_tool_timeout_seconds
+        .unwrap_or(DEFAULT_MAX_BUSINESS_TOOL_TIMEOUT_SECONDS)
+        .max(1);
+    if default_tool_timeout_seconds > max_tool_timeout_seconds {
+        return Err(StoreError::InvalidSystemSettings);
+    }
+    let now = unix_now();
+    Ok(IntegrationApp {
+        id: Uuid::new_v4().to_string(),
+        integration_id,
+        name,
+        enabled: input.enabled,
+        client_id: random_token(),
+        client_secret_hash: String::new(),
+        redirect_uri,
+        scopes,
+        authorization_code_ttl_seconds,
+        hidden_session_idle_timeout_seconds,
+        default_tool_timeout_seconds,
+        max_tool_timeout_seconds,
+        last_used_at: None,
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+fn validate_integration_app_update(input: &UpdateIntegrationApp) -> Result<(), StoreError> {
+    validate_redirect_uri(&input.redirect_uri)?;
+    normalize_scope_string(&input.scopes)?;
+    if input.name.trim().is_empty()
+        || input.authorization_code_ttl_seconds == 0
+        || input.hidden_session_idle_timeout_seconds == 0
+        || input.default_tool_timeout_seconds == 0
+        || input.max_tool_timeout_seconds == 0
+        || input.default_tool_timeout_seconds > input.max_tool_timeout_seconds
+    {
+        return Err(StoreError::InvalidSystemSettings);
+    }
+    Ok(())
+}
+
+fn normalize_redirect_uri(value: String) -> Result<String, StoreError> {
+    let value = value.trim();
+    validate_redirect_uri(value)?;
+    Ok(value.to_string())
+}
+
+fn validate_redirect_uri(value: &str) -> Result<(), StoreError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(StoreError::InvalidSystemSettings);
+    }
+    if !CALLBACK_URL_REGEX.is_match(value) {
+        return Err(StoreError::InvalidSystemSettings);
+    }
+    Ok(())
+}
+
+fn integration_id_slug(value: &str) -> Result<String, StoreError> {
+    let mut slug = String::with_capacity(value.len());
+    let mut last_was_dash = false;
+    for ch in value.trim().chars() {
+        let normalized = ch.to_ascii_lowercase();
+        if normalized.is_ascii_alphanumeric() {
+            slug.push(normalized);
+            last_was_dash = false;
+            continue;
+        }
+        if !last_was_dash && !slug.is_empty() {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        return Err(StoreError::InvalidSystemSettings);
+    }
+    Ok(slug)
+}
+
+fn normalize_scope_string(value: &str) -> Result<String, StoreError> {
+    let tokens = value
+        .split_whitespace()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return Err(StoreError::InvalidSystemSettings);
+    }
+    Ok(tokens.join(" "))
+}
+
+fn normalize_required_token(value: &str) -> Result<String, StoreError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(StoreError::InvalidSystemSettings);
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_integration_tools(
+    tools: Vec<IncomingIntegrationToolDefinition>,
+) -> Result<Vec<IncomingIntegrationToolDefinition>, StoreError> {
+    let mut normalized = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let name = normalize_required_token(&tool.name)?;
+        let description = normalize_required_token(&tool.description)?;
+        if !tool.parameters.is_object() {
+            // 工具参数需要是 JSON object，后续业务系统据此解释字段结构。
+            return Err(StoreError::InvalidSystemSettings);
+        }
+        normalized.push(IncomingIntegrationToolDefinition {
+            name,
+            description,
+            parameters: tool.parameters,
+        });
+    }
+    normalized.sort_by(|left, right| left.name.cmp(&right.name));
+    // Reject duplicate names so one tool never disappears silently.
+    if normalized
+        .windows(2)
+        .any(|pair| pair[0].name == pair[1].name)
+    {
+        return Err(StoreError::InvalidSystemSettings);
+    }
+    Ok(normalized)
+}
+
+fn insert_memory_integration_app(inner: &mut StoreInner, app: IntegrationApp) {
+    let id = app.id.clone();
+    inner
+        .integration_app_ids_by_client_id
+        .insert(app.client_id.clone(), id.clone());
+    inner
+        .integration_app_ids_by_integration_id
+        .insert(app.integration_id.clone(), id.clone());
+    inner.integration_apps_by_id.insert(id, app);
+}
+
+fn integration_app_select(filter: &str, suffix: &str) -> String {
+    format!(
+        r#"
+        select id::text as id,
+               integration_id,
+               name,
+               enabled,
+               client_id,
+               client_secret_hash,
+               redirect_uri,
+               scopes,
+               authorization_code_ttl_seconds,
+               hidden_session_idle_timeout_seconds,
+               default_tool_timeout_seconds,
+               max_tool_timeout_seconds,
+               extract(epoch from last_used_at)::bigint as last_used_at,
+               extract(epoch from created_at)::bigint as created_at,
+               extract(epoch from updated_at)::bigint as updated_at
+        from integration_apps
+        {filter}
+        {suffix}
+        "#
+    )
+}
+
+fn row_to_integration_app(row: &sqlx::postgres::PgRow) -> Result<IntegrationApp, StoreError> {
+    Ok(IntegrationApp {
+        id: row.try_get("id").map_err(|_| StoreError::DatabaseFailed)?,
+        integration_id: row
+            .try_get("integration_id")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        name: row
+            .try_get("name")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        enabled: row
+            .try_get("enabled")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        client_id: row
+            .try_get("client_id")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        client_secret_hash: row
+            .try_get("client_secret_hash")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        redirect_uri: row
+            .try_get("redirect_uri")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        scopes: row
+            .try_get("scopes")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        authorization_code_ttl_seconds: u64::try_from(
+            row.try_get::<i64, _>("authorization_code_ttl_seconds")
+                .map_err(|_| StoreError::DatabaseFailed)?,
+        )
+        .map_err(|_| StoreError::DatabaseFailed)?,
+        hidden_session_idle_timeout_seconds: u64::try_from(
+            row.try_get::<i64, _>("hidden_session_idle_timeout_seconds")
+                .map_err(|_| StoreError::DatabaseFailed)?,
+        )
+        .map_err(|_| StoreError::DatabaseFailed)?,
+        default_tool_timeout_seconds: u64::try_from(
+            row.try_get::<i64, _>("default_tool_timeout_seconds")
+                .map_err(|_| StoreError::DatabaseFailed)?,
+        )
+        .map_err(|_| StoreError::DatabaseFailed)?,
+        max_tool_timeout_seconds: u64::try_from(
+            row.try_get::<i64, _>("max_tool_timeout_seconds")
+                .map_err(|_| StoreError::DatabaseFailed)?,
+        )
+        .map_err(|_| StoreError::DatabaseFailed)?,
+        last_used_at: row
+            .try_get::<Option<i64>, _>("last_used_at")
+            .map_err(|_| StoreError::DatabaseFailed)?
+            .map(|value| value as u64),
+        created_at: row
+            .try_get::<i64, _>("created_at")
+            .map_err(|_| StoreError::DatabaseFailed)? as u64,
+        updated_at: row
+            .try_get::<i64, _>("updated_at")
+            .map_err(|_| StoreError::DatabaseFailed)? as u64,
+    })
+}
+
+fn row_to_integration_tool(
+    row: &sqlx::postgres::PgRow,
+) -> Result<IntegrationToolDefinition, StoreError> {
+    Ok(IntegrationToolDefinition {
+        name: row
+            .try_get("name")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        description: row
+            .try_get("description")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        parameters: row
+            .try_get("parameters")
+            .map_err(|_| StoreError::DatabaseFailed)?,
+        created_at: row
+            .try_get::<i64, _>("created_at")
+            .map_err(|_| StoreError::DatabaseFailed)? as u64,
+        updated_at: row
+            .try_get::<i64, _>("updated_at")
+            .map_err(|_| StoreError::DatabaseFailed)? as u64,
+    })
 }
 
 impl StoreInner {
@@ -3998,4 +4783,42 @@ fn random_token() -> String {
 fn hash_token(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     URL_SAFE_NO_PAD.encode(digest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_redirect_uri, StoreError};
+
+    #[test]
+    fn normalize_redirect_uri_accepts_http_and_https_urls() {
+        assert_eq!(
+            normalize_redirect_uri("https://crm.example/callback".to_string()).unwrap(),
+            "https://crm.example/callback"
+        );
+        assert_eq!(
+            normalize_redirect_uri("http://localhost:3000/callback".to_string()).unwrap(),
+            "http://localhost:3000/callback"
+        );
+        assert_eq!(
+            normalize_redirect_uri("HTTPS://crm.example/callback".to_string()).unwrap(),
+            "HTTPS://crm.example/callback"
+        );
+    }
+
+    #[test]
+    fn normalize_redirect_uri_rejects_invalid_urls() {
+        for value in [
+            "",
+            "   ",
+            "callback",
+            "/relative",
+            "ftp://example.com/callback",
+            "https://crm.example:99999/callback",
+        ] {
+            assert!(matches!(
+                normalize_redirect_uri(value.to_string()),
+                Err(StoreError::InvalidSystemSettings)
+            ));
+        }
+    }
 }
