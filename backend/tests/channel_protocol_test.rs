@@ -1331,6 +1331,11 @@ async fn hermes_channel_protocol_rejects_editing_business_tool_request_message()
         .ensure_integration_channel(&user_id, "business-crm")
         .await
         .expect("integration channel can be created");
+    state
+        .channel_store
+        .bind_integration_channel_to_instance(&user_id, "business-crm", "instance-1")
+        .await
+        .expect("integration channel can be bound to the managed instance");
     let session = state
         .channel_store
         .create_session(
