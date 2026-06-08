@@ -1456,11 +1456,19 @@ async fn ensure_public_channel(
     state: &AppState,
     user_id: &str,
 ) -> Result<crate::channel::service::Channel, ApiError> {
-    state
-        .channel_store
-        .ensure_hub_channel(user_id)
-        .await
-        .map_err(map_channel_error)
+    match state.store.hermes_instance_for_user(user_id).await {
+        Ok(instance) => state
+            .channel_store
+            .bind_hub_channel_to_instance(user_id, &instance.id)
+            .await
+            .map_err(map_channel_error),
+        Err(crate::session::store::StoreError::InviteNotFound) => state
+            .channel_store
+            .ensure_hub_channel(user_id)
+            .await
+            .map_err(map_channel_error),
+        Err(_) => Err(ApiError::Internal),
+    }
 }
 
 fn session_live_event_stream(

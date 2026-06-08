@@ -5,7 +5,7 @@ use tokio::time::{sleep, Duration};
 
 #[tokio::test]
 async fn memory_messages_expose_and_refresh_updated_at() {
-    let store = ChannelStore::default();
+    let store = ChannelStore::in_memory_for_tests();
     let user_id = "user-message-time";
     let channel = store
         .ensure_hub_channel(user_id)
@@ -57,7 +57,7 @@ async fn memory_messages_expose_and_refresh_updated_at() {
 
 #[tokio::test]
 async fn memory_append_session_message_before_deadline_rejects_expired_create() {
-    let store = ChannelStore::default();
+    let store = ChannelStore::in_memory_for_tests();
     let user_id = "user-message-deadline";
     let channel = store
         .ensure_hub_channel(user_id)

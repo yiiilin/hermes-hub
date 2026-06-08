@@ -63,7 +63,7 @@ impl LlmProviderClient for SequenceLlmProviderClient {
 
 async fn test_state(provider: DynLlmProviderClient) -> AppState {
     let config = AppConfig::for_tests();
-    let registry = ModelRegistry::new(ModelConfig {
+    let registry = ModelRegistry::in_memory_for_tests(ModelConfig {
         config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
         provider_name: "primary-provider".to_string(),
         provider_base_url: "https://primary.example/v1".to_string(),
@@ -139,8 +139,8 @@ async fn test_state(provider: DynLlmProviderClient) -> AppState {
             Arc::new(NoopDockerRuntime),
         ),
         config,
-        store: SessionStore::default(),
-        channel_store: ChannelStore::default(),
+        store: SessionStore::in_memory_for_tests(),
+        channel_store: ChannelStore::in_memory_for_tests(),
         model_registry: registry,
         llm_provider: provider,
         ldap_authenticator: DefaultLdapAuthenticator::default().shared(),

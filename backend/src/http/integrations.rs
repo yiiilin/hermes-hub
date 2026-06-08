@@ -18,6 +18,7 @@ use std::{
     convert::Infallible,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use uuid::Uuid;
 
 use crate::{
     channel::{
@@ -261,19 +262,13 @@ async fn create_session(
     let access = integration_access(&state, &headers).await?;
     let kind = ChannelSessionKind::parse(payload.kind.as_deref().unwrap_or("agent"))
         .map_err(map_channel_error)?;
-    let settings = state
-        .store
-        .system_settings()
-        .await
-        .map_err(|_| ApiError::Internal)?;
     let session = state
         .channel_store
-        .create_session_with_limit(
+        .create_session(
             access.user_id(),
             &access.channel.id,
             kind,
             payload.title,
-            settings.max_sessions_per_user,
             true,
         )
         .await
@@ -947,6 +942,130 @@ pub(crate) fn business_tool_request_event(
     }
 }
 
+pub(crate) async fn integration_business_tool_channel_prompt(
+    state: &AppState,
+    integration_id: &str,
+) -> Result<Option<String>, ApiError> {
+    let app = state
+        .store
+        .integration_app_by_integration_id(integration_id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::NotFound("integration app not found"))?;
+    if !app.enabled {
+        return Ok(None);
+    }
+
+    let tools = state
+        .store
+        .list_integration_tools(&app.integration_id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    if tools.is_empty() {
+        return Ok(None);
+    }
+
+    let timeout_hint = effective_business_tool_timeout_seconds(
+        Some(app.default_tool_timeout_seconds),
+        app.default_tool_timeout_seconds,
+        app.max_tool_timeout_seconds,
+    )?;
+
+    Ok(Some(render_integration_business_tool_channel_prompt(
+        &tools,
+        timeout_hint,
+    )))
+}
+
+fn render_integration_business_tool_channel_prompt(
+    tools: &[IntegrationToolDefinition],
+    default_timeout_seconds: u64,
+) -> String {
+    let mut prompt = String::from(
+        "你当前可以调用第三方业务工具，但必须统一通过 `business_tool_request` 工具发起。\n\n\
+调用规则：\n\
+- 只能通过 `business_tool_request` 发起第三方工具调用。\n\
+- `tool_name` 必须严格等于下方列出的工具名称之一。\n\
+- `arguments` 必须是 JSON object，并且字段必须符合对应工具的参数 schema。\n\
+- 不要伪造第三方工具执行结果。\n\
+- 不要手写 business tool protocol 消息；始终调用工具。\n",
+    );
+    prompt.push_str(&format!(
+        "- 如果没有显式指定超时时间，默认可按 {} 秒理解。\n\n",
+        default_timeout_seconds
+    ));
+    prompt.push_str("当前可用第三方工具：\n");
+
+    for (index, tool) in tools.iter().enumerate() {
+        prompt.push_str(&format!(
+            "{}. `{}`\n描述：{}\n参数 schema：\n{}\n\n",
+            index + 1,
+            tool.name,
+            tool.description.trim(),
+            render_tool_schema_for_prompt(&tool.parameters)
+        ));
+    }
+
+    prompt.push_str(
+        "调用 `business_tool_request` 时请传入：\n\
+`{\"tool_name\":\"具体工具名\",\"arguments\":{...}}`\n",
+    );
+    prompt
+}
+
+fn render_tool_schema_for_prompt(schema: &Value) -> String {
+    match serde_json::to_string_pretty(schema) {
+        Ok(json) => json,
+        Err(_) => "{}".to_string(),
+    }
+}
+
+pub(crate) fn business_tool_request_message_from_args(
+    request_id: &str,
+    args: &Value,
+    timeout_seconds: Option<u64>,
+) -> Result<String, ApiError> {
+    let object = args
+        .as_object()
+        .ok_or(ApiError::BadRequest("invalid business tool request"))?;
+    let tool_name = object
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(ApiError::BadRequest("invalid business tool request"))?;
+    let arguments = object
+        .get("arguments")
+        .cloned()
+        .ok_or(ApiError::BadRequest("invalid business tool request"))?;
+    if !arguments.is_object() {
+        return Err(ApiError::BadRequest("invalid business tool request"));
+    }
+
+    render_business_tool_request_draft_content(request_id, tool_name, arguments, timeout_seconds)
+}
+
+pub(crate) fn render_business_tool_request_draft_content(
+    request_id: &str,
+    tool_name: &str,
+    arguments: Value,
+    timeout_seconds: Option<u64>,
+) -> Result<String, ApiError> {
+    serde_json::to_string(&BusinessToolRequestEnvelope {
+        request_id: request_id.to_string(),
+        tool_name: tool_name.to_string(),
+        arguments,
+        timeout_seconds,
+        expires_at: None,
+    })
+    .map(|json| format!("{BUSINESS_TOOL_REQUEST_MARKER}\n{json}"))
+    .map_err(|_| ApiError::Internal)
+}
+
+pub(crate) fn generated_business_tool_request_id() -> String {
+    format!("req-{}", Uuid::new_v4())
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1018,11 +1137,19 @@ async fn integration_access(
     if !app.enabled {
         return Err(ApiError::NotFound("integration app is not enabled"));
     }
-    let channel = state
-        .channel_store
-        .ensure_integration_channel(&auth.user.id, &integration_id)
-        .await
-        .map_err(map_channel_error)?;
+    let channel = match state.store.hermes_instance_for_user(&auth.user.id).await {
+        Ok(instance) => state
+            .channel_store
+            .bind_integration_channel_to_instance(&auth.user.id, &integration_id, &instance.id)
+            .await
+            .map_err(map_channel_error)?,
+        Err(crate::session::store::StoreError::InviteNotFound) => state
+            .channel_store
+            .ensure_integration_channel(&auth.user.id, &integration_id)
+            .await
+            .map_err(map_channel_error)?,
+        Err(_) => return Err(ApiError::Internal),
+    };
 
     Ok(IntegrationAccess {
         auth,

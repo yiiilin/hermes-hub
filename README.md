@@ -115,21 +115,36 @@ Requirements: Rust 1.88+, Node.js 24, npm, Docker, and Docker Compose.
 
 ```bash
 docker compose --env-file deploy/.env.example -f deploy/compose.yml up -d postgres rustfs
+export HERMES_HUB_TEST_DATABASE_URL=postgres://hermes_hub:change-me-postgres@127.0.0.1:15432/hermes_hub
 cargo test --workspace
 
 cd frontend
 npm ci
 npm test
 npm run build
+# 正式包默认不再包含 /examples；只有联调 demo 时才显式构建它。
+npm run build:hermes-hub-example
 ```
 
 Run locally:
 
 ```bash
+export DATABASE_URL=postgres://hermes_hub:change-me-postgres@127.0.0.1:15432/hermes_hub
+export HERMES_HUB_SECRET_MASTER_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+export HERMES_OBJECT_STORAGE_ENDPOINT=http://127.0.0.1:19000
+export HERMES_OBJECT_STORAGE_BUCKET=hermes-hub
+export HERMES_OBJECT_STORAGE_REGION=us-east-1
+export HERMES_OBJECT_STORAGE_ACCESS_KEY=rustfsadmin
+export HERMES_OBJECT_STORAGE_SECRET_KEY=change-me-rustfs-secret
+export HERMES_OBJECT_STORAGE_FORCE_PATH_STYLE=true
 HERMES_HUB_STATIC_DIR=frontend/dist \
 HERMES_DATA_ROOT="$(pwd)/data/hub/users" \
 cargo run -p hermes-hub-backend
 ```
+
+The backend no longer falls back to in-memory runtime persistence. Local startup now requires
+PostgreSQL, `HERMES_HUB_SECRET_MASTER_KEY`, and a real object storage endpoint so development and
+production use the same persistence semantics.
 
 ## Docker
 

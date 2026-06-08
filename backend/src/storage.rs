@@ -379,21 +379,11 @@ impl HubObjectStorage for S3ObjectStorage {
     }
 }
 
-pub fn object_storage_from_config(config: &ObjectStorageConfig) -> DynObjectStorage {
-    if config.endpoint.is_some() && config.access_key.is_some() && config.secret_key.is_some() {
-        if let Ok(storage) = S3ObjectStorage::from_config(config) {
-            return storage.shared();
-        } else {
-            tracing::warn!(
-                endpoint = ?config.endpoint,
-                bucket = %config.bucket,
-                "failed to initialize configured S3 object storage; falling back to memory"
-            );
-        }
-    }
-
-    // 未配置 S3 时使用内存实现，便于测试和本地快速启动；部署 compose 默认接 RustFS。
-    InMemoryObjectStorage::new(config.bucket.clone()).shared()
+pub fn object_storage_from_config(
+    config: &ObjectStorageConfig,
+) -> Result<DynObjectStorage, ObjectStorageError> {
+    let storage = S3ObjectStorage::from_config(config)?;
+    Ok(storage.shared())
 }
 
 pub fn session_object_key(

@@ -2,7 +2,7 @@ use hermes_hub_backend::channel::service::{ChannelSessionKind, ChannelStore, Cha
 
 #[tokio::test]
 async fn home_session_is_pinned_protected_and_excluded_from_session_limit() {
-    let store = ChannelStore::default();
+    let store = ChannelStore::in_memory_for_tests();
     let channel = store
         .ensure_hub_channel("user-1")
         .await
@@ -70,7 +70,7 @@ async fn home_session_is_pinned_protected_and_excluded_from_session_limit() {
 
 #[tokio::test]
 async fn integration_channel_is_stable_per_user_and_integration() {
-    let store = ChannelStore::default();
+    let store = ChannelStore::in_memory_for_tests();
 
     let crm_for_user_1 = store
         .ensure_integration_channel("user-1", "crm-client")
@@ -97,4 +97,98 @@ async fn integration_channel_is_stable_per_user_and_integration() {
         store.ensure_integration_channel("user-1", " ").await,
         Err(ChannelStoreError::InvalidIntegrationId)
     ));
+}
+
+#[tokio::test]
+async fn hidden_sessions_do_not_consume_visible_session_limit() {
+    let store = ChannelStore::in_memory_for_tests();
+    let channel = store
+        .ensure_hub_channel("user-1")
+        .await
+        .expect("hub channel can be created");
+
+    // hidden_from_web 目前用于 integration session；这里直接在 store 层锁住配额语义，
+    // 避免后续改动把隐藏会话重新算进 Web 可见会话上限。
+    let hidden = store
+        .create_session("user-1", &channel.id, ChannelSessionKind::Agent, None, true)
+        .await
+        .expect("hidden session can be created");
+    assert!(hidden.hidden_from_web);
+
+    let visible = store
+        .create_session_with_limit(
+            "user-1",
+            &channel.id,
+            ChannelSessionKind::Agent,
+            None,
+            1,
+            false,
+        )
+        .await
+        .expect("hidden session must not consume visible session quota");
+    assert!(!visible.hidden_from_web);
+
+    let second_visible = store
+        .create_session_with_limit(
+            "user-1",
+            &channel.id,
+            ChannelSessionKind::Agent,
+            None,
+            1,
+            false,
+        )
+        .await;
+    assert!(matches!(
+        second_visible,
+        Err(ChannelStoreError::SessionLimitExceeded {
+            max_sessions_per_user: 1
+        })
+    ));
+}
+
+#[tokio::test]
+async fn memory_run_lookup_rejects_unbound_channel_for_specific_instance() {
+    let store = ChannelStore::in_memory_for_tests();
+    let channel = store
+        .ensure_hub_channel("user-1")
+        .await
+        .expect("hub channel can be created");
+    let session = store
+        .create_session(
+            "user-1",
+            &channel.id,
+            ChannelSessionKind::Agent,
+            None,
+            false,
+        )
+        .await
+        .expect("session can be created");
+    let message = store
+        .append_session_message(
+            "user-1",
+            &channel.id,
+            &session.id,
+            hermes_hub_backend::channel::service::ChannelMessageRole::User,
+            Some("unbound-run-message".to_string()),
+            "hello".to_string(),
+            serde_json::json!([]),
+        )
+        .await
+        .expect("message can be created");
+    let run = store
+        .create_channel_run(
+            "user-1",
+            &channel.id,
+            &session.id,
+            &message.id,
+            "hello".to_string(),
+            serde_json::json!([]),
+        )
+        .await
+        .expect("run can be created");
+
+    let looked_up = store
+        .get_run_for_instance(Some("instance-1"), &run.run_id)
+        .await;
+    assert!(matches!(looked_up, Err(ChannelStoreError::RunNotFound)));
 }

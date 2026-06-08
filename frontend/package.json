@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "tsc -b && vite build",
+    "build:hermes-hub-example": "tsc -b && HERMES_HUB_BUILD_HERMES_EXAMPLE=1 vite build --outDir dist-hermes-hub-example",
     "test": "vitest run",
     "test:e2e": "playwright test"
   },

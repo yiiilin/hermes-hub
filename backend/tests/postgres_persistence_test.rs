@@ -1761,3 +1761,67 @@ async fn postgres_system_settings_persist_session_limit() {
     assert_eq!(reloaded.oidc.client_secret, "oidc-secret");
     assert_eq!(reloaded.ldap.bind_password, "ldap-bind-secret");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_hidden_sessions_do_not_consume_visible_session_limit() {
+    let Some(pool) = postgres_pool().await else {
+        eprintln!(
+            "skipping postgres hidden session quota test: HERMES_HUB_TEST_DATABASE_URL is not set"
+        );
+        return;
+    };
+    run_migrations(&pool).await.expect("migrations can run");
+
+    let state = test_state(pool, InMemoryLlmProviderClient::default()).await;
+    let user = state
+        .store
+        .create_bootstrap_admin("hidden-quota@example.com", "hidden-quota-password")
+        .await
+        .expect("postgres user can be created");
+    let channel = state
+        .channel_store
+        .ensure_hub_channel(&user.id)
+        .await
+        .expect("hub channel can be ensured");
+
+    let hidden = state
+        .channel_store
+        .create_session(&user.id, &channel.id, ChannelSessionKind::Agent, None, true)
+        .await
+        .expect("hidden session can be created");
+    assert!(hidden.hidden_from_web);
+
+    let visible = state
+        .channel_store
+        .create_session_with_limit(
+            &user.id,
+            &channel.id,
+            ChannelSessionKind::Agent,
+            None,
+            1,
+            false,
+        )
+        .await
+        .expect("hidden session must not consume visible session quota");
+    assert!(!visible.hidden_from_web);
+
+    let second_visible = state
+        .channel_store
+        .create_session_with_limit(
+            &user.id,
+            &channel.id,
+            ChannelSessionKind::Agent,
+            None,
+            1,
+            false,
+        )
+        .await;
+    assert!(matches!(
+        second_visible,
+        Err(
+            hermes_hub_backend::channel::service::ChannelStoreError::SessionLimitExceeded {
+                max_sessions_per_user: 1
+            }
+        )
+    ));
+}

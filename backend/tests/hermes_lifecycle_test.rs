@@ -61,7 +61,7 @@ fn ready_test_state(store: SessionStore) -> AppState {
     let mut config = AppConfig::for_tests();
     config.initial_model_config.provider_base_url = "https://ready-provider.example/v1".into();
     config.initial_model_config.provider_api_key = "ready-provider-key".into();
-    let model_registry = ModelRegistry::new(config.initial_model_config.clone());
+    let model_registry = ModelRegistry::in_memory_for_tests(config.initial_model_config.clone());
     AppState {
         docker_provisioner: DockerProvisioner::new_with_runtime(
             docker_config_from_app(&config, &config.initial_model_config),
@@ -69,7 +69,7 @@ fn ready_test_state(store: SessionStore) -> AppState {
         ),
         config,
         store,
-        channel_store: ChannelStore::default(),
+        channel_store: ChannelStore::in_memory_for_tests(),
         model_registry,
         llm_provider: InMemoryLlmProviderClient::default().shared(),
         ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
@@ -80,7 +80,7 @@ fn ready_test_state(store: SessionStore) -> AppState {
 
 #[tokio::test]
 async fn lifecycle_sweep_keeps_public_platform_hermes_running_and_stops_idle_user_instances() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let admin = store
         .create_bootstrap_admin("admin@example.com", "admin-password-123")
         .await
@@ -130,7 +130,7 @@ async fn lifecycle_sweep_keeps_public_platform_hermes_running_and_stops_idle_use
 
 #[tokio::test]
 async fn lifecycle_sweep_does_not_wake_disabled_public_platform_hermes_for_scheduled_tasks() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     store
         .create_bootstrap_admin("admin@example.com", "admin-password-123")
         .await
@@ -188,7 +188,7 @@ async fn lifecycle_sweep_does_not_wake_disabled_public_platform_hermes_for_sched
 
 #[tokio::test]
 async fn lifecycle_sweep_stops_running_public_platform_hermes_when_disabled() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     store
         .create_bootstrap_admin("admin@example.com", "admin-password-123")
         .await

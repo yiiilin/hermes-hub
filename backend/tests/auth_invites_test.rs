@@ -5,18 +5,17 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use hermes_hub_backend::{build_router, AppConfig};
 use hermes_hub_backend::{
     build_router_with_state,
     channel::service::ChannelStore,
     docker_config_from_app,
     hermes::docker_provisioner::{DockerProvisioner, NoopDockerRuntime},
-    ldap::{DynLdapAuthenticator, InMemoryLdapAuthenticator},
+    ldap::{DefaultLdapAuthenticator, DynLdapAuthenticator, InMemoryLdapAuthenticator},
     llm_proxy::InMemoryLlmProviderClient,
     model_config::ModelRegistry,
     session::store::SessionStore,
     storage::InMemoryObjectStorage,
-    AppState,
+    AppConfig, AppState,
 };
 use serde_json::{json, Value};
 use std::{
@@ -27,7 +26,25 @@ use tokio::net::TcpListener;
 use tower::ServiceExt;
 
 fn test_app() -> Router {
-    build_router(AppConfig::for_tests())
+    let config = AppConfig::for_tests();
+    let object_storage = InMemoryObjectStorage::new(config.object_storage.bucket.clone()).shared();
+    let docker_provisioner = DockerProvisioner::new_with_runtime_and_object_storage(
+        docker_config_from_app(&config, &config.initial_model_config),
+        Arc::new(NoopDockerRuntime),
+        object_storage.clone(),
+    );
+    let state = AppState {
+        docker_provisioner,
+        config,
+        store: SessionStore::in_memory_for_tests(),
+        channel_store: ChannelStore::in_memory_for_tests(),
+        model_registry: ModelRegistry::default_for_tests(),
+        llm_provider: InMemoryLlmProviderClient::default().shared(),
+        ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
+        object_storage,
+        session_events: Default::default(),
+    };
+    build_router_with_state(state)
 }
 
 fn test_app_with_ldap(ldap_authenticator: DynLdapAuthenticator) -> Router {
@@ -38,8 +55,8 @@ fn test_app_with_ldap(ldap_authenticator: DynLdapAuthenticator) -> Router {
             Arc::new(NoopDockerRuntime),
         ),
         config,
-        store: SessionStore::default(),
-        channel_store: ChannelStore::default(),
+        store: SessionStore::in_memory_for_tests(),
+        channel_store: ChannelStore::in_memory_for_tests(),
         model_registry: ModelRegistry::default_for_tests(),
         llm_provider: InMemoryLlmProviderClient::default().shared(),
         ldap_authenticator,

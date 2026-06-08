@@ -397,7 +397,7 @@ mod tests {
         llm_proxy::InMemoryLlmProviderClient,
         model_config::ModelRegistry,
         session::store::SessionStore,
-        storage::object_storage_from_config,
+        storage::InMemoryObjectStorage,
         AppConfig, AppState,
     };
     use axum::{
@@ -413,7 +413,7 @@ mod tests {
         let mut config = AppConfig::for_tests();
         config.initial_model_config.provider_base_url = "https://ready-provider.example/v1".into();
         config.initial_model_config.provider_api_key = "ready-provider-key".into();
-        let store = SessionStore::default();
+        let store = SessionStore::in_memory_for_tests();
         store
             .create_bootstrap_admin("admin@example.com", "admin-password-123")
             .await
@@ -484,17 +484,18 @@ mod tests {
     }
 
     fn test_state(config: AppConfig, store: SessionStore) -> AppState {
-        let object_storage = object_storage_from_config(&config.object_storage);
+        let object_storage =
+            InMemoryObjectStorage::new(config.object_storage.bucket.clone()).shared();
         let docker_provisioner = DockerProvisioner::new_with_runtime_and_object_storage(
             docker_config_from_app(&config, &config.initial_model_config),
             Arc::new(NoopDockerRuntime),
             object_storage.clone(),
         );
         AppState {
-            model_registry: ModelRegistry::new(config.initial_model_config.clone()),
+            model_registry: ModelRegistry::in_memory_for_tests(config.initial_model_config.clone()),
             config,
             store,
-            channel_store: ChannelStore::default(),
+            channel_store: ChannelStore::in_memory_for_tests(),
             llm_provider: InMemoryLlmProviderClient::default().shared(),
             ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
             docker_provisioner,

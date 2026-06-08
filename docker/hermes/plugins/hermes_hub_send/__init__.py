@@ -65,6 +65,34 @@ HERMES_HUB_SEND_SCHEMA = {
     },
 }
 
+HERMES_HUB_BUSINESS_TOOL_REQUEST_SCHEMA = {
+    "name": "business_tool_request",
+    "description": (
+        "Call a Hermes Hub integration business tool. Use this when the current "
+        "conversation exposes third-party tools such as save_note or search_notes."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "tool_name": {
+                "type": "string",
+                "description": "Exact business tool name provided by the current integration.",
+            },
+            "arguments": {
+                "type": "object",
+                "description": "JSON object arguments for the selected business tool.",
+                "additionalProperties": True,
+            },
+            "timeout_seconds": {
+                "type": "integer",
+                "description": "Optional timeout hint in seconds for the business tool request.",
+            },
+        },
+        "required": ["tool_name", "arguments"],
+        "additionalProperties": False,
+    },
+}
+
 
 def _sanitize_error_text(text: Any) -> str:
     # 对齐官方 send_message_tool：所有面向模型/用户的错误都先做敏感字段脱敏。
@@ -122,6 +150,10 @@ def _check_hub_send_available() -> bool:
     return _live_hub_adapter() is not None
 
 
+def _check_business_tool_request_available() -> bool:
+    return _check_hub_send_available()
+
+
 def hermes_hub_send_tool(args: dict[str, Any], **_kw: Any) -> str:
     """Hermes Hub 当前会话版 send_message。
 
@@ -129,6 +161,11 @@ def hermes_hub_send_tool(args: dict[str, Any], **_kw: Any) -> str:
     _handle_send 负责解析/过滤，_send_to_platform 负责分块和平台投递。
     """
     return _handle_send(args or {})
+
+
+def business_tool_request_tool(args: dict[str, Any], **_kw: Any) -> str:
+    """通过 Hub 内部 API 发起第三方业务工具调用。"""
+    return _handle_business_tool_request(args or {})
 
 
 def _handle_send(args: dict[str, Any]) -> str:
@@ -175,6 +212,62 @@ def _handle_send(args: dict[str, Any]) -> str:
     if isinstance(result, dict) and result.get("error"):
         return json.dumps(_error(str(result["error"])), ensure_ascii=False)
     return _tool_error("Hermes Hub send returned an invalid result")
+
+
+def _handle_business_tool_request(args: dict[str, Any]) -> str:
+    tool_name = str((args or {}).get("tool_name") or "").strip()
+    arguments = (args or {}).get("arguments")
+    timeout_seconds = (args or {}).get("timeout_seconds")
+    if not tool_name:
+        return _tool_error("tool_name is required")
+    if not isinstance(arguments, dict):
+        return _tool_error("arguments must be an object")
+    if timeout_seconds is not None:
+        try:
+            timeout_seconds = int(timeout_seconds)
+        except Exception:
+            return _tool_error("timeout_seconds must be an integer")
+        if timeout_seconds <= 0:
+            return _tool_error("timeout_seconds must be positive")
+
+    session_id = _current_hub_session_id()
+    if not session_id:
+        return _tool_error("Hermes Hub session context is unavailable")
+
+    adapter = _live_hub_adapter()
+    if adapter is None:
+        return _tool_error("Hermes Hub adapter is not connected")
+
+    payload = {
+        "args": {
+            "tool_name": tool_name,
+            "arguments": arguments,
+        }
+    }
+    if timeout_seconds is not None:
+        payload["timeout_seconds"] = timeout_seconds
+
+    try:
+        from model_tools import _run_async
+
+        response = _run_async(
+            adapter._request_json(
+                "POST",
+                f"/sessions/{session_id}/business-tool-request",
+                json=payload,
+            )
+        )
+    except Exception as error:
+        logger.warning("Hermes Hub business tool request failed: %s", error, exc_info=True)
+        return _tool_error(f"Hermes Hub business tool request failed: {error}")
+
+    if isinstance(response, dict):
+        result = response.get("result")
+        if isinstance(result, str):
+            return result
+        if response.get("error"):
+            return _tool_error(str(response["error"]))
+    return _tool_error("Hermes Hub business tool request returned an invalid result")
 
 
 def _normalize_message_line_breaks(message: str) -> str:
@@ -436,5 +529,13 @@ def register(ctx: Any) -> None:
         schema=HERMES_HUB_SEND_SCHEMA,
         handler=hermes_hub_send_tool,
         check_fn=_check_hub_send_available,
+        emoji="",
+    )
+    ctx.register_tool(
+        name="business_tool_request",
+        toolset="hermes_hub",
+        schema=HERMES_HUB_BUSINESS_TOOL_REQUEST_SCHEMA,
+        handler=business_tool_request_tool,
+        check_fn=_check_business_tool_request_available,
         emoji="",
     )

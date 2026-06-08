@@ -47,12 +47,12 @@ fn app_with_config(config: AppConfig) -> (Router, SessionStore) {
             Arc::new(NoopDockerRuntime),
             object_storage.clone(),
         );
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = AppState {
-        model_registry: ModelRegistry::new(config.initial_model_config.clone()),
+        model_registry: ModelRegistry::in_memory_for_tests(config.initial_model_config.clone()),
         config,
         store: store.clone(),
-        channel_store: ChannelStore::default(),
+        channel_store: ChannelStore::in_memory_for_tests(),
         llm_provider: InMemoryLlmProviderClient::default().shared(),
         ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
         docker_provisioner,

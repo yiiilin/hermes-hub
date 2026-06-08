@@ -29,7 +29,7 @@ use tempfile::tempdir;
 use tower::ServiceExt;
 
 fn test_state(store: SessionStore) -> AppState {
-    test_state_with_channel_store(store, ChannelStore::default())
+    test_state_with_channel_store(store, ChannelStore::in_memory_for_tests())
 }
 
 fn test_state_with_channel_store(store: SessionStore, channel_store: ChannelStore) -> AppState {
@@ -56,7 +56,7 @@ fn test_state_with_channel_store(store: SessionStore, channel_store: ChannelStor
 }
 
 fn ready_model_registry() -> ModelRegistry {
-    ModelRegistry::new(ModelConfig {
+    ModelRegistry::in_memory_for_tests(ModelConfig {
         config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
         provider_name: "openai-compatible".to_string(),
         provider_base_url: "https://ready-provider.example/v1".to_string(),
@@ -398,6 +398,12 @@ fn managed_instance_for(user_id: &str) -> HermesInstance {
     }
 }
 
+fn managed_instance_for_with_id(user_id: &str, instance_id: &str) -> HermesInstance {
+    let mut instance = managed_instance_for(user_id);
+    instance.id = instance_id.to_string();
+    instance
+}
+
 async fn configure_business_tool_integration(state: &AppState) {
     let created = state
         .store
@@ -429,7 +435,7 @@ async fn configure_business_tool_integration(state: &AppState) {
 
 #[tokio::test]
 async fn channel_messages_and_attachments_are_hub_owned() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let app = test_app(store.clone());
     let cookie = bootstrap_and_login(&app).await;
     let user_id = store
@@ -606,7 +612,7 @@ async fn channel_messages_and_attachments_are_hub_owned() {
 
 #[tokio::test]
 async fn channel_message_attachments_must_reference_uploaded_hub_objects() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let app = test_app(store.clone());
     let cookie = bootstrap_and_login(&app).await;
     let user_id = store
@@ -642,7 +648,7 @@ async fn channel_message_attachments_must_reference_uploaded_hub_objects() {
 
 #[tokio::test]
 async fn deleting_channel_session_stops_active_run_and_removes_messages_and_files() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let app = test_app(store.clone());
     let cookie = bootstrap_and_login(&app).await;
     let user_id = store
@@ -732,7 +738,7 @@ async fn deleting_channel_session_stops_active_run_and_removes_messages_and_file
 
 #[tokio::test]
 async fn deleting_channel_session_removes_cron_jobs_targeting_that_session() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
     let cookie = bootstrap_and_login(&app).await;
@@ -812,7 +818,7 @@ async fn deleting_channel_session_removes_cron_jobs_targeting_that_session() {
 
 #[tokio::test]
 async fn assistant_message_with_container_image_path_keeps_text_without_output_attachment() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let app = test_app(store.clone());
     let cookie = bootstrap_and_login(&app).await;
     let user_id = store
@@ -859,7 +865,7 @@ async fn assistant_message_with_container_image_path_keeps_text_without_output_a
 
 #[tokio::test]
 async fn listing_legacy_assistant_image_path_does_not_read_container_file() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
     let cookie = bootstrap_and_login(&app).await;
@@ -934,7 +940,7 @@ async fn listing_legacy_assistant_image_path_does_not_read_container_file() {
 
 #[tokio::test]
 async fn assistant_message_with_container_file_path_keeps_text_without_output_attachment() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let app = test_app(store.clone());
     let cookie = bootstrap_and_login(&app).await;
     let user_id = store
@@ -980,7 +986,7 @@ async fn assistant_message_with_container_file_path_keeps_text_without_output_at
 
 #[tokio::test]
 async fn assistant_message_with_client_key_is_idempotent_without_recopying_container_path() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let app = test_app(store.clone());
     let cookie = bootstrap_and_login(&app).await;
     let user_id = store
@@ -1064,7 +1070,7 @@ async fn assistant_message_with_client_key_is_idempotent_without_recopying_conta
 
 #[tokio::test]
 async fn hermes_instance_can_deliver_channel_message_to_hub() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let instance_token = "instance-channel-token";
     state
@@ -1137,8 +1143,170 @@ async fn hermes_instance_can_deliver_channel_message_to_hub() {
 }
 
 #[tokio::test]
+async fn hermes_instance_cannot_deliver_message_to_other_instance_session_in_memory() {
+    let store = SessionStore::in_memory_for_tests();
+    let state = test_state(store.clone());
+    let owner_instance_id = "instance-owner";
+    let attacker_instance_id = "instance-attacker";
+    let attacker_token = "instance-attacker-token";
+    state
+        .model_registry
+        .add_instance_token_for_instance(attacker_instance_id, attacker_token)
+        .await
+        .expect("attacker token can be registered");
+    let app = build_router_with_state(state.clone());
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    store
+        .bind_hermes_instance(managed_instance_for_with_id(&user_id, owner_instance_id))
+        .await
+        .expect("owner instance can be bound");
+
+    let session_id = create_web_session(&app, &cookie).await;
+    let delivered = request_raw(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/messages"),
+        "application/json",
+        br#"{"role":"assistant","content":"cross-instance write","attachments":[]}"#.to_vec(),
+        None,
+        Some(attacker_token),
+    )
+    .await;
+    assert_eq!(delivered.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn channel_inbox_delivers_runs_for_non_default_memory_instance_id() {
+    let store = SessionStore::in_memory_for_tests();
+    let state = test_state(store.clone());
+    let instance_token = "instance-non-default-token";
+    let instance_id = "instance-local-dev";
+    state
+        .model_registry
+        .add_instance_token_for_instance(instance_id, instance_token)
+        .await
+        .expect("instance token can be registered");
+    let app = build_router_with_state(state.clone());
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    store
+        .bind_hermes_instance(managed_instance_for_with_id(&user_id, instance_id))
+        .await
+        .expect("instance can be bound");
+
+    let session_id = create_web_session(&app, &cookie).await;
+    let created_run = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{session_id}/runs"),
+        json!({
+            "content": "本地开发实例也应该拿到这个 run",
+            "attachments": [],
+            "client_message_key": "memory-instance-run"
+        }),
+        Some(&cookie),
+    )
+    .await;
+    let (status, created_run_body) = response_json(created_run).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created_run_body["run"]["status"], "queued");
+    let run_id = created_run_body["run"]["run_id"].clone();
+
+    let inbox = request_raw(
+        &app,
+        Method::GET,
+        "/internal/channel/v1/inbox?timeout_seconds=0&limit=4",
+        "application/json",
+        Vec::new(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, inbox_body) = response_json(inbox).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inbox_body["items"].as_array().expect("items").len(), 1);
+    assert_eq!(inbox_body["items"][0]["id"], run_id);
+    assert_eq!(
+        inbox_body["items"][0]["content"],
+        "本地开发实例也应该拿到这个 run"
+    );
+}
+
+#[tokio::test]
+async fn channel_inbox_delivers_runs_when_memory_session_predates_instance_binding() {
+    let store = SessionStore::in_memory_for_tests();
+    let state = test_state(store.clone());
+    let instance_token = "instance-late-bind-token";
+    let instance_id = "instance-late-bind";
+    state
+        .model_registry
+        .add_instance_token_for_instance(instance_id, instance_token)
+        .await
+        .expect("instance token can be registered");
+    let app = build_router_with_state(state.clone());
+    let cookie = bootstrap_and_login(&app).await;
+    let user_id = store
+        .user_by_session_cookie(&cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+
+    // 先创建 Web 会话，再补 Hermes 实例，覆盖本次修复最关键的 late-bind 场景。
+    let session_id = create_web_session(&app, &cookie).await;
+    store
+        .bind_hermes_instance(managed_instance_for_with_id(&user_id, instance_id))
+        .await
+        .expect("instance can be bound after session creation");
+
+    let created_run = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{session_id}/runs"),
+        json!({
+            "content": "会话先创建，实例后补绑，也应该继续收到 run",
+            "attachments": [],
+            "client_message_key": "memory-late-bind-run"
+        }),
+        Some(&cookie),
+    )
+    .await;
+    let (status, created_run_body) = response_json(created_run).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created_run_body["run"]["status"], "queued");
+    let run_id = created_run_body["run"]["run_id"].clone();
+
+    let inbox = request_raw(
+        &app,
+        Method::GET,
+        "/internal/channel/v1/inbox?timeout_seconds=0&limit=4",
+        "application/json",
+        Vec::new(),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, inbox_body) = response_json(inbox).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inbox_body["items"].as_array().expect("items").len(), 1);
+    assert_eq!(inbox_body["items"][0]["id"], run_id);
+    assert_eq!(
+        inbox_body["items"][0]["content"],
+        "会话先创建，实例后补绑，也应该继续收到 run"
+    );
+}
+
+#[tokio::test]
 async fn hermes_channel_protocol_rejects_editing_business_tool_request_message() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let instance_token = "instance-business-tool-edit-token";
     state
@@ -1300,7 +1468,7 @@ async fn hermes_channel_protocol_rejects_editing_business_tool_request_message()
 
 #[tokio::test]
 async fn channel_session_events_stream_snapshot_and_adapter_messages() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let instance_token = "instance-session-events-token";
     state
@@ -1406,7 +1574,7 @@ async fn channel_session_events_stream_snapshot_and_adapter_messages() {
 
 #[tokio::test]
 async fn public_session_events_stream_session_title_updates() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
     let cookie = bootstrap_and_login(&app).await;
@@ -1493,7 +1661,7 @@ async fn public_session_events_stream_session_title_updates() {
 
 #[tokio::test]
 async fn public_session_message_rejects_reserved_business_tool_client_key() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
     let cookie = bootstrap_and_login(&app).await;
@@ -1538,7 +1706,7 @@ async fn public_session_message_rejects_reserved_business_tool_client_key() {
 
 #[tokio::test]
 async fn unauthenticated_public_sessions_are_scoped_by_public_cookie() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     enable_public_platform(&store).await;
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
@@ -1669,7 +1837,7 @@ async fn unauthenticated_public_sessions_are_scoped_by_public_cookie() {
 
 #[tokio::test]
 async fn public_session_token_header_restores_public_session_without_cookie() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     enable_public_platform(&store).await;
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
@@ -1722,7 +1890,7 @@ async fn public_session_token_header_restores_public_session_without_cookie() {
 
 #[tokio::test]
 async fn public_session_list_chooses_valid_token_between_cookie_and_header() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     enable_public_platform(&store).await;
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
@@ -1806,7 +1974,7 @@ async fn public_session_list_chooses_valid_token_between_cookie_and_header() {
 
 #[tokio::test]
 async fn public_session_id_path_claims_public_session_for_new_browser() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     enable_public_platform(&store).await;
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
@@ -1864,7 +2032,7 @@ async fn public_session_id_path_claims_public_session_for_new_browser() {
 
 #[tokio::test]
 async fn public_home_session_cannot_be_claimed_or_opened() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     enable_public_platform(&store).await;
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
@@ -1943,7 +2111,7 @@ async fn public_home_session_cannot_be_claimed_or_opened() {
 
 #[tokio::test]
 async fn deleting_public_session_revokes_all_tokens_for_that_session() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     enable_public_platform(&store).await;
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
@@ -2002,7 +2170,7 @@ async fn deleting_public_session_revokes_all_tokens_for_that_session() {
 
 #[tokio::test]
 async fn public_session_recycle_at_tracks_latest_message_time() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     enable_public_platform(&store).await;
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
@@ -2086,7 +2254,7 @@ async fn public_session_recycle_at_tracks_latest_message_time() {
 
 #[tokio::test]
 async fn public_sessions_do_not_consume_admin_session_limit() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     enable_public_platform(&store).await;
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
@@ -2133,7 +2301,7 @@ async fn public_sessions_do_not_consume_admin_session_limit() {
 
 #[tokio::test]
 async fn invalid_public_session_cookie_lists_empty_without_creating_public_user() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     enable_public_platform(&store).await;
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
@@ -2165,7 +2333,7 @@ async fn invalid_public_session_cookie_lists_empty_without_creating_public_user(
 
 #[tokio::test]
 async fn public_session_attachment_download_uses_public_cookie() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     enable_public_platform(&store).await;
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
@@ -2288,7 +2456,7 @@ async fn public_session_attachment_download_uses_public_cookie() {
 
 #[tokio::test]
 async fn public_attachment_download_prefers_valid_header_over_stale_cookie() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     enable_public_platform(&store).await;
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
@@ -2347,7 +2515,7 @@ async fn public_attachment_download_prefers_valid_header_over_stale_cookie() {
 
 #[tokio::test]
 async fn public_session_attachment_upload_accepts_public_token_header() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     enable_public_platform(&store).await;
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
@@ -2392,7 +2560,7 @@ async fn public_session_attachment_upload_accepts_public_token_header() {
 
 #[tokio::test]
 async fn hermes_channel_protocol_uploads_output_file_before_delivering_message() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let instance_token = "instance-channel-file-token";
     state
@@ -2559,7 +2727,7 @@ async fn hermes_channel_protocol_uploads_output_file_before_delivering_message()
 
 #[tokio::test]
 async fn hermes_channel_protocol_delivers_atomic_media_output_message() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     store
         .update_system_settings(SystemSettings {
             max_attachment_upload_bytes: 4096,
@@ -2694,7 +2862,7 @@ async fn hermes_channel_protocol_delivers_atomic_media_output_message() {
 
 #[tokio::test]
 async fn hermes_channel_protocol_rejects_reserved_business_tool_client_key_for_media_output() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     store
         .update_system_settings(SystemSettings {
             max_attachment_upload_bytes: 4096,
@@ -2755,7 +2923,7 @@ async fn hermes_channel_protocol_rejects_reserved_business_tool_client_key_for_m
 
 #[tokio::test]
 async fn hermes_channel_protocol_accepts_ordered_attachment_placeholders() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let instance_token = "instance-channel-ordered-attachments-token";
     state
@@ -2875,7 +3043,7 @@ async fn hermes_channel_protocol_accepts_ordered_attachment_placeholders() {
 
 #[tokio::test]
 async fn hermes_channel_protocol_rejects_attachment_without_placeholder() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let instance_token = "instance-channel-placeholder-validation-token";
     state
@@ -2992,7 +3160,7 @@ async fn hermes_channel_protocol_rejects_attachment_without_placeholder() {
 
 #[tokio::test]
 async fn hermes_channel_protocol_returns_existing_media_output_after_run_stops() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let instance_token = "instance-channel-media-retry-token";
     state
@@ -3127,7 +3295,7 @@ async fn hermes_channel_protocol_returns_existing_media_output_after_run_stops()
 
 #[tokio::test]
 async fn hermes_channel_protocol_accepts_large_output_files_within_config_limit() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let instance_token = "instance-channel-large-file-token";
     state
@@ -3178,7 +3346,7 @@ async fn hermes_channel_protocol_accepts_large_output_files_within_config_limit(
 
 #[tokio::test]
 async fn hermes_channel_protocol_rejects_output_attachment_over_system_upload_limit() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     store
         .update_system_settings(SystemSettings {
             max_attachment_upload_bytes: 1024,
@@ -3234,7 +3402,7 @@ async fn hermes_channel_protocol_rejects_output_attachment_over_system_upload_li
 
 #[tokio::test]
 async fn hermes_channel_protocol_rejects_media_output_file_over_system_upload_limit() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     store
         .update_system_settings(SystemSettings {
             max_attachment_upload_bytes: 1024,
@@ -3299,7 +3467,7 @@ async fn hermes_channel_protocol_rejects_media_output_file_over_system_upload_li
 
 #[tokio::test]
 async fn user_attachment_upload_rejects_file_over_system_upload_limit() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     store
         .update_system_settings(SystemSettings {
             max_attachment_upload_bytes: 1024,
@@ -3339,7 +3507,7 @@ async fn user_attachment_upload_rejects_file_over_system_upload_limit() {
 
 #[tokio::test]
 async fn assistant_message_binds_hub_attachment_referenced_in_content() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let instance_token = "instance-channel-linked-file-token";
     state
@@ -3447,7 +3615,7 @@ async fn assistant_message_binds_hub_attachment_referenced_in_content() {
 
 #[tokio::test]
 async fn channel_inbox_waits_briefly_when_no_runs_are_ready() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let instance_token = "instance-empty-inbox-token";
     state
@@ -3481,7 +3649,7 @@ async fn channel_inbox_waits_briefly_when_no_runs_are_ready() {
 
 #[tokio::test]
 async fn channel_inbox_delivers_gateway_restart_control_once() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
     let cookie = bootstrap_and_login(&app).await;
@@ -3541,7 +3709,7 @@ async fn channel_inbox_delivers_gateway_restart_control_once() {
 
 #[tokio::test]
 async fn hermes_adapter_can_report_runtime_version_to_hub() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
     let cookie = bootstrap_and_login(&app).await;
@@ -3584,7 +3752,7 @@ async fn hermes_adapter_can_report_runtime_version_to_hub() {
 
 #[tokio::test]
 async fn hermes_adapter_poll_records_heartbeat_and_marks_instance_healthy() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
     let cookie = bootstrap_and_login(&app).await;
@@ -3636,7 +3804,7 @@ async fn hermes_adapter_poll_records_heartbeat_and_marks_instance_healthy() {
 
 #[tokio::test]
 async fn hermes_adapter_can_report_scheduler_snapshot_to_admin_view() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
     let cookie = bootstrap_and_login(&app).await;
@@ -3718,7 +3886,7 @@ async fn hermes_adapter_can_report_scheduler_snapshot_to_admin_view() {
 
 #[tokio::test]
 async fn user_can_read_only_their_own_scheduler_snapshot() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let app = build_router_with_state(state.clone());
     let admin_cookie = bootstrap_and_login(&app).await;
@@ -3860,7 +4028,7 @@ async fn user_can_read_only_their_own_scheduler_snapshot() {
 
 #[tokio::test]
 async fn channel_run_enqueue_can_be_polled_and_completed_by_hermes_hub_adapter() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let instance_token = "instance-adapter-queue-token";
     state
@@ -4197,8 +4365,133 @@ async fn channel_run_enqueue_can_be_polled_and_completed_by_hermes_hub_adapter()
 }
 
 #[tokio::test]
+async fn integration_inbox_injects_business_tool_channel_prompt() {
+    let state = test_state(SessionStore::in_memory_for_tests());
+    let app = build_router_with_state(state.clone());
+    let admin_cookie = bootstrap_and_login(&app).await;
+    let user_id = state
+        .store
+        .user_by_session_cookie(&admin_cookie, "hermes_hub_session")
+        .await
+        .expect("user can be read from session")
+        .id;
+    state
+        .store
+        .bind_hermes_instance(managed_instance_for(&user_id))
+        .await
+        .expect("instance can be bound");
+    state
+        .model_registry
+        .add_instance_token_for_instance("instance-1", "instance-adapter-integration-token")
+        .await
+        .expect("instance token can be registered");
+
+    let created = state
+        .store
+        .create_integration_app(hermes_hub_backend::session::store::NewIntegrationApp {
+            name: "Example".to_string(),
+            enabled: true,
+            redirect_uri: "https://example.test/callback".to_string(),
+            scopes: "openid profile email".to_string(),
+            authorization_code_ttl_seconds: Some(600),
+            hidden_session_idle_timeout_seconds: Some(3600),
+            default_tool_timeout_seconds: Some(60),
+            max_tool_timeout_seconds: Some(300),
+        })
+        .await
+        .expect("integration app can be created");
+    state
+        .store
+        .replace_integration_tools(
+            &created.app.integration_id,
+            vec![
+                IncomingIntegrationToolDefinition {
+                    name: "save_note".to_string(),
+                    description: "保存笔记".to_string(),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {
+                            "content": { "type": "string" }
+                        },
+                        "required": ["content"]
+                    }),
+                },
+                IncomingIntegrationToolDefinition {
+                    name: "search_notes".to_string(),
+                    description: "搜索笔记".to_string(),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string" }
+                        },
+                        "required": ["query"]
+                    }),
+                },
+            ],
+        )
+        .await
+        .expect("integration tools can be saved");
+
+    let channel = state
+        .channel_store
+        .bind_integration_channel_to_instance(&user_id, &created.app.integration_id, "instance-1")
+        .await
+        .expect("integration channel can be bound");
+    let session = state
+        .channel_store
+        .create_session(&user_id, &channel.id, ChannelSessionKind::Agent, None, true)
+        .await
+        .expect("integration session can be created");
+    let message = state
+        .channel_store
+        .append_session_message(
+            &user_id,
+            &channel.id,
+            &session.id,
+            ChannelMessageRole::User,
+            Some("integration-user-turn-1".to_string()),
+            "帮我记笔记".to_string(),
+            json!([]),
+        )
+        .await
+        .expect("message can be appended");
+    state
+        .channel_store
+        .create_channel_run(
+            &user_id,
+            &channel.id,
+            &session.id,
+            &message.id,
+            message.content.clone(),
+            message.attachments.clone(),
+        )
+        .await
+        .expect("run can be created");
+
+    let inbox = request_raw(
+        &app,
+        Method::GET,
+        "/internal/channel/v1/inbox?timeout_seconds=0&limit=4",
+        "application/json",
+        Vec::new(),
+        None,
+        Some("instance-adapter-integration-token"),
+    )
+    .await;
+    let (status, inbox_body) = response_json(inbox).await;
+    assert_eq!(status, StatusCode::OK);
+    let item = &inbox_body["items"][0];
+    let channel_prompt = item["channel_prompt"]
+        .as_str()
+        .expect("integration inbox injects channel prompt");
+    assert!(channel_prompt.contains("business_tool_request"));
+    assert!(channel_prompt.contains("save_note"));
+    assert!(channel_prompt.contains("search_notes"));
+}
+
+#[tokio::test]
 async fn adapter_execution_edit_after_newer_message_appends_to_latest_execution_slot() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let instance_token = "instance-adapter-execution-order-token";
     state
@@ -4300,7 +4593,7 @@ async fn adapter_execution_edit_after_newer_message_appends_to_latest_execution_
 
 #[tokio::test]
 async fn assistant_message_with_hermes_run_key_does_not_clear_active_run() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let instance_token = "instance-hermes-run-key-token";
     state
@@ -4373,7 +4666,7 @@ async fn assistant_message_with_hermes_run_key_does_not_clear_active_run() {
 
 #[tokio::test]
 async fn terminal_adapter_run_remains_visible_until_browser_clears_it() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let instance_token = "instance-adapter-terminal-token";
     state
@@ -4460,7 +4753,7 @@ async fn terminal_adapter_run_remains_visible_until_browser_clears_it() {
 
 #[tokio::test]
 async fn late_adapter_output_after_stop_does_not_create_message() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let instance_token = "instance-late-output-token";
     state
@@ -4588,7 +4881,7 @@ async fn late_adapter_output_after_stop_does_not_create_message() {
 
 #[tokio::test]
 async fn completed_adapter_run_exposes_output_message_id_until_cleared() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let state = test_state(store.clone());
     let instance_token = "instance-adapter-completed-token";
     state

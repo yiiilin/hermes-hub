@@ -32,9 +32,9 @@ fn test_state() -> AppState {
             Arc::new(NoopDockerRuntime),
         ),
         config,
-        store: SessionStore::default(),
-        channel_store: ChannelStore::default(),
-        model_registry: ModelRegistry::new(ready_test_model_config()),
+        store: SessionStore::in_memory_for_tests(),
+        channel_store: ChannelStore::in_memory_for_tests(),
+        model_registry: ModelRegistry::in_memory_for_tests(ready_test_model_config()),
         llm_provider: InMemoryLlmProviderClient::default().shared(),
         ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
         object_storage: InMemoryObjectStorage::default().shared(),
@@ -600,6 +600,157 @@ async fn oauth_bearer_uses_integration_sessions_without_channel_id() {
         .expect("web sessions array")
         .iter()
         .all(|session| session["id"] != session_id));
+}
+
+#[tokio::test]
+async fn oauth_integration_sessions_do_not_consume_web_session_limit() {
+    let state = test_state();
+    let app = test_app(state.clone());
+    let admin_cookie = bootstrap_admin(&app).await;
+    let integration_app = configure_integration_app(&state).await;
+    let mut settings = state
+        .store
+        .system_settings()
+        .await
+        .expect("settings can be read");
+    settings.max_sessions_per_user = 2;
+    state
+        .store
+        .update_system_settings(settings)
+        .await
+        .expect("settings can be updated");
+
+    let web_session = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent" }),
+        Some(&admin_cookie),
+        None,
+    )
+    .await;
+    assert_eq!(web_session.status(), StatusCode::CREATED);
+
+    let token = oauth_access_token(
+        &app,
+        &admin_cookie,
+        &integration_app.app.client_id,
+        &integration_app.client_secret,
+    )
+    .await;
+
+    let integration_session = request_json(
+        &app,
+        Method::POST,
+        "/api/integrations/sessions",
+        json!({ "kind": "agent", "title": "not counted against web quota" }),
+        None,
+        Some(&token),
+    )
+    .await;
+    let (status, body) = response_json(integration_session).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["session"]["hidden_from_web"], true);
+    let integration_session_id = body["session"]["id"]
+        .as_str()
+        .expect("integration session id")
+        .to_string();
+
+    let second_web_session = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent" }),
+        Some(&admin_cookie),
+        None,
+    )
+    .await;
+    let (status, body) = response_json(second_web_session).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(body["session"]["id"].as_str().is_some());
+
+    let third_web_session = request_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        json!({ "kind": "agent" }),
+        Some(&admin_cookie),
+        None,
+    )
+    .await;
+    let (status, body) = response_json(third_web_session).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "session_limit_exceeded");
+    assert_eq!(body["max_sessions_per_user"], 2);
+
+    let events = request_empty(
+        &app,
+        Method::GET,
+        &format!("/api/integrations/sessions/{integration_session_id}/events"),
+        None,
+        Some(&token),
+    )
+    .await;
+    assert_eq!(events.status(), StatusCode::OK);
+    let mut event_stream = events.into_body().into_data_stream();
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), event_stream.next())
+        .await
+        .expect("integration snapshot arrives")
+        .expect("snapshot chunk exists")
+        .expect("snapshot is readable");
+    let snapshot_text = String::from_utf8_lossy(&snapshot);
+    assert!(
+        snapshot_text.contains("event: messages_snapshot"),
+        "unexpected snapshot chunk: {snapshot_text}"
+    );
+
+    let appended = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/integrations/sessions/{integration_session_id}/messages"),
+        json!({
+            "role": "user",
+            "content": "still works after web quota is full",
+            "client_message_key": "quota-proof-1"
+        }),
+        None,
+        Some(&token),
+    )
+    .await;
+    let (status, body) = response_json(appended).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        body["message"]["content"],
+        "still works after web quota is full"
+    );
+
+    let mut run_event_text = String::new();
+    for _ in 0..4 {
+        let next_event =
+            tokio::time::timeout(std::time::Duration::from_secs(1), event_stream.next())
+                .await
+                .expect("session event arrives")
+                .expect("event chunk exists")
+                .expect("event is readable");
+        let next_event_text = String::from_utf8_lossy(&next_event).to_string();
+        if next_event_text.contains("event: run_updated") {
+            run_event_text = next_event_text;
+            break;
+        }
+    }
+    assert!(
+        !run_event_text.is_empty(),
+        "expected run_updated event after integration user message"
+    );
+    assert!(
+        run_event_text.contains("event: run_updated"),
+        "unexpected run event chunk: {run_event_text}"
+    );
+    assert!(
+        run_event_text.contains("\"status\":\"queued\"")
+            || run_event_text.contains("\"status\":\"running\""),
+        "unexpected run event chunk: {run_event_text}"
+    );
 }
 
 #[tokio::test]
@@ -1221,4 +1372,114 @@ async fn business_tool_result_callback_rejects_expired_request() {
     assert_eq!(status, StatusCode::GONE);
     assert_eq!(body["error"], "gone");
     assert_eq!(body["message"], "business tool request expired");
+}
+
+#[tokio::test]
+async fn internal_business_tool_request_endpoint_waits_for_result() {
+    let state = test_state();
+    let app = test_app(state.clone());
+    let admin_cookie = bootstrap_admin(&app).await;
+    let integration_app = configure_integration_app(&state).await;
+    let user_id = state
+        .store
+        .user_by_session_cookie(&admin_cookie, "hermes_hub_session")
+        .await
+        .expect("admin cookie resolves to user")
+        .id;
+    let token = oauth_access_token(
+        &app,
+        &admin_cookie,
+        &integration_app.app.client_id,
+        &integration_app.client_secret,
+    )
+    .await;
+    let session_id = create_integration_session(&app, &token).await;
+    let integration_channel = state
+        .channel_store
+        .ensure_integration_channel(&user_id, &integration_app.app.integration_id)
+        .await
+        .expect("integration channel exists");
+    let instance = hermes_hub_backend::hermes::instance::HermesInstance::managed_docker(
+        &user_id,
+        "/tmp/workspace".to_string(),
+        None,
+        "/tmp/config".to_string(),
+    );
+    let instance_id = instance.id.clone();
+    state
+        .store
+        .bind_hermes_instance(instance)
+        .await
+        .expect("instance can be bound");
+    state
+        .channel_store
+        .bind_integration_channel_to_instance(
+            &user_id,
+            &integration_app.app.integration_id,
+            &instance_id,
+        )
+        .await
+        .expect("integration channel can be rebound");
+    let instance_token = "integration-instance-token";
+    state
+        .model_registry
+        .add_instance_token_for_instance(&instance_id, instance_token)
+        .await
+        .expect("instance token can be registered");
+
+    let callback_app = app.clone();
+    let callback_token = token.clone();
+    let callback_session_id = session_id.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let callback_task = tokio::spawn(async move {
+        let mut receiver = state.session_events.subscribe();
+        let _ = ready_tx.send(());
+        loop {
+            match receiver.recv().await.expect("event exists") {
+                hermes_hub_backend::channel::events::SessionEvent::BusinessToolRequest { request }
+                    if request.session_id == callback_session_id
+                        && request.status
+                            == hermes_hub_backend::channel::events::BusinessToolRequestStatus::Pending =>
+                {
+                    let response = request_json(
+                        &callback_app,
+                        Method::POST,
+                        &format!(
+                            "/api/integrations/sessions/{}/business-tool-requests/{}/result",
+                            callback_session_id, request.request_id
+                        ),
+                        json!({ "result": "CRM says the case is approved" }),
+                        None,
+                        Some(&callback_token),
+                    )
+                    .await;
+                    assert_eq!(response.status(), StatusCode::CREATED);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+    ready_rx.await.expect("callback subscriber is ready");
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        &format!("/internal/channel/v1/sessions/{session_id}/business-tool-request"),
+        json!({
+            "args": {
+                "tool_name": "business-crm",
+                "arguments": { "ticket": "A-1" }
+            }
+        }),
+        None,
+        Some(instance_token),
+    )
+    .await;
+    let (status, body) = response_json(response).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["result"], "CRM says the case is approved");
+    callback_task.await.expect("callback task finishes");
+    let _ = integration_channel;
 }

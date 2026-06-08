@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     ffi::OsStr,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use tokio::process::Command;
 #[cfg(unix)]
 use tokio::{
@@ -29,9 +30,9 @@ use super::{
     provisioner::{HermesProvisioner, ProvisionerError},
 };
 
-/// Hub 托管 Hermes 容器规格版本。只要 env、挂载、工作目录或安全策略有变化，
-/// 就提升这个值，确保已存在的旧容器会被重建并拿到新行为。
-const MANAGED_CONTAINER_SPEC_VERSION: &str = "2026-06-04-nfs-nosharecache";
+/// Hub 托管 Hermes 容器规格版本前缀。
+/// 真实版本会叠加 bundled Hermes 运行时资产哈希，确保插件源码变化也会触发容器重建。
+const MANAGED_CONTAINER_SPEC_VERSION_PREFIX: &str = "2026-06-08-business-tool-request-v1";
 const MANAGED_CONTAINER_SPEC_LABEL: &str = "hermes_hub_spec_version";
 const HUB_INBOX_PATH: &str = "/internal/channel/v1/inbox";
 const HUB_INBOX_TIMEOUT_SECONDS: u16 = 25;
@@ -66,8 +67,17 @@ pub struct DockerProvisionerConfig {
     pub memory_limit: Option<String>,
     pub cpu_limit: Option<String>,
     pub docker_binary: String,
+    pub backend_runtime_hint: DockerBackendRuntimeHint,
+    pub network_gateway_hint: Option<String>,
     pub managed_skills: Option<ManagedSkillsMountConfig>,
     pub managed_profile: Option<ManagedProfileConfig>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DockerBackendRuntimeHint {
+    Auto,
+    Host,
+    Container,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -152,6 +162,37 @@ impl ContainerMount {
     }
 }
 
+fn managed_container_spec_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            let mut hasher = Sha256::new();
+            for asset in [
+                include_bytes!("../../../docker/hermes/Dockerfile").as_slice(),
+                include_bytes!("../../../docker/hermes/plugins/platforms/hermes_hub/plugin.yaml")
+                    .as_slice(),
+                include_bytes!("../../../docker/hermes/plugins/platforms/hermes_hub/adapter.py")
+                    .as_slice(),
+                include_bytes!("../../../docker/hermes/plugins/hermes_hub_send/plugin.yaml")
+                    .as_slice(),
+                include_bytes!("../../../docker/hermes/plugins/hermes_hub_send/__init__.py")
+                    .as_slice(),
+            ] {
+                // 规格版本必须跟 bundled 运行时内容绑定，避免 latest tag 下继续复用旧插件容器。
+                hasher.update(asset);
+                hasher.update([0]);
+            }
+            let digest = hasher.finalize();
+            let short_hash = digest
+                .iter()
+                .take(6)
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!("{MANAGED_CONTAINER_SPEC_VERSION_PREFIX}-{short_hash}")
+        })
+        .as_str()
+}
+
 /// 可渲染为 Docker create 参数的规范。adapter-only 托管 Hermes 不包含任何端口发布配置。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ContainerSpec {
@@ -160,6 +201,7 @@ pub struct ContainerSpec {
     pub network: String,
     pub internal_port: u16,
     pub env: Vec<String>,
+    pub extra_hosts: Vec<String>,
     pub mounts: Vec<ContainerMount>,
     pub labels: Vec<(String, String)>,
     pub memory_limit: Option<String>,
@@ -378,8 +420,9 @@ impl DockerRuntime for NoopDockerRuntime {
         let stdout = if args.get(0).map(String::as_str) == Some("container")
             && args.get(1).map(String::as_str) == Some("inspect")
         {
+            let spec_version = managed_container_spec_version();
             format!(
-                r#"{{"Id":"noop-container-id","State":{{"Running":true}},"Config":{{"Labels":{{"{MANAGED_CONTAINER_SPEC_LABEL}":"{MANAGED_CONTAINER_SPEC_VERSION}"}}}}}}"#
+                r#"{{"Id":"noop-container-id","State":{{"Running":true}},"Config":{{"Labels":{{"{MANAGED_CONTAINER_SPEC_LABEL}":"{spec_version}"}}}}}}"#
             )
         } else if args.first().map(String::as_str) == Some("create") {
             "noop-container-id".to_string()
@@ -475,6 +518,10 @@ impl DockerProvisioner {
             .ok_or(ProvisionerError::InvalidManagedInstance)?;
         let config_file = path_to_string(PathBuf::from(&config).join("config.yaml"));
 
+        let hub_llm_base_url = self.effective_hub_llm_base_url();
+        let hub_channel_base_url = hub_channel_base_url(&hub_llm_base_url);
+        let extra_hosts = extra_hosts_for_hub_base_url(&hub_llm_base_url);
+        let spec_version = managed_container_spec_version();
         let mut mounts = vec![
             ContainerMount::bind(workspace, "/workspace", false),
             ContainerMount::bind(config, "/config", false),
@@ -505,16 +552,13 @@ impl DockerProvisioner {
             ),
             "HERMES_HOME=/config".to_string(),
             "HERMES_INFERENCE_PROVIDER=custom".to_string(),
-            format!("CUSTOM_BASE_URL={}", self.config.hub_llm_base_url),
-            format!("OPENAI_BASE_URL={}", self.config.hub_llm_base_url),
+            format!("CUSTOM_BASE_URL={hub_llm_base_url}"),
+            format!("OPENAI_BASE_URL={hub_llm_base_url}"),
             format!(
                 "OPENAI_API_KEY={}",
                 instance.llm_api_key.as_deref().unwrap_or("unissued")
             ),
-            format!(
-                "HERMES_HUB_CHANNEL_BASE_URL={}",
-                hub_channel_base_url(&self.config.hub_llm_base_url)
-            ),
+            format!("HERMES_HUB_CHANNEL_BASE_URL={hub_channel_base_url}"),
             format!(
                 "HERMES_HUB_CHANNEL_TOKEN={}",
                 instance.llm_api_key.as_deref().unwrap_or("unissued")
@@ -561,6 +605,9 @@ impl DockerProvisioner {
             network: self.config.network.clone(),
             internal_port: self.config.internal_port,
             env,
+            // 只有在容器里确实需要通过 host.docker.internal 回到宿主机时才注入 add-host，
+            // 避免把这一 Linux 兼容性假设强加到所有部署环境。
+            extra_hosts,
             // Hermes gateway 会在 HERMES_HOME 下写入 sessions、logs、skills 等运行态文件；
             // 统一管理 skills 通过单独只读挂载提供，避免进入 /config/skills 的 curator 路径。
             mounts,
@@ -570,7 +617,7 @@ impl DockerProvisioner {
                 ("instance_id".to_string(), instance.id.clone()),
                 (
                     MANAGED_CONTAINER_SPEC_LABEL.to_string(),
-                    MANAGED_CONTAINER_SPEC_VERSION.to_string(),
+                    spec_version.to_string(),
                 ),
             ],
             memory_limit: self.config.memory_limit.clone(),
@@ -609,17 +656,18 @@ impl DockerProvisioner {
 
         let existing_inspection = self.inspect_container(&next.name).await?;
         let mut runtime_repair_only = false;
+        let spec_version = managed_container_spec_version();
         if let Some(inspection) = existing_inspection.as_ref() {
             let config_changed = self.managed_config_changed(&next)?;
             let runtime_state_needs_repair = self.managed_runtime_state_needs_repair(&next)?;
             let current_container_usable = inspection.running
                 && inspection.health_status.as_deref() != Some("unhealthy")
-                && inspection.spec_version.as_deref() == Some(MANAGED_CONTAINER_SPEC_VERSION);
+                && inspection.spec_version.as_deref() == Some(spec_version);
             if inspection.running
                 && inspection.health_status.as_deref() != Some("unhealthy")
                 && !config_changed
                 && !runtime_state_needs_repair
-                && inspection.spec_version.as_deref() == Some(MANAGED_CONTAINER_SPEC_VERSION)
+                && inspection.spec_version.as_deref() == Some(spec_version)
             {
                 apply_inspection_status(&mut next, &inspection);
                 self.remember(next.clone())?;
@@ -922,6 +970,10 @@ impl DockerProvisioner {
             args.push("--env".to_string());
             args.push(env);
         }
+        for extra_host in spec.extra_hosts {
+            args.push("--add-host".to_string());
+            args.push(extra_host);
+        }
         for mount in spec.mounts {
             args.push("--mount".to_string());
             args.push(render_container_mount(&mount));
@@ -1139,6 +1191,8 @@ impl DockerProvisioner {
     }
 
     fn render_managed_config(&self, instance: &HermesInstance) -> Result<String, ProvisionerError> {
+        let hub_llm_base_url = self.effective_hub_llm_base_url();
+        let hub_channel_base_url = hub_channel_base_url(&hub_llm_base_url);
         let model = yaml_string(&self.config.default_model)?;
         let image_gen_section = if self.config.image_model_enabled {
             let image_model = yaml_string(&self.config.image_model)?;
@@ -1152,8 +1206,8 @@ impl DockerProvisioner {
         } else {
             String::new()
         };
-        let base_url = yaml_string(&self.config.hub_llm_base_url)?;
-        let channel_base_url = yaml_string(&hub_channel_base_url(&self.config.hub_llm_base_url))?;
+        let base_url = yaml_string(&hub_llm_base_url)?;
+        let channel_base_url = yaml_string(&hub_channel_base_url)?;
         let api_key = yaml_string(instance.llm_api_key.as_deref().unwrap_or(""))?;
         let api_mode = yaml_string(normalize_hermes_api_mode(&self.config.api_mode))?;
         let instance_id = yaml_string(&instance.id)?;
@@ -1238,6 +1292,60 @@ impl DockerProvisioner {
             temperature = self.config.temperature,
             parallel_tool_calls = self.config.supports_parallel_tools,
         ))
+    }
+
+    /// 托管容器里访问 Hub 的地址与 backend 进程自己使用的地址不总是相同。
+    /// `cargo run` 本地开发时，backend 在宿主机，managed Hermes 在 Docker bridge 网络中，
+    /// 此时 compose 内网别名 `hermes-hub` 并不存在，需要改写成宿主机可达地址。
+    /// 已经显式配置了宿主机地址时保持原值，避免覆盖管理员的部署意图。
+    fn effective_hub_llm_base_url(&self) -> String {
+        if self.backend_running_inside_container() {
+            return self.config.hub_llm_base_url.clone();
+        }
+
+        rewrite_compose_internal_hub_url_for_host_runtime(
+            &self.config.hub_llm_base_url,
+            self.docker_network_gateway(&self.config.network).as_deref(),
+        )
+    }
+
+    fn docker_network_gateway(&self, network: &str) -> Option<String> {
+        if let Some(gateway) = self.config.network_gateway_hint.as_deref() {
+            let gateway = gateway.trim();
+            if gateway.eq_ignore_ascii_case("disabled") {
+                return None;
+            }
+            if !gateway.is_empty() {
+                return Some(gateway.to_string());
+            }
+        }
+        let output = std::process::Command::new(&self.config.docker_binary)
+            .args([
+                "network",
+                "inspect",
+                network,
+                "--format",
+                "{{range .IPAM.Config}}{{.Gateway}}{{end}}",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let gateway = String::from_utf8(output.stdout).ok()?.trim().to_string();
+        if gateway.is_empty() {
+            None
+        } else {
+            Some(gateway)
+        }
+    }
+
+    fn backend_running_inside_container(&self) -> bool {
+        match self.config.backend_runtime_hint {
+            DockerBackendRuntimeHint::Auto => detect_container_runtime(),
+            DockerBackendRuntimeHint::Host => false,
+            DockerBackendRuntimeHint::Container => true,
+        }
     }
 }
 
@@ -1652,6 +1760,60 @@ fn hub_channel_base_url(hub_llm_base_url: &str) -> String {
     }
 
     trimmed.to_string()
+}
+
+fn rewrite_compose_internal_hub_url_for_host_runtime(
+    hub_llm_base_url: &str,
+    network_gateway: Option<&str>,
+) -> String {
+    let Ok(mut url) = reqwest::Url::parse(hub_llm_base_url) else {
+        return hub_llm_base_url.to_string();
+    };
+    let Some(host) = url.host_str() else {
+        return hub_llm_base_url.to_string();
+    };
+    if host != "hermes-hub" {
+        return hub_llm_base_url.to_string();
+    }
+
+    if let Some(gateway) = network_gateway {
+        if url.set_host(Some(&gateway)).is_ok() {
+            return url.to_string();
+        }
+    }
+
+    if url.set_host(Some("host.docker.internal")).is_ok() {
+        return url.to_string();
+    }
+
+    hub_llm_base_url.to_string()
+}
+
+fn detect_container_runtime() -> bool {
+    if Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists() {
+        return true;
+    }
+
+    std::fs::read_to_string("/proc/1/cgroup")
+        .map(|content| {
+            content.contains("/docker/")
+                || content.contains("/kubepods/")
+                || content.contains("/containerd/")
+                || content.contains("/libpod-")
+                || content.contains("/podman-")
+        })
+        .unwrap_or(false)
+}
+
+fn extra_hosts_for_hub_base_url(hub_llm_base_url: &str) -> Vec<String> {
+    let Ok(url) = reqwest::Url::parse(hub_llm_base_url) else {
+        return Vec::new();
+    };
+    if url.host_str() == Some("host.docker.internal") {
+        vec!["host.docker.internal:host-gateway".to_string()]
+    } else {
+        Vec::new()
+    }
 }
 
 fn write_file_if_changed(path: &Path, content: &str) -> Result<bool, ProvisionerError> {

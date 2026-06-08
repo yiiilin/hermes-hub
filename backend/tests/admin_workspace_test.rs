@@ -27,7 +27,25 @@ use std::{
 use tower::ServiceExt;
 
 fn test_app() -> Router {
-    hermes_hub_backend::build_router(AppConfig::for_tests())
+    let config = AppConfig::for_tests();
+    let object_storage = InMemoryObjectStorage::new(config.object_storage.bucket.clone()).shared();
+    let docker_provisioner = hermes_hub_backend::hermes::docker_provisioner::DockerProvisioner::new_with_runtime_and_object_storage(
+        docker_config_from_app(&config, &config.initial_model_config),
+        Arc::new(hermes_hub_backend::hermes::docker_provisioner::NoopDockerRuntime),
+        object_storage.clone(),
+    );
+    let state = AppState {
+        object_storage,
+        config,
+        store: SessionStore::in_memory_for_tests(),
+        channel_store: ChannelStore::in_memory_for_tests(),
+        model_registry: ModelRegistry::default_for_tests(),
+        llm_provider: InMemoryLlmProviderClient::default().shared(),
+        ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
+        docker_provisioner,
+        session_events: hermes_hub_backend::channel::events::SessionEventHub::default(),
+    };
+    build_router_with_state(state)
 }
 
 #[derive(Clone, Default)]
@@ -117,7 +135,8 @@ async fn app_state_with_recording_docker_runtime() -> (AppState, RecordingDocker
     let mut config = AppConfig::for_tests();
     config.skills_fs.mount_enabled = true;
     config.managed_profile.enabled = true;
-    let model_registry = ModelRegistry::new(ready_model_config(LLM_MODEL_CONFIG_KIND));
+    let model_registry =
+        ModelRegistry::in_memory_for_tests(ready_model_config(LLM_MODEL_CONFIG_KIND));
     model_registry
         .replace(ready_model_config(TITLE_MODEL_CONFIG_KIND))
         .await
@@ -132,8 +151,8 @@ async fn app_state_with_recording_docker_runtime() -> (AppState, RecordingDocker
     let state = AppState {
         object_storage,
         config,
-        store: SessionStore::default(),
-        channel_store: ChannelStore::default(),
+        store: SessionStore::in_memory_for_tests(),
+        channel_store: ChannelStore::in_memory_for_tests(),
         model_registry,
         llm_provider: InMemoryLlmProviderClient::default().shared(),
         ldap_authenticator: DefaultLdapAuthenticator::default().shared(),

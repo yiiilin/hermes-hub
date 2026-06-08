@@ -1,12 +1,14 @@
 use hermes_hub_backend::hermes::{
     docker_provisioner::{
-        ContainerMount, DockerProvisioner, DockerProvisionerConfig, DockerRuntime,
-        DockerRuntimeOutput, ManagedProfileConfig, ManagedSkillsMountConfig, RuntimeModelSettings,
+        ContainerMount, DockerBackendRuntimeHint, DockerProvisioner, DockerProvisionerConfig,
+        DockerRuntime, DockerRuntimeOutput, ManagedProfileConfig, ManagedSkillsMountConfig,
+        RuntimeModelSettings,
     },
     instance::{HermesInstanceKind, HermesInstanceStatus},
     provisioner::HermesProvisioner,
 };
 use hermes_hub_backend::storage::{HubObjectStorage, InMemoryObjectStorage};
+use sha2::{Digest, Sha256};
 use std::{
     os::unix::fs::{symlink, PermissionsExt},
     path::{Path, PathBuf},
@@ -26,6 +28,7 @@ struct FakeDockerRuntime {
     spec_version: Arc<Mutex<Option<String>>>,
     image: Arc<Mutex<Option<String>>>,
     fail_start: Arc<Mutex<bool>>,
+    network_gateway: Arc<Mutex<Option<String>>>,
 }
 
 fn filesystem_mode(path: &Path) -> u32 {
@@ -102,6 +105,34 @@ fn assert_hub_toolsets_hide_official_messaging(toolsets: &[String]) {
     }
 }
 
+fn expected_current_managed_spec_version() -> String {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("backend crate lives under repo root")
+        .to_path_buf();
+    let assets = [
+        repo_root.join("docker/hermes/Dockerfile"),
+        repo_root.join("docker/hermes/plugins/platforms/hermes_hub/plugin.yaml"),
+        repo_root.join("docker/hermes/plugins/platforms/hermes_hub/adapter.py"),
+        repo_root.join("docker/hermes/plugins/hermes_hub_send/plugin.yaml"),
+        repo_root.join("docker/hermes/plugins/hermes_hub_send/__init__.py"),
+    ];
+    let mut hasher = Sha256::new();
+    for asset in assets {
+        // 规格版本需要显式跟随 bundled Hermes 运行时内容变化，避免 latest tag 下继续复用旧容器。
+        let content = std::fs::read(asset).expect("bundled Hermes asset is readable");
+        hasher.update(content);
+        hasher.update([0]);
+    }
+    let digest = hasher.finalize();
+    let short_hash = digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("2026-06-08-business-tool-request-v1-{short_hash}")
+}
+
 #[async_trait::async_trait]
 impl DockerRuntime for FakeDockerRuntime {
     async fn run(
@@ -142,6 +173,25 @@ impl DockerRuntime for FakeDockerRuntime {
         if args.get(0).map(String::as_str) == Some("network")
             && args.get(1).map(String::as_str) == Some("inspect")
         {
+            let network_gateway = self
+                .network_gateway
+                .lock()
+                .expect("network gateway lock")
+                .clone();
+            if let Some(gateway) = network_gateway {
+                let formatted = if args.get(3).map(String::as_str)
+                    == Some("{{range .IPAM.Config}}{{.Gateway}}{{end}}")
+                {
+                    gateway
+                } else {
+                    String::new()
+                };
+                return Ok(DockerRuntimeOutput {
+                    success: true,
+                    stdout: formatted,
+                    stderr: String::new(),
+                });
+            }
             return Ok(DockerRuntimeOutput {
                 success: false,
                 stdout: String::new(),
@@ -262,9 +312,18 @@ fn test_config() -> DockerProvisionerConfig {
         memory_limit: Some("1g".to_string()),
         cpu_limit: Some("1.0".to_string()),
         docker_binary: "docker".to_string(),
+        backend_runtime_hint: DockerBackendRuntimeHint::Container,
+        network_gateway_hint: None,
         managed_skills: None,
         managed_profile: None,
     }
+}
+
+fn host_runtime_test_config() -> DockerProvisionerConfig {
+    let mut config = test_config();
+    config.hub_llm_base_url = "http://hermes-hub:8080/internal/llm/v1".to_string();
+    config.backend_runtime_hint = DockerBackendRuntimeHint::Host;
+    config
 }
 
 fn test_config_with_managed_skills() -> DockerProvisionerConfig {
@@ -1280,7 +1339,7 @@ async fn docker_provisioner_repairs_pairing_state_even_when_config_is_unchanged(
     *runtime.container_running.lock().expect("running lock") = true;
     *runtime.health_status.lock().expect("health lock") = Some("healthy".to_string());
     *runtime.spec_version.lock().expect("spec lock") =
-        Some("2026-06-04-nfs-nosharecache".to_string());
+        Some(expected_current_managed_spec_version());
     runtime.calls.lock().expect("calls lock").clear();
 
     provisioner
@@ -1310,6 +1369,108 @@ async fn docker_provisioner_repairs_pairing_state_even_when_config_is_unchanged(
             .iter()
             .any(|args| args.get(0).map(String::as_str) == Some("rm")),
         "runtime-only pairing repair should not recreate an otherwise healthy current container"
+    );
+}
+
+#[tokio::test]
+async fn docker_provisioner_rewrites_compose_hub_url_to_bridge_gateway_for_host_runtime() {
+    let runtime = FakeDockerRuntime::default();
+    let mut config = host_runtime_test_config();
+    config.network_gateway_hint = Some("172.21.0.1".to_string());
+    let provisioner = DockerProvisioner::new_with_runtime(config, Arc::new(runtime));
+    let instance = provisioner.prepare_instance("user-host-runtime");
+
+    let spec = provisioner
+        .container_spec_for(&instance)
+        .expect("container spec can be rendered");
+
+    assert!(spec
+        .env
+        .iter()
+        .any(|entry| entry == "CUSTOM_BASE_URL=http://172.21.0.1:8080/internal/llm/v1"));
+    assert!(spec
+        .env
+        .iter()
+        .any(|entry| entry == "OPENAI_BASE_URL=http://172.21.0.1:8080/internal/llm/v1"));
+    assert!(spec.env.iter().any(|entry| {
+        entry == "HERMES_HUB_CHANNEL_BASE_URL=http://172.21.0.1:8080/internal/channel/v1"
+    }));
+    assert!(
+        spec.extra_hosts.is_empty(),
+        "bridge gateway 可用时不需要 host.docker.internal fallback"
+    );
+}
+
+#[tokio::test]
+async fn docker_provisioner_falls_back_to_host_docker_internal_when_gateway_is_unknown() {
+    let runtime = FakeDockerRuntime::default();
+    let mut config = host_runtime_test_config();
+    // 显式关闭网关探测，稳定进入 host.docker.internal fallback 分支。
+    config.network_gateway_hint = Some("disabled".to_string());
+    let provisioner = DockerProvisioner::new_with_runtime(config, Arc::new(runtime));
+    let instance = provisioner.prepare_instance("user-host-runtime-fallback");
+
+    let spec = provisioner
+        .container_spec_for(&instance)
+        .expect("container spec can be rendered");
+
+    assert!(spec
+        .env
+        .iter()
+        .any(|entry| entry == "CUSTOM_BASE_URL=http://host.docker.internal:8080/internal/llm/v1"));
+    assert!(spec.env.iter().any(|entry| {
+        entry == "HERMES_HUB_CHANNEL_BASE_URL=http://host.docker.internal:8080/internal/channel/v1"
+    }));
+    assert_eq!(
+        spec.extra_hosts,
+        vec!["host.docker.internal:host-gateway".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn docker_provisioner_recreates_running_container_when_spec_version_is_stale() {
+    let runtime = FakeDockerRuntime::default();
+    let provisioner = DockerProvisioner::new_with_runtime(test_config(), Arc::new(runtime.clone()));
+    let instance = provisioner
+        .ensure_instance("user-stale-spec-version", "instance-token")
+        .await
+        .expect("initial instance can be created");
+    *runtime.container_exists.lock().expect("exists lock") = true;
+    *runtime.container_running.lock().expect("running lock") = true;
+    *runtime.health_status.lock().expect("health lock") = Some("healthy".to_string());
+    *runtime.spec_version.lock().expect("spec lock") =
+        Some("2026-06-04-nfs-nosharecache".to_string());
+    runtime.calls.lock().expect("calls lock").clear();
+
+    provisioner
+        .ensure_container(&instance, "instance-token")
+        .await
+        .expect("stale spec should trigger container recreation");
+
+    let calls = runtime.calls.lock().expect("calls lock");
+    assert!(
+        calls
+            .iter()
+            .any(|args| args.get(0).map(String::as_str) == Some("stop")),
+        "stale current container should be stopped before recreation"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|args| args.get(0).map(String::as_str) == Some("rm")),
+        "stale current container should be removed before recreation"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|args| args.get(0).map(String::as_str) == Some("create")),
+        "stale current container should be recreated with the new spec"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|args| args.get(0).map(String::as_str) == Some("start")),
+        "recreated container should be started again"
     );
 }
 
@@ -1350,7 +1511,7 @@ async fn docker_provisioner_accepts_hermes_owned_private_pairing_directory_witho
     *runtime.container_running.lock().expect("running lock") = true;
     *runtime.health_status.lock().expect("health lock") = Some("healthy".to_string());
     *runtime.spec_version.lock().expect("spec lock") =
-        Some("2026-06-04-nfs-nosharecache".to_string());
+        Some(expected_current_managed_spec_version());
     runtime.calls.lock().expect("calls lock").clear();
 
     provisioner
@@ -1615,6 +1776,10 @@ async fn docker_provisioner_test() {
         .iter()
         .any(|entry| entry == "HERMES_TOOL_PROGRESS_MODE=verbose"));
     assert!(spec.env.iter().any(|entry| entry == "HERMES_YOLO_MODE=1"));
+    assert!(
+        spec.extra_hosts.is_empty(),
+        "compose/容器内网场景不应无条件注入 host.docker.internal"
+    );
     assert!(spec
         .env
         .iter()
@@ -1628,7 +1793,7 @@ async fn docker_provisioner_test() {
         .iter()
         .all(|entry| entry != "HERMES_HUB_DISABLE_CRON=1"));
     assert!(spec.labels.iter().any(|(key, value)| {
-        key == "hermes_hub_spec_version" && value == "2026-06-04-nfs-nosharecache"
+        key == "hermes_hub_spec_version" && value == &expected_current_managed_spec_version()
     }));
     assert!(spec
         .mounts
@@ -1883,7 +2048,12 @@ async fn docker_provisioner_test() {
     );
     assert!(
         create_call.windows(2).any(|args| {
-            args[0] == "--label" && args[1] == "hermes_hub_spec_version=2026-06-04-nfs-nosharecache"
+            args[0] == "--label"
+                && args[1]
+                    == format!(
+                        "hermes_hub_spec_version={}",
+                        expected_current_managed_spec_version()
+                    )
         }),
         "managed Hermes containers must carry the current spec label"
     );

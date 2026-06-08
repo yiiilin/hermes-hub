@@ -30,16 +30,17 @@ use axum::{
 };
 use channel::service::ChannelStore;
 use hermes::docker_provisioner::{
-    DockerProvisioner, DockerProvisionerConfig, ManagedProfileConfig, ManagedSkillsMountConfig,
-    NoopDockerRuntime,
+    DockerBackendRuntimeHint, DockerProvisioner, DockerProvisionerConfig, ManagedProfileConfig,
+    ManagedSkillsMountConfig,
 };
 use ldap::{DefaultLdapAuthenticator, DynLdapAuthenticator};
-use llm_proxy::{DynLlmProviderClient, InMemoryLlmProviderClient, ReqwestLlmProviderClient};
+use llm_proxy::{DynLlmProviderClient, ReqwestLlmProviderClient};
 use model_config::{ModelConfig, ModelRegistry};
 use serde::Serialize;
 use session::store::SessionStore;
+use std::path::Path;
 use std::sync::Arc;
-use storage::{object_storage_from_config, DynObjectStorage};
+use storage::{object_storage_from_config, DynObjectStorage, ObjectStorageError};
 use thiserror::Error;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -66,14 +67,20 @@ pub struct AppState {
 
 #[derive(Debug, Error)]
 pub enum AppInitError {
+    #[error("database url is required for runtime startup")]
+    MissingDatabaseUrl,
+    #[error("HERMES_DATA_ROOT must be an absolute host path")]
+    InvalidHermesDataRoot,
     #[error("database connection failed")]
     Database(#[from] sqlx::Error),
-    #[error("secret master key is required when DATABASE_URL is set")]
+    #[error("secret master key is required for runtime startup")]
     MissingSecretMasterKey,
     #[error("secret master key is invalid")]
     InvalidSecretMasterKey(#[from] security::crypto::SecretCipherError),
     #[error("model registry initialization failed")]
     ModelRegistry(#[from] model_config::ModelRegistryError),
+    #[error("object storage initialization failed")]
+    ObjectStorage(#[from] ObjectStorageError),
 }
 
 #[derive(Serialize)]
@@ -81,32 +88,22 @@ struct HealthResponse {
     status: &'static str,
 }
 
-/// Build the backend HTTP router.
-pub fn build_router(config: AppConfig) -> Router {
-    let object_storage = object_storage_from_config(&config.object_storage);
-    let docker_provisioner = DockerProvisioner::new_with_runtime_and_object_storage(
-        docker_config_from_app(&config, &config.initial_model_config),
-        Arc::new(NoopDockerRuntime),
-        object_storage.clone(),
-    );
-    let state = AppState {
-        model_registry: ModelRegistry::new(config.initial_model_config.clone()),
-        config,
-        store: SessionStore::default(),
-        channel_store: ChannelStore::default(),
-        llm_provider: InMemoryLlmProviderClient::default().shared(),
-        ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
-        docker_provisioner,
-        object_storage,
-        session_events: channel::events::SessionEventHub::default(),
-    };
-
-    build_router_with_state(state)
-}
-
-/// 根据运行时配置构建 Router；存在 DATABASE_URL 时启用 PostgreSQL 后端。
+/// 根据运行时配置构建 Router。
+///
+/// 真实运行时强制要求 PostgreSQL 持久化；未配置数据库时直接启动失败，
+/// 避免默默退回 memory store，导致线上与持久化模式语义不一致。
 pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppInitError> {
-    let object_storage = object_storage_from_config(&config.object_storage);
+    let mut config = config;
+    normalize_runtime_paths(&mut config)?;
+    let database_url = config
+        .database_url
+        .clone()
+        .ok_or(AppInitError::MissingDatabaseUrl)?;
+    let secret_master_key = config
+        .secret_master_key
+        .clone()
+        .ok_or(AppInitError::MissingSecretMasterKey)?;
+    let object_storage = object_storage_from_config(&config.object_storage)?;
     let docker_provisioner = DockerProvisioner::new_with_runtime_and_object_storage(
         docker_config_from_app(&config, &config.initial_model_config),
         Arc::new(hermes::docker_provisioner::CommandDockerRuntime::new(
@@ -114,28 +111,6 @@ pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppIn
         )),
         object_storage.clone(),
     );
-
-    let Some(database_url) = config.database_url.clone() else {
-        let state = AppState {
-            model_registry: ModelRegistry::new(config.initial_model_config.clone()),
-            config,
-            store: SessionStore::default(),
-            channel_store: ChannelStore::default(),
-            llm_provider: ReqwestLlmProviderClient::default().shared(),
-            ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
-            docker_provisioner,
-            object_storage,
-            session_events: channel::events::SessionEventHub::default(),
-        };
-        tokio::spawn(hermes::lifecycle::start_hermes_lifecycle_sweeper(
-            state.clone(),
-        ));
-        return Ok(build_router_with_state(state));
-    };
-    let secret_master_key = config
-        .secret_master_key
-        .clone()
-        .ok_or(AppInitError::MissingSecretMasterKey)?;
     let cipher = security::crypto::SecretCipher::from_master_key(&secret_master_key)?;
     let pool = db::connect(&database_url).await?;
     db::migrations::run_migrations(&pool).await?;
@@ -163,17 +138,33 @@ pub async fn build_router_from_config(config: AppConfig) -> Result<Router, AppIn
     Ok(build_router_with_state(state))
 }
 
+fn normalize_runtime_paths(config: &mut AppConfig) -> Result<(), AppInitError> {
+    ensure_absolute_path(&config.hermes_docker.data_root)?;
+    Ok(())
+}
+
+fn ensure_absolute_path(path: &Path) -> Result<(), AppInitError> {
+    if !path.is_absolute() {
+        return Err(AppInitError::InvalidHermesDataRoot);
+    }
+    Ok(())
+}
+
 pub fn build_router_with_state(state: AppState) -> Router {
     let static_dir = state.config.static_dir.clone();
     let index_file = static_dir.join("index.html");
+    let examples_dir = static_dir.join("examples");
     // 后端作为 Web 服务器托管前端构建产物；SPA 深链统一回落到 index.html。
     let static_assets = ServeDir::new(static_dir).fallback(ServeFile::new(index_file));
+    // /examples 只按真实静态文件提供；正式包没打进来时必须明确 404，不能误落到主应用 SPA。
+    let example_assets = ServeDir::new(examples_dir);
 
     Router::new()
         .route("/health", get(health))
         .merge(http::router())
         .route("/api", any(api_not_found))
         .route("/api/{*path}", any(api_not_found))
+        .nest_service("/examples", example_assets)
         .fallback_service(static_assets)
         // 普通 JSON/API 请求保持小 body limit；大附件上传路由单独禁用框架限制并流式校验。
         .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
@@ -212,6 +203,8 @@ pub fn docker_config_from_app(
         memory_limit: config.hermes_docker.memory_limit.clone(),
         cpu_limit: config.hermes_docker.cpu_limit.clone(),
         docker_binary: config.hermes_docker.docker_binary.clone(),
+        backend_runtime_hint: DockerBackendRuntimeHint::Auto,
+        network_gateway_hint: None,
         managed_skills: config
             .skills_fs
             .mount_enabled

@@ -143,7 +143,8 @@ pub enum ModelRegistryError {
 }
 
 impl ModelRegistry {
-    pub fn new(config: ModelConfig) -> Self {
+    /// 仅供测试使用的内存版 model registry。
+    pub fn in_memory_for_tests(config: ModelConfig) -> Self {
         let configs_by_kind = default_config_set(config);
         Self {
             backend: ModelRegistryBackend::Memory(Arc::new(Mutex::new(ModelRegistryInner {
@@ -166,7 +167,7 @@ impl ModelRegistry {
     }
 
     pub fn default_for_tests() -> Self {
-        Self::new(ModelConfig {
+        Self::in_memory_for_tests(ModelConfig {
             config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
             provider_name: "openai-compatible".to_string(),
             provider_base_url: "https://provider.example/v1".to_string(),

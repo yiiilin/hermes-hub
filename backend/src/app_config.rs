@@ -261,7 +261,7 @@ fn hermes_docker_config_from_env() -> HermesDockerConfig {
             .unwrap_or_else(|_| "hermes-hub-net".to_string()),
         internal_port: env_u16("HERMES_CONTAINER_INTERNAL_PORT", 8000),
         hub_llm_base_url: std::env::var("HERMES_HUB_LLM_BASE_URL")
-            .unwrap_or_else(|_| "http://hermes-hub:8080/internal/llm/v1".to_string()),
+            .unwrap_or_else(|_| default_hub_llm_base_url()),
         memory_limit: optional_env("HERMES_CONTAINER_MEMORY_LIMIT").or(Some("1g".to_string())),
         cpu_limit: optional_env("HERMES_CONTAINER_CPU_LIMIT").or(Some("1.0".to_string())),
         docker_binary: std::env::var("HERMES_DOCKER_BINARY")
@@ -364,11 +364,15 @@ fn default_hermes_docker_config() -> HermesDockerConfig {
         data_root: PathBuf::from("/tmp/hermes-hub/users"),
         network: "hermes-hub-net".to_string(),
         internal_port: 8000,
-        hub_llm_base_url: "http://hermes-hub:8080/internal/llm/v1".to_string(),
+        hub_llm_base_url: default_hub_llm_base_url(),
         memory_limit: Some("1g".to_string()),
         cpu_limit: Some("1.0".to_string()),
         docker_binary: "docker".to_string(),
     }
+}
+
+fn default_hub_llm_base_url() -> String {
+    "http://hermes-hub:8080/internal/llm/v1".to_string()
 }
 
 fn default_object_storage_config() -> ObjectStorageConfig {
@@ -475,9 +479,19 @@ mod tests {
         hermes_docker_config_from_env, managed_profile_config_from_env, model_config_from_env,
         object_storage_config_from_env, skills_fs_config_from_env, speech_input_config_from_env,
     };
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env test lock can be acquired")
+    }
 
     #[test]
     fn object_storage_accepts_hub_prefixed_env_aliases() {
+        let _guard = env_lock();
         const NAMES: &[&str] = &[
             "HERMES_OBJECT_STORAGE_ENDPOINT",
             "HERMES_OBJECT_STORAGE_BUCKET",
@@ -536,6 +550,7 @@ mod tests {
 
     #[test]
     fn llm_model_config_uses_long_default_request_timeout() {
+        let _guard = env_lock();
         let saved = std::env::var("HERMES_HUB_MODEL_REQUEST_TIMEOUT_SECONDS").ok();
         std::env::remove_var("HERMES_HUB_MODEL_REQUEST_TIMEOUT_SECONDS");
 
@@ -550,21 +565,32 @@ mod tests {
 
     #[test]
     fn hermes_docker_config_defaults_to_ghcr_wrapper_image() {
-        let saved = std::env::var("HERMES_DOCKER_IMAGE").ok();
+        let _guard = env_lock();
+        let saved_image = std::env::var("HERMES_DOCKER_IMAGE").ok();
+        let saved_hub_url = std::env::var("HERMES_HUB_LLM_BASE_URL").ok();
         std::env::remove_var("HERMES_DOCKER_IMAGE");
+        std::env::remove_var("HERMES_HUB_LLM_BASE_URL");
 
         // Hub 托管的 Hermes 运行时默认使用 GHCR 上的薄包装镜像；
-        // 具体官方 Hermes 版本由镜像 tag 跟随。
+        // 应用级默认值仍保持 compose 内网主机名，是否改写到宿主机地址由 provisioner 按运行环境决定。
         let config = hermes_docker_config_from_env();
         assert_eq!(config.image, "ghcr.io/yiiilin/hermes-hub-hermes:latest");
+        assert_eq!(
+            config.hub_llm_base_url,
+            "http://hermes-hub:8080/internal/llm/v1"
+        );
 
-        if let Some(value) = saved {
+        if let Some(value) = saved_image {
             std::env::set_var("HERMES_DOCKER_IMAGE", value);
+        }
+        if let Some(value) = saved_hub_url {
+            std::env::set_var("HERMES_HUB_LLM_BASE_URL", value);
         }
     }
 
     #[test]
     fn skills_fs_config_reads_nfs_env_and_pins_container_mount_path() {
+        let _guard = env_lock();
         const NAMES: &[&str] = &[
             "HERMES_HUB_SKILLS_FS_BIND_ADDR",
             "HERMES_HUB_SKILLS_FS_PREFIX",
@@ -616,6 +642,7 @@ mod tests {
 
     #[test]
     fn managed_profile_config_reads_env() {
+        let _guard = env_lock();
         const NAMES: &[&str] = &[
             "HERMES_HUB_MANAGED_PROFILE_ENABLED",
             "HERMES_HUB_MANAGED_PROFILE_PREFIX",
@@ -658,6 +685,7 @@ mod tests {
 
     #[test]
     fn speech_input_config_is_disabled_until_env_enables_asr() {
+        let _guard = env_lock();
         const NAMES: &[&str] = &[
             "HERMES_SPEECH_INPUT_ENABLED",
             "HERMES_HUB_SPEECH_INPUT_ENABLED",

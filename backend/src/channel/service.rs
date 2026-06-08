@@ -174,6 +174,9 @@ impl ChannelAttachmentKind {
 pub struct Channel {
     pub id: String,
     pub user_id: String,
+    /// 绑定到负责消费该 channel run 的 Hermes 实例；为空表示 channel 尚未完成归属，
+    /// 此时内部实例访问和 run 派发都会拒绝放行，避免错误路由。
+    pub hermes_instance_id: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub created_at: u64,
@@ -346,6 +349,7 @@ pub struct ChannelSessionContext {
     pub user_id: String,
     pub channel_id: String,
     pub hermes_instance_id: Option<String>,
+    pub channel_name: String,
 }
 
 #[derive(Debug, Error)]
@@ -393,26 +397,15 @@ enum ChannelStoreBackend {
     Postgres(PgPool),
 }
 
-impl Default for ChannelStore {
-    fn default() -> Self {
+impl ChannelStore {
+    /// 仅供测试使用的内存版 channel store。
+    pub fn in_memory_for_tests() -> Self {
         Self {
             backend: ChannelStoreBackend::Memory(Arc::new(
                 Mutex::new(ChannelStoreInner::default()),
             )),
         }
     }
-}
-
-#[derive(Default)]
-struct ChannelStoreInner {
-    channels_by_id: HashMap<String, Channel>,
-    sessions_by_id: HashMap<String, ChannelSession>,
-    messages_by_session_id: HashMap<String, Vec<ChannelMessage>>,
-    attachments_by_id: HashMap<String, ChannelAttachment>,
-    runs_by_id: HashMap<String, ChannelRun>,
-}
-
-impl ChannelStore {
     pub fn postgres(pool: PgPool) -> Self {
         Self {
             backend: ChannelStoreBackend::Postgres(pool),
@@ -436,6 +429,9 @@ impl ChannelStore {
                 let channel = Channel {
                     id: Uuid::new_v4().to_string(),
                     user_id: user_id.to_string(),
+                    // 内存后端没有 SessionStore 可联查实例；这里尽量继承该用户已绑定
+                    // channel 的实例归属，避免后续 run 留在“未绑定即可消费”的灰色状态。
+                    hermes_instance_id: memory_latest_instance_id_for_user(&inner, user_id),
                     name,
                     description,
                     created_at: now,
@@ -449,7 +445,13 @@ impl ChannelStore {
             }
             ChannelStoreBackend::Postgres(pool) => block_on_db(async {
                 let instance = sqlx::query(
-                    "select id::text as id from hermes_instances where user_id = $1::uuid limit 1",
+                    r#"
+                    select id::text as id
+                    from hermes_instances
+                    where user_id = $1::uuid
+                    order by created_at desc, id desc
+                    limit 1
+                    "#,
                 )
                 .bind(user_id)
                 .fetch_optional(pool)
@@ -463,6 +465,7 @@ impl ChannelStore {
                     values ($1::uuid, $2::uuid, $3::uuid, $4, $5)
                     returning id::text as id,
                               user_id::text as user_id,
+                              hermes_instance_id::text as hermes_instance_id,
                               name,
                               description,
                               extract(epoch from created_at)::bigint as created_at,
@@ -495,17 +498,18 @@ impl ChannelStore {
         match &self.backend {
             ChannelStoreBackend::Memory(inner) => {
                 let inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
-                Ok(inner
-                    .channels_by_id
-                    .values()
-                    .find(|channel| channel.user_id == user_id && channel.name == HUB_CHANNEL_NAME)
-                    .cloned())
+                Ok(memory_channel_by_user_name(
+                    &inner,
+                    user_id,
+                    HUB_CHANNEL_NAME,
+                ))
             }
             ChannelStoreBackend::Postgres(pool) => block_on_db(async {
                 let row = sqlx::query(
                     r#"
                     select id::text as id,
                            user_id::text as user_id,
+                           hermes_instance_id::text as hermes_instance_id,
                            name,
                            description,
                            extract(epoch from created_at)::bigint as created_at,
@@ -545,6 +549,9 @@ impl ChannelStore {
                 let channel = Channel {
                     id: Uuid::new_v4().to_string(),
                     user_id: user_id.to_string(),
+                    // Hub 标准 channel 在内存态也继承当前用户已知实例，和 Postgres
+                    // 分支保持一致，避免 run 创建后再补绑之前出现误派发窗口。
+                    hermes_instance_id: memory_latest_instance_id_for_user(&inner, user_id),
                     name: HUB_CHANNEL_NAME.to_string(),
                     description: Some("Hermes Hub default channel".to_string()),
                     created_at: now,
@@ -557,7 +564,13 @@ impl ChannelStore {
             }
             ChannelStoreBackend::Postgres(pool) => block_on_db(async {
                 let instance = sqlx::query(
-                    "select id::text as id from hermes_instances where user_id = $1::uuid limit 1",
+                    r#"
+                    select id::text as id
+                    from hermes_instances
+                    where user_id = $1::uuid
+                    order by created_at desc, id desc
+                    limit 1
+                    "#,
                 )
                 .bind(user_id)
                 .fetch_optional(pool)
@@ -574,6 +587,7 @@ impl ChannelStore {
                         updated_at = now()
                     returning id::text as id,
                               user_id::text as user_id,
+                              hermes_instance_id::text as hermes_instance_id,
                               name,
                               description,
                               extract(epoch from created_at)::bigint as created_at,
@@ -621,6 +635,9 @@ impl ChannelStore {
                 let channel = Channel {
                     id: Uuid::new_v4().to_string(),
                     user_id: user_id.to_string(),
+                    // integration channel 可能先于 adapter poll 被创建；这里先继承该用户
+                    // 现有实例归属，减少未绑定 channel 的驻留时间。
+                    hermes_instance_id: memory_latest_instance_id_for_user(&inner, user_id),
                     name,
                     description,
                     created_at: now,
@@ -653,6 +670,7 @@ impl ChannelStore {
                         updated_at = now()
                     returning id::text as id,
                               user_id::text as user_id,
+                              hermes_instance_id::text as hermes_instance_id,
                               name,
                               description,
                               extract(epoch from created_at)::bigint as created_at,
@@ -682,7 +700,35 @@ impl ChannelStore {
         instance_id: &str,
     ) -> Result<Channel, ChannelStoreError> {
         match &self.backend {
-            ChannelStoreBackend::Memory(_) => self.ensure_hub_channel(user_id).await,
+            ChannelStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
+                let Some(channel_id) =
+                    memory_channel_by_user_name(&inner, user_id, HUB_CHANNEL_NAME)
+                        .map(|channel| channel.id)
+                else {
+                    let now = unix_now();
+                    let channel = Channel {
+                        id: Uuid::new_v4().to_string(),
+                        user_id: user_id.to_string(),
+                        hermes_instance_id: Some(instance_id.to_string()),
+                        name: HUB_CHANNEL_NAME.to_string(),
+                        description: Some("Hermes Hub default channel".to_string()),
+                        created_at: now,
+                        updated_at: now,
+                    };
+                    inner
+                        .channels_by_id
+                        .insert(channel.id.clone(), channel.clone());
+                    return Ok(channel);
+                };
+                let channel = inner
+                    .channels_by_id
+                    .get_mut(&channel_id)
+                    .ok_or(ChannelStoreError::ChannelNotFound)?;
+                channel.hermes_instance_id = Some(instance_id.to_string());
+                channel.updated_at = unix_now();
+                Ok(channel.clone())
+            }
             ChannelStoreBackend::Postgres(pool) => block_on_db(async {
                 let row = sqlx::query(
                     r#"
@@ -693,6 +739,7 @@ impl ChannelStore {
                         updated_at = now()
                     returning id::text as id,
                               user_id::text as user_id,
+                              hermes_instance_id::text as hermes_instance_id,
                               name,
                               description,
                               extract(epoch from created_at)::bigint as created_at,
@@ -731,9 +778,33 @@ impl ChannelStore {
         ));
 
         match &self.backend {
-            ChannelStoreBackend::Memory(_) => {
-                self.ensure_integration_channel(user_id, integration_id)
-                    .await
+            ChannelStoreBackend::Memory(inner) => {
+                let mut inner = inner.lock().map_err(|_| ChannelStoreError::LockFailed)?;
+                let Some(channel_id) =
+                    memory_channel_by_user_name(&inner, user_id, &name).map(|channel| channel.id)
+                else {
+                    let now = unix_now();
+                    let channel = Channel {
+                        id: Uuid::new_v4().to_string(),
+                        user_id: user_id.to_string(),
+                        hermes_instance_id: Some(instance_id.to_string()),
+                        name,
+                        description,
+                        created_at: now,
+                        updated_at: now,
+                    };
+                    inner
+                        .channels_by_id
+                        .insert(channel.id.clone(), channel.clone());
+                    return Ok(channel);
+                };
+                let channel = inner
+                    .channels_by_id
+                    .get_mut(&channel_id)
+                    .ok_or(ChannelStoreError::ChannelNotFound)?;
+                channel.hermes_instance_id = Some(instance_id.to_string());
+                channel.updated_at = unix_now();
+                Ok(channel.clone())
             }
             ChannelStoreBackend::Postgres(pool) => block_on_db(async {
                 let row = sqlx::query(
@@ -745,6 +816,7 @@ impl ChannelStore {
                         updated_at = now()
                     returning id::text as id,
                               user_id::text as user_id,
+                              hermes_instance_id::text as hermes_instance_id,
                               name,
                               description,
                               extract(epoch from created_at)::bigint as created_at,
@@ -785,6 +857,7 @@ impl ChannelStore {
                     r#"
                     select id::text as id,
                            user_id::text as user_id,
+                           hermes_instance_id::text as hermes_instance_id,
                            name,
                            description,
                            extract(epoch from created_at)::bigint as created_at,
@@ -897,7 +970,9 @@ impl ChannelStore {
                     .sessions_by_id
                     .values()
                     .filter(|session| {
-                        user_channel_ids.contains(&session.channel_id) && !session.is_home
+                        user_channel_ids.contains(&session.channel_id)
+                            && !session.is_home
+                            && !session.hidden_from_web
                     })
                     .count();
                 if session_count >= max_sessions_per_user as usize {
@@ -948,6 +1023,7 @@ impl ChannelStore {
                     join channels on channels.id = channel_sessions.channel_id
                     where channels.user_id = $1::uuid
                       and not channel_sessions.is_home
+                      and not channel_sessions.hidden_from_web
                     "#,
                     )
                     .bind(user_id)
@@ -3061,7 +3137,10 @@ impl ChannelStore {
                 Ok(ChannelSessionContext {
                     user_id: channel.user_id.clone(),
                     channel_id: channel.id.clone(),
-                    hermes_instance_id: None,
+                    // 内部 channel protocol 的实例鉴权必须看到内存态绑定结果，
+                    // 否则 session_id 访问会退化成只校验 user_id。
+                    hermes_instance_id: channel.hermes_instance_id.clone(),
+                    channel_name: channel.name.clone(),
                 })
             }
             ChannelStoreBackend::Postgres(pool) => block_on_db(async {
@@ -3069,7 +3148,8 @@ impl ChannelStore {
                     r#"
                     select channels.user_id::text as user_id,
                            channels.id::text as channel_id,
-                           channels.hermes_instance_id::text as hermes_instance_id
+                           channels.hermes_instance_id::text as hermes_instance_id,
+                           channels.name
                     from channel_sessions
                     join channels on channels.id = channel_sessions.channel_id
                     where channel_sessions.id = $1::uuid
@@ -3091,10 +3171,22 @@ impl ChannelStore {
                     hermes_instance_id: row
                         .try_get("hermes_instance_id")
                         .map_err(|_| ChannelStoreError::DatabaseFailed)?,
+                    channel_name: row
+                        .try_get("name")
+                        .map_err(|_| ChannelStoreError::DatabaseFailed)?,
                 })
             }),
         }
     }
+}
+
+#[derive(Default)]
+struct ChannelStoreInner {
+    channels_by_id: HashMap<String, Channel>,
+    sessions_by_id: HashMap<String, ChannelSession>,
+    messages_by_session_id: HashMap<String, Vec<ChannelMessage>>,
+    attachments_by_id: HashMap<String, ChannelAttachment>,
+    runs_by_id: HashMap<String, ChannelRun>,
 }
 
 fn memory_channel_by_user_name(
@@ -3116,6 +3208,21 @@ fn memory_channel_by_user_name(
         .cloned()
 }
 
+fn memory_latest_instance_id_for_user(inner: &ChannelStoreInner, user_id: &str) -> Option<String> {
+    inner
+        .channels_by_id
+        .values()
+        .filter(|channel| channel.user_id == user_id)
+        .filter_map(|channel| {
+            channel
+                .hermes_instance_id
+                .as_ref()
+                .map(|instance_id| (channel.updated_at, channel.created_at, instance_id.clone()))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)))
+        .map(|(_, _, instance_id)| instance_id)
+}
+
 fn row_to_channel(row: &sqlx::postgres::PgRow) -> Result<Channel, ChannelStoreError> {
     Ok(Channel {
         id: row
@@ -3123,6 +3230,9 @@ fn row_to_channel(row: &sqlx::postgres::PgRow) -> Result<Channel, ChannelStoreEr
             .map_err(|_| ChannelStoreError::DatabaseFailed)?,
         user_id: row
             .try_get("user_id")
+            .map_err(|_| ChannelStoreError::DatabaseFailed)?,
+        hermes_instance_id: row
+            .try_get("hermes_instance_id")
             .map_err(|_| ChannelStoreError::DatabaseFailed)?,
         name: row
             .try_get("name")
@@ -3353,9 +3463,13 @@ fn run_belongs_to_instance(
     let Some(channel) = inner.channels_by_id.get(&session.channel_id) else {
         return false;
     };
-    // 内存 store 没有 hermes_instance_id 字段；测试环境按用户唯一实例注册，
-    // 这里允许绑定缺失时继续消费，PostgreSQL 路径会做严格 instance 过滤。
-    channel.user_id == expected_instance_id || expected_instance_id == "instance-1"
+    // 内存 store 现在也显式记录 channel 的实例归属，避免本地开发时因实例 id
+    // 不是固定的 `instance-1` 导致 inbox 永远拉不到 queued run。
+    channel
+        .hermes_instance_id
+        .as_deref()
+        .map(|bound_instance_id| bound_instance_id == expected_instance_id)
+        .unwrap_or(false)
 }
 
 async fn find_postgres_message_by_client_key(

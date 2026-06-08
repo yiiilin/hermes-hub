@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 #[tokio::test]
 async fn system_settings_include_public_platform_retention_hours() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
 
     let defaults = store
         .system_settings()
@@ -39,7 +39,7 @@ async fn system_settings_include_public_platform_retention_hours() {
 
 #[tokio::test]
 async fn hidden_public_platform_user_does_not_close_bootstrap_registration() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let public_user = store
         .ensure_public_platform_user()
         .await
@@ -63,7 +63,7 @@ async fn hidden_public_platform_user_does_not_close_bootstrap_registration() {
 
 #[tokio::test]
 async fn public_platform_identity_cannot_be_used_as_a_login_account() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let public_user = store
         .ensure_public_platform_user()
         .await
@@ -99,7 +99,7 @@ async fn public_platform_identity_cannot_be_used_as_a_login_account() {
 
 #[tokio::test]
 async fn expired_public_session_candidates_are_retryable_until_access_is_deleted() {
-    let store = SessionStore::default();
+    let store = SessionStore::in_memory_for_tests();
     let session_id = Uuid::new_v4().to_string();
     store
         .grant_public_session_access("public-token", &session_id, 0)

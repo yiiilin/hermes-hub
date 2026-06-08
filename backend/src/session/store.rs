@@ -61,8 +61,12 @@ enum SessionStoreBackend {
     Postgres { pool: PgPool, cipher: SecretCipher },
 }
 
-impl Default for SessionStore {
-    fn default() -> Self {
+impl SessionStore {
+    /// 仅供测试使用的内存版 store。
+    ///
+    /// 真实运行时必须显式走 PostgreSQL，避免再出现默认构造偷偷落到 memory
+    /// backend 的情况。
+    pub fn in_memory_for_tests() -> Self {
         Self {
             backend: SessionStoreBackend::Memory(Arc::new(Mutex::new(StoreInner::default()))),
         }

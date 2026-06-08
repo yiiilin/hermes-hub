@@ -81,8 +81,8 @@ fn test_state_with_provider(provider: DynLlmProviderClient, registry: ModelRegis
             Arc::new(NoopDockerRuntime),
         ),
         config,
-        store: SessionStore::default(),
-        channel_store: ChannelStore::default(),
+        store: SessionStore::in_memory_for_tests(),
+        channel_store: ChannelStore::in_memory_for_tests(),
         model_registry: registry,
         llm_provider: provider,
         ldap_authenticator: DefaultLdapAuthenticator::default().shared(),
@@ -96,7 +96,7 @@ fn test_app(provider: InMemoryLlmProviderClient, registry: ModelRegistry) -> Rou
 }
 
 fn test_registry() -> ModelRegistry {
-    ModelRegistry::new(ModelConfig {
+    ModelRegistry::in_memory_for_tests(ModelConfig {
         config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
         provider_name: "openai-compatible".to_string(),
         provider_base_url: "https://provider.example/v1".to_string(),
@@ -343,7 +343,7 @@ async fn llm_proxy_caps_requested_output_tokens_at_model_config_limit() {
         content_type: Some("application/json".to_string()),
         body: b"{}".to_vec(),
     });
-    let registry = ModelRegistry::new(ModelConfig {
+    let registry = ModelRegistry::in_memory_for_tests(ModelConfig {
         config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
         provider_name: "openai-compatible".to_string(),
         provider_base_url: "https://provider.example/v1".to_string(),
@@ -392,7 +392,7 @@ async fn llm_proxy_injects_reasoning_for_chat_and_responses_requests() {
         content_type: Some("application/json".to_string()),
         body: b"{}".to_vec(),
     });
-    let registry = ModelRegistry::new(ModelConfig {
+    let registry = ModelRegistry::in_memory_for_tests(ModelConfig {
         config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
         provider_name: "openai-compatible".to_string(),
         provider_base_url: "https://provider.example/v1".to_string(),
@@ -572,7 +572,7 @@ async fn llm_proxy_uses_llm_fallback_when_primary_provider_returns_error_status(
         }),
     ]);
     let provider_requests = provider.clone();
-    let registry = ModelRegistry::new(ModelConfig {
+    let registry = ModelRegistry::in_memory_for_tests(ModelConfig {
         config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
         provider_name: "primary-provider".to_string(),
         provider_base_url: "https://primary.example/v1".to_string(),
@@ -642,7 +642,7 @@ async fn llm_proxy_uses_llm_fallback_when_primary_provider_returns_error_status(
 async fn llm_proxy_uses_real_http_provider_and_records_usage() {
     let captured = CapturedProviderRequest::default();
     let provider_base_url = format!("{}/v1", spawn_provider_server(captured.clone()).await);
-    let registry = ModelRegistry::new(ModelConfig {
+    let registry = ModelRegistry::in_memory_for_tests(ModelConfig {
         config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
         provider_name: "local-provider".to_string(),
         provider_base_url,
@@ -709,7 +709,7 @@ async fn llm_proxy_uses_real_http_provider_and_records_usage() {
 #[tokio::test]
 async fn llm_proxy_allows_longer_timeout_for_streaming_provider_requests() {
     let provider_base_url = format!("{}/v1", spawn_slow_stream_provider_server().await);
-    let registry = ModelRegistry::new(ModelConfig {
+    let registry = ModelRegistry::in_memory_for_tests(ModelConfig {
         config_kind: LLM_MODEL_CONFIG_KIND.to_string(),
         provider_name: "slow-provider".to_string(),
         provider_base_url,

@@ -12,10 +12,13 @@ use std::{
     collections::HashMap,
     time::{Duration, Instant},
 };
+use tokio::time::{sleep, timeout};
 
 use crate::{
     channel::{
-        events::{BusinessToolRequestStatus, SessionEvent},
+        events::{
+            BusinessToolRequestStatus, BusinessToolRequestStatus as ToolRequestStatus, SessionEvent,
+        },
         service::{
             AppendSessionMessageOutcome, ChannelAttachment, ChannelAttachmentDirection,
             ChannelMessage, ChannelMessageRole, ChannelRun, ChannelRunStatus,
@@ -23,6 +26,8 @@ use crate::{
     },
     http::integrations::{
         business_tool_request_client_key, business_tool_request_event,
+        business_tool_request_message_from_args, business_tool_request_result_client_key,
+        generated_business_tool_request_id, integration_business_tool_channel_prompt,
         is_business_tool_request_message, is_reserved_business_tool_client_key,
         validate_business_tool_request_message, ValidatedBusinessToolRequest,
     },
@@ -73,6 +78,10 @@ pub fn router() -> Router<AppState> {
             post(update_run_status),
         )
         .route(
+            "/internal/channel/v1/sessions/{session_id}/business-tool-request",
+            post(call_business_tool_request),
+        )
+        .route(
             "/internal/channel/v1/attachments/{attachment_id}/download",
             get(download_input_attachment),
         )
@@ -115,6 +124,19 @@ struct InstanceStatusReportRequest {
     runtime_image: Option<String>,
     runtime_version: Option<String>,
     scheduler_snapshot: Option<SchedulerSnapshotReportRequest>,
+}
+
+#[derive(Deserialize)]
+struct CallBusinessToolRequest {
+    args: Value,
+    timeout_seconds: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct CallBusinessToolResponse {
+    request_id: String,
+    status: String,
+    result: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -177,6 +199,8 @@ struct InboxItem {
     user_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel_prompt: Option<String>,
     attachments: Value,
 }
 
@@ -1194,6 +1218,91 @@ async fn update_run_status(
     Ok(Json(RunResponse { run }))
 }
 
+async fn call_business_tool_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(payload): Json<CallBusinessToolRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let token_context = verify_instance_token(&state, &headers).await?;
+    let session_context = state
+        .channel_store
+        .session_context(&session_id)
+        .await
+        .map_err(map_channel_error)?;
+    ensure_token_can_access_session(
+        &token_context,
+        &session_context.user_id,
+        &session_context.hermes_instance_id,
+    )?;
+    let Some(integration_id) = session_context
+        .channel_name
+        .strip_prefix("integration:")
+        .map(str::to_string)
+    else {
+        return Err(ApiError::BadRequest(
+            "business tool request requires integration session",
+        ));
+    };
+
+    let request_id = generated_business_tool_request_id();
+    let request_content = business_tool_request_message_from_args(
+        &request_id,
+        &payload.args,
+        payload.timeout_seconds,
+    )?;
+    let validated =
+        validate_business_tool_request_message(&state, &integration_id, &request_content)
+            .await?
+            .ok_or(ApiError::BadRequest("invalid business tool request"))?;
+    let request_client_key = business_tool_request_client_key(&validated.request_id);
+
+    let append_outcome = state
+        .channel_store
+        .append_session_message_with_outcome_before_deadline(
+            &session_context.user_id,
+            &session_context.channel_id,
+            &session_id,
+            ChannelMessageRole::Assistant,
+            Some(request_client_key),
+            validated.normalized_content.clone(),
+            json!([]),
+            validated.expires_at,
+        )
+        .await
+        .map_err(map_channel_error)?;
+    let Some(append_outcome) = append_outcome else {
+        return Err(ApiError::Gone("business tool request expired"));
+    };
+    let (request_message, created) = match append_outcome {
+        AppendSessionMessageOutcome::Created(message) => (message, true),
+        AppendSessionMessageOutcome::Existing(message) => (message, false),
+    };
+    if created {
+        state
+            .session_events
+            .publish(SessionEvent::BusinessToolRequest {
+                request: business_tool_request_event(
+                    &request_message,
+                    &integration_id,
+                    &validated,
+                    BusinessToolRequestStatus::Pending,
+                    None,
+                ),
+            });
+    }
+
+    let result = wait_for_business_tool_result(
+        &state,
+        &session_id,
+        &request_message.id,
+        &validated,
+        &integration_id,
+    )
+    .await?;
+    Ok(Json(result))
+}
+
 async fn report_instance_status(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1468,13 +1577,16 @@ fn ensure_token_can_access_session(
         }
     }
 
-    if let (Some(token_instance_id), Some(session_instance_id)) = (
+    match (
         token_context.hermes_instance_id.as_deref(),
         session_instance_id.as_deref(),
     ) {
-        if token_instance_id != session_instance_id {
-            return Err(ApiError::Forbidden);
-        }
+        // session 级内部接口只能由已绑定到同一 Hermes 实例的 adapter 访问。
+        // 一旦 session 还没完成实例归属，就拒绝访问，而不是退化成宽松模式。
+        (Some(token_instance_id), Some(session_instance_id))
+            if token_instance_id == session_instance_id => {}
+        (Some(_), Some(_)) | (Some(_), None) => return Err(ApiError::Forbidden),
+        (None, _) => return Err(ApiError::Forbidden),
     }
 
     Ok(())
@@ -1500,6 +1612,17 @@ async fn inbox_item_for_run(state: &AppState, run: ChannelRun) -> Result<InboxIt
         .session_context(&run.session_id)
         .await
         .map_err(map_channel_error)?;
+    let channel_prompt = session_context
+        .channel_name
+        .strip_prefix("integration:")
+        .map(str::to_string)
+        .map(|integration_id| async move {
+            integration_business_tool_channel_prompt(state, &integration_id).await
+        });
+    let channel_prompt = match channel_prompt {
+        Some(future) => future.await?,
+        None => None,
+    };
     Ok(InboxItem {
         item_type: "message".to_string(),
         id: run.run_id.clone(),
@@ -1508,6 +1631,7 @@ async fn inbox_item_for_run(state: &AppState, run: ChannelRun) -> Result<InboxIt
         session_id: Some(run.session_id),
         user_id: Some(session_context.user_id),
         content: Some(run.input),
+        channel_prompt,
         attachments,
     })
 }
@@ -1521,8 +1645,138 @@ fn gateway_restart_control_item(instance_id: &str) -> InboxItem {
         session_id: None,
         user_id: None,
         content: None,
+        channel_prompt: None,
         attachments: json!([]),
     }
+}
+
+async fn wait_for_business_tool_result(
+    state: &AppState,
+    session_id: &str,
+    _request_message_id: &str,
+    request: &ValidatedBusinessToolRequest,
+    integration_id: &str,
+) -> Result<CallBusinessToolResponse, ApiError> {
+    let result_client_key = business_tool_request_result_client_key(&request.request_id);
+    // 先订阅事件，再查一次是否已有结果，避免“结果先落库并广播，当前等待方后订阅”时丢事件。
+    let receiver = state.session_events.subscribe();
+    if let Some(existing) = state
+        .channel_store
+        .find_session_message_by_client_key(session_id, &result_client_key)
+        .await
+        .map_err(map_channel_error)?
+    {
+        return Ok(CallBusinessToolResponse {
+            request_id: request.request_id.clone(),
+            status: "completed".to_string(),
+            result: existing.content,
+        });
+    }
+
+    let wait_budget = request.expires_at.saturating_sub(unix_now());
+    if wait_budget == 0 {
+        return Err(ApiError::Gone("business tool request expired"));
+    }
+    let request_id = request.request_id.clone();
+    let session_id_owned = session_id.to_string();
+    let integration_id_owned = integration_id.to_string();
+    let waited = timeout(Duration::from_secs(wait_budget), async move {
+        let mut receiver = receiver;
+        loop {
+            match receiver.recv().await {
+                Ok(SessionEvent::MessageCreated { message })
+                    if message.session_id == session_id_owned
+                        && message.client_message_key.as_deref()
+                            == Some(result_client_key.as_str()) =>
+                {
+                    return Ok(CallBusinessToolResponse {
+                        request_id: request_id.clone(),
+                        status: "completed".to_string(),
+                        result: message.content,
+                    });
+                }
+                Ok(SessionEvent::BusinessToolRequest { request: event })
+                    if event.session_id == session_id_owned
+                        && event.request_id == request_id
+                        && event.integration_id == integration_id_owned =>
+                {
+                    if event.status == ToolRequestStatus::Completed {
+                        if let Some(result_message_id) = event.result_message_id {
+                            return wait_for_result_message_by_id(
+                                state,
+                                &session_id_owned,
+                                &result_message_id,
+                                &request_id,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Ok(SessionEvent::BusinessToolRequest { .. }) => {}
+                Ok(SessionEvent::MessageUpdated { .. })
+                | Ok(SessionEvent::SessionUpdated { .. })
+                | Ok(SessionEvent::RunUpdated { .. })
+                | Ok(SessionEvent::RunCleared { .. })
+                | Ok(SessionEvent::SessionDeleted { .. })
+                | Ok(SessionEvent::MessageCreated { .. }) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    if let Some(existing) = state
+                        .channel_store
+                        .find_session_message_by_client_key(&session_id_owned, &result_client_key)
+                        .await
+                        .map_err(map_channel_error)?
+                    {
+                        return Ok(CallBusinessToolResponse {
+                            request_id: request_id.clone(),
+                            status: "completed".to_string(),
+                            result: existing.content,
+                        });
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(ApiError::Internal)
+                }
+            }
+        }
+    })
+    .await;
+
+    match waited {
+        Ok(result) => result,
+        Err(_) => Err(ApiError::Gone("business tool request expired")),
+    }
+}
+
+async fn wait_for_result_message_by_id(
+    state: &AppState,
+    session_id: &str,
+    result_message_id: &str,
+    request_id: &str,
+) -> Result<CallBusinessToolResponse, ApiError> {
+    for _ in 0..10 {
+        let context = state
+            .channel_store
+            .session_context(session_id)
+            .await
+            .map_err(map_channel_error)?;
+        let messages = state
+            .channel_store
+            .list_session_messages(&context.user_id, &context.channel_id, session_id)
+            .await
+            .map_err(map_channel_error)?;
+        if let Some(message) = messages
+            .into_iter()
+            .find(|message| message.id == result_message_id)
+        {
+            return Ok(CallBusinessToolResponse {
+                request_id: request_id.to_string(),
+                status: "completed".to_string(),
+                result: message.content,
+            });
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    Err(ApiError::Internal)
 }
 
 fn with_internal_download_urls(mut attachments: Value) -> Value {

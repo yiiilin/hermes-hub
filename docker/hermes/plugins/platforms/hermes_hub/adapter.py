@@ -633,6 +633,7 @@ class HermesHubAdapter(BasePlatformAdapter):
             message_id=inbox_id,
             media_urls=media_urls,
             media_types=media_types,
+            channel_prompt=item.get("channel_prompt"),
         )
         await self.handle_message(event)
 
