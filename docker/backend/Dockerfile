@@ -7,6 +7,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY backend/Cargo.toml backend/Cargo.toml
 COPY backend/src backend/src
 COPY backend/migrations backend/migrations
+# backend 会把 Hermes wrapper 相关文件打进二进制资源里；builder 阶段必须显式复制这些输入。
+COPY docker/hermes docker/hermes
 
 RUN cargo build --release -p hermes-hub-backend --bins
 
